@@ -147,15 +147,15 @@ echo "  General Research Agent: http://localhost:$GENERAL_RESEARCH_PORT"
 echo ""
 echo "停止系统: $SCRIPT_DIR/stop_system.sh"
 
-# 启动 Orchestrator 看门狗（自动重启崩溃的 orchestrator）
-nohup bash -c "
-while true; do
-    sleep 2
-    if ! ss -tlnp 2>/dev/null | grep -q ':$ORCHESTRATOR_PORT '; then
-        echo \"[\$(date '+%H:%M:%S')] Orchestrator 崩溃，自动重启...\" >> \"$SCRIPT_DIR/logs/watchdog.log\"
-        nohup '$BIN_DIR/ai_orchestrator' orch-1 $ORCHESTRATOR_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT $MCP_ARGS >> '$SCRIPT_DIR/logs/orchestrator.log' 2>&1 &
-        echo \$! >> '$SCRIPT_DIR/pids/orchestrator.pid'
-    fi
-done
-" > "$SCRIPT_DIR/logs/watchdog.log" 2>&1 &
+# 启动看门狗（自动重启崩溃的 orchestrator 和 gRPC server）
+nohup "$SCRIPT_DIR/watchdog.sh" \
+    "$ORCHESTRATOR_PORT" \
+    "$REGISTRY_PORT" \
+    "$API_KEY" \
+    "$REDIS_HOST" \
+    "$REDIS_PORT" \
+    "$MCP_ARGS" \
+    "$BIN_DIR" \
+    "$PROJECT_ROOT" \
+    > "$SCRIPT_DIR/logs/watchdog.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/pids/watchdog.pid"

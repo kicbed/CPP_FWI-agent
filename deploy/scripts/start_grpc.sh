@@ -76,15 +76,36 @@ bash "$PROJECT_ROOT/examples/ai_orchestrator/start_system.sh" 2>&1
 
 # 启动 gRPC Server
 echo -e "${YELLOW}[4/5] 启动 gRPC Server...${NC}"
-nohup "$PROJECT_ROOT/build/server/rpc_server" \
+
+# 清理旧 gRPC server 进程
+fuser -k 50051/tcp 2>/dev/null || true
+sleep 1
+
+# 启动 gRPC Server（用 trap 忽略 SIGINT，防止 Ctrl+C 杀死 server）
+mkdir -p "$PROJECT_ROOT/deploy/logs" "$PROJECT_ROOT/deploy/pids"
+nohup bash -c "trap '' INT TERM HUP; exec '$PROJECT_ROOT/build/server/rpc_server'" \
     > "$PROJECT_ROOT/deploy/logs/grpc_server.log" 2>&1 &
 echo $! > "$PROJECT_ROOT/deploy/pids/grpc_server.pid"
-sleep 2
 
-if ss -tlnp 2>/dev/null | grep -q ":50051 "; then
-    echo -e "${GREEN}  ✓ gRPC Server 启动成功 (端口 50051)${NC}"
-else
-    echo -e "${RED}  ✗ gRPC Server 启动失败${NC}"
+# 等待 gRPC server 就绪（最多 10 秒）
+echo -ne "  等待 gRPC Server 启动"
+for i in $(seq 1 10); do
+    sleep 1
+    if ss -tlnp 2>/dev/null | grep -q ":50051 "; then
+        echo ""
+        echo -e "${GREEN}  ✓ gRPC Server 启动成功 (端口 50051)${NC}"
+        break
+    fi
+    echo -ne "."
+done
+
+# 最终检查
+if ! ss -tlnp 2>/dev/null | grep -q ":50051 "; then
+    echo ""
+    echo -e "${RED}  ✗ gRPC Server 启动失败！${NC}"
+    echo -e "${RED}  查看日志: tail deploy/logs/grpc_server.log${NC}"
+    echo -e "${RED}  请确认 Agent 系统已启动，然后手动启动 gRPC Server${NC}"
+    exit 1
 fi
 
 echo ""
