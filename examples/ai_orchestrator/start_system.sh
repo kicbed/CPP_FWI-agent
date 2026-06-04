@@ -4,6 +4,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN_DIR="$PROJECT_ROOT/build/examples/ai_orchestrator"
 
+# 自动加载 .env 文件（如果存在）
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    echo "加载配置: $PROJECT_ROOT/.env"
+    set -a
+    source "$PROJECT_ROOT/.env"
+    set +a
+fi
+
 if [ ! -f "$BIN_DIR/ai_orchestrator" ]; then
     echo "错误: 找不到可执行文件，请先编译项目"
     exit 1
@@ -22,11 +30,48 @@ MCP_SERVER="$PROJECT_ROOT/mcp_server_integrated/build/mcp_server"
 MCP_PLUGINS="$PROJECT_ROOT/mcp_server_integrated/build/plugins"
 ENABLE_MCP="${ENABLE_MCP:-false}"
 
-API_KEY="${QWEN_API_KEY:-sk-your-api-key}"
-if [ "$API_KEY" == "sk-your-api-key" ]; then
-    echo "警告: 请设置 QWEN_API_KEY 环境变量"
+# 自动检测 LLM 提供商和 API Key
+LLM_PROVIDER="${LLM_PROVIDER:-qwen}"
+API_KEY=""
+
+case "$LLM_PROVIDER" in
+    deepseek)
+        API_KEY="${DEEPSEEK_API_KEY:-}"
+        ;;
+    qwen)
+        API_KEY="${QWEN_API_KEY:-}"
+        ;;
+    openai)
+        API_KEY="${OPENAI_API_KEY:-}"
+        ;;
+    local)
+        API_KEY="not-needed"
+        ;;
+    *)
+        # 兼容旧配置：检查 QWEN_API_KEY
+        API_KEY="${QWEN_API_KEY:-${DEEPSEEK_API_KEY:-${OPENAI_API_KEY:-}}}"
+        ;;
+esac
+
+if [ -z "$API_KEY" ]; then
+    echo "错误: 请设置 API Key"
+    echo ""
+    echo "方法 1: 使用 .env 文件（推荐）"
+    echo "  cp .env.example .env"
+    echo "  nano .env  # 填入你的密钥"
+    echo "  source .env"
+    echo ""
+    echo "方法 2: 直接设置环境变量"
+    echo "  export LLM_PROVIDER=deepseek"
+    echo "  export DEEPSEEK_API_KEY=sk-你的密钥"
+    echo ""
+    echo "方法 3: 使用通义千问"
+    echo "  export QWEN_API_KEY=sk-你的密钥"
+    echo ""
     exit 1
 fi
+
+echo "使用 LLM: $LLM_PROVIDER"
 
 mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/pids"
 

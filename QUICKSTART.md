@@ -42,7 +42,22 @@ DEEPSEEK_API_KEY=sk-你的密钥
 pip3 install sentence-transformers flask
 
 # 启动 Embedding 服务（后台运行）
-nohup python3 deploy/scripts/embedding_server.py > deploy/logs/embedding.log 2>&1 &
+nohup python3 deploy/scripts/embedding_server.py --model BAAI/bge-small-zh-v1.5 --port 6000 > deploy/logs/embedding.log 2>&1 &
+
+# 验证服务启动
+curl http://localhost:6000/health
+```
+
+**Embedding 服务端口**: 6000
+
+**查看日志**:
+```bash
+tail -f deploy/logs/embedding.log
+```
+
+**停止服务**:
+```bash
+pkill -f embedding_server
 ```
 
 ### 步骤 5: 启动系统
@@ -52,7 +67,26 @@ source .env
 ./examples/ai_orchestrator/start_system.sh
 ```
 
-### 步骤 6: 测试
+### 步骤 6: 使用系统
+
+**方式 1: 交互式客户端（推荐）**
+
+```bash
+./build/examples/ai_orchestrator/ai_client http://localhost:5000
+```
+
+进入后可以直接输入文字对话：
+```
+[default] > 什么是 FWI
+AI: FWI（全波形反演）是...
+
+[default] > 计算 123 * 456
+AI: 123 × 456 = 56088
+
+[default] > /quit
+```
+
+**方式 2: curl 测试**
 
 ```bash
 curl -X POST http://localhost:5000/ -H 'Content-Type: application/json' -d '{
@@ -60,6 +94,12 @@ curl -X POST http://localhost:5000/ -H 'Content-Type: application/json' -d '{
   "params":{"message":{"role":"user","contextId":"ctx",
   "parts":[{"kind":"text","text":"什么是 FWI"}]}}
 }'
+```
+
+**方式 3: gRPC 客户端**
+
+```bash
+./build/client/rpc_client
 ```
 
 ---

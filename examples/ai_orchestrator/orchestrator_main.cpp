@@ -11,7 +11,7 @@
  */
 
 #include "redis_task_store.hpp"
-#include "qwen_client.hpp"
+#include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
 
@@ -112,15 +112,15 @@ public:
         : agent_id_(agent_id)
         , listen_address_(listen_address)
         , task_store_(std::make_shared<RedisTaskStore>(redis_host, redis_port))
-        , qwen_client_(api_key)
+        , llm_client_(api_key, orch_config.llm_provider, orch_config.llm_model, orch_config.llm_api_url)
         , registry_client_(registry_url)
         , mcp_integration_(std::make_unique<MCPAgentIntegration>())
         , orch_config_(orch_config)
         , trace_logger_(agent_id)
         , memory_manager_(redis_host, redis_port)
         , agent_retriever_(registry_client_, orch_config.embedding_provider, orch_config.dashscope_api_key, orch_config.local_embedding_url)
-        , llm_agent_selector_(qwen_client_)
-        , tool_calling_engine_(mcp_integration_.get(), qwen_client_) {
+        , llm_agent_selector_(llm_client_)
+        , tool_calling_engine_(mcp_integration_.get(), llm_client_) {
 
         // 初始化 MCP 集成
         if (!mcp_integration_->initialize(mcp_config)) {
@@ -606,7 +606,7 @@ std::string analyze_intent(const std::string& text) {
         + text;
 
     try {
-        std::string result = qwen_client_.chat(system_prompt, user_prompt);
+        std::string result = llm_client_.chat(system_prompt, user_prompt);
 
         trace_logger_.log_system(LogLevel::INFO, "原始意图识别结果: " + result);
 
@@ -723,7 +723,7 @@ std::string analyze_intent(const std::string& text) {
 
             system_prompt += "历史对话：\n" + history_text;
 
-            return qwen_client_.chat(system_prompt, query);
+            return llm_client_.chat(system_prompt, query);
 
         } catch (const std::exception& e) {
             trace_logger_.log_system(LogLevel::ERROR, std::string("general 问答失败: ") + e.what());
@@ -780,7 +780,7 @@ std::string analyze_intent(const std::string& text) {
                 "如果用户要求执行实际 FWI 计算，请说明这是理论指导，建议用户提供模型参数后可扩展。\n\n"
                 "历史对话：\n" + history_text;
 
-            return qwen_client_.chat(system_prompt, query);
+            return llm_client_.chat(system_prompt, query);
 
         } catch (const std::exception& e) {
             trace_logger_.log_system(LogLevel::ERROR, std::string("FWI 问答失败: ") + e.what());
@@ -885,7 +885,7 @@ std::string analyze_intent(const std::string& text) {
     std::string agent_id_;
     std::string listen_address_;
     std::shared_ptr<RedisTaskStore> task_store_;
-    QwenClient qwen_client_;
+    LLMClient llm_client_;
     RegistryClient registry_client_;
     std::unique_ptr<MCPAgentIntegration> mcp_integration_;
     OrchestratorConfig orch_config_;

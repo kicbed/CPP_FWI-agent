@@ -17,30 +17,31 @@
 ## 快速开始
 
 ```bash
-# 1. 编译
-mkdir -p build && cd build
-cmake .. && make -j$(nproc)
-cd ..
+# 1. 一键设置
+./setup.sh
 
-# 2. 编译 MCP Server
-cd mcp_server_integrated
-mkdir -p build && cd build
-cmake .. && make -j$(nproc)
-cd ../..
+# 2. 编辑配置文件（填入你的 API Key）
+nano .env
 
-# 3. 设置环境变量
-export QWEN_API_KEY=sk-your-qwen-api-key
-export DASHSCOPE_API_KEY=sk-your-dashscope-api-key  # 可选，用于 Embedding
+# 3. 启动本地 Embedding 服务（可选，推荐）
+nohup python3 deploy/scripts/embedding_server.py --model BAAI/bge-small-zh-v1.5 --port 6000 > deploy/logs/embedding.log 2>&1 &
 
 # 4. 启动系统
-./deploy/scripts/start.sh
+./examples/ai_orchestrator/start_system.sh
 
-# 5. 测试
-curl -X POST http://localhost:5000/ -H 'Content-Type: application/json' -d '{
-  "jsonrpc":"2.0","id":"test","method":"message/send",
-  "params":{"message":{"role":"user","contextId":"ctx",
-  "parts":[{"kind":"text","text":"什么是 FWI"}]}}
-}'
+# 5. 使用交互式客户端
+./build/examples/ai_orchestrator/ai_client http://localhost:5000
+```
+
+**交互示例**:
+```
+[default] > 什么是 FWI
+AI: FWI（全波形反演）是...
+
+[default] > 计算 123 * 456
+AI: 123 × 456 = 56088
+
+[default] > /quit
 ```
 
 ## 模型切换指南

@@ -47,12 +47,39 @@ if ! redis-cli ping > /dev/null 2>&1; then
 fi
 echo -e "${GREEN}Redis 运行正常${NC}"
 
-# 检查环境变量
-if [ -z "$QWEN_API_KEY" ]; then
-    echo -e "${RED}错误: 请设置 QWEN_API_KEY 环境变量${NC}"
-    echo "  export QWEN_API_KEY=sk-your-api-key"
+# 自动加载 .env 文件（如果存在）
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    echo -e "${GREEN}加载配置: $PROJECT_ROOT/.env${NC}"
+    set -a
+    source "$PROJECT_ROOT/.env"
+    set +a
+fi
+
+# 检查环境变量 - 支持多种 LLM
+LLM_PROVIDER="${LLM_PROVIDER:-qwen}"
+API_KEY=""
+
+case "$LLM_PROVIDER" in
+    deepseek) API_KEY="${DEEPSEEK_API_KEY:-}" ;;
+    qwen) API_KEY="${QWEN_API_KEY:-}" ;;
+    openai) API_KEY="${OPENAI_API_KEY:-}" ;;
+    local) API_KEY="not-needed" ;;
+    *) API_KEY="${QWEN_API_KEY:-${DEEPSEEK_API_KEY:-${OPENAI_API_KEY:-}}}" ;;
+esac
+
+if [ -z "$API_KEY" ]; then
+    echo -e "${RED}错误: 请设置 API Key${NC}"
+    echo ""
+    echo "方法 1: 使用 .env 文件（推荐）"
+    echo "  cp .env.example .env && nano .env && source .env"
+    echo ""
+    echo "方法 2: 直接设置"
+    echo "  export LLM_PROVIDER=deepseek"
+    echo "  export DEEPSEEK_API_KEY=sk-你的密钥"
     exit 1
 fi
+
+echo -e "${GREEN}使用 LLM: $LLM_PROVIDER${NC}"
 
 # 创建日志目录
 LOG_DIR="$DEPLOY_DIR/logs"

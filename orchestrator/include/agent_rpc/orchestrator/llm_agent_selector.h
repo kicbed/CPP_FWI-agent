@@ -37,8 +37,11 @@ public:
      * @brief Construct with LLM client
      * @param llm_client LLM client (e.g., QwenClient)
      */
-    explicit LLMAgentSelector(QwenClient& llm_client)
-        : llm_client_(llm_client) {}
+    template<typename LLMType>
+    explicit LLMAgentSelector(LLMType& llm_client)
+        : chat_func_([&llm_client](const std::string& sys, const std::string& user) {
+            return llm_client.chat(sys, user);
+        }) {}
 
     /**
      * @brief Select the most appropriate Agent
@@ -68,7 +71,7 @@ public:
 
         try {
             // Call LLM
-            std::string response = llm_client_.chat(
+            std::string response = chat_func_(
                 "你是一个 Agent 选择器。根据用户问题，从候选 Agent 中选择最合适的。"
                 "只返回 JSON，不要其他内容。",
                 prompt
@@ -181,7 +184,7 @@ private:
         }
     }
 
-    QwenClient& llm_client_;
+    std::function<std::string(const std::string&, const std::string&)> chat_func_;
 };
 
 } // namespace orchestrator

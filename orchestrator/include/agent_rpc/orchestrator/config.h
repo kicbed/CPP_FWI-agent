@@ -12,6 +12,17 @@
 #include <vector>
 #include <stdexcept>
 
+// LLM Provider 类型 - 使用 forward declaration 避免重复定义
+#ifndef LLM_PROVIDER_DEFINED
+#define LLM_PROVIDER_DEFINED
+enum class LLMProvider {
+    DEEPSEEK,   // DeepSeek (OpenAI 兼容)
+    QWEN,       // 通义千问 (DashScope)
+    OPENAI,     // OpenAI
+    LOCAL       // 本地模型 (Ollama)
+};
+#endif
+
 namespace agent_rpc {
 namespace orchestrator {
 
@@ -104,6 +115,11 @@ struct OrchestratorConfig {
     std::string api_token;          // Simple token for access control
     std::vector<std::string> allowed_clients;  // Allowed client IDs
 
+    // LLM Provider
+    LLMProvider llm_provider = LLMProvider::DEEPSEEK;
+    std::string llm_model;
+    std::string llm_api_url;
+
     // Logging
     std::string log_file;
     std::string log_level = "INFO";
@@ -169,6 +185,28 @@ struct OrchestratorConfig {
         const char* api_token = std::getenv("AGENT_API_TOKEN");
         if (api_token) {
             config.api_token = api_token;
+        }
+
+        // LLM Provider
+        const char* llm_provider = std::getenv("LLM_PROVIDER");
+        if (llm_provider) {
+            std::string provider_str = llm_provider;
+            if (provider_str == "deepseek") config.llm_provider = LLMProvider::DEEPSEEK;
+            else if (provider_str == "qwen") config.llm_provider = LLMProvider::QWEN;
+            else if (provider_str == "openai") config.llm_provider = LLMProvider::OPENAI;
+            else if (provider_str == "local") config.llm_provider = LLMProvider::LOCAL;
+        }
+
+        // LLM Model
+        const char* llm_model = std::getenv("LLM_MODEL");
+        if (llm_model) {
+            config.llm_model = llm_model;
+        }
+
+        // LLM API URL
+        const char* llm_api_url = std::getenv("LLM_API_URL");
+        if (llm_api_url) {
+            config.llm_api_url = llm_api_url;
         }
 
         return config;

@@ -51,10 +51,13 @@ public:
      * @param mcp_integration MCP integration for tool access
      * @param llm_client LLM client for tool selection
      */
+    template<typename LLMType>
     ToolCallingEngine(agent_rpc::mcp::MCPAgentIntegration* mcp_integration,
-                     QwenClient& llm_client)
+                     LLMType& llm_client)
         : mcp_integration_(mcp_integration)
-        , llm_client_(llm_client) {}
+        , chat_func_([&llm_client](const std::string& sys, const std::string& user) {
+            return llm_client.chat(sys, user);
+        }) {}
 
     /**
      * @brief Process a query with tool calling
@@ -136,7 +139,7 @@ public:
 
         try {
             // Call LLM
-            std::string response = llm_client_.chat(
+            std::string response = chat_func_(
                 "你是一个工具选择器。根据用户问题，从候选工具中选择最合适的，并生成参数。"
                 "只返回 JSON，不要其他内容。",
                 prompt
@@ -286,7 +289,7 @@ private:
     }
 
     agent_rpc::mcp::MCPAgentIntegration* mcp_integration_;
-    QwenClient& llm_client_;
+    std::function<std::string(const std::string&, const std::string&)> chat_func_;
 };
 
 } // namespace orchestrator
