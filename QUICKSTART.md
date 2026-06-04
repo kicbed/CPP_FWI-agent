@@ -2,29 +2,33 @@
 
 ## 一、启动
 
-### 方式 1：HTTP 模式（推荐）
+### HTTP 模式
 
-一个终端运行：
+客户端通过 HTTP POST 直连 Orchestrator (port 5000)：
 
 ```bash
 cd /root/projects/project/agent-communication-main-v2
 ./deploy/scripts/start_http.sh
 ```
 
-启动顺序：Embedding → Agent 系统 → 客户端。完成后直接进入对话界面。
+启动顺序：Embedding → Agent 系统 → 客户端。
 
-### 方式 2：gRPC 模式
+### gRPC 模式
 
-一个终端运行：
+客户端通过 gRPC 协议连接 gRPC Server (port 50051)，gRPC Server 代理转发到 Orchestrator：
+
+```
+gRPC Client ──gRPC──> gRPC Server (:50051) ──A2A/HTTP──> Orchestrator (:5000) ──> Agents
+```
 
 ```bash
 cd /root/projects/project/agent-communication-main-v2
 ./deploy/scripts/start_grpc.sh
 ```
 
-> **两种模式的客户端完全相同**，底层都是 HTTP POST。区别只是 UI 标题显示"HTTP 模式"或"gRPC 模式"。
+启动顺序：Embedding → Agent 系统 → gRPC Server → gRPC 客户端。
 
-### 方式 3：手动分步启动
+### 手动分步启动
 
 需要分别控制服务和客户端时：
 
@@ -32,33 +36,33 @@ cd /root/projects/project/agent-communication-main-v2
 # 终端 1：启动 Agent 系统
 ./examples/ai_orchestrator/start_system.sh
 
-# 终端 2：启动客户端（二选一）
-./build/examples/ai_orchestrator/ai_client http://localhost:5000      # HTTP 版
-./build/client/grpc_ai_client http://localhost:5000                    # gRPC 版
+# 终端 2（可选）：启动 gRPC Server
+./build/server/rpc_server
+
+# 终端 3：启动客户端（二选一）
+./build/examples/ai_orchestrator/ai_client http://localhost:5000      # HTTP 版（直连 Orchestrator）
+./build/client/grpc_ai_client localhost:50051                          # gRPC 版（通过 gRPC Server）
 ```
 
-> **⚠️ 不要同时开两个终端分别运行 `start_system.sh` + `start_grpc.sh`！**
-> `start_grpc.sh` 内部已经调用了 `start_system.sh`，重复启动会导致端口冲突。
+> **⚠️ 不要同时运行 `start_system.sh` + `start_http.sh` 或 `start_grpc.sh`！**
+> 一键脚本内部已经调用了 `start_system.sh`，重复启动会导致端口冲突。
 
 ## 二、停止
 
 ```bash
-# 停止所有服务（Agent 系统 + Embedding + 看门狗）
+# 停止所有服务（Agent 系统 + Embedding + gRPC Server + 看门狗）
 ./examples/ai_orchestrator/stop_system.sh
 ```
 
 如果停止脚本无效，手动清理：
 
 ```bash
-# 按端口杀进程
-for p in 8500 5000 5001 5002 5003 5004 50051 6000; do
-    fuser -k $p/tcp 2>/dev/null
-done
+for p in 8500 5000 5001 5002 5003 5004 50051 6000; do fuser -k $p/tcp 2>/dev/null; done
 ```
 
 ### 退出客户端
 
-在客户端界面中输入 `/quit` 退出。服务会在后台继续运行。
+在客户端界面中输入 `/quit`。服务在后台继续运行。
 
 ## 三、客户端使用
 
@@ -70,7 +74,6 @@ done
 
   [1] 什么是FWI全波形反演？  (4 条)
   [2] 计算 123*456  (2 条)
-  [3] 如何写论文摘要  (2 条)
 
   输入数字 进入对话  n 新建  d 数字 删除  /help 帮助  /quit 退出
 ```
@@ -123,18 +126,22 @@ LOCAL_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
 
 | 端口 | 服务 | 说明 |
 |------|------|------|
-| 5000 | Orchestrator | 调度中心，客户端连接这个端口 |
+| 5000 | Orchestrator | 调度中心，HTTP 模式客户端连接此端口 |
 | 5001 | Math Agent | 数学计算 |
 | 5002 | FWI Theory Agent | FWI 理论 |
 | 5003 | FWI Teaching Agent | FWI 教学 |
 | 5004 | General Research Agent | 通用研究 |
 | 8500 | Registry | 服务注册中心 |
+| 50051 | gRPC Server | gRPC 模式客户端连接此端口 |
 | 6000 | Embedding | 本地向量化服务 |
 
 ## 七、常见问题
 
-### "服务无响应 / 连接被拒绝"
+### "连接被拒绝"
 Agent 系统没有启动。运行 `./examples/ai_orchestrator/start_system.sh` 或使用一键启动脚本。
+
+### gRPC 模式 "gRPC 错误: Connection refused"
+gRPC Server 没有启动。确认 `./deploy/scripts/start_grpc.sh` 完整运行，或手动启动 `./build/server/rpc_server`。
 
 ### 启动后 Orchestrator 崩溃
 看门狗会自动重启（2 秒内）。查看日志：`tail examples/ai_orchestrator/logs/watchdog.log`

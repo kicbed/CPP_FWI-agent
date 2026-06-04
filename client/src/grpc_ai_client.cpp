@@ -1,10 +1,15 @@
 /**
  * @file grpc_ai_client.cpp
- * @brief FWI Agent gRPC 客户端 - 稳定版（与 HTTP 相同 UI）
+ * @brief FWI Agent gRPC 客户端
+ *
+ * 通过 gRPC 协议连接 RPC Server (port 50051)
+ * 架构: grpc_ai_client ──gRPC──> rpc_server ──A2A/HTTP──> Orchestrator ──> Agents
  */
 #pragma GCC diagnostic ignored "-Wunused-result"
 
-#include <curl/curl.h>
+#include "agent_rpc/client/ai_query_client.h"
+#include "agent_rpc/common/logger.h"
+
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <string>
@@ -14,8 +19,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
+#include <signal.h>
 
 using json = nlohmann::json;
+using namespace agent_rpc::client;
 
 // 颜色
 namespace C {
@@ -30,11 +37,6 @@ namespace C {
     const std::string W = "\033[37m";
     const std::string GR = "\033[90m";
     const std::string CL = "\033[2J\033[H";
-}
-
-static size_t WriteCallback(void* c, size_t s, size_t n, std::string* p) {
-    p->append((char*)c, s*n);
-    return s*n;
 }
 
 struct Conv {
@@ -109,54 +111,24 @@ void show_history(const std::string& ctx_id) {
     }
 }
 
-std::string g_last_curl_error;
+std::string send_msg(AIQueryClient& client, const std::string& txt, const std::string& ctx) {
+    auto resp = client.query(txt, ctx, 120);
 
-std::string http_post(const std::string& url, const std::string& body) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return "";
-    std::string r;
-    struct curl_slist* h = nullptr;
-    h = curl_slist_append(h, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, h);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        g_last_curl_error = curl_easy_strerror(res);
-    } else {
-        g_last_curl_error.clear();
-    }
-    curl_slist_free_all(h);
-    curl_easy_cleanup(curl);
-    return r;
-}
-
-std::string send_msg(const std::string& url, const std::string& txt, const std::string& ctx) {
-    static int rid = 0;
-    json req = {
-        {"jsonrpc","2.0"}, {"id",std::to_string(++rid)}, {"method","message/send"},
-        {"params",{{"message",{{"role","user"},{"contextId",ctx},{"parts",{{{{"kind","text"},{"text",txt}}}}}}},{"historyLength",20}}}
-    };
-    std::string resp = http_post(url, req.dump());
-    if (resp.empty()) {
-        if (g_last_curl_error.find("Connection refused") != std::string::npos)
-            return C::R_ + "连接被拒绝，请确认 Agent 系统已启动 (运行 start_system.sh)" + C::R;
-        if (g_last_curl_error.find("timed out") != std::string::npos)
+    if (resp.status().code() != 0) {
+        std::string msg = resp.status().message();
+        if (msg.find("Connection refused") != std::string::npos ||
+            msg.find("connect") != std::string::npos)
+            return C::R_ + "连接被拒绝，请确认 gRPC Server 已启动 (运行 start_grpc.sh)" + C::R;
+        if (msg.find("Deadline") != std::string::npos ||
+            msg.find("timeout") != std::string::npos)
             return C::R_ + "请求超时（120秒），服务可能繁忙" + C::R;
-        return C::R_ + "服务无响应: " + g_last_curl_error + C::R;
+        return C::R_ + "gRPC 错误: " + msg + C::R;
     }
-    try {
-        auto j = json::parse(resp);
-        if (j.contains("error")) return C::R_ + "错误: " + j["error"]["message"].get<std::string>() + C::R;
-        if (j.contains("result") && j["result"].contains("parts") && !j["result"]["parts"].empty())
-            return j["result"]["parts"][0]["text"].get<std::string>();
-        return C::R_ + "无法解析响应" + C::R;
-    } catch(const std::exception& e) {
-        return C::R_ + "解析失败: " + e.what() + C::R;
-    }
+
+    std::string answer = resp.answer();
+    if (answer.empty())
+        return C::R_ + "收到空响应" + C::R;
+    return answer;
 }
 
 void logo() {
@@ -189,12 +161,23 @@ void print_list(const std::vector<Conv>& convs) {
 }
 
 int main(int argc, char* argv[]) {
-    std::string url = "http://localhost:5000";
-    if (argc > 1) {
-        std::string addr = argv[1];
-        if (addr.find("http") == std::string::npos) url = "http://" + addr;
-        else url = addr;
+    std::string server_addr = "localhost:50051";
+    if (argc > 1) server_addr = argv[1];
+
+    // 初始化日志
+    agent_rpc::common::LogConfig log_config;
+    log_config.level = agent_rpc::common::LogLevel::Level_ERROR;
+    log_config.color_output = false;
+    agent_rpc::common::initializeAdvancedLogger(log_config);
+
+    // 连接 gRPC Server
+    AIQueryClient grpc_client;
+    if (!grpc_client.connect(server_addr)) {
+        std::cerr << C::R_ << "  ✗ 无法连接 gRPC Server: " << server_addr << C::R << std::endl;
+        std::cerr << C::D << "    请确认 gRPC Server 已启动 (运行 start_grpc.sh)" << C::R << std::endl;
+        return 1;
     }
+    std::cout << C::G << "  ✓ 已连接 gRPC Server: " << server_addr << C::R << std::endl;
 
     auto convs = load_convos();
     std::string ctx;
@@ -295,12 +278,13 @@ int main(int argc, char* argv[]) {
             }
 
             std::cout << C::D << "  ⏳ 思考中..." << C::R << "\r" << std::flush;
-            std::string resp = send_msg(url, input, ctx);
+            std::string resp = send_msg(grpc_client, input, ctx);
             std::cout << "\n";
             std::cout << C::B << C::G << "  🤖 AI: " << C::R << resp << "\n\n";
             std::cout << C::GR << "  ─────────────────────────────────────────────────────────────────" << C::R << "\n\n";
         }
     }
 
+    grpc_client.disconnect();
     return 0;
 }
