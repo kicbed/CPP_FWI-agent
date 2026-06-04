@@ -66,6 +66,18 @@ export AGENT_API_TOKEN=your-secret-token
 
 ### 2.3 启动系统
 
+**一键启动（推荐）**:
+
+```bash
+# HTTP 模式（包含交互式客户端）
+./deploy/scripts/start_http.sh
+
+# gRPC 模式（包含 Server + Client）
+./deploy/scripts/start_grpc.sh
+```
+
+**手动启动**:
+
 ```bash
 # 使用部署脚本
 ./deploy/scripts/start.sh

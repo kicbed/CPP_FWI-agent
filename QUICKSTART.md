@@ -62,47 +62,56 @@ tail -f deploy/logs/embedding.log
 pkill -f embedding_server
 ```
 
-### 步骤 5: 启动系统
+### 步骤 5: 启动系统（一键启动）
 
+**HTTP 模式（推荐）**:
 ```bash
-source .env
-./examples/ai_orchestrator/start_system.sh
+./deploy/scripts/start_http.sh
+```
+
+**gRPC 模式**:
+```bash
+./deploy/scripts/start_grpc.sh
 ```
 
 ### 步骤 6: 使用系统
 
-**方式 1: 交互式客户端（推荐）**
+启动后会自动进入交互式客户端：
 
-```bash
-./build/examples/ai_orchestrator/ai_client http://localhost:5000
+```
+╔══════════════════════════════════════════════════════════════╗
+║           🔬  FWI 全波形反演科研助手平台  🔬                ║
+╚══════════════════════════════════════════════════════════════╝
+
+  连接到: http://localhost:5000
+
+┌────────────────────────────────────────────────────────────┐
+│  📚 对话历史                                                │
+└────────────────────────────────────────────────────────────┘
+
+  ▶ [1] default (12 条消息)
+      └─ 1 + 1 = 2
+    [2] demo (6 条消息)
+    [3] test-history (2 条消息)
+
+─────────────────────────────────────────────────────────────
+  n 新建对话   1-9 选择对话   Enter 进入   /help 帮助   /quit 退出
+
+  > 
 ```
 
-进入后可以直接输入文字对话：
-```
-[default] > 什么是 FWI
-AI: FWI（全波形反演）是...
+**功能说明**:
+| 命令 | 功能 |
+|------|------|
+| `n` | 新建对话 |
+| `1-9` | 选择对话 |
+| `Enter` | 进入选中的对话 |
+| `/help` | 显示帮助 |
+| `/card` | 查看 Agent Card |
+| `/list` | 返回对话列表 |
+| `/quit` | 退出 |
 
-[default] > 计算 123 * 456
-AI: 123 × 456 = 56088
-
-[default] > /quit
-```
-
-**方式 2: curl 测试**
-
-```bash
-curl -X POST http://localhost:5000/ -H 'Content-Type: application/json' -d '{
-  "jsonrpc":"2.0","id":"test","method":"message/send",
-  "params":{"message":{"role":"user","contextId":"ctx",
-  "parts":[{"kind":"text","text":"什么是 FWI"}]}}
-}'
-```
-
-**方式 3: gRPC 客户端**
-
-```bash
-./build/client/rpc_client
-```
+**历史记录**: 退出后再进入，所有对话历史都会保留（存储在 Redis 中）。
 
 ---
 
