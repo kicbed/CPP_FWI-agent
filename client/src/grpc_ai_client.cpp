@@ -134,14 +134,15 @@ std::string send_msg(const std::string& url, const std::string& txt, const std::
         {"params",{{"message",{{"role","user"},{"contextId",ctx},{"parts",{{{{"kind","text"},{"text",txt}}}}}}},{"historyLength",20}}}
     };
     std::string resp = http_post(url, req.dump());
+    if (resp.empty()) return C::R_ + "服务无响应，请检查是否启动" + C::R;
     try {
         auto j = json::parse(resp);
         if (j.contains("error")) return C::R_ + "错误: " + j["error"]["message"].get<std::string>() + C::R;
         if (j.contains("result") && j["result"].contains("parts") && !j["result"]["parts"].empty())
             return j["result"]["parts"][0]["text"].get<std::string>();
-        return C::R_ + "无法解析" + C::R;
-    } catch(...) {
-        return C::R_ + "解析失败" + C::R;
+        return C::R_ + "无法解析响应" + C::R;
+    } catch(const std::exception& e) {
+        return C::R_ + "解析失败: " + e.what() + C::R;
     }
 }
 
