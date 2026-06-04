@@ -77,22 +77,14 @@ echo "使用 LLM: $LLM_PROVIDER"
 mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/pids"
 
 # 清理旧进程，确保端口可用
+# 注意：进程名在 Linux 上被截断为 15 字符，所以用 -f 匹配完整命令行
+# 但 -f 会匹配脚本自身路径（包含 ai_orchestrator），必须精确匹配二进制路径
 echo "清理旧进程..."
-pkill -9 ai_registry_server 2>/dev/null || true
-pkill -9 ai_math_agent 2>/dev/null || true
-pkill -9 ai_fwi_theory_agent 2>/dev/null || true
-pkill -9 ai_fwi_teaching_agent 2>/dev/null || true
-pkill -9 ai_general_research_agent 2>/dev/null || true
-pkill -9 ai_orchestrator 2>/dev/null || true
-sleep 1
-# 等待端口释放
 for port in $REGISTRY_PORT $ORCHESTRATOR_PORT $MATH_AGENT_PORT $FWI_THEORY_PORT $FWI_TEACHING_PORT $GENERAL_RESEARCH_PORT; do
-    while ss -tlnp 2>/dev/null | grep -q ":$port "; do
-        echo "  等待端口 $port 释放..."
-        sleep 1
-    done
+    # 找出占用端口的进程 PID 并 kill
+    fuser -k "$port/tcp" 2>/dev/null || true
 done
-sleep 1
+sleep 2
 
 echo "=========================================="
 echo "AI Agent 系统启动"
