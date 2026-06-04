@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN_DIR="$PROJECT_ROOT/build/examples/ai_orchestrator"
@@ -76,6 +75,24 @@ fi
 echo "使用 LLM: $LLM_PROVIDER"
 
 mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/pids"
+
+# 清理旧进程，确保端口可用
+echo "清理旧进程..."
+pkill -9 ai_registry_server 2>/dev/null || true
+pkill -9 ai_math_agent 2>/dev/null || true
+pkill -9 ai_fwi_theory_agent 2>/dev/null || true
+pkill -9 ai_fwi_teaching_agent 2>/dev/null || true
+pkill -9 ai_general_research_agent 2>/dev/null || true
+pkill -9 ai_orchestrator 2>/dev/null || true
+sleep 1
+# 等待端口释放
+for port in $REGISTRY_PORT $ORCHESTRATOR_PORT $MATH_AGENT_PORT $FWI_THEORY_PORT $FWI_TEACHING_PORT $GENERAL_RESEARCH_PORT; do
+    while ss -tlnp 2>/dev/null | grep -q ":$port "; do
+        echo "  等待端口 $port 释放..."
+        sleep 1
+    done
+done
+sleep 1
 
 echo "=========================================="
 echo "AI Agent 系统启动"
