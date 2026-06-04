@@ -109,6 +109,8 @@ void show_history(const std::string& ctx_id) {
     }
 }
 
+std::string g_last_curl_error;
+
 std::string http_post(const std::string& url, const std::string& body) {
     CURL* curl = curl_easy_init();
     if (!curl) return "";
@@ -121,7 +123,12 @@ std::string http_post(const std::string& url, const std::string& body) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
-    curl_easy_perform(curl);
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        g_last_curl_error = curl_easy_strerror(res);
+    } else {
+        g_last_curl_error.clear();
+    }
     curl_slist_free_all(h);
     curl_easy_cleanup(curl);
     return r;
@@ -134,7 +141,13 @@ std::string send_msg(const std::string& url, const std::string& txt, const std::
         {"params",{{"message",{{"role","user"},{"contextId",ctx},{"parts",{{{{"kind","text"},{"text",txt}}}}}}},{"historyLength",20}}}
     };
     std::string resp = http_post(url, req.dump());
-    if (resp.empty()) return C::R_ + "服务无响应，请检查是否启动" + C::R;
+    if (resp.empty()) {
+        if (g_last_curl_error.find("Connection refused") != std::string::npos)
+            return C::R_ + "连接被拒绝，请确认 Agent 系统已启动 (运行 start_system.sh)" + C::R;
+        if (g_last_curl_error.find("timed out") != std::string::npos)
+            return C::R_ + "请求超时（120秒），服务可能繁忙" + C::R;
+        return C::R_ + "服务无响应: " + g_last_curl_error + C::R;
+    }
     try {
         auto j = json::parse(resp);
         if (j.contains("error")) return C::R_ + "错误: " + j["error"]["message"].get<std::string>() + C::R;
