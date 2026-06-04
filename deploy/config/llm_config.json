@@ -5,10 +5,10 @@
     "providers": {
       "deepseek": {
         "name": "DeepSeek",
-        "api_url": "https://api.deepseek.com/v1/chat/completions",
-        "model": "deepseek-chat",
+        "api_url": "https://api.deepseek.com/anthropic",
+        "model": "deepseek-v4-flash[1m]",
         "api_key": "${DEEPSEEK_API_KEY}",
-        "description": "DeepSeek V3 - 性价比高，中文效果好"
+        "description": "DeepSeek V4 - 性价比高，中文效果好"
       },
       "mimo": {
         "name": "MiMo",

@@ -14,8 +14,9 @@
   },
 
   "api_keys": {
-    "qwen": "${sk-d2ef9d662b8b4abb998f0f0a497229ed}",
-    "dashscope": "${sk-d2ef9d662b8b4abb998f0f0a497229ed}"
+    "qwen": "${QWEN_API_KEY}",
+    "dashscope": "${DASHSCOPE_API_KEY}",
+    "deepseek": "${DEEPSEEK_API_KEY}"
   },
 
   "features": {
