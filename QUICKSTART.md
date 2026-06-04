@@ -41,14 +41,16 @@ DEEPSEEK_API_KEY=sk-你的密钥
 # 安装 Python 依赖（只需一次）
 pip3 install sentence-transformers flask
 
-# 启动 Embedding 服务（后台运行）
-nohup python3 deploy/scripts/embedding_server.py --model BAAI/bge-small-zh-v1.5 --port 6000 > deploy/logs/embedding.log 2>&1 &
+# 启动 Embedding 服务（后台运行，默认使用 Qwen3-Embedding-0.6B）
+nohup python3 deploy/scripts/embedding_server.py > deploy/logs/embedding.log 2>&1 &
 
 # 验证服务启动
 curl http://localhost:6000/health
 ```
 
 **Embedding 服务端口**: 6000
+
+**默认模型**: Qwen/Qwen3-Embedding-0.6B（可在 .env 中修改 `LOCAL_EMBEDDING_MODEL`）
 
 **查看日志**:
 ```bash

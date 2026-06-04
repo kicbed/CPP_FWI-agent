@@ -42,9 +42,12 @@ done
 
 # 2. 停止 Embedding 服务
 echo -e "${YELLOW}[2/3] 停止 Embedding 服务...${NC}"
+
+# 检查所有可能的 PID 文件位置
 for pid_file in \
     "$SCRIPT_DIR/pids/embedding.pid" \
-    "$PROJECT_ROOT/deploy/pids/embedding.pid"; do
+    "$PROJECT_ROOT/deploy/pids/embedding.pid" \
+    "$PROJECT_ROOT/deploy/logs/embedding.pid"; do
     if [ -f "$pid_file" ]; then
         pid=$(cat "$pid_file")
         if kill -0 "$pid" 2>/dev/null; then
@@ -58,6 +61,17 @@ for pid_file in \
         rm -f "$pid_file"
     fi
 done
+
+# 也通过端口查找并停止
+embedding_pid=$(ss -tlnp | grep ":6000 " | grep -oP 'pid=\d+' | grep -oP '\d+')
+if [ -n "$embedding_pid" ]; then
+    echo -e "  停止 Embedding (端口 6000, PID: $embedding_pid)"
+    kill "$embedding_pid" 2>/dev/null
+    sleep 1
+    if kill -0 "$embedding_pid" 2>/dev/null; then
+        kill -9 "$embedding_pid" 2>/dev/null
+    fi
+fi
 
 # 3. 通过进程名强制停止（兜底）
 echo -e "${YELLOW}[3/3] 清理残留进程...${NC}"

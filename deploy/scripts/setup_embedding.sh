@@ -31,8 +31,8 @@ echo -e "${YELLOW}[1/3] 安装 Python 依赖...${NC}"
 pip3 install sentence-transformers flask --quiet
 echo -e "${GREEN}依赖安装完成${NC}"
 
-# 模型名称
-MODEL_NAME="${1:-Qwen/Qwen3-Embedding-0.6B}"
+# 模型名称（优先使用参数，其次使用环境变量，最后使用默认值）
+MODEL_NAME="${1:-${LOCAL_EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}}"
 PORT="${2:-6000}"
 
 echo -e "${YELLOW}[2/3] 下载模型: $MODEL_NAME${NC}"
