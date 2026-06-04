@@ -29,4 +29,9 @@ for pid_file in "$PID_DIR"/*.pid; do
     fi
 done
 
+# 也尝试通过进程名停止 Embedding 服务
+if pkill -f "embedding_server.py" 2>/dev/null; then
+    echo -e "${YELLOW}停止 Embedding 服务${NC}"
+fi
+
 echo -e "${GREEN}系统已停止${NC}"

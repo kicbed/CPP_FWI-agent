@@ -29,6 +29,7 @@ REDIS_PORT=6379
 MCP_SERVER="$PROJECT_ROOT/mcp_server_integrated/build/mcp_server"
 MCP_PLUGINS="$PROJECT_ROOT/mcp_server_integrated/build/plugins"
 ENABLE_MCP="${ENABLE_MCP:-false}"
+EMBEDDING_URL="${LOCAL_EMBEDDING_URL:-http://localhost:6000}"
 
 # 自动检测 LLM 提供商和 API Key
 LLM_PROVIDER="${LLM_PROVIDER:-qwen}"

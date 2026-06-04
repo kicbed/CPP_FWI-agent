@@ -104,6 +104,97 @@ curl -X POST http://localhost:5000/ -H 'Content-Type: application/json' -d '{
 
 ---
 
+## 配置说明
+
+### 路由模式
+
+编辑 `.env` 文件：
+
+```bash
+# 固定路由（简单，if-else 逻辑）
+ROUTING_MODE=fixed
+
+# Agent-RAG 动态路由（智能，基于 Embedding 语义匹配）（推荐）
+ROUTING_MODE=agent-rag
+```
+
+### 工具调用模式
+
+```bash
+# 规则选择（简单，关键词匹配）
+TOOL_CALLING_MODE=rule
+
+# LLM 选择（智能，让 LLM 选择工具）（推荐）
+TOOL_CALLING_MODE=llm
+```
+
+### MCP 工具开关
+
+```bash
+# 启用 MCP 工具（推荐）
+ENABLE_MCP=true
+
+# 禁用 MCP 工具
+ENABLE_MCP=false
+```
+
+### Embedding 配置
+
+```bash
+# 本地 Embedding（推荐，免费，使用 GPU）
+EMBEDDING_PROVIDER=local
+LOCAL_EMBEDDING_URL=http://localhost:6000
+
+# DashScope API（阿里云，需要付费）
+EMBEDDING_PROVIDER=dashscope
+DASHSCOPE_API_KEY=sk-你的密钥
+```
+
+### LLM 配置
+
+```bash
+# DeepSeek（推荐，便宜）
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=sk-你的密钥
+
+# 通义千问（阿里）
+LLM_PROVIDER=qwen
+QWEN_API_KEY=sk-你的密钥
+
+# OpenAI
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-你的密钥
+
+# 本地模型（Ollama，完全免费）
+LLM_PROVIDER=local
+LOCAL_LLM_URL=http://localhost:11434
+```
+
+### 完整配置示例
+
+```bash
+# .env 文件示例
+
+# LLM 配置
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=sk-你的deepseek密钥
+
+# Embedding 配置
+EMBEDDING_PROVIDER=local
+LOCAL_EMBEDDING_URL=http://localhost:6000
+
+# 功能开关
+ENABLE_MCP=true
+ROUTING_MODE=agent-rag
+TOOL_CALLING_MODE=llm
+
+# Redis
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+```
+
+---
+
 ## 日常使用
 
 ### 启动系统
