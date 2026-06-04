@@ -6,6 +6,7 @@ set(SERVER_SOURCES
     src/rpc_server.cpp
     src/agent_service.cpp
     src/ai_query_service.cpp
+    src/http_bridge.cpp
 )
 
 # 创建静态库

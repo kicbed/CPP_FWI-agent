@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Agent Orchestrator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            slate: { 950: '#020617' },
+            accent: { DEFAULT: '#6366F1', light: '#818CF8', dark: '#4F46E5' },
+          },
+          fontFamily: {
+            heading: ['Space Grotesk', 'sans-serif'],
+            body: ['DM Sans', 'sans-serif'],
+            mono: ['Fira Code', 'monospace'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'DM Sans', sans-serif; background: #0F172A; color: #F1F5F9; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+
+    /* Typing indicator */
+    @keyframes typingBounce {
+      0%, 60%, 100% { transform: translateY(0); }
+      30% { transform: translateY(-6px); }
+    }
+    .typing-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #6366F1; display: inline-block;
+      animation: typingBounce 1.4s infinite ease-in-out;
+    }
+    .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+    /* Cursor blink */
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+    .cursor-blink::after {
+      content: '|'; color: #6366F1; font-weight: 100;
+      animation: blink 1s step-end infinite;
+    }
+
+    /* Message slide-in */
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .msg-enter { animation: slideUp 0.3s ease-out; }
+
+    /* Glow effect */
+    .glow-accent { box-shadow: 0 0 20px rgba(99, 102, 241, 0.3); }
+    .glow-accent:hover { box-shadow: 0 0 30px rgba(99, 102, 241, 0.5); }
+
+    /* Mode switch */
+    .mode-active {
+      background: linear-gradient(135deg, #6366F1 0%, #818CF8 100%);
+      color: white; box-shadow: 0 0 16px rgba(99,102,241,0.4);
+    }
+
+    /* Code block */
+    pre {
+      background: #0F172A; border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 8px; padding: 12px 16px; overflow-x: auto;
+      font-family: 'Fira Code', monospace; font-size: 13px; line-height: 1.6;
+    }
+    code {
+      font-family: 'Fira Code', monospace; font-size: 13px;
+      background: rgba(99,102,241,0.15); padding: 2px 6px; border-radius: 4px;
+    }
+    pre code { background: none; padding: 0; }
+
+    /* Markdown styles */
+    .markdown-body h1, .markdown-body h2, .markdown-body h3 {
+      font-family: 'Space Grotesk', sans-serif; font-weight: 600;
+      margin-top: 16px; margin-bottom: 8px;
+    }
+    .markdown-body h1 { font-size: 1.5em; }
+    .markdown-body h2 { font-size: 1.25em; }
+    .markdown-body h3 { font-size: 1.1em; }
+    .markdown-body p { margin-bottom: 8px; line-height: 1.7; }
+    .markdown-body ul, .markdown-body ol { margin-left: 20px; margin-bottom: 8px; }
+    .markdown-body li { margin-bottom: 4px; line-height: 1.6; }
+    .markdown-body blockquote {
+      border-left: 3px solid #6366F1; padding-left: 12px;
+      color: #94A3B8; margin: 8px 0;
+    }
+    .markdown-body table { border-collapse: collapse; margin: 8px 0; width: 100%; }
+    .markdown-body th, .markdown-body td {
+      border: 1px solid #334155; padding: 8px 12px; text-align: left;
+    }
+    .markdown-body th { background: #1E293B; font-weight: 600; }
+    .markdown-body a { color: #818CF8; text-decoration: underline; }
+    .markdown-body hr { border: none; border-top: 1px solid #334155; margin: 16px 0; }
+
+    /* Status pulse */
+    @keyframes pulse-green {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.4); }
+      50% { box-shadow: 0 0 0 6px rgba(16,185,129,0); }
+    }
+    .status-online { animation: pulse-green 2s infinite; }
+
+    /* Responsive sidebar */
+    @media (max-width: 768px) {
+      .sidebar { position: fixed; z-index: 50; transform: translateX(-100%); transition: transform 0.3s; }
+      .sidebar.open { transform: translateX(0); }
+      .sidebar-overlay { display: none; }
+      .sidebar-overlay.open { display: block; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 40; }
+    }
+  </style>
+</head>
+<body class="h-screen flex overflow-hidden">
+
+  <!-- Mobile menu button -->
+  <button id="menuBtn" class="md:hidden fixed top-4 left-4 z-50 p-2 bg-slate-800 rounded-lg border border-white/10" onclick="toggleSidebar()">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
+  </button>
+
+  <!-- Sidebar overlay (mobile) -->
+  <div id="sidebarOverlay" class="sidebar-overlay" onclick="toggleSidebar()"></div>
+
+  <!-- Sidebar -->
+  <aside id="sidebar" class="sidebar w-64 bg-slate-900/80 border-r border-white/5 flex flex-col h-full shrink-0">
+    <!-- Logo -->
+    <div class="p-5 border-b border-white/5">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-accent to-accent-light flex items-center justify-center">
+          <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+        </div>
+        <div>
+          <h1 class="font-heading font-bold text-base leading-tight">AI Orchestrator</h1>
+          <p class="text-xs text-slate-400">Multi-Agent System</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Mode Switch -->
+    <div class="px-4 pt-4 pb-2">
+      <p class="text-xs text-slate-500 uppercase tracking-wider mb-2 font-medium">通信模式</p>
+      <div class="flex bg-slate-800 rounded-lg p-1 gap-1">
+        <button id="modeHttp" onclick="switchMode('http')" class="flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 mode-active">
+          HTTP
+        </button>
+        <button id="modeGrpc" onclick="switchMode('grpc')" class="flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 text-slate-400 hover:text-slate-200">
+          gRPC
+        </button>
+      </div>
+    </div>
+
+    <!-- New Chat -->
+    <div class="px-4 pt-3">
+      <button onclick="newChat()" class="w-full py-2.5 px-4 bg-accent/10 hover:bg-accent/20 border border-accent/30 rounded-lg text-sm font-medium text-accent-light transition-all duration-200 flex items-center justify-center gap-2">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+        新对话
+      </button>
+    </div>
+
+    <!-- Chat History -->
+    <div class="flex-1 overflow-y-auto px-4 pt-4">
+      <p class="text-xs text-slate-500 uppercase tracking-wider mb-2 font-medium">历史对话</p>
+      <div id="chatHistory" class="space-y-1"></div>
+    </div>
+
+    <!-- System Status -->
+    <div class="p-4 border-t border-white/5">
+      <p class="text-xs text-slate-500 uppercase tracking-wider mb-3 font-medium">系统状态</p>
+      <div class="space-y-2">
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-400">Orchestrator</span>
+          <div class="flex items-center gap-1.5">
+            <div id="statusOrchestrator" class="w-2 h-2 rounded-full bg-slate-600"></div>
+            <span id="statusOrchestratorText" class="text-xs text-slate-500">检测中</span>
+          </div>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-400">gRPC Server</span>
+          <div class="flex items-center gap-1.5">
+            <div id="statusGrpc" class="w-2 h-2 rounded-full bg-slate-600"></div>
+            <span id="statusGrpcText" class="text-xs text-slate-500">检测中</span>
+          </div>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-400">当前模式</span>
+          <span id="currentModeLabel" class="text-xs font-mono text-accent-light">HTTP :5000</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="flex-1 flex flex-col h-full min-w-0">
+    <!-- Header -->
+    <header class="h-14 border-b border-white/5 flex items-center justify-between px-6 bg-slate-900/50 backdrop-blur-sm shrink-0">
+      <div class="flex items-center gap-3">
+        <h2 id="chatTitle" class="font-heading font-semibold text-sm">新对话</h2>
+        <span id="modeTag" class="px-2 py-0.5 bg-accent/15 text-accent-light text-xs rounded-full font-mono">HTTP</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <button onclick="clearChat()" class="p-2 hover:bg-slate-800 rounded-lg transition-colors text-slate-400 hover:text-slate-200" title="清空对话">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Chat Area -->
+    <div id="chatArea" class="flex-1 overflow-y-auto px-4 md:px-6 py-4">
+      <!-- Welcome message -->
+      <div id="welcomeMsg" class="flex flex-col items-center justify-center h-full text-center">
+        <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-accent to-accent-light flex items-center justify-center mb-6 glow-accent">
+          <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
+        </div>
+        <h3 class="font-heading text-xl font-bold mb-2">AI Agent Orchestrator</h3>
+        <p class="text-slate-400 text-sm max-w-md mb-6">多智能体协作系统，支持 HTTP 直连和 gRPC 两种通信模式。输入你的问题开始对话。</p>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg w-full">
+          <button onclick="sendQuick('说一说数字孪生地球')" class="p-3 bg-slate-800/60 hover:bg-slate-800 border border-white/5 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30">
+            <span class="text-accent-light">🌏</span> 数字孪生地球
+          </button>
+          <button onclick="sendQuick('说说最先进的工程agent')" class="p-3 bg-slate-800/60 hover:bg-slate-800 border border-white/5 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30">
+            <span class="text-accent-light">🤖</span> 最先进的工程 Agent
+          </button>
+          <button onclick="sendQuick('解释一下FWI理论')" class="p-3 bg-slate-800/60 hover:bg-slate-800 border border-white/5 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30">
+            <span class="text-accent-light">📡</span> FWI 理论
+          </button>
+          <button onclick="sendQuick('帮我解一个微分方程')" class="p-3 bg-slate-800/60 hover:bg-slate-800 border border-white/5 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30">
+            <span class="text-accent-light">📐</span> 微分方程
+          </button>
+        </div>
+      </div>
+
+      <!-- Messages container -->
+      <div id="messages" class="max-w-3xl mx-auto space-y-4 hidden"></div>
+
+      <!-- Typing indicator -->
+      <div id="typingIndicator" class="max-w-3xl mx-auto hidden">
+        <div class="flex items-start gap-3 msg-enter">
+          <div class="w-8 h-8 rounded-lg bg-accent/20 flex items-center justify-center shrink-0">
+            <svg class="w-4 h-4 text-accent-light" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+          </div>
+          <div class="bg-slate-800 rounded-2xl rounded-tl-md px-4 py-3 border border-white/5">
+            <div class="flex items-center gap-1.5">
+              <span class="typing-dot"></span>
+              <span class="typing-dot"></span>
+              <span class="typing-dot"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Input Area -->
+    <div class="border-t border-white/5 bg-slate-900/50 backdrop-blur-sm px-4 md:px-6 py-4 shrink-0">
+      <div class="max-w-3xl mx-auto">
+        <div class="flex items-end gap-3">
+          <div class="flex-1 relative">
+            <textarea
+              id="userInput"
+              placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"
+              rows="1"
+              class="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 pr-12 text-sm resize-none focus:outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/30 transition-all placeholder:text-slate-500"
+              onkeydown="handleKeyDown(event)"
+              oninput="autoResize(this)"
+            ></textarea>
+          </div>
+          <button
+            id="sendBtn"
+            onclick="sendMessage()"
+            class="p-3 bg-accent hover:bg-accent-dark rounded-xl transition-all duration-200 glow-accent disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
+          </button>
+          <button
+            id="stopBtn"
+            onclick="stopGeneration()"
+            class="p-3 bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 rounded-xl transition-all duration-200 hidden"
+          >
+            <svg class="w-5 h-5 text-red-400" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+          </button>
+        </div>
+        <p class="text-xs text-slate-600 mt-2 text-center">
+          Powered by Multi-Agent Orchestrator · HTTP / gRPC 双模式
+        </p>
+      </div>
+    </div>
+  </main>
+
+  <!-- Toast notification -->
+  <div id="toast" class="fixed bottom-20 left-1/2 -translate-x-1/2 px-4 py-2 bg-slate-800 border border-white/10 rounded-lg text-sm shadow-xl transition-all duration-300 opacity-0 translate-y-2 pointer-events-none z-50"></div>
+
+  <script>
+    // ===== State =====
+    const state = {
+      mode: localStorage.getItem('agent-mode') || 'http',
+      chatId: Date.now().toString(),
+      chats: JSON.parse(localStorage.getItem('agent-chats') || '{}'),
+      streaming: false,
+      abortController: null,
+      contextId: null,
+    };
+
+    const CONFIG = {
+      http: { url: 'http://localhost:5000', label: 'HTTP :5000' },
+      grpc: { url: 'http://localhost:50052', label: 'gRPC :50052' },
+    };
+
+    // ===== Init =====
+    document.addEventListener('DOMContentLoaded', () => {
+      switchMode(state.mode);
+      renderHistory();
+      checkStatus();
+      setInterval(checkStatus, 15000);
+      document.getElementById('userInput').focus();
+    });
+
+    // ===== Mode Switch =====
+    function switchMode(mode) {
+      state.mode = mode;
+      localStorage.setItem('agent-mode', mode);
+      state.contextId = null;
+
+      const httpBtn = document.getElementById('modeHttp');
+      const grpcBtn = document.getElementById('modeGrpc');
+      if (mode === 'http') {
+        httpBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 mode-active';
+        grpcBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 text-slate-400 hover:text-slate-200';
+      } else {
+        grpcBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 mode-active';
+        httpBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 text-slate-400 hover:text-slate-200';
+      }
+
+      document.getElementById('modeTag').textContent = mode === 'http' ? 'HTTP' : 'gRPC';
+      document.getElementById('currentModeLabel').textContent = CONFIG[mode].label;
+      showToast(`已切换到 ${mode.toUpperCase()} 模式`);
+    }
+
+    // ===== Chat =====
+    function newChat() {
+      state.chatId = Date.now().toString();
+      state.contextId = null;
+      document.getElementById('messages').innerHTML = '';
+      document.getElementById('messages').classList.add('hidden');
+      document.getElementById('welcomeMsg').classList.remove('hidden');
+      document.getElementById('chatTitle').textContent = '新对话';
+      renderHistory();
+    }
+
+    function clearChat() {
+      const msgs = document.getElementById('messages');
+      msgs.innerHTML = '';
+      msgs.classList.add('hidden');
+      document.getElementById('welcomeMsg').classList.remove('hidden');
+      state.contextId = null;
+    }
+
+    function loadChat(chatId) {
+      const chat = state.chats[chatId];
+      if (!chat) return;
+      state.chatId = chatId;
+      state.contextId = chat.contextId || null;
+
+      document.getElementById('welcomeMsg').classList.add('hidden');
+      const msgs = document.getElementById('messages');
+      msgs.classList.remove('hidden');
+      msgs.innerHTML = '';
+
+      chat.messages.forEach(m => {
+        appendMessage(m.role, m.content, false);
+      });
+
+      document.getElementById('chatTitle').textContent = chat.title || '对话';
+      scrollToBottom();
+      if (window.innerWidth < 768) toggleSidebar();
+    }
+
+    function saveChat(title, messages, contextId) {
+      state.chats[state.chatId] = { title, messages, contextId, mode: state.mode, time: Date.now() };
+      // Keep only last 50 chats
+      const keys = Object.keys(state.chats).sort((a, b) => state.chats[b].time - state.chats[a].time);
+      if (keys.length > 50) keys.slice(50).forEach(k => delete state.chats[k]);
+      localStorage.setItem('agent-chats', JSON.stringify(state.chats));
+      renderHistory();
+    }
+
+    function renderHistory() {
+      const container = document.getElementById('chatHistory');
+      const entries = Object.entries(state.chats)
+        .sort(([,a],[,b]) => b.time - a.time)
+        .slice(0, 20);
+
+      if (entries.length === 0) {
+        container.innerHTML = '<p class="text-xs text-slate-600 text-center py-4">暂无对话</p>';
+        return;
+      }
+
+      container.innerHTML = entries.map(([id, chat]) => {
+        const active = id === state.chatId ? 'bg-slate-800 border-accent/20' : 'hover:bg-slate-800/50';
+        const modeIcon = chat.mode === 'grpc' ? '⚡' : '🌐';
+        return `<button onclick="loadChat('${id}')" class="w-full text-left px-3 py-2 rounded-lg border border-transparent text-sm truncate transition-all duration-150 ${active}">
+          <span class="text-xs mr-1">${modeIcon}</span>${chat.title || '未命名对话'}
+        </button>`;
+      }).join('');
+    }
+
+    // ===== Messaging =====
+    function sendQuick(text) {
+      document.getElementById('userInput').value = text;
+      sendMessage();
+    }
+
+    function handleKeyDown(e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    }
+
+    function autoResize(el) {
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+    }
+
+    async function sendMessage() {
+      const input = document.getElementById('userInput');
+      const text = input.value.trim();
+      if (!text || state.streaming) return;
+
+      input.value = '';
+      input.style.height = 'auto';
+
+      // Hide welcome, show messages
+      document.getElementById('welcomeMsg').classList.add('hidden');
+      const msgs = document.getElementById('messages');
+      msgs.classList.remove('hidden');
+
+      // Append user message
+      appendMessage('user', text);
+      scrollToBottom();
+
+      // Save title from first message
+      const chatMessages = getChatMessages();
+      chatMessages.push({ role: 'user', content: text });
+      const title = text.slice(0, 30) + (text.length > 30 ? '...' : '');
+
+      // Show typing
+      showTyping(true);
+      state.streaming = true;
+      updateSendBtn();
+
+      try {
+        let answer;
+        if (state.mode === 'http') {
+          answer = await sendHttp(text);
+        } else {
+          answer = await sendGrpc(text);
+        }
+
+        showTyping(false);
+        appendMessage('assistant', answer);
+
+        chatMessages.push({ role: 'assistant', content: answer });
+        saveChat(title, chatMessages, state.contextId);
+      } catch (err) {
+        showTyping(false);
+        if (err.name === 'AbortError') {
+          appendMessage('system', '⚠️ 已停止生成');
+        } else {
+          appendMessage('system', `❌ ${err.message}`);
+        }
+      } finally {
+        state.streaming = false;
+        updateSendBtn();
+        scrollToBottom();
+      }
+    }
+
+    function stopGeneration() {
+      if (state.abortController) {
+        state.abortController.abort();
+      }
+    }
+
+    // ===== HTTP Mode =====
+    async function sendHttp(text) {
+      state.abortController = new AbortController();
+      const id = 'req-' + Date.now();
+
+      // Try streaming first
+      try {
+        return await sendHttpStream(text, id);
+      } catch (e) {
+        // Fallback to non-streaming
+        if (e.name === 'AbortError') throw e;
+        return await sendHttpSync(text, id);
+      }
+    }
+
+    async function sendHttpStream(text, id) {
+      const body = {
+        jsonrpc: '2.0', id, method: 'message/stream',
+        params: {
+          message: { role: 'user', contextId: state.contextId || undefined, parts: [{ kind: 'text', text }] },
+          historyLength: 10,
+        },
+      };
+
+      const resp = await fetch(CONFIG.http.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: state.abortController.signal,
+      });
+
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      const contentType = resp.headers.get('content-type') || '';
+      if (contentType.includes('text/event-stream')) {
+        return await parseSSE(resp, id);
+      }
+
+      // JSON response
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error.message || '请求失败');
+      return extractAnswer(data.result);
+    }
+
+    async function parseSSE(resp, id) {
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let answer = '';
+      let contextId = state.contextId;
+
+      // Create streaming message element
+      const msgEl = appendMessage('assistant', '', true);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const jsonStr = line.slice(6).trim();
+          if (!jsonStr || jsonStr === '[DONE]') continue;
+
+          try {
+            const event = JSON.parse(jsonStr);
+            const result = event.result;
+
+            if (result?.contextId) contextId = result.contextId;
+
+            // Handle task status update
+            if (result?.status?.message?.parts) {
+              for (const part of result.status.message.parts) {
+                if (part.kind === 'text' && part.text) {
+                  answer += part.text;
+                  updateStreamMessage(msgEl, answer);
+                }
+              }
+            }
+
+            // Handle artifacts
+            if (result?.artifacts) {
+              for (const artifact of result.artifacts) {
+                if (artifact.parts) {
+                  for (const part of artifact.parts) {
+                    if (part.kind === 'text' && part.text) {
+                      answer += part.text;
+                      updateStreamMessage(msgEl, answer);
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            // Not valid JSON, skip
+          }
+        }
+      }
+
+      if (contextId) state.contextId = contextId;
+      finalizeStreamMessage(msgEl, answer);
+      return answer;
+    }
+
+    async function sendHttpSync(text, id) {
+      const body = {
+        jsonrpc: '2.0', id, method: 'message/send',
+        params: {
+          message: { role: 'user', contextId: state.contextId || undefined, parts: [{ kind: 'text', text }] },
+          historyLength: 10,
+        },
+      };
+
+      const resp = await fetch(CONFIG.http.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: state.abortController.signal,
+      });
+
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+      const data = await resp.json();
+
+      if (data.error) throw new Error(data.error.message || '请求失败');
+      if (data.result?.contextId) state.contextId = data.result.contextId;
+
+      return extractAnswer(data.result);
+    }
+
+    function extractAnswer(result) {
+      if (!result) return '无响应内容';
+
+      // Try artifacts first
+      if (result.artifacts?.length > 0) {
+        for (const a of result.artifacts) {
+          if (a.parts?.length > 0) {
+            const textParts = a.parts.filter(p => p.kind === 'text').map(p => p.text);
+            if (textParts.length > 0) return textParts.join('\n');
+          }
+        }
+      }
+
+      // Try status message
+      if (result.status?.message?.parts?.length > 0) {
+        const textParts = result.status.message.parts.filter(p => p.kind === 'text').map(p => p.text);
+        if (textParts.length > 0) return textParts.join('\n');
+      }
+
+      // Try top-level parts
+      if (result.parts?.length > 0) {
+        const textParts = result.parts.filter(p => p.kind === 'text').map(p => p.text);
+        if (textParts.length > 0) return textParts.join('\n');
+      }
+
+      return JSON.stringify(result, null, 2);
+    }
+
+    // ===== gRPC Mode =====
+    async function sendGrpc(text) {
+      state.abortController = new AbortController();
+
+      const resp = await fetch(`${CONFIG.grpc.url}/api/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: text, context_id: state.contextId || '' }),
+        signal: state.abortController.signal,
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        throw new Error(`gRPC 网关错误 ${resp.status}: ${errText || resp.statusText}`);
+      }
+
+      const data = await resp.json();
+      if (data.status && data.status !== 0) {
+        throw new Error(data.error || `服务返回错误 (code: ${data.status})`);
+      }
+
+      if (data.context_id) state.contextId = data.context_id;
+      return data.answer || '无响应内容';
+    }
+
+    // ===== UI Helpers =====
+    function appendMessage(role, content, streaming = false) {
+      const msgs = document.getElementById('messages');
+      const el = document.createElement('div');
+      el.className = 'msg-enter';
+
+      if (role === 'user') {
+        el.innerHTML = `
+          <div class="flex items-start gap-3 justify-end">
+            <div class="bg-blue-600 rounded-2xl rounded-tr-md px-4 py-3 max-w-[80%]">
+              <p class="text-sm leading-relaxed whitespace-pre-wrap">${escapeHtml(content)}</p>
+            </div>
+            <div class="w-8 h-8 rounded-lg bg-blue-600/30 flex items-center justify-center shrink-0">
+              <svg class="w-4 h-4 text-blue-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
+            </div>
+          </div>`;
+      } else if (role === 'assistant') {
+        const rendered = streaming ? '' : renderMarkdown(content);
+        el.innerHTML = `
+          <div class="flex items-start gap-3">
+            <div class="w-8 h-8 rounded-lg bg-accent/20 flex items-center justify-center shrink-0">
+              <svg class="w-4 h-4 text-accent-light" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+            </div>
+            <div class="bg-slate-800 rounded-2xl rounded-tl-md px-4 py-3 max-w-[85%] border border-white/5 flex-1">
+              <div class="markdown-body text-sm leading-relaxed ${streaming ? 'cursor-blink' : ''}" ${streaming ? 'data-streaming="true"' : ''}>${rendered}</div>
+              ${!streaming ? `<div class="mt-2 flex gap-2">
+                <button onclick="copyText(this)" class="text-xs text-slate-500 hover:text-slate-300 transition-colors flex items-center gap-1">
+                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                  复制
+                </button>
+              </div>` : ''}
+            </div>
+          </div>`;
+        if (streaming) el.dataset.role = 'streaming';
+      } else {
+        el.innerHTML = `<div class="text-center text-sm text-slate-400 py-2">${content}</div>`;
+      }
+
+      msgs.appendChild(el);
+      return el;
+    }
+
+    function updateStreamMessage(el, content) {
+      const body = el.querySelector('.markdown-body');
+      if (body) {
+        body.innerHTML = renderMarkdown(content);
+        scrollToBottom();
+      }
+    }
+
+    function finalizeStreamMessage(el, content) {
+      const body = el.querySelector('.markdown-body');
+      if (body) {
+        body.classList.remove('cursor-blink');
+        body.removeAttribute('data-streaming');
+        body.innerHTML = renderMarkdown(content);
+        // Add copy button
+        const wrapper = body.parentElement;
+        if (!wrapper.querySelector('.mt-2')) {
+          const btn = document.createElement('div');
+          btn.className = 'mt-2 flex gap-2';
+          btn.innerHTML = `<button onclick="copyText(this)" class="text-xs text-slate-500 hover:text-slate-300 transition-colors flex items-center gap-1">
+            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+            复制
+          </button>`;
+          wrapper.appendChild(btn);
+        }
+      }
+    }
+
+    function showTyping(show) {
+      document.getElementById('typingIndicator').classList.toggle('hidden', !show);
+      if (show) scrollToBottom();
+    }
+
+    function updateSendBtn() {
+      const sendBtn = document.getElementById('sendBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      if (state.streaming) {
+        sendBtn.classList.add('hidden');
+        stopBtn.classList.remove('hidden');
+      } else {
+        sendBtn.classList.remove('hidden');
+        stopBtn.classList.add('hidden');
+      }
+    }
+
+    function scrollToBottom() {
+      const area = document.getElementById('chatArea');
+      requestAnimationFrame(() => { area.scrollTop = area.scrollHeight; });
+    }
+
+    function getChatMessages() {
+      const chat = state.chats[state.chatId];
+      return chat ? [...chat.messages] : [];
+    }
+
+    function copyText(btn) {
+      const mdBody = btn.closest('.border-white\\/5').querySelector('.markdown-body');
+      if (mdBody) {
+        navigator.clipboard.writeText(mdBody.innerText).then(() => {
+          btn.innerHTML = '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg> 已复制';
+          setTimeout(() => {
+            btn.innerHTML = '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg> 复制';
+          }, 2000);
+        });
+      }
+    }
+
+    // ===== Status Check =====
+    async function checkStatus() {
+      // Check Orchestrator (port 5000)
+      try {
+        const resp = await fetch('http://localhost:5000', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 'ping', method: 'message/send', params: { message: { role: 'user', parts: [{ kind: 'text', text: 'ping' }] } } }),
+          signal: AbortSignal.timeout(5000),
+        });
+        setStatus('Orchestrator', true);
+      } catch (e) {
+        setStatus('Orchestrator', false);
+      }
+
+      // Check gRPC HTTP Bridge (port 50052)
+      try {
+        await fetch('http://localhost:50052/health', {
+          signal: AbortSignal.timeout(3000),
+        });
+        setStatus('Grpc', true);
+      } catch (e) {
+        setStatus('Grpc', false, '未连接');
+      }
+    }
+
+    function setStatus(name, online, customText) {
+      const dot = document.getElementById(`status${name}`);
+      const text = document.getElementById(`status${name}Text`);
+      if (online) {
+        dot.className = 'w-2 h-2 rounded-full bg-emerald-500 status-online';
+        text.textContent = '运行中';
+        text.className = 'text-xs text-emerald-400';
+      } else {
+        dot.className = 'w-2 h-2 rounded-full bg-red-500';
+        text.textContent = customText || '离线';
+        text.className = 'text-xs text-red-400';
+      }
+    }
+
+    // ===== Markdown Renderer (minimal) =====
+    function renderMarkdown(text) {
+      if (!text) return '';
+      let html = escapeHtml(text);
+
+      // Code blocks
+      html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+        return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
+      });
+
+      // Inline code
+      html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+      // Headers
+      html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+      html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+      html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+
+      // Bold & Italic
+      html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+      // Links
+      html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+      // Blockquotes
+      html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+
+      // Horizontal rule
+      html = html.replace(/^---$/gm, '<hr>');
+
+      // Unordered lists
+      html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+      html = html.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
+
+      // Ordered lists
+      html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+
+      // Tables (simple)
+      html = html.replace(/\|(.+)\|/g, (match) => {
+        const cells = match.split('|').filter(c => c.trim());
+        if (cells.every(c => /^[\s-]+$/.test(c))) return '';
+        const tag = match.includes('---') ? 'th' : 'td';
+        return '<tr>' + cells.map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
+      });
+
+      // Paragraphs
+      html = html.replace(/\n\n/g, '</p><p>');
+      html = html.replace(/\n/g, '<br>');
+
+      // Clean up
+      html = html.replace(/<p><\/p>/g, '');
+      if (!html.startsWith('<')) html = '<p>' + html + '</p>';
+
+      return html;
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    // ===== Toast =====
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.classList.remove('opacity-0', 'translate-y-2');
+      toast.classList.add('opacity-100', 'translate-y-0');
+      setTimeout(() => {
+        toast.classList.add('opacity-0', 'translate-y-2');
+        toast.classList.remove('opacity-100', 'translate-y-0');
+      }, 2000);
+    }
+
+    // ===== Sidebar Toggle (mobile) =====
+    function toggleSidebar() {
+      document.getElementById('sidebar').classList.toggle('open');
+      document.getElementById('sidebarOverlay').classList.toggle('open');
+    }
+  </script>
+</body>
+</html>

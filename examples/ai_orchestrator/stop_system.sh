@@ -63,19 +63,21 @@ for pid_file in \
 done
 
 # 也通过端口查找并停止
-embedding_pid=$(ss -tlnp | grep ":6000 " | grep -oP 'pid=\d+' | grep -oP '\d+')
-if [ -n "$embedding_pid" ]; then
-    echo -e "  停止 Embedding (端口 6000, PID: $embedding_pid)"
-    kill "$embedding_pid" 2>/dev/null
-    sleep 1
-    if kill -0 "$embedding_pid" 2>/dev/null; then
-        kill -9 "$embedding_pid" 2>/dev/null
+for port in 6000 50051 50052; do
+    port_pid=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -oP 'pid=\d+' | grep -oP '\d+')
+    if [ -n "$port_pid" ]; then
+        echo -e "  停止服务 (端口 $port, PID: $port_pid)"
+        kill "$port_pid" 2>/dev/null
+        sleep 1
+        if kill -0 "$port_pid" 2>/dev/null; then
+            kill -9 "$port_pid" 2>/dev/null
+        fi
     fi
-fi
+done
 
 # 3. 通过进程名强制停止（兜底）
 echo -e "${YELLOW}[3/3] 清理残留进程...${NC}"
-for pattern in "ai_orchestrator" "ai_math_agent" "ai_registry_server" "ai_fwi_theory" "ai_fwi_teaching" "ai_general_research" "embedding_server"; do
+for pattern in "ai_orchestrator" "ai_math_agent" "ai_registry_server" "ai_fwi_theory" "ai_fwi_teaching" "ai_general_research" "embedding_server" "rpc_server"; do
     pids=$(pgrep -f "$pattern" 2>/dev/null)
     if [ -n "$pids" ]; then
         echo -e "  强制停止 $pattern (PIDs: $pids)"

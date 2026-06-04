@@ -110,6 +110,11 @@ if ! ss -tlnp 2>/dev/null | grep -q ":50051 "; then
     exit 1
 fi
 
+# 检查 HTTP 桥接端口
+if ss -tlnp 2>/dev/null | grep -q ":50052 "; then
+    echo -e "${GREEN}  ✓ HTTP 桥接启动成功 (端口 50052)${NC}"
+fi
+
 echo ""
 echo -e "${CYAN}=========================================="
 echo "系统启动完成!"
@@ -118,6 +123,9 @@ echo ""
 echo "服务地址:"
 echo "  Orchestrator:  http://localhost:5000"
 echo "  gRPC Server:   localhost:50051"
+echo "  HTTP 桥接:     http://localhost:50052 (Web 前端用)"
+echo ""
+echo "Web UI 启动:    python3 web/serve.py"
 echo ""
 echo "停止系统:       ./examples/ai_orchestrator/stop_system.sh"
 echo ""

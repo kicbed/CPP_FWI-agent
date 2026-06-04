@@ -13,6 +13,7 @@
 
 #include "agent_rpc/server/rpc_server.h"
 #include "agent_rpc/server/ai_query_service.h"
+#include "agent_rpc/server/http_bridge.h"
 #include "agent_rpc/a2a_adapter/a2a_config.h"
 #include "agent_rpc/common/logger.h"
 #include <iostream>
@@ -42,6 +43,7 @@ void printUsage(const char* program) {
     std::cout << "选项:" << std::endl;
     std::cout << "  -p, --port PORT           gRPC 监听端口 (默认: 50051)" << std::endl;
     std::cout << "  -o, --orchestrator URL    Orchestrator 地址 (默认: http://localhost:5000)" << std::endl;
+    std::cout << "      --http-port PORT      HTTP 桥接端口 (默认: 50052, 设为 0 禁用)" << std::endl;
     std::cout << "  -r, --registry ADDR       注册中心地址，例如 consul://127.0.0.1:8500" << std::endl;
     std::cout << "      --enable-registry     显式启用服务注册" << std::endl;
     std::cout << "  -t, --timeout SECONDS     请求超时时间 (默认: 60)" << std::endl;
@@ -51,10 +53,14 @@ void printUsage(const char* program) {
     std::cout << "  RPC_SERVER_PORT           gRPC 监听端口" << std::endl;
     std::cout << "  ORCHESTRATOR_URL          Orchestrator 地址" << std::endl;
     std::cout << "  RPC_REGISTRY_ADDRESS      注册中心地址" << std::endl;
+    std::cout << "  HTTP_BRIDGE_PORT          HTTP 桥接端口" << std::endl;
     std::cout << std::endl;
     std::cout << "示例:" << std::endl;
     std::cout << "  " << program << std::endl;
-    std::cout << "  " << program << " -p 50051 -o http://localhost:5000" << std::endl;
+    std::cout << "  " << program << " -p 50051 --http-port 50052" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Web UI:" << std::endl;
+    std::cout << "  浏览器访问 http://localhost:50052/api/query" << std::endl;
     std::cout << std::endl;
     std::cout << "启动顺序:" << std::endl;
     std::cout << "  1. 启动 ai_orchestrator 系统: ./start_system.sh" << std::endl;
@@ -67,9 +73,10 @@ int main(int argc, char* argv[]) {
     std::string port = "50051";
     std::string orchestrator_url = "http://localhost:5000";
     std::string registry_address = "localhost:8500";
+    int http_bridge_port = 50052;
     bool enable_registry = false;
     int timeout_seconds = 60;
-    
+
     // 从环境变量读取
     if (const char* env_port = std::getenv("RPC_SERVER_PORT")) {
         port = env_port;
@@ -81,11 +88,14 @@ int main(int argc, char* argv[]) {
         registry_address = env_registry;
         enable_registry = true;
     }
-    
+    if (const char* env_http_port = std::getenv("HTTP_BRIDGE_PORT")) {
+        http_bridge_port = std::atoi(env_http_port);
+    }
+
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        
+
         if (arg == "-h" || arg == "--help") {
             printUsage(argv[0]);
             return 0;
@@ -93,6 +103,8 @@ int main(int argc, char* argv[]) {
             port = argv[++i];
         } else if ((arg == "-o" || arg == "--orchestrator") && i + 1 < argc) {
             orchestrator_url = argv[++i];
+        } else if (arg == "--http-port" && i + 1 < argc) {
+            http_bridge_port = std::atoi(argv[++i]);
         } else if ((arg == "-r" || arg == "--registry") && i + 1 < argc) {
             registry_address = argv[++i];
             enable_registry = true;
@@ -178,12 +190,26 @@ int main(int argc, char* argv[]) {
     std::cout << "==========================================" << std::endl;
     
     LOG_INFO("RPC Server 已启动: " + config.server_address);
-    
+
+    // 启动 HTTP 桥接服务（为 Web 前端提供 HTTP API）
+    HttpBridge http_bridge;
+    if (http_bridge_port > 0) {
+        if (http_bridge.start(http_bridge_port, orchestrator_url)) {
+            std::cout << "HTTP 桥接:     0.0.0.0:" << http_bridge_port << std::endl;
+            std::cout << "  Web UI API:  http://localhost:" << http_bridge_port << "/api/query" << std::endl;
+        } else {
+            std::cerr << "警告: HTTP 桥接启动失败 (端口 " << http_bridge_port << ")" << std::endl;
+        }
+    }
+
     // 主循环
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     
+    // 停止 HTTP 桥接
+    http_bridge.stop();
+
     // 停止服务器
     server.stop();
     LOG_INFO("RPC Server 已停止");
