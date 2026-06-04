@@ -1,16 +1,6 @@
 /**
  * @file knowledge_base.h
- * @brief KnowledgeBase - local knowledge base for FWI research
- *
- * Provides keyword-based search over local Markdown/JSON knowledge files.
- * First version uses simple keyword matching, future versions can use embeddings.
- *
- * Directory structure:
- * resources/
- * ├── fwi_knowledge/        # FWI theory (Markdown)
- * ├── fwi_models/           # Model metadata (JSON)
- * ├── fwi_datasets/         # Dataset metadata (JSON)
- * └── fwi_notes/            # Research notes (Markdown)
+ * @brief KnowledgeBase - improved knowledge base with better search
  */
 
 #pragma once
@@ -29,65 +19,35 @@ using json = nlohmann::json;
 namespace agent_rpc {
 namespace orchestrator {
 
-/**
- * @brief Knowledge document
- */
 struct KnowledgeDocument {
-    std::string path;           // File path
-    std::string title;          // Document title
-    std::string content;        // Full content
-    std::string category;       // Category (knowledge/models/datasets/notes)
-    float relevance_score;      // Relevance score (for search results)
+    std::string path;
+    std::string title;
+    std::string content;
+    std::string category;
+    float relevance_score;
 };
 
-/**
- * @brief Local knowledge base
- *
- * Loads and searches local Markdown/JSON knowledge files.
- * Supports keyword-based search with relevance scoring.
- */
 class KnowledgeBase {
 public:
     KnowledgeBase() = default;
 
-    /**
-     * @brief Load knowledge base from directory
-     * @param resource_dir Root resource directory
-     * @return true if loaded successfully
-     *
-     * Expected structure:
-     * resource_dir/
-     * ├── fwi_knowledge/*.md
-     * ├── fwi_models/*.json
-     * ├── fwi_datasets/*.json
-     * └── fwi_notes/*.md
-     */
     bool load(const std::string& resource_dir) {
         resource_dir_ = resource_dir;
-
-        // Load all categories
         load_directory(resource_dir + "/fwi_knowledge", "knowledge");
         load_directory(resource_dir + "/fwi_models", "models");
         load_directory(resource_dir + "/fwi_datasets", "datasets");
         load_directory(resource_dir + "/fwi_notes", "notes");
-
         return !documents_.empty();
     }
 
     /**
-     * @brief Search knowledge base
-     * @param query Search query
-     * @param topK Maximum results to return
-     * @return Relevant documents sorted by score
+     * @brief Search knowledge base with improved matching
      */
     std::vector<KnowledgeDocument> search(const std::string& query, int topK = 3) {
         std::vector<KnowledgeDocument> results;
-
-        // Normalize query
         std::string lower_query = to_lowercase(query);
         auto keywords = split_keywords(lower_query);
 
-        // Score each document
         for (auto& doc : documents_) {
             float score = compute_relevance(lower_query, keywords, doc);
             if (score > 0.0f) {
@@ -97,13 +57,11 @@ public:
             }
         }
 
-        // Sort by score descending
         std::sort(results.begin(), results.end(),
                   [](const KnowledgeDocument& a, const KnowledgeDocument& b) {
                       return a.relevance_score > b.relevance_score;
                   });
 
-        // Return topK
         if (results.size() > static_cast<size_t>(topK)) {
             results.resize(topK);
         }
@@ -111,34 +69,20 @@ public:
         return results;
     }
 
-    /**
-     * @brief Read a specific file
-     * @param path File path (relative to resource_dir)
-     * @return File content
-     */
     std::string read(const std::string& path) {
         std::string full_path = resource_dir_ + "/" + path;
         return read_file(full_path);
     }
 
-    /**
-     * @brief Get all documents
-     */
     const std::vector<KnowledgeDocument>& get_all_documents() const {
         return documents_;
     }
 
-    /**
-     * @brief Get document count
-     */
     size_t get_document_count() const {
         return documents_.size();
     }
 
 private:
-    /**
-     * @brief Load all files from a directory
-     */
     void load_directory(const std::string& dir_path, const std::string& category) {
         DIR* dir = opendir(dir_path.c_str());
         if (!dir) return;
@@ -146,54 +90,38 @@ private:
         struct dirent* entry;
         while ((entry = readdir(dir)) != nullptr) {
             std::string filename = entry->d_name;
-
-            // Skip . and ..
             if (filename == "." || filename == "..") continue;
 
             std::string full_path = dir_path + "/" + filename;
-
-            // Check if it's a file
             struct stat st;
             if (stat(full_path.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) continue;
 
-            // Read file
             std::string content = read_file(full_path);
             if (content.empty()) continue;
 
-            // Extract title from filename or first line
             std::string title = extract_title(filename, content);
 
-            // Add document
             KnowledgeDocument doc;
             doc.path = full_path;
             doc.title = title;
             doc.content = content;
             doc.category = category;
             doc.relevance_score = 0.0f;
-
             documents_.push_back(doc);
         }
 
         closedir(dir);
     }
 
-    /**
-     * @brief Read file content
-     */
     std::string read_file(const std::string& path) {
         std::ifstream file(path);
         if (!file.is_open()) return "";
-
         std::ostringstream oss;
         oss << file.rdbuf();
         return oss.str();
     }
 
-    /**
-     * @brief Extract title from filename or content
-     */
     std::string extract_title(const std::string& filename, const std::string& content) {
-        // Try to extract from first line (Markdown heading)
         size_t pos = content.find("# ");
         if (pos != std::string::npos) {
             size_t end = content.find("\n", pos);
@@ -201,8 +129,6 @@ private:
                 return content.substr(pos + 2, end - pos - 2);
             }
         }
-
-        // Use filename
         std::string title = filename;
         size_t dot_pos = title.rfind(".");
         if (dot_pos != std::string::npos) {
@@ -212,7 +138,7 @@ private:
     }
 
     /**
-     * @brief Compute relevance score
+     * @brief Improved relevance scoring
      */
     float compute_relevance(const std::string& lower_query,
                            const std::vector<std::string>& keywords,
@@ -222,39 +148,61 @@ private:
         std::string lower_title = to_lowercase(doc.title);
         std::string lower_content = to_lowercase(doc.content);
 
-        // Title match (high weight)
+        // 1. Exact phrase match in title (highest weight)
+        if (lower_title.find(lower_query) != std::string::npos) {
+            score += 2.0f;
+        }
+
+        // 2. Keyword match in title
         for (const auto& kw : keywords) {
-            if (lower_title.find(kw) != std::string::npos) {
+            if (kw.length() >= 2 && lower_title.find(kw) != std::string::npos) {
+                score += 0.8f;
+            }
+        }
+
+        // 3. Exact phrase match in content
+        if (lower_content.find(lower_query) != std::string::npos) {
+            score += 1.5f;
+        }
+
+        // 4. Keyword match in content (count occurrences)
+        for (const auto& kw : keywords) {
+            if (kw.length() >= 2) {
+                size_t pos = 0;
+                int count = 0;
+                while ((pos = lower_content.find(kw, pos)) != std::string::npos) {
+                    count++;
+                    pos += kw.length();
+                }
+                score += std::min(1.0f, count * 0.2f);
+            }
+        }
+
+        // 5. Category boost
+        if (doc.category == "knowledge") {
+            // Boost knowledge documents for theory questions
+            if (lower_query.find("理论") != std::string::npos ||
+                lower_query.find("概念") != std::string::npos ||
+                lower_query.find("解释") != std::string::npos ||
+                lower_query.find("什么是") != std::string::npos) {
                 score += 0.5f;
             }
         }
 
-        // Content keyword match
-        for (const auto& kw : keywords) {
-            size_t pos = 0;
-            int count = 0;
-            while ((pos = lower_content.find(kw, pos)) != std::string::npos) {
-                count++;
-                pos += kw.length();
+        // 6. Acronym matching (AWI, FWI, etc.)
+        std::string upper_query = to_uppercase(lower_query);
+        if (upper_query.find("AWI") != std::string::npos ||
+            upper_query.find("FWI") != std::string::npos) {
+            std::string upper_content = to_uppercase(doc.content);
+            if (upper_content.find("AWI") != std::string::npos ||
+                upper_content.find("FWI") != std::string::npos) {
+                score += 1.0f;
             }
-            score += std::min(0.3f, count * 0.05f);
-        }
-
-        // Category boost
-        if (doc.category == "knowledge" && lower_query.find("理论") != std::string::npos) {
-            score += 0.2f;
-        }
-        if (doc.category == "models" && lower_query.find("模型") != std::string::npos) {
-            score += 0.2f;
-        }
-        if (doc.category == "datasets" && lower_query.find("数据") != std::string::npos) {
-            score += 0.2f;
         }
 
         return score;
     }
 
-    // Utility
     static std::string to_lowercase(const std::string& str) {
         std::string result;
         result.reserve(str.size());
@@ -264,15 +212,67 @@ private:
         return result;
     }
 
+    static std::string to_uppercase(const std::string& str) {
+        std::string result;
+        result.reserve(str.size());
+        for (char c : str) {
+            result += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        return result;
+    }
+
     static std::vector<std::string> split_keywords(const std::string& text) {
         std::vector<std::string> keywords;
-        std::istringstream iss(text);
-        std::string word;
-        while (iss >> word) {
-            if (word.length() > 1) {
-                keywords.push_back(word);
+
+        // 分割中文和英文
+        std::string current_word;
+        for (size_t i = 0; i < text.length(); ++i) {
+            char c = text[i];
+
+            // 空格或标点符号作为分隔符
+            if (std::isspace(c) || std::ispunct(c)) {
+                if (!current_word.empty()) {
+                    keywords.push_back(current_word);
+                    current_word.clear();
+                }
+                continue;
             }
+
+            // 中文字符（UTF-8 多字节）
+            if (static_cast<unsigned char>(c) >= 0x80) {
+                // 提取完整的 UTF-8 字符
+                std::string utf8_char;
+                utf8_char += c;
+                int bytes = 1;
+                if ((c & 0xE0) == 0xC0) bytes = 2;
+                else if ((c & 0xF0) == 0xE0) bytes = 3;
+                else if ((c & 0xF8) == 0xF0) bytes = 4;
+
+                for (int j = 1; j < bytes && (i + j) < text.length(); ++j) {
+                    utf8_char += text[i + j];
+                }
+                i += bytes - 1;
+
+                // 中文字符作为单独的关键词
+                if (utf8_char.length() >= 3) {  // 中文字符通常是3字节
+                    keywords.push_back(utf8_char);
+                }
+                continue;
+            }
+
+            // 英文字符
+            current_word += c;
         }
+
+        if (!current_word.empty()) {
+            keywords.push_back(current_word);
+        }
+
+        // 添加完整的查询作为关键词
+        if (text.length() >= 2) {
+            keywords.push_back(text);
+        }
+
         return keywords;
     }
 

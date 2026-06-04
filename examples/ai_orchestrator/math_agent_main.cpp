@@ -1,5 +1,5 @@
 #include "redis_task_store.hpp"
-#include "qwen_client.hpp"
+#include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
 #include <a2a/models/agent_message.hpp>
@@ -25,7 +25,7 @@ public:
     MathAgent(const std::string& agent_id, const std::string& listen_address, const std::string& registry_url,
               const std::string& api_key, const std::string& redis_host, int redis_port, const MCPAgentConfig& mcp_config = MCPAgentConfig())
         : agent_id_(agent_id), listen_address_(listen_address), task_store_(std::make_shared<RedisTaskStore>(redis_host, redis_port)),
-          qwen_client_(api_key), registry_client_(registry_url), mcp_integration_(std::make_unique<MCPAgentIntegration>()) {
+          llm_client_(api_key, LLMProvider::DEEPSEEK), registry_client_(registry_url), mcp_integration_(std::make_unique<MCPAgentIntegration>()) {
         if (!mcp_integration_->initialize(mcp_config)) {
             std::cerr << "[MathAgent] MCP 初始化失败" << std::endl;
         } else if (mcp_integration_->isAvailable()) {
@@ -137,7 +137,7 @@ private:
         if (mcp_integration_ && mcp_integration_->isAvailable()) tool_result = tryMCPCalculation(question);
         std::string system_prompt = "你是一个专业的数学助手。请解答用户的数学问题，给出详细的解题步骤。如果是计算题，请给出准确的计算结果。";
         if (!tool_result.empty()) system_prompt += "\n\n工具计算结果参考:\n" + tool_result;
-        return qwen_client_.chat(system_prompt + "\n\n历史对话:\n" + history_text, question);
+        return llm_client_.chat(system_prompt + "\n\n历史对话:\n" + history_text, question);
     }
 
     std::string tryMCPCalculation(const std::string& question) {
@@ -181,7 +181,7 @@ private:
 
     std::string agent_id_, listen_address_;
     std::shared_ptr<RedisTaskStore> task_store_;
-    QwenClient qwen_client_;
+    LLMClient llm_client_;
     RegistryClient registry_client_;
     std::unique_ptr<MCPAgentIntegration> mcp_integration_;
 };

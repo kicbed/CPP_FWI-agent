@@ -1,5 +1,5 @@
 #include "redis_task_store.hpp"
-#include "qwen_client.hpp"
+#include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
 #include <a2a/models/agent_message.hpp>
@@ -24,7 +24,7 @@ public:
     FWITheoryAgent(const std::string& agent_id, const std::string& listen_address, const std::string& registry_url,
                    const std::string& api_key, const std::string& redis_host, int redis_port)
         : agent_id_(agent_id), listen_address_(listen_address), task_store_(std::make_shared<RedisTaskStore>(redis_host, redis_port)),
-          qwen_client_(api_key), registry_client_(registry_url) {
+          llm_client_(api_key, LLMProvider::DEEPSEEK), registry_client_(registry_url) {
         std::string resource_dir = "resources";
         if (knowledge_base_.load(resource_dir)) {
             std::cout << "[FWITheoryAgent] 知识库加载成功，文档数: " << knowledge_base_.get_document_count() << std::endl;
@@ -87,29 +87,62 @@ private:
             history_text += role_str + ": " + text + "\n";
         }
 
-        auto relevant_docs = knowledge_base_.search(query, 3);
+        // 搜索知识库
+        std::cout << "[FWITheoryAgent] 搜索知识库: " << query << std::endl;
+        auto relevant_docs = knowledge_base_.search(query, 5);
+        std::cout << "[FWITheoryAgent] 找到 " << relevant_docs.size() << " 个相关文档" << std::endl;
+        for (const auto& doc : relevant_docs) {
+            std::cout << "  - " << doc.title << " (分数: " << doc.relevance_score << ")" << std::endl;
+        }
+
+        // 调试：输出知识库内容长度
+        if (!relevant_docs.empty()) {
+            std::cout << "[FWITheoryAgent] 第一个文档内容长度: " << relevant_docs[0].content.length() << std::endl;
+            std::cout << "[FWITheoryAgent] 第一个文档内容前200字: " << relevant_docs[0].content.substr(0, 200) << std::endl;
+        }
         std::string knowledge_context;
         if (!relevant_docs.empty()) {
-            knowledge_context = "\n\n## 参考资料\n";
+            knowledge_context = "\n\n## ⚠️ 重要：本地知识库资料（必须使用）\n"
+                               "以下是本地知识库中与用户问题直接相关的资料。\n"
+                               "**你必须使用这些资料来回答问题，不要自己编造。**\n"
+                               "**回答时必须引用知识库内容。**\n\n";
             for (const auto& doc : relevant_docs) {
-                knowledge_context += "### " + doc.title + "\n" + doc.content.substr(0, 500) + "...\n\n";
+                knowledge_context += "### 📚 " + doc.title + " (相关度: " +
+                                    std::to_string(doc.relevance_score) + ")\n";
+                // 提供完整内容
+                std::string content = doc.content;
+                if (content.length() > 3000) {
+                    content = content.substr(0, 3000) + "\n... (更多内容省略)";
+                }
+                knowledge_context += content + "\n\n";
             }
+        } else {
+            knowledge_context = "\n\n## 本地知识库\n"
+                               "本地知识库中没有找到与用户问题直接相关的资料。\n"
+                               "请基于你的专业知识回答，但要说明这是你的推测。\n\n";
         }
 
         std::string system_prompt =
             "你是一位全波形反演(FWI)领域的资深科研助手。\n\n"
-            "## 专业知识范围\n"
-            "- FWI 理论基础：最小二乘目标函数、Fréchet 梯度推导、伴随状态法\n"
-            "- 常见问题诊断：cycle skipping、局部极小值陷阱\n"
-            "- 高级反演策略：多尺度反演、自适应波形反演(AWI)、包络反演\n"
-            "- 正则化技术：Tikhonov 正则化、TV 正则化\n\n"
-            "## 回答要求\n"
-            "1. 概念解释要准确严谨，必要时给出数学公式（LaTeX 格式）\n"
-            "2. 可以用生活类比帮助理解\n\n"
-            + knowledge_context +
-            "历史对话：\n" + history_text;
 
-        return qwen_client_.chat(system_prompt, query);
+            "## 🔴 最重要的规则\n"
+            "你必须使用下方提供的「本地知识库资料」来回答问题。\n"
+            "如果知识库有相关内容，你必须基于知识库内容回答，不要说「未找到」。\n"
+            "如果知识库没有相关内容，你才能用自己的知识回答。\n\n"
+
+            "## 专业知识范围\n"
+            "- FWI 理论基础\n"
+            "- 高级反演策略：多尺度反演、AWI、包络反演\n"
+            "- 正则化技术\n\n"
+
+            + knowledge_context +
+            "\n## 历史对话\n" + history_text;
+
+        // 调试：输出 prompt 长度
+        std::cout << "[FWITheoryAgent] Prompt 长度: " << system_prompt.length() << std::endl;
+        std::cout << "[FWITheoryAgent] 知识库内容长度: " << knowledge_context.length() << std::endl;
+
+        return llm_client_.chat(system_prompt, query);
     }
 
     void save_message(const std::string& context_id, const AgentMessage& message) {
@@ -130,7 +163,7 @@ private:
 
     std::string agent_id_, listen_address_;
     std::shared_ptr<RedisTaskStore> task_store_;
-    QwenClient qwen_client_;
+    LLMClient llm_client_;
     RegistryClient registry_client_;
     KnowledgeBase knowledge_base_;
 };

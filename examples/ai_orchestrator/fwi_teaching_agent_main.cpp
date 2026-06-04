@@ -1,5 +1,5 @@
 #include "redis_task_store.hpp"
-#include "qwen_client.hpp"
+#include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
 #include <a2a/models/agent_message.hpp>
@@ -22,7 +22,7 @@ public:
     FWITeachingAgent(const std::string& agent_id, const std::string& listen_address, const std::string& registry_url,
                      const std::string& api_key, const std::string& redis_host, int redis_port)
         : agent_id_(agent_id), listen_address_(listen_address), task_store_(std::make_shared<RedisTaskStore>(redis_host, redis_port)),
-          qwen_client_(api_key), registry_client_(registry_url) {
+          llm_client_(api_key, LLMProvider::DEEPSEEK), registry_client_(registry_url) {
         std::cout << "[FWITeachingAgent] 初始化完成" << std::endl;
     }
 
@@ -89,7 +89,7 @@ private:
             "4. **代码思路**: 给出伪代码\n"
             "5. **汇报表达**: 如何在论文/汇报中描述\n\n"
             "历史对话：\n" + history_text;
-        return qwen_client_.chat(system_prompt, query);
+        return llm_client_.chat(system_prompt, query);
     }
 
     void save_message(const std::string& context_id, const AgentMessage& message) {
@@ -110,7 +110,7 @@ private:
 
     std::string agent_id_, listen_address_;
     std::shared_ptr<RedisTaskStore> task_store_;
-    QwenClient qwen_client_;
+    LLMClient llm_client_;
     RegistryClient registry_client_;
 };
 
