@@ -230,6 +230,67 @@ std::vector<Conversation> load_conversations() {
     return convs;
 }
 
+/**
+ * @brief 获取会话的完整历史消息
+ */
+std::vector<std::pair<std::string, std::string>> get_session_messages(const std::string& context_id, int limit = 20) {
+    std::vector<std::pair<std::string, std::string>> messages;
+    std::string cmd = "redis-cli lrange 'a2a:session:" + context_id + "' 0 -1 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return messages;
+
+    char buffer[8192];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        std::string line(buffer);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+            line.pop_back();
+        if (line.empty()) continue;
+
+        try {
+            auto msg = nlohmann::json::parse(line);
+            std::string role = msg.value("role", "unknown");
+            std::string text;
+            if (msg.contains("parts") && !msg["parts"].empty()) {
+                text = msg["parts"][0].value("text", "");
+            }
+            if (!text.empty()) {
+                messages.push_back({role, text});
+            }
+        } catch (...) {}
+    }
+    pclose(pipe);
+
+    if (limit > 0 && messages.size() > static_cast<size_t>(limit)) {
+        messages.erase(messages.begin(), messages.end() - limit);
+    }
+    return messages;
+}
+
+/**
+ * @brief 打印历史对话
+ */
+void print_conversation_history(const std::string& context_id) {
+    auto messages = get_session_messages(context_id, 20);
+
+    if (messages.empty()) {
+        std::cout << UI::DIM << "    暂无历史消息" << UI::RESET << "\n\n";
+        return;
+    }
+
+    for (const auto& [role, text] : messages) {
+        if (role == "user") {
+            std::cout << UI::BOLD << UI::BLUE << "    👤 你: " << UI::RESET << text << "\n\n";
+        } else {
+            std::string display_text = text;
+            if (display_text.length() > 300) {
+                display_text = display_text.substr(0, 300) + "...";
+            }
+            std::cout << UI::BOLD << UI::GREEN << "    🤖 AI: " << UI::RESET << display_text << "\n\n";
+        }
+    }
+    print_separator();
+}
+
 void print_conversation_list(const std::vector<Conversation>& convs, int selected) {
     std::cout << "\n";
     std::cout << UI::CYAN << "  ┌─────────────────────────────────────────────────────────────────┐" << UI::RESET << "\n";
@@ -265,26 +326,38 @@ void print_conversation_list(const std::vector<Conversation>& convs, int selecte
     std::cout << UI::DIM << "/quit" << UI::RESET << " 退出\n\n";
 }
 
+/**
+ * @brief 读取一个按键（支持方向键）
+ */
+#include <termios.h>
+#include <unistd.h>
+
 int read_key() {
-    if(system("stty raw -echo 2>/dev/null")){}
+    struct termios old_termios, new_termios;
+    tcgetattr(STDIN_FILENO, &old_termios);
+    new_termios = old_termios;
+    new_termios.c_lflag &= ~(ICANON | ECHO);
+    new_termios.c_cc[VMIN] = 1;
+    new_termios.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
+
     int c = getchar();
-    if(system("stty cooked echo 2>/dev/null")){}
 
     if (c == 27) {
-        if(system("stty raw -echo 2>/dev/null")){}
         int next = getchar();
-        if(system("stty cooked echo 2>/dev/null")){}
         if (next == 91) {
-            if(system("stty raw -echo 2>/dev/null")){}
             int arrow = getchar();
-            if(system("stty cooked echo 2>/dev/null")){}
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
             switch (arrow) {
                 case 65: return 1000;
                 case 66: return 1001;
             }
         }
+        tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
         return 27;
     }
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
     return c;
 }
 
@@ -345,6 +418,9 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < pad; i++) std::cout << " ";
                     std::cout << UI::CYAN << "│" << UI::RESET << "\n";
                     std::cout << UI::CYAN << "  └─────────────────────────────────────────────────────────────────┘" << UI::RESET << "\n\n";
+
+                    // 显示历史对话
+                    print_conversation_history(current_ctx);
                 }
                 continue;
             }
@@ -381,6 +457,9 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < pad; i++) std::cout << " ";
                     std::cout << UI::CYAN << "│" << UI::RESET << "\n";
                     std::cout << UI::CYAN << "  └─────────────────────────────────────────────────────────────────┘" << UI::RESET << "\n\n";
+
+                    // 显示历史对话
+                    print_conversation_history(current_ctx);
                 }
                 continue;
             }

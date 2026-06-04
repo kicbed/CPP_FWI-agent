@@ -563,7 +563,7 @@ private:
                         {"contextId", context_id},
                         {"parts", {{{"kind", "text"}, {"text", query}}}}
                     }},
-                    {"historyLength", 5}
+                    {"historyLength", 20}
                 }}
             };
 
@@ -663,7 +663,7 @@ std::string analyze_intent(const std::string& text) {
                         {"contextId", context_id},
                         {"parts", {{{"kind", "text"}, {"text", query}}}}
                     }},
-                    {"historyLength", 5}
+                    {"historyLength", 20}
                 }}
             };
 

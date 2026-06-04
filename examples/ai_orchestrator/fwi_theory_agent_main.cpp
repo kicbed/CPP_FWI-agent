@@ -78,7 +78,7 @@ private:
     }
 
     std::string answer_fwi_question(const std::string& query, const std::string& context_id) {
-        auto history = task_store_->get_history(context_id, 5);
+        auto history = task_store_->get_history(context_id, 20);
         std::string history_text;
         for (const auto& msg : history) {
             std::string role_str = to_string(msg.role());

@@ -159,6 +159,51 @@ public:
         } catch (...) {}
         return "";
     }
+
+    /**
+     * @brief 获取会话的完整历史消息
+     * @param context_id 会话 ID
+     * @param limit 最大消息数（0 = 全部）
+     * @return 消息列表，每个元素包含 role 和 text
+     */
+    static std::vector<std::pair<std::string, std::string>> get_session_messages(
+        const std::string& context_id, int limit = 0) {
+
+        std::vector<std::pair<std::string, std::string>> messages;
+
+        std::string cmd = "redis-cli lrange 'a2a:session:" + context_id + "' 0 -1 2>/dev/null";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) return messages;
+
+        char buffer[8192];
+        while (fgets(buffer, sizeof(buffer), pipe)) {
+            std::string line(buffer);
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+                line.pop_back();
+
+            if (line.empty()) continue;
+
+            try {
+                auto msg = json::parse(line);
+                std::string role = msg.value("role", "unknown");
+                std::string text;
+                if (msg.contains("parts") && !msg["parts"].empty()) {
+                    text = msg["parts"][0].value("text", "");
+                }
+                if (!text.empty()) {
+                    messages.push_back({role, text});
+                }
+            } catch (...) {}
+        }
+        pclose(pipe);
+
+        // 限制消息数量
+        if (limit > 0 && messages.size() > static_cast<size_t>(limit)) {
+            messages.erase(messages.begin(), messages.end() - limit);
+        }
+
+        return messages;
+    }
 };
 
 // ============================================================
@@ -182,7 +227,7 @@ public:
                     {"contextId", context_id},
                     {"parts", {{{"kind", "text"}, {"text", text}}}}
                 }},
-                {"historyLength", 10}
+                {"historyLength", 20}
             }}
         };
         std::string resp = HttpClient::post(server_url_, request.dump());
@@ -340,6 +385,31 @@ void print_conversation_list(const std::vector<Conversation>& convs, int selecte
     std::cout << UI::DIM << "/quit" << UI::RESET << " 退出\n\n";
 }
 
+/**
+ * @brief 打印历史对话
+ */
+void print_conversation_history(const std::string& context_id) {
+    auto messages = RedisHelper::get_session_messages(context_id, 20);
+
+    if (messages.empty()) {
+        std::cout << UI::DIM << "    暂无历史消息" << UI::RESET << "\n\n";
+        return;
+    }
+
+    for (const auto& [role, text] : messages) {
+        if (role == "user") {
+            std::cout << UI::BOLD << UI::BLUE << "    👤 你: " << UI::RESET << text << "\n\n";
+        } else {
+            std::string display_text = text;
+            if (display_text.length() > 300) {
+                display_text = display_text.substr(0, 300) + "...";
+            }
+            std::cout << UI::BOLD << UI::GREEN << "    🤖 AI: " << UI::RESET << display_text << "\n\n";
+        }
+    }
+    print_separator();
+}
+
 void print_help() {
     std::cout << "\n";
     std::cout << UI::CYAN << "  ┌─────────────────────────────────────────────────────────────────┐" << UI::RESET << "\n";
@@ -364,28 +434,47 @@ void print_help() {
 /**
  * @brief 使用 popen + read 读取单个字符（支持方向键）
  */
-int read_key() {
-    // 使用 stty 设置终端为原始模式
-    (void)system("stty raw -echo 2>/dev/null");
-    int c = getchar();
-    (void)system("stty cooked echo 2>/dev/null");
+/**
+ * @brief 读取一个按键（支持方向键）
+ *
+ * 使用 termios 直接控制终端，避免 stty 的问题
+ */
+#include <termios.h>
+#include <unistd.h>
 
-    // 检查方向键（转义序列）
+int read_key() {
+    struct termios old_termios, new_termios;
+
+    // 保存当前终端设置
+    tcgetattr(STDIN_FILENO, &old_termios);
+    new_termios = old_termios;
+
+    // 设置为原始模式：关闭行缓冲和回显
+    new_termios.c_lflag &= ~(ICANON | ECHO);
+    new_termios.c_cc[VMIN] = 1;   // 最少读取 1 个字符
+    new_termios.c_cc[VTIME] = 0;  // 不超时
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
+
+    int c = getchar();
+
+    // 检查是否是转义序列（方向键）
     if (c == 27) {
-        (void)system("stty raw -echo 2>/dev/null");
         int next = getchar();
-        (void)system("stty cooked echo 2>/dev/null");
         if (next == 91) {
-            (void)system("stty raw -echo 2>/dev/null");
             int arrow = getchar();
-            (void)system("stty cooked echo 2>/dev/null");
+            // 恢复终端设置
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
             switch (arrow) {
                 case 65: return 1000;  // 上
                 case 66: return 1001;  // 下
             }
         }
+        tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
         return 27;
     }
+
+    // 恢复终端设置
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
     return c;
 }
 
@@ -441,6 +530,9 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < pad; i++) std::cout << " ";
                     std::cout << UI::CYAN << "│" << UI::RESET << "\n";
                     std::cout << UI::CYAN << "  └─────────────────────────────────────────────────────────────────┘" << UI::RESET << "\n\n";
+
+                    // 显示历史对话
+                    print_conversation_history(current_ctx);
                 }
                 continue;
             }
@@ -480,6 +572,9 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < pad; i++) std::cout << " ";
                     std::cout << UI::CYAN << "│" << UI::RESET << "\n";
                     std::cout << UI::CYAN << "  └─────────────────────────────────────────────────────────────────┘" << UI::RESET << "\n\n";
+
+                    // 显示历史对话
+                    print_conversation_history(current_ctx);
                 }
                 continue;
             }
