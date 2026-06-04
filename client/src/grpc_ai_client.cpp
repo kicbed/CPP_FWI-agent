@@ -267,6 +267,15 @@ std::vector<std::pair<std::string, std::string>> get_session_messages(const std:
 }
 
 /**
+ * @brief 删除会话
+ */
+bool delete_session(const std::string& context_id) {
+    std::string cmd = "redis-cli del 'a2a:session:" + context_id + "' 'a2a:history:" + context_id + "' 'a2a:task:" + context_id + "' 2>/dev/null";
+    int ret = system(cmd.c_str());
+    return ret == 0;
+}
+
+/**
  * @brief 打印历史对话
  */
 void print_conversation_history(const std::string& context_id) {
@@ -435,6 +444,29 @@ int main(int argc, char* argv[]) {
                 for (int i = 0; i < 54; i++) std::cout << " ";
                 std::cout << UI::CYAN << "│" << UI::RESET << "\n";
                 std::cout << UI::CYAN << "  └─────────────────────────────────────────────────────────────────┘" << UI::RESET << "\n\n";
+                continue;
+            }
+
+            // d - 删除
+            if ((key == 'd' || key == 'D') && !conversations.empty()) {
+                std::string ctx_to_delete = conversations[selected].context_id;
+                std::string title_to_delete = conversations[selected].title;
+
+                std::cout << "\n" << UI::YELLOW << "  确认删除 \"" << title_to_delete << "\"? (y/n): " << UI::RESET;
+                if(system("stty cooked echo 2>/dev/null")){}
+                std::string confirm;
+                std::getline(std::cin, confirm);
+
+                if (confirm == "y" || confirm == "Y") {
+                    delete_session(ctx_to_delete);
+                    conversations = load_conversations();
+                    if (selected >= static_cast<int>(conversations.size())) {
+                        selected = std::max(0, static_cast<int>(conversations.size()) - 1);
+                    }
+                    std::cout << UI::GREEN << "  ✓ 已删除" << UI::RESET << "\n";
+                } else {
+                    std::cout << UI::DIM << "  取消删除" << UI::RESET << "\n";
+                }
                 continue;
             }
 

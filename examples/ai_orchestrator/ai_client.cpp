@@ -167,24 +167,27 @@ public:
      * @return 消息列表，每个元素包含 role 和 text
      */
     static std::vector<std::pair<std::string, std::string>> get_session_messages(
-        const std::string& context_id, int limit = 0) {
+        const std::string& context_id, int limit = 20) {
 
         std::vector<std::pair<std::string, std::string>> messages;
 
-        std::string cmd = "redis-cli lrange 'a2a:session:" + context_id + "' 0 -1 2>/dev/null";
+        // 使用 redis-cli 获取所有消息
+        std::string cmd = "redis-cli lrange 'a2a:session:" + context_id + "' 0 -1";
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) return messages;
 
-        char buffer[8192];
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            std::string line(buffer);
-            while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-                line.pop_back();
+        std::string buffer;
+        char line[8192];
+        while (fgets(line, sizeof(line), pipe)) {
+            std::string str(line);
+            // 去掉换行符
+            while (!str.empty() && (str.back() == '\n' || str.back() == '\r'))
+                str.pop_back();
 
-            if (line.empty()) continue;
+            if (str.empty()) continue;
 
             try {
-                auto msg = json::parse(line);
+                auto msg = json::parse(str);
                 std::string role = msg.value("role", "unknown");
                 std::string text;
                 if (msg.contains("parts") && !msg["parts"].empty()) {
@@ -193,16 +196,29 @@ public:
                 if (!text.empty()) {
                     messages.push_back({role, text});
                 }
-            } catch (...) {}
+            } catch (...) {
+                // 忽略解析错误
+            }
         }
         pclose(pipe);
 
-        // 限制消息数量
+        // 限制消息数量（保留最新的）
         if (limit > 0 && messages.size() > static_cast<size_t>(limit)) {
             messages.erase(messages.begin(), messages.end() - limit);
         }
 
         return messages;
+    }
+
+    /**
+     * @brief 删除会话
+     * @param context_id 会话 ID
+     * @return 是否成功
+     */
+    static bool delete_session(const std::string& context_id) {
+        std::string cmd = "redis-cli del 'a2a:session:" + context_id + "' 'a2a:history:" + context_id + "' 'a2a:task:" + context_id + "' 2>/dev/null";
+        int ret = system(cmd.c_str());
+        return ret == 0;
     }
 };
 
@@ -381,6 +397,7 @@ void print_conversation_list(const std::vector<Conversation>& convs, int selecte
     std::cout << UI::DIM << "    ↑/↓" << UI::RESET << " 选择   ";
     std::cout << UI::DIM << "Enter" << UI::RESET << " 进入   ";
     std::cout << UI::DIM << "n" << UI::RESET << " 新建   ";
+    std::cout << UI::DIM << "d" << UI::RESET << " 删除   ";
     std::cout << UI::DIM << "/help" << UI::RESET << " 帮助   ";
     std::cout << UI::DIM << "/quit" << UI::RESET << " 退出\n\n";
 }
@@ -548,6 +565,31 @@ int main(int argc, char* argv[]) {
                 for (int i = 0; i < 54; i++) std::cout << " ";
                 std::cout << UI::CYAN << "│" << UI::RESET << "\n";
                 std::cout << UI::CYAN << "  └─────────────────────────────────────────────────────────────────┘" << UI::RESET << "\n\n";
+                continue;
+            }
+
+            // d - 删除
+            if ((key == 'd' || key == 'D') && !conversations.empty()) {
+                std::string ctx_to_delete = conversations[selected].context_id;
+                std::string title_to_delete = conversations[selected].title;
+
+                std::cout << "\n" << UI::YELLOW << "  确认删除 \"" << title_to_delete << "\"? (y/n): " << UI::RESET;
+
+                // 读取确认
+                if(system("stty cooked echo 2>/dev/null")){}
+                std::string confirm;
+                std::getline(std::cin, confirm);
+
+                if (confirm == "y" || confirm == "Y") {
+                    RedisHelper::delete_session(ctx_to_delete);
+                    conversations = load_conversations();
+                    if (selected >= static_cast<int>(conversations.size())) {
+                        selected = std::max(0, static_cast<int>(conversations.size()) - 1);
+                    }
+                    std::cout << UI::GREEN << "  ✓ 已删除" << UI::RESET << "\n";
+                } else {
+                    std::cout << UI::DIM << "  取消删除" << UI::RESET << "\n";
+                }
                 continue;
             }
 
