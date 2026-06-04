@@ -11,10 +11,25 @@ set(CLIENT_SOURCES
 add_library(agent_rpc_client STATIC ${CLIENT_SOURCES})
 
 # ============================================================================
-# RPC Client 可执行文件
+# RPC Client 可执行文件（原版）
 # ============================================================================
 add_executable(rpc_client src/main.cpp)
 target_link_libraries(rpc_client
+    agent_rpc_client
+    agent_rpc_common
+    agent_rpc_registry
+    proto_lib
+    ${GRPC_LIBRARIES}
+    ${PROTOBUF_LIBRARIES}
+    pthread
+    uuid
+)
+
+# ============================================================================
+# gRPC AI Client（新版，带对话列表和 UI）
+# ============================================================================
+add_executable(grpc_ai_client src/grpc_ai_client.cpp)
+target_link_libraries(grpc_ai_client
     agent_rpc_client
     agent_rpc_common
     agent_rpc_registry
