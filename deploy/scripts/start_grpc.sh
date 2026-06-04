@@ -42,7 +42,7 @@ if [ -z "$DEEPSEEK_API_KEY" ] && [ -z "$QWEN_API_KEY" ]; then
 fi
 
 # 启动 Embedding
-echo -e "${YELLOW}[2/5] 启动 Embedding 服务...${NC}"
+echo -e "${YELLOW}[2/5] 启动 Embedding 服务（首次加载模型约需 15 秒）...${NC}"
 EMBEDDING_MODEL="${LOCAL_EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}"
 pkill -f embedding_server 2>/dev/null || true
 sleep 1
@@ -51,12 +51,24 @@ nohup python3 "$PROJECT_ROOT/deploy/scripts/embedding_server.py" \
     --port 6000 \
     > "$PROJECT_ROOT/deploy/logs/embedding.log" 2>&1 &
 echo $! > "$PROJECT_ROOT/deploy/pids/embedding.pid"
-sleep 8
 
-if curl -s http://localhost:6000/health > /dev/null 2>&1; then
-    echo -e "${GREEN}  ✓ Embedding 服务启动成功${NC}"
-else
+# 等待服务启动（最多 60 秒）
+echo -ne "  等待模型加载"
+for i in $(seq 1 30); do
+    sleep 2
+    if curl -s http://localhost:6000/health > /dev/null 2>&1; then
+        echo ""
+        echo -e "${GREEN}  ✓ Embedding 服务启动成功${NC}"
+        break
+    fi
+    echo -ne "."
+done
+
+# 最终检查
+if ! curl -s http://localhost:6000/health > /dev/null 2>&1; then
+    echo ""
     echo -e "${RED}  ✗ Embedding 服务启动失败${NC}"
+    echo -e "${RED}  查看日志: tail deploy/logs/embedding.log${NC}"
     exit 1
 fi
 
