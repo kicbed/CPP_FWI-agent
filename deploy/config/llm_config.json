@@ -1,0 +1,63 @@
+{
+  "llm": {
+    "provider": "deepseek",
+
+    "providers": {
+      "deepseek": {
+        "name": "DeepSeek",
+        "api_url": "https://api.deepseek.com/v1/chat/completions",
+        "model": "deepseek-chat",
+        "api_key": "${DEEPSEEK_API_KEY}",
+        "description": "DeepSeek V3 - 性价比高，中文效果好"
+      },
+      "mimo": {
+        "name": "MiMo",
+        "api_url": "https://api.minimax.chat/v1/text/chatcompletion_v2",
+        "model": "MiniMax-Text-01",
+        "api_key": "${MIMO_API_KEY}",
+        "description": "小米 MiMo - 国产模型"
+      },
+      "qwen": {
+        "name": "通义千问",
+        "api_url": "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+        "model": "qwen-plus",
+        "api_key": "${QWEN_API_KEY}",
+        "description": "阿里通义千问"
+      },
+      "openai": {
+        "name": "OpenAI",
+        "api_url": "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-4o-mini",
+        "api_key": "${OPENAI_API_KEY}",
+        "description": "OpenAI GPT-4o-mini"
+      },
+      "local": {
+        "name": "本地模型",
+        "api_url": "http://localhost:11434/v1/chat/completions",
+        "model": "qwen2.5:7b",
+        "api_key": "not-needed",
+        "description": "Ollama 本地模型"
+      }
+    }
+  },
+
+  "embedding": {
+    "provider": "local",
+
+    "providers": {
+      "local": {
+        "name": "本地 Embedding",
+        "api_url": "http://localhost:6000",
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "description": "本地 sentence-transformers 模型，免费"
+      },
+      "dashscope": {
+        "name": "DashScope Embedding",
+        "api_url": "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",
+        "model": "text-embedding-v2",
+        "api_key": "${DASHSCOPE_API_KEY}",
+        "description": "阿里 DashScope Embedding API"
+      }
+    }
+  }
+}

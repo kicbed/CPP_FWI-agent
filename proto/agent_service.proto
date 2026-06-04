@@ -1,0 +1,147 @@
+syntax = "proto3";
+
+package agent_communication;
+
+import "common.proto";
+
+// 消息类型
+message Message {
+    string id = 1;
+    string type = 2;
+    string content = 3;
+    int64 timestamp = 4;
+    map<string, string> headers = 5;
+    bytes payload = 6;
+}
+
+// 发送消息请求
+message SendMessageRequest {
+    Message message = 1;
+    string target_agent = 2;
+    int32 timeout_seconds = 3;
+}
+
+// 发送消息响应
+message SendMessageResponse {
+    common.Status status = 1;
+    string message_id = 2;
+    int64 timestamp = 3;
+}
+
+// 接收消息请求
+message ReceiveMessageRequest {
+    string agent_id = 1;
+    int32 max_messages = 2;
+    int32 timeout_seconds = 3;
+}
+
+// 接收消息响应
+message ReceiveMessageResponse {
+    common.Status status = 1;
+    repeated Message messages = 2;
+}
+
+// 广播消息请求
+message BroadcastMessageRequest {
+    Message message = 1;
+    repeated string target_agents = 2;
+    bool exclude_sender = 3;
+}
+
+// 广播消息响应
+message BroadcastMessageResponse {
+    common.Status status = 1;
+    int32 success_count = 2;
+    int32 failure_count = 3;
+    repeated string failed_agents = 4;
+}
+
+// 获取代理列表请求
+message GetAgentsRequest {
+    string filter = 1;
+    int32 limit = 2;
+    int32 offset = 3;
+}
+
+// 获取代理列表响应
+message GetAgentsResponse {
+    common.Status status = 1;
+    repeated common.ServiceInfo agents = 2;
+    int32 total_count = 3;
+}
+
+// 注册代理请求
+message RegisterAgentRequest {
+    common.ServiceInfo agent_info = 1;
+    int32 heartbeat_interval = 2;
+}
+
+// 注册代理响应
+message RegisterAgentResponse {
+    common.Status status = 1;
+    string agent_id = 2;
+    int64 registration_time = 3;
+}
+
+// 注销代理请求
+message UnregisterAgentRequest {
+    string agent_id = 1;
+    string reason = 2;
+}
+
+// 注销代理响应
+message UnregisterAgentResponse {
+    common.Status status = 1;
+    int64 unregistration_time = 2;
+}
+
+// 心跳请求
+message HeartbeatRequest {
+    string agent_id = 1;
+    common.ServiceInfo agent_info = 2;
+}
+
+// 心跳响应
+message HeartbeatResponse {
+    common.Status status = 1;
+    int64 server_time = 2;
+}
+
+// 代理通信服务定义
+service AgentCommunicationService {
+    // 简单RPC - 发送消息
+    rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+    
+    // 简单RPC - 接收消息
+    rpc ReceiveMessage(ReceiveMessageRequest) returns (ReceiveMessageResponse);
+    
+    // 简单RPC - 广播消息
+    rpc BroadcastMessage(BroadcastMessageRequest) returns (BroadcastMessageResponse);
+    
+    // 简单RPC - 获取代理列表
+    rpc GetAgents(GetAgentsRequest) returns (GetAgentsResponse);
+    
+    // 简单RPC - 注册代理
+    rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
+    
+    // 简单RPC - 注销代理
+    rpc UnregisterAgent(UnregisterAgentRequest) returns (UnregisterAgentResponse);
+    
+    // 简单RPC - 心跳
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+    
+    // 服务端流式RPC - 监听消息
+    rpc ListenMessages(ReceiveMessageRequest) returns (stream Message);
+    
+    // 客户端流式RPC - 批量发送消息
+    rpc BatchSendMessages(stream SendMessageRequest) returns (SendMessageResponse);
+    
+    // 双向流式RPC - 实时通信
+    rpc RealTimeCommunication(stream Message) returns (stream Message);
+}
+
+// 健康检查服务
+service HealthService {
+    rpc Check(common.HealthCheckRequest) returns (common.HealthCheckResponse);
+    rpc Watch(common.HealthCheckRequest) returns (stream common.HealthCheckResponse);
+}

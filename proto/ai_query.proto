@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package agent_communication;
+
+import "common.proto";
+
+// ============================================================================
+// AI Query Messages
+// ============================================================================
+
+// Agent偏好设置
+message AgentPreference {
+    repeated string preferred_skills = 1;  // 偏好技能
+    repeated string preferred_agents = 2;  // 偏好Agent ID
+    bool allow_fallback = 3;               // 允许回退到其他Agent
+}
+
+// AI查询请求
+message AIQueryRequest {
+    string request_id = 1;           // 请求唯一ID
+    string question = 2;             // 用户问题
+    string context_id = 3;           // 上下文ID (用于多轮对话)
+    int32 history_length = 4;        // 历史消息长度限制
+    int32 timeout_seconds = 5;       // 超时时间
+    map<string, string> metadata = 6; // 元数据
+    AgentPreference preference = 7;   // Agent偏好设置
+}
+
+// 产物
+message Artifact {
+    string name = 1;
+    string mime_type = 2;
+    bytes data = 3;
+    map<string, string> metadata = 4;
+}
+
+// AI查询响应
+message AIQueryResponse {
+    string request_id = 1;           // 请求ID
+    common.Status status = 2;        // 状态
+    string answer = 3;               // AI回答
+    string agent_id = 4;             // 处理的Agent ID
+    string agent_name = 5;           // 处理的Agent名称
+    string task_id = 6;              // A2A任务ID
+    string context_id = 7;           // 上下文ID
+    repeated Artifact artifacts = 8;  // 产物列表
+    int64 processing_time_ms = 9;    // 处理时间
+}
+
+// 流式事件
+message AIStreamEvent {
+    string event_id = 1;
+    string event_type = 2;           // "partial", "status", "complete", "error"
+    string content = 3;              // 部分内容
+    string task_state = 4;           // 任务状态
+    string context_id = 5;
+    int64 timestamp = 6;
+}
+
+// 查询状态请求
+message QueryStatusRequest {
+    string task_id = 1;
+    string context_id = 2;
+}
+
+// Agent消息 (用于历史)
+message AgentHistoryMessage {
+    string message_id = 1;
+    string role = 2;                 // "user", "agent", "system"
+    string content = 3;
+    int64 timestamp = 4;
+}
+
+// 查询状态响应
+message QueryStatusResponse {
+    common.Status status = 1;
+    string task_state = 2;
+    repeated AgentHistoryMessage history = 3;
+}
+
+// ============================================================================
+// AI Query Service
+// ============================================================================
+
+// AI查询服务
+service AIQueryService {
+    // 同步查询
+    rpc Query(AIQueryRequest) returns (AIQueryResponse);
+    
+    // 流式查询
+    rpc QueryStream(AIQueryRequest) returns (stream AIStreamEvent);
+    
+    // 获取查询状态
+    rpc GetQueryStatus(QueryStatusRequest) returns (QueryStatusResponse);
+}

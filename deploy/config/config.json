@@ -1,0 +1,40 @@
+{
+  "server": {
+    "registry_port": 8500,
+    "orchestrator_port": 5000,
+    "math_agent_port": 5001,
+    "fwi_theory_agent_port": 5002,
+    "fwi_teaching_agent_port": 5003,
+    "general_research_agent_port": 5004
+  },
+
+  "redis": {
+    "host": "127.0.0.1",
+    "port": 6379
+  },
+
+  "api_keys": {
+    "qwen": "${sk-d2ef9d662b8b4abb998f0f0a497229ed}",
+    "dashscope": "${sk-d2ef9d662b8b4abb998f0f0a497229ed}"
+  },
+
+  "features": {
+    "enable_mcp": true,
+    "enable_rag": false,
+    "routing_mode": "agent-rag",
+    "tool_calling_mode": "llm",
+    "rag_top_k": 5,
+    "rag_threshold": 0.3
+  },
+
+  "access": {
+    "enable_auth": false,
+    "api_token": "${AGENT_API_TOKEN}",
+    "allowed_clients": ["*"]
+  },
+
+  "logging": {
+    "log_dir": "logs",
+    "log_level": "INFO"
+  }
+}

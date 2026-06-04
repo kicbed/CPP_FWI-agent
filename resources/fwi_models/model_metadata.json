@@ -1,0 +1,41 @@
+{
+  "models": [
+    {
+      "id": "marmousi2",
+      "name": "Marmousi-2 模型",
+      "description": "经典 FWI 测试模型，模拟西非海岸的复杂地质构造，包含盐丘、断层、倾斜层等。",
+      "dimensions": {"nx": 13601, "nz": 2801},
+      "grid_spacing": {"dx": 1.25, "dz": 1.25},
+      "units": "meters",
+      "velocity_range": {"min": 1500, "max": 4500},
+      "source": "Marmousi-2 (Martin et al., 2006)",
+      "reference": "Martin, G. S., et al. (2006). Marmousi2: An elastic upgrade for Marmousi. The Leading Edge, 25(2), 156-166.",
+      "file_format": "SEGY",
+      "tags": ["2D", "acoustic", "complex", "salt", "benchmark"]
+    },
+    {
+      "id": "overthrust",
+      "name": "Overthrust 模型",
+      "description": "SEG/EAGE 经典模型，包含逆冲断层构造，常用于测试 FWI 对复杂构造的成像能力。",
+      "dimensions": {"nx": 801, "nz": 187},
+      "grid_spacing": {"dx": 25.0, "dz": 25.0},
+      "units": "meters",
+      "velocity_range": {"min": 2200, "max": 6000},
+      "source": "SEG/EAGE Overthrust Model",
+      "reference": "Aminzadeh, F., et al. (1997). 3-D salt and overthrust models. SEG/EAGE Modeling Series.",
+      "file_format": "binary",
+      "tags": ["2D", "acoustic", "overthrust", "benchmark"]
+    },
+    {
+      "id": "salt2d",
+      "name": "2D 盐丘模型",
+      "description": "墨西哥湾风格的盐丘模型，用于测试 FWI 对高速体的成像能力。",
+      "dimensions": {"nx": 1001, "nz": 301},
+      "grid_spacing": {"dx": 10.0, "dz": 10.0},
+      "units": "meters",
+      "velocity_range": {"min": 1500, "max": 4500},
+      "source": "Synthetic model",
+      "tags": ["2D", "acoustic", "salt", "synthetic"]
+    }
+  ]
+}

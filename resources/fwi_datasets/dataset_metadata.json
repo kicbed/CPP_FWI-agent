@@ -1,0 +1,52 @@
+{
+  "datasets": [
+    {
+      "id": "marmousi2_synthetic",
+      "name": "Marmousi-2 合成数据集",
+      "description": "基于 Marmousi-2 模型生成的合成地震数据，用于 FWI 算法验证。",
+      "model_id": "marmousi2",
+      "acquisition": {
+        "type": "2D marine",
+        "n_sources": 340,
+        "n_receivers": 340,
+        "source_depth": 12.5,
+        "receiver_depth": 12.5,
+        "source_spacing": 50.0,
+        "receiver_spacing": 50.0,
+        "frequency_range": [3, 40]
+      },
+      "sampling": {
+        "dt": 0.001,
+        "nt": 3000,
+        "total_time": 3.0
+      },
+      "units": {"distance": "meters", "time": "seconds"},
+      "file_format": "SEGY",
+      "tags": ["2D", "synthetic", "marine", "benchmark"]
+    },
+    {
+      "id": "overthrust_synthetic",
+      "name": "Overthrust 合成数据集",
+      "description": "基于 Overthrust 模型生成的合成地震数据。",
+      "model_id": "overthrust",
+      "acquisition": {
+        "type": "2D land",
+        "n_sources": 100,
+        "n_receivers": 100,
+        "source_depth": 0,
+        "receiver_depth": 0,
+        "source_spacing": 80.0,
+        "receiver_spacing": 80.0,
+        "frequency_range": [2, 30]
+      },
+      "sampling": {
+        "dt": 0.004,
+        "nt": 1500,
+        "total_time": 6.0
+      },
+      "units": {"distance": "meters", "time": "seconds"},
+      "file_format": "binary",
+      "tags": ["2D", "synthetic", "land", "benchmark"]
+    }
+  ]
+}

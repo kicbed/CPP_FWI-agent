@@ -1,0 +1,5 @@
+export QWEN_API_KEY="sk-d2ef9d662b8b4abb998f0f0a497229ed"
+export DASHSCOPE_API_KEY="sk-d2ef9d662b8b4abb998f0f0a497229ed"
+ENABLE_MCP=true ENABLE_RAG=false ./examples/ai_orchestrator/start_system.sh
+./build/server/rpc_server
+./build/client/rpc_client
