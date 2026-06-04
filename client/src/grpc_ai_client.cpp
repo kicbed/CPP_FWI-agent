@@ -1,18 +1,12 @@
 /**
- * @file ai_client.cpp
- * @brief FWI Agent 科研助手 - 交互式客户端 v3
+ * @file grpc_ai_client.cpp
+ * @brief FWI Agent gRPC 客户端 - 与 HTTP 版本相同的 UI
  *
- * 功能：
- * - 上下键选择对话（使用 stty 原始模式）
- * - 对话标题自动摘要
- * - 历史记录持久化（从 Redis 加载）
- * - 精美 UI 界面
+ * 通过 HTTP 连接 Orchestrator（与 ai_client 相同的 UI）
  */
 
-#include <a2a/models/agent_message.hpp>
-#include <a2a/models/message_part.hpp>
-#include <a2a/core/jsonrpc_request.hpp>
-#include <a2a/core/jsonrpc_response.hpp>
+#pragma GCC diagnostic ignored "-Wunused-result"
+
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <iostream>
@@ -23,9 +17,8 @@
 #include <sstream>
 #include <algorithm>
 #include <cstdlib>
-#include <cstdio>
+#include <csignal>
 
-using namespace a2a;
 using json = nlohmann::json;
 
 // ============================================================
@@ -39,16 +32,12 @@ namespace UI {
     const std::string GREEN   = "\033[32m";
     const std::string YELLOW  = "\033[33m";
     const std::string BLUE    = "\033[34m";
-    const std::string MAGENTA = "\033[35m";
     const std::string CYAN    = "\033[36m";
     const std::string WHITE   = "\033[37m";
     const std::string GRAY    = "\033[90m";
     const std::string CLEAR   = "\033[2J\033[H";
 }
 
-// ============================================================
-// CURL 回调
-// ============================================================
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
     userp->append((char*)contents, size * nmemb);
     return size * nmemb;
@@ -69,19 +58,6 @@ struct Conversation {
 // ============================================================
 class HttpClient {
 public:
-    static std::string get(const std::string& url) {
-        CURL* curl = curl_easy_init();
-        if (!curl) return "";
-        std::string response;
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-        curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-        return response;
-    }
-
     static std::string post(const std::string& url, const std::string& body) {
         CURL* curl = curl_easy_init();
         if (!curl) return "";
@@ -199,10 +175,6 @@ public:
         }
     }
 
-    std::string get_agent_card() {
-        return HttpClient::get(server_url_ + "/.well-known/agent-card.json");
-    }
-
 private:
     std::string server_url_;
     int req_id_ = 0;
@@ -212,9 +184,7 @@ private:
 // UI 组件
 // ============================================================
 
-void clear_screen() {
-    std::cout << UI::CLEAR << std::flush;
-}
+void clear_screen() { std::cout << UI::CLEAR << std::flush; }
 
 void print_separator() {
     std::cout << UI::GRAY << "  ─────────────────────────────────────────────────────────────────" << UI::RESET << "\n";
@@ -224,9 +194,7 @@ std::string generate_title(const std::string& text) {
     if (text.empty()) return "新对话";
     std::string title = text;
     std::replace(title.begin(), title.end(), '\n', ' ');
-    if (title.length() > 35) {
-        title = title.substr(0, 35) + "...";
-    }
+    if (title.length() > 35) title = title.substr(0, 35) + "...";
     return title;
 }
 
@@ -238,48 +206,11 @@ void print_welcome(const std::string& server_url) {
     std::cout << UI::BOLD << UI::WHITE << "            🔬  FWI 全波形反演科研助手平台  🔬                  ";
     std::cout << UI::RESET << UI::CYAN << "║" << UI::RESET << "\n";
     std::cout << UI::CYAN << "  ║" << UI::RESET;
-    std::cout << UI::DIM << "             Full Waveform Inversion Research Assistant               ";
+    std::cout << UI::DIM << "                       gRPC 模式                                  ";
     std::cout << UI::RESET << UI::CYAN << "║" << UI::RESET << "\n";
     std::cout << UI::CYAN << "  ╚═══════════════════════════════════════════════════════════════════╝" << UI::RESET << "\n";
     std::cout << "\n";
     std::cout << UI::DIM << "    连接: " << server_url << UI::RESET << "\n\n";
-}
-
-void print_agent_card(const std::string& card_json) {
-    try {
-        auto card = json::parse(card_json);
-        std::cout << "\n";
-        std::cout << UI::CYAN << "  ╔═══════════════════════════════════════════════════════════════════╗" << UI::RESET << "\n";
-        std::cout << UI::CYAN << "  ║" << UI::RESET << UI::BOLD << UI::WHITE << "  📋 Agent Card";
-        for (int i = 0; i < 52; i++) std::cout << " ";
-        std::cout << UI::CYAN << "║" << UI::RESET << "\n";
-        std::cout << UI::CYAN << "  ╚═══════════════════════════════════════════════════════════════════╝" << UI::RESET << "\n\n";
-        std::cout << UI::BOLD << "    📛 名称    " << UI::RESET << card.value("name", "Unknown") << "\n";
-        std::cout << UI::BOLD << "    📝 描述    " << UI::RESET << card.value("description", "") << "\n";
-        std::cout << UI::BOLD << "    🔢 版本    " << UI::RESET << card.value("version", "") << "\n";
-        if (card.contains("capabilities")) {
-            auto caps = card["capabilities"];
-            std::cout << UI::BOLD << "    ⚡ 能力    " << UI::RESET;
-            std::vector<std::string> list;
-            if (caps.value("streaming", false)) list.push_back("流式");
-            if (caps.value("task_management", false)) list.push_back("任务管理");
-            for (size_t i = 0; i < list.size(); ++i) {
-                if (i > 0) std::cout << " · ";
-                std::cout << UI::GREEN << list[i] << UI::RESET;
-            }
-            std::cout << "\n";
-        }
-        if (card.contains("skills") && !card["skills"].empty()) {
-            std::cout << UI::BOLD << "    🎯 技能    " << UI::RESET << "\n";
-            for (const auto& skill : card["skills"]) {
-                std::cout << "        • " << UI::YELLOW << skill.value("name", "") << UI::RESET
-                          << ": " << skill.value("description", "") << "\n";
-            }
-        }
-        std::cout << "\n";
-    } catch (const std::exception& e) {
-        std::cout << UI::RED << "  解析失败: " << e.what() << UI::RESET << "\n";
-    }
 }
 
 std::vector<Conversation> load_conversations() {
@@ -291,15 +222,11 @@ std::vector<Conversation> load_conversations() {
         conv.message_count = RedisHelper::get_session_count(id);
         std::string last_user_msg = RedisHelper::get_last_user_message(id);
         conv.title = generate_title(last_user_msg);
-        conv.last_message = last_user_msg.length() > 50
-            ? last_user_msg.substr(0, 50) + "..."
-            : last_user_msg;
+        conv.last_message = last_user_msg.length() > 50 ? last_user_msg.substr(0, 50) + "..." : last_user_msg;
         convs.push_back(conv);
     }
     std::sort(convs.begin(), convs.end(),
-        [](const Conversation& a, const Conversation& b) {
-            return a.message_count > b.message_count;
-        });
+        [](const Conversation& a, const Conversation& b) { return a.message_count > b.message_count; });
     return convs;
 }
 
@@ -312,8 +239,7 @@ void print_conversation_list(const std::vector<Conversation>& convs, int selecte
     std::cout << UI::CYAN << "  └─────────────────────────────────────────────────────────────────┘" << UI::RESET << "\n\n";
 
     if (convs.empty()) {
-        std::cout << UI::DIM << "    暂无历史对话" << UI::RESET << "\n";
-        std::cout << UI::DIM << "    按 Enter 新建对话开始聊天" << UI::RESET << "\n\n";
+        std::cout << UI::DIM << "    暂无历史对话" << UI::RESET << "\n\n";
     } else {
         for (size_t i = 0; i < convs.size(); ++i) {
             bool is_selected = (static_cast<int>(i) == selected);
@@ -322,8 +248,7 @@ void print_conversation_list(const std::vector<Conversation>& convs, int selecte
             std::string meta_color = is_selected ? UI::GREEN : UI::GRAY;
 
             std::cout << indicator << title_color << convs[i].title << UI::RESET;
-            std::cout << "  " << meta_color << "(" << convs[i].message_count << " 条)" << UI::RESET;
-            std::cout << "\n";
+            std::cout << "  " << meta_color << "(" << convs[i].message_count << " 条)" << UI::RESET << "\n";
 
             if (is_selected && !convs[i].last_message.empty()) {
                 std::cout << "      " << UI::DIM << "└─ " << convs[i].last_message << UI::RESET << "\n";
@@ -340,48 +265,22 @@ void print_conversation_list(const std::vector<Conversation>& convs, int selecte
     std::cout << UI::DIM << "/quit" << UI::RESET << " 退出\n\n";
 }
 
-void print_help() {
-    std::cout << "\n";
-    std::cout << UI::CYAN << "  ┌─────────────────────────────────────────────────────────────────┐" << UI::RESET << "\n";
-    std::cout << UI::CYAN << "  │" << UI::RESET << UI::BOLD << UI::WHITE << "  📖 帮助";
-    for (int i = 0; i < 55; i++) std::cout << " ";
-    std::cout << UI::CYAN << "│" << UI::RESET << "\n";
-    std::cout << UI::CYAN << "  └─────────────────────────────────────────────────────────────────┘" << UI::RESET << "\n\n";
-    std::cout << UI::BOLD << "    列表模式:" << UI::RESET << "\n";
-    std::cout << "      ↑/↓         选择对话\n";
-    std::cout << "      Enter       进入选中的对话\n";
-    std::cout << "      n           新建对话\n";
-    std::cout << "      1-9         直接选择对应对话\n\n";
-    std::cout << UI::BOLD << "    对话模式:" << UI::RESET << "\n";
-    std::cout << "      直接输入    发送消息\n";
-    std::cout << "      /help       显示帮助\n";
-    std::cout << "      /card       查看 Agent Card\n";
-    std::cout << "      /list       返回对话列表\n";
-    std::cout << "      /clear      清屏\n";
-    std::cout << "      /quit       退出\n\n";
-}
-
-/**
- * @brief 使用 popen + read 读取单个字符（支持方向键）
- */
 int read_key() {
-    // 使用 stty 设置终端为原始模式
-    (void)system("stty raw -echo 2>/dev/null");
+    if(system("stty raw -echo 2>/dev/null")){}
     int c = getchar();
-    (void)system("stty cooked echo 2>/dev/null");
+    if(system("stty cooked echo 2>/dev/null")){}
 
-    // 检查方向键（转义序列）
     if (c == 27) {
-        (void)system("stty raw -echo 2>/dev/null");
+        if(system("stty raw -echo 2>/dev/null")){}
         int next = getchar();
-        (void)system("stty cooked echo 2>/dev/null");
+        if(system("stty cooked echo 2>/dev/null")){}
         if (next == 91) {
-            (void)system("stty raw -echo 2>/dev/null");
+            if(system("stty raw -echo 2>/dev/null")){}
             int arrow = getchar();
-            (void)system("stty cooked echo 2>/dev/null");
+            if(system("stty cooked echo 2>/dev/null")){}
             switch (arrow) {
-                case 65: return 1000;  // 上
-                case 66: return 1001;  // 下
+                case 65: return 1000;
+                case 66: return 1001;
             }
         }
         return 27;
@@ -392,9 +291,18 @@ int read_key() {
 // ============================================================
 // 主程序
 // ============================================================
+
 int main(int argc, char* argv[]) {
     std::string server_url = "http://localhost:5000";
-    if (argc > 1) server_url = argv[1];
+    if (argc > 1) {
+        // 如果传入的是 host:port 格式，转换为 http://host:port
+        std::string addr = argv[1];
+        if (addr.find("http") == std::string::npos) {
+            server_url = "http://" + addr;
+        } else {
+            server_url = addr;
+        }
+    }
 
     AgentClient client(server_url);
     auto conversations = load_conversations();
@@ -406,30 +314,26 @@ int main(int argc, char* argv[]) {
 
     while (true) {
         if (!in_conversation) {
-            // ========== 列表模式 ==========
             print_conversation_list(conversations, selected);
             std::cout << UI::BOLD << UI::CYAN << "  > " << UI::RESET << std::flush;
 
             int key = read_key();
 
-            // 上箭头
-            if (key == 1000) {
+            if (key == 1000) {  // 上
                 if (selected > 0) selected--;
                 clear_screen();
                 print_welcome(server_url);
                 continue;
             }
 
-            // 下箭头
-            if (key == 1001) {
+            if (key == 1001) {  // 下
                 if (selected < static_cast<int>(conversations.size()) - 1) selected++;
                 clear_screen();
                 print_welcome(server_url);
                 continue;
             }
 
-            // Enter
-            if (key == 13) {
+            if (key == 13) {  // Enter
                 if (!conversations.empty()) {
                     current_ctx = conversations[selected].context_id;
                     in_conversation = true;
@@ -445,7 +349,6 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // n - 新建
             if (key == 'n' || key == 'N') {
                 current_ctx = "ctx-" + std::to_string(std::time(nullptr));
                 in_conversation = true;
@@ -459,13 +362,11 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // q - 退出
             if (key == 'q' || key == 'Q') {
                 std::cout << "\n" << UI::GREEN << "  👋 再见！" << UI::RESET << "\n\n";
                 break;
             }
 
-            // 数字选择
             if (key >= '1' && key <= '9') {
                 int num = key - '0';
                 if (num >= 1 && num <= static_cast<int>(conversations.size())) {
@@ -484,25 +385,19 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // 其他按键 - 回退到行模式读取
-            (void)system("stty cooked echo 2>/dev/null");
+            // 其他按键
+            if(system("stty cooked echo 2>/dev/null")){}
             std::string input;
-            if (key >= 32 && key < 127) {
-                input = static_cast<char>(key);
-            }
+            if (key >= 32 && key < 127) input = static_cast<char>(key);
             std::string rest;
             std::getline(std::cin, rest);
             input += rest;
 
             if (input.empty()) continue;
-
             if (input == "/quit" || input == "/exit") {
                 std::cout << "\n" << UI::GREEN << "  👋 再见！" << UI::RESET << "\n\n";
                 break;
             }
-
-            if (input == "/help") { print_help(); continue; }
-            if (input == "/card") { print_agent_card(client.get_agent_card()); continue; }
 
             // 默认新建对话
             current_ctx = "ctx-" + std::to_string(std::time(nullptr));
@@ -530,15 +425,12 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            if (input == "/help") { print_help(); continue; }
-            if (input == "/card") { print_agent_card(client.get_agent_card()); continue; }
             if (input == "/clear") { clear_screen(); continue; }
 
             // 发送消息
             std::cout << "\n" << UI::DIM << "    ⏳ 思考中..." << UI::RESET << "\r" << std::flush;
             std::string response = client.send_message(input, current_ctx);
-            std::cout << "\033[2K";
-            std::cout << "\n";
+            std::cout << "\033[2K\n";
             std::cout << UI::BOLD << UI::GREEN << "    🤖 AI: " << UI::RESET << response << "\n\n";
             print_separator();
         }
