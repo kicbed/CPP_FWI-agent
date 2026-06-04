@@ -73,7 +73,7 @@ fi
 
 # 启动 Agent 系统
 echo -e "${YELLOW}[3/4] 启动 Agent 系统...${NC}"
-"$PROJECT_ROOT/examples/ai_orchestrator/start_system.sh" 2>&1 | tail -3
+bash "$PROJECT_ROOT/examples/ai_orchestrator/start_system.sh" 2>&1
 
 echo ""
 echo -e "${CYAN}=========================================="

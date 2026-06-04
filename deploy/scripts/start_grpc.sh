@@ -9,8 +9,6 @@
 # 4. 启动 gRPC Client
 #
 
-set -e
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
@@ -74,7 +72,7 @@ fi
 
 # 启动 Agent 系统
 echo -e "${YELLOW}[3/5] 启动 Agent 系统...${NC}"
-"$PROJECT_ROOT/examples/ai_orchestrator/start_system.sh" 2>&1 | tail -3
+bash "$PROJECT_ROOT/examples/ai_orchestrator/start_system.sh" 2>&1
 
 # 启动 gRPC Server
 echo -e "${YELLOW}[4/5] 启动 gRPC Server...${NC}"
@@ -83,16 +81,12 @@ nohup "$PROJECT_ROOT/build/server/rpc_server" \
 echo $! > "$PROJECT_ROOT/deploy/pids/grpc_server.pid"
 sleep 2
 
-if ss -tlnp | grep -q ":50051"; then
+if ss -tlnp 2>/dev/null | grep -q ":50051 "; then
     echo -e "${GREEN}  ✓ gRPC Server 启动成功 (端口 50051)${NC}"
 else
     echo -e "${RED}  ✗ gRPC Server 启动失败${NC}"
 fi
 
-echo ""
-echo -e "${CYAN}=========================================="
-echo "系统启动完成!"
-echo -e "==========================================${NC}"
 echo ""
 echo -e "${CYAN}=========================================="
 echo "系统启动完成!"
