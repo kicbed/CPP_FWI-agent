@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN" class="dark">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,12 +7,11 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
-      darkMode: 'class',
       theme: {
         extend: {
           colors: {
-            slate: { 950: '#020617' },
-            accent: { DEFAULT: '#6366F1', light: '#818CF8', dark: '#4F46E5' },
+            accent: { DEFAULT: '#4F46E5', light: '#6366F1', dark: '#4338CA' },
+            surface: { 50: '#F8FAFC', 100: '#F1F5F9', 200: '#E2E8F0', 300: '#CBD5E1' },
           },
           fontFamily: {
             heading: ['Space Grotesk', 'sans-serif'],
@@ -26,17 +25,16 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="icon" href="favicon.svg">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: 'DM Sans', sans-serif; background: #0F172A; color: #F1F5F9; }
+    body { font-family: 'DM Sans', sans-serif; background: #F8FAFC; color: #1E293B; }
 
-    /* Scrollbar */
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+    ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94A3B8; }
 
-    /* Typing indicator */
     @keyframes typingBounce {
       0%, 60%, 100% { transform: translateY(0); }
       30% { transform: translateY(-6px); }
@@ -49,49 +47,39 @@
     .typing-dot:nth-child(2) { animation-delay: 0.2s; }
     .typing-dot:nth-child(3) { animation-delay: 0.4s; }
 
-    /* Cursor blink */
-    @keyframes blink {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0; }
-    }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
     .cursor-blink::after {
       content: '|'; color: #6366F1; font-weight: 100;
       animation: blink 1s step-end infinite;
     }
 
-    /* Message slide-in */
     @keyframes slideUp {
       from { opacity: 0; transform: translateY(12px); }
       to { opacity: 1; transform: translateY(0); }
     }
     .msg-enter { animation: slideUp 0.3s ease-out; }
 
-    /* Glow effect */
-    .glow-accent { box-shadow: 0 0 20px rgba(99, 102, 241, 0.3); }
-    .glow-accent:hover { box-shadow: 0 0 30px rgba(99, 102, 241, 0.5); }
+    .glow-accent { box-shadow: 0 0 20px rgba(79, 70, 229, 0.15); }
+    .glow-accent:hover { box-shadow: 0 0 30px rgba(79, 70, 229, 0.25); }
 
-    /* Mode switch */
     .mode-active {
-      background: linear-gradient(135deg, #6366F1 0%, #818CF8 100%);
-      color: white; box-shadow: 0 0 16px rgba(99,102,241,0.4);
+      background: linear-gradient(135deg, #4F46E5 0%, #6366F1 100%);
+      color: white; box-shadow: 0 2px 8px rgba(79,70,229,0.3);
     }
 
-    /* Code block */
     pre {
-      background: #0F172A; border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 8px; padding: 12px 16px; overflow-x: auto;
-      font-family: 'Fira Code', monospace; font-size: 13px; line-height: 1.6;
+      background: #1E293B; border-radius: 8px; padding: 12px 16px; overflow-x: auto;
+      font-family: 'Fira Code', monospace; font-size: 13px; line-height: 1.6; color: #E2E8F0;
     }
     code {
       font-family: 'Fira Code', monospace; font-size: 13px;
-      background: rgba(99,102,241,0.15); padding: 2px 6px; border-radius: 4px;
+      background: rgba(79,70,229,0.08); padding: 2px 6px; border-radius: 4px; color: #4F46E5;
     }
-    pre code { background: none; padding: 0; }
+    pre code { background: none; padding: 0; color: #E2E8F0; }
 
-    /* Markdown styles */
     .markdown-body h1, .markdown-body h2, .markdown-body h3 {
       font-family: 'Space Grotesk', sans-serif; font-weight: 600;
-      margin-top: 16px; margin-bottom: 8px;
+      margin-top: 16px; margin-bottom: 8px; color: #0F172A;
     }
     .markdown-body h1 { font-size: 1.5em; }
     .markdown-body h2 { font-size: 1.25em; }
@@ -101,52 +89,51 @@
     .markdown-body li { margin-bottom: 4px; line-height: 1.6; }
     .markdown-body blockquote {
       border-left: 3px solid #6366F1; padding-left: 12px;
-      color: #94A3B8; margin: 8px 0;
+      color: #64748B; margin: 8px 0; background: #F1F5F9; padding: 8px 12px; border-radius: 0 6px 6px 0;
     }
     .markdown-body table { border-collapse: collapse; margin: 8px 0; width: 100%; }
     .markdown-body th, .markdown-body td {
-      border: 1px solid #334155; padding: 8px 12px; text-align: left;
+      border: 1px solid #E2E8F0; padding: 8px 12px; text-align: left;
     }
-    .markdown-body th { background: #1E293B; font-weight: 600; }
-    .markdown-body a { color: #818CF8; text-decoration: underline; }
-    .markdown-body hr { border: none; border-top: 1px solid #334155; margin: 16px 0; }
+    .markdown-body th { background: #F1F5F9; font-weight: 600; }
+    .markdown-body a { color: #4F46E5; text-decoration: underline; }
+    .markdown-body hr { border: none; border-top: 1px solid #E2E8F0; margin: 16px 0; }
+    .markdown-body strong { color: #0F172A; }
 
-    /* Status pulse */
     @keyframes pulse-green {
       0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.4); }
       50% { box-shadow: 0 0 0 6px rgba(16,185,129,0); }
     }
     .status-online { animation: pulse-green 2s infinite; }
 
-    /* Responsive sidebar */
     @media (max-width: 768px) {
       .sidebar { position: fixed; z-index: 50; transform: translateX(-100%); transition: transform 0.3s; }
       .sidebar.open { transform: translateX(0); }
       .sidebar-overlay { display: none; }
-      .sidebar-overlay.open { display: block; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 40; }
+      .sidebar-overlay.open { display: block; position: fixed; inset: 0; background: rgba(0,0,0,0.3); z-index: 40; }
     }
   </style>
 </head>
 <body class="h-screen flex overflow-hidden">
 
   <!-- Mobile menu button -->
-  <button id="menuBtn" class="md:hidden fixed top-4 left-4 z-50 p-2 bg-slate-800 rounded-lg border border-white/10" onclick="toggleSidebar()">
-    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
+  <button id="menuBtn" class="md:hidden fixed top-4 left-4 z-50 p-2 bg-white rounded-lg border border-slate-200 shadow-sm" onclick="toggleSidebar()">
+    <svg class="w-5 h-5 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
   </button>
 
   <!-- Sidebar overlay (mobile) -->
   <div id="sidebarOverlay" class="sidebar-overlay" onclick="toggleSidebar()"></div>
 
   <!-- Sidebar -->
-  <aside id="sidebar" class="sidebar w-64 bg-slate-900/80 border-r border-white/5 flex flex-col h-full shrink-0">
+  <aside id="sidebar" class="sidebar w-64 bg-white border-r border-slate-200 flex flex-col h-full shrink-0">
     <!-- Logo -->
-    <div class="p-5 border-b border-white/5">
+    <div class="p-5 border-b border-slate-100">
       <div class="flex items-center gap-3">
         <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-accent to-accent-light flex items-center justify-center">
           <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
         </div>
         <div>
-          <h1 class="font-heading font-bold text-base leading-tight">AI Orchestrator</h1>
+          <h1 class="font-heading font-bold text-base leading-tight text-slate-900">AI Orchestrator</h1>
           <p class="text-xs text-slate-400">Multi-Agent System</p>
         </div>
       </div>
@@ -154,12 +141,12 @@
 
     <!-- Mode Switch -->
     <div class="px-4 pt-4 pb-2">
-      <p class="text-xs text-slate-500 uppercase tracking-wider mb-2 font-medium">通信模式</p>
-      <div class="flex bg-slate-800 rounded-lg p-1 gap-1">
+      <p class="text-xs text-slate-400 uppercase tracking-wider mb-2 font-medium">通信模式</p>
+      <div class="flex bg-slate-100 rounded-lg p-1 gap-1">
         <button id="modeHttp" onclick="switchMode('http')" class="flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 mode-active">
           HTTP
         </button>
-        <button id="modeGrpc" onclick="switchMode('grpc')" class="flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 text-slate-400 hover:text-slate-200">
+        <button id="modeGrpc" onclick="switchMode('grpc')" class="flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 text-slate-400 hover:text-slate-600">
           gRPC
         </button>
       </div>
@@ -167,7 +154,7 @@
 
     <!-- New Chat -->
     <div class="px-4 pt-3">
-      <button onclick="newChat()" class="w-full py-2.5 px-4 bg-accent/10 hover:bg-accent/20 border border-accent/30 rounded-lg text-sm font-medium text-accent-light transition-all duration-200 flex items-center justify-center gap-2">
+      <button onclick="newChat()" class="w-full py-2.5 px-4 bg-accent/5 hover:bg-accent/10 border border-accent/20 rounded-lg text-sm font-medium text-accent transition-all duration-200 flex items-center justify-center gap-2">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
         新对话
       </button>
@@ -175,31 +162,31 @@
 
     <!-- Chat History -->
     <div class="flex-1 overflow-y-auto px-4 pt-4">
-      <p class="text-xs text-slate-500 uppercase tracking-wider mb-2 font-medium">历史对话</p>
+      <p class="text-xs text-slate-400 uppercase tracking-wider mb-2 font-medium">历史对话</p>
       <div id="chatHistory" class="space-y-1"></div>
     </div>
 
     <!-- System Status -->
-    <div class="p-4 border-t border-white/5">
-      <p class="text-xs text-slate-500 uppercase tracking-wider mb-3 font-medium">系统状态</p>
+    <div class="p-4 border-t border-slate-100">
+      <p class="text-xs text-slate-400 uppercase tracking-wider mb-3 font-medium">系统状态</p>
       <div class="space-y-2">
         <div class="flex items-center justify-between">
-          <span class="text-xs text-slate-400">Orchestrator</span>
+          <span class="text-xs text-slate-500">Orchestrator</span>
           <div class="flex items-center gap-1.5">
-            <div id="statusOrchestrator" class="w-2 h-2 rounded-full bg-slate-600"></div>
-            <span id="statusOrchestratorText" class="text-xs text-slate-500">检测中</span>
+            <div id="statusOrchestrator" class="w-2 h-2 rounded-full bg-slate-300"></div>
+            <span id="statusOrchestratorText" class="text-xs text-slate-400">检测中</span>
           </div>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-xs text-slate-400">gRPC Server</span>
+          <span class="text-xs text-slate-500">gRPC Server</span>
           <div class="flex items-center gap-1.5">
-            <div id="statusGrpc" class="w-2 h-2 rounded-full bg-slate-600"></div>
-            <span id="statusGrpcText" class="text-xs text-slate-500">检测中</span>
+            <div id="statusGrpc" class="w-2 h-2 rounded-full bg-slate-300"></div>
+            <span id="statusGrpcText" class="text-xs text-slate-400">检测中</span>
           </div>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-xs text-slate-400">当前模式</span>
-          <span id="currentModeLabel" class="text-xs font-mono text-accent-light">HTTP :5000</span>
+          <span class="text-xs text-slate-500">当前模式</span>
+          <span id="currentModeLabel" class="text-xs font-mono text-accent">HTTP :5000</span>
         </div>
       </div>
     </div>
@@ -208,13 +195,13 @@
   <!-- Main Content -->
   <main class="flex-1 flex flex-col h-full min-w-0">
     <!-- Header -->
-    <header class="h-14 border-b border-white/5 flex items-center justify-between px-6 bg-slate-900/50 backdrop-blur-sm shrink-0">
+    <header class="h-14 border-b border-slate-200 flex items-center justify-between px-6 bg-white/80 backdrop-blur-sm shrink-0">
       <div class="flex items-center gap-3">
-        <h2 id="chatTitle" class="font-heading font-semibold text-sm">新对话</h2>
-        <span id="modeTag" class="px-2 py-0.5 bg-accent/15 text-accent-light text-xs rounded-full font-mono">HTTP</span>
+        <h2 id="chatTitle" class="font-heading font-semibold text-sm text-slate-900">新对话</h2>
+        <span id="modeTag" class="px-2 py-0.5 bg-accent/10 text-accent text-xs rounded-full font-mono">HTTP</span>
       </div>
       <div class="flex items-center gap-2">
-        <button onclick="clearChat()" class="p-2 hover:bg-slate-800 rounded-lg transition-colors text-slate-400 hover:text-slate-200" title="清空对话">
+        <button onclick="clearChat()" class="p-2 hover:bg-slate-100 rounded-lg transition-colors text-slate-400 hover:text-slate-600" title="清空对话">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
         </button>
       </div>
@@ -227,20 +214,20 @@
         <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-accent to-accent-light flex items-center justify-center mb-6 glow-accent">
           <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
         </div>
-        <h3 class="font-heading text-xl font-bold mb-2">AI Agent Orchestrator</h3>
+        <h3 class="font-heading text-xl font-bold mb-2 text-slate-900">AI Agent Orchestrator</h3>
         <p class="text-slate-400 text-sm max-w-md mb-6">多智能体协作系统，支持 HTTP 直连和 gRPC 两种通信模式。输入你的问题开始对话。</p>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg w-full">
-          <button onclick="sendQuick('说一说数字孪生地球')" class="p-3 bg-slate-800/60 hover:bg-slate-800 border border-white/5 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30">
-            <span class="text-accent-light">🌏</span> 数字孪生地球
+          <button onclick="sendQuick('说一说数字孪生地球')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm">
+            <span class="text-accent">🌏</span> <span class="text-slate-700">数字孪生地球</span>
           </button>
-          <button onclick="sendQuick('说说最先进的工程agent')" class="p-3 bg-slate-800/60 hover:bg-slate-800 border border-white/5 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30">
-            <span class="text-accent-light">🤖</span> 最先进的工程 Agent
+          <button onclick="sendQuick('说说最先进的工程agent')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm">
+            <span class="text-accent">🤖</span> <span class="text-slate-700">最先进的工程 Agent</span>
           </button>
-          <button onclick="sendQuick('解释一下FWI理论')" class="p-3 bg-slate-800/60 hover:bg-slate-800 border border-white/5 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30">
-            <span class="text-accent-light">📡</span> FWI 理论
+          <button onclick="sendQuick('解释一下FWI理论')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm">
+            <span class="text-accent">📡</span> <span class="text-slate-700">FWI 理论</span>
           </button>
-          <button onclick="sendQuick('帮我解一个微分方程')" class="p-3 bg-slate-800/60 hover:bg-slate-800 border border-white/5 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30">
-            <span class="text-accent-light">📐</span> 微分方程
+          <button onclick="sendQuick('帮我解一个微分方程')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm">
+            <span class="text-accent">📐</span> <span class="text-slate-700">微分方程</span>
           </button>
         </div>
       </div>
@@ -251,10 +238,10 @@
       <!-- Typing indicator -->
       <div id="typingIndicator" class="max-w-3xl mx-auto hidden">
         <div class="flex items-start gap-3 msg-enter">
-          <div class="w-8 h-8 rounded-lg bg-accent/20 flex items-center justify-center shrink-0">
-            <svg class="w-4 h-4 text-accent-light" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+          <div class="w-8 h-8 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
+            <svg class="w-4 h-4 text-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
           </div>
-          <div class="bg-slate-800 rounded-2xl rounded-tl-md px-4 py-3 border border-white/5">
+          <div class="bg-white rounded-2xl rounded-tl-md px-4 py-3 border border-slate-200 shadow-sm">
             <div class="flex items-center gap-1.5">
               <span class="typing-dot"></span>
               <span class="typing-dot"></span>
@@ -266,7 +253,7 @@
     </div>
 
     <!-- Input Area -->
-    <div class="border-t border-white/5 bg-slate-900/50 backdrop-blur-sm px-4 md:px-6 py-4 shrink-0">
+    <div class="border-t border-slate-200 bg-white/80 backdrop-blur-sm px-4 md:px-6 py-4 shrink-0">
       <div class="max-w-3xl mx-auto">
         <div class="flex items-end gap-3">
           <div class="flex-1 relative">
@@ -274,7 +261,7 @@
               id="userInput"
               placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"
               rows="1"
-              class="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 pr-12 text-sm resize-none focus:outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/30 transition-all placeholder:text-slate-500"
+              class="w-full bg-white border border-slate-200 rounded-xl px-4 py-3 pr-12 text-sm resize-none focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent/20 transition-all placeholder:text-slate-400 shadow-sm"
               onkeydown="handleKeyDown(event)"
               oninput="autoResize(this)"
             ></textarea>
@@ -289,12 +276,12 @@
           <button
             id="stopBtn"
             onclick="stopGeneration()"
-            class="p-3 bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 rounded-xl transition-all duration-200 hidden"
+            class="p-3 bg-red-50 hover:bg-red-100 border border-red-200 rounded-xl transition-all duration-200 hidden"
           >
-            <svg class="w-5 h-5 text-red-400" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+            <svg class="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
           </button>
         </div>
-        <p class="text-xs text-slate-600 mt-2 text-center">
+        <p class="text-xs text-slate-400 mt-2 text-center">
           Powered by Multi-Agent Orchestrator · HTTP / gRPC 双模式
         </p>
       </div>
@@ -302,7 +289,7 @@
   </main>
 
   <!-- Toast notification -->
-  <div id="toast" class="fixed bottom-20 left-1/2 -translate-x-1/2 px-4 py-2 bg-slate-800 border border-white/10 rounded-lg text-sm shadow-xl transition-all duration-300 opacity-0 translate-y-2 pointer-events-none z-50"></div>
+  <div id="toast" class="fixed bottom-20 left-1/2 -translate-x-1/2 px-4 py-2 bg-slate-900 text-white border border-slate-700 rounded-lg text-sm shadow-xl transition-all duration-300 opacity-0 translate-y-2 pointer-events-none z-50"></div>
 
   <script>
     // ===== State =====
@@ -339,10 +326,10 @@
       const grpcBtn = document.getElementById('modeGrpc');
       if (mode === 'http') {
         httpBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 mode-active';
-        grpcBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 text-slate-400 hover:text-slate-200';
+        grpcBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 text-slate-400 hover:text-slate-600';
       } else {
         grpcBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 mode-active';
-        httpBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 text-slate-400 hover:text-slate-200';
+        httpBtn.className = 'flex-1 py-2 px-3 rounded-md text-sm font-medium transition-all duration-200 text-slate-400 hover:text-slate-600';
       }
 
       document.getElementById('modeTag').textContent = mode === 'http' ? 'HTTP' : 'gRPC';
@@ -391,7 +378,6 @@
 
     function saveChat(title, messages, contextId) {
       state.chats[state.chatId] = { title, messages, contextId, mode: state.mode, time: Date.now() };
-      // Keep only last 50 chats
       const keys = Object.keys(state.chats).sort((a, b) => state.chats[b].time - state.chats[a].time);
       if (keys.length > 50) keys.slice(50).forEach(k => delete state.chats[k]);
       localStorage.setItem('agent-chats', JSON.stringify(state.chats));
@@ -405,14 +391,14 @@
         .slice(0, 20);
 
       if (entries.length === 0) {
-        container.innerHTML = '<p class="text-xs text-slate-600 text-center py-4">暂无对话</p>';
+        container.innerHTML = '<p class="text-xs text-slate-400 text-center py-4">暂无对话</p>';
         return;
       }
 
       container.innerHTML = entries.map(([id, chat]) => {
-        const active = id === state.chatId ? 'bg-slate-800 border-accent/20' : 'hover:bg-slate-800/50';
+        const active = id === state.chatId ? 'bg-accent/5 border-accent/20' : 'hover:bg-slate-50';
         const modeIcon = chat.mode === 'grpc' ? '⚡' : '🌐';
-        return `<button onclick="loadChat('${id}')" class="w-full text-left px-3 py-2 rounded-lg border border-transparent text-sm truncate transition-all duration-150 ${active}">
+        return `<button onclick="loadChat('${id}')" class="w-full text-left px-3 py-2 rounded-lg border border-transparent text-sm truncate transition-all duration-150 ${active} text-slate-700">
           <span class="text-xs mr-1">${modeIcon}</span>${chat.title || '未命名对话'}
         </button>`;
       }).join('');
@@ -444,21 +430,17 @@
       input.value = '';
       input.style.height = 'auto';
 
-      // Hide welcome, show messages
       document.getElementById('welcomeMsg').classList.add('hidden');
       const msgs = document.getElementById('messages');
       msgs.classList.remove('hidden');
 
-      // Append user message
       appendMessage('user', text);
       scrollToBottom();
 
-      // Save title from first message
       const chatMessages = getChatMessages();
       chatMessages.push({ role: 'user', content: text });
       const title = text.slice(0, 30) + (text.length > 30 ? '...' : '');
 
-      // Show typing
       showTyping(true);
       state.streaming = true;
       updateSendBtn();
@@ -501,11 +483,9 @@
       state.abortController = new AbortController();
       const id = 'req-' + Date.now();
 
-      // Try streaming first
       try {
         return await sendHttpStream(text, id);
       } catch (e) {
-        // Fallback to non-streaming
         if (e.name === 'AbortError') throw e;
         return await sendHttpSync(text, id);
       }
@@ -534,7 +514,6 @@
         return await parseSSE(resp, id);
       }
 
-      // JSON response
       const data = await resp.json();
       if (data.error) throw new Error(data.error.message || '请求失败');
       return extractAnswer(data.result);
@@ -547,7 +526,6 @@
       let answer = '';
       let contextId = state.contextId;
 
-      // Create streaming message element
       const msgEl = appendMessage('assistant', '', true);
 
       while (true) {
@@ -569,7 +547,6 @@
 
             if (result?.contextId) contextId = result.contextId;
 
-            // Handle task status update
             if (result?.status?.message?.parts) {
               for (const part of result.status.message.parts) {
                 if (part.kind === 'text' && part.text) {
@@ -579,7 +556,6 @@
               }
             }
 
-            // Handle artifacts
             if (result?.artifacts) {
               for (const artifact of result.artifacts) {
                 if (artifact.parts) {
@@ -592,9 +568,7 @@
                 }
               }
             }
-          } catch (e) {
-            // Not valid JSON, skip
-          }
+          } catch (e) {}
         }
       }
 
@@ -631,7 +605,6 @@
     function extractAnswer(result) {
       if (!result) return '无响应内容';
 
-      // Try artifacts first
       if (result.artifacts?.length > 0) {
         for (const a of result.artifacts) {
           if (a.parts?.length > 0) {
@@ -641,13 +614,11 @@
         }
       }
 
-      // Try status message
       if (result.status?.message?.parts?.length > 0) {
         const textParts = result.status.message.parts.filter(p => p.kind === 'text').map(p => p.text);
         if (textParts.length > 0) return textParts.join('\n');
       }
 
-      // Try top-level parts
       if (result.parts?.length > 0) {
         const textParts = result.parts.filter(p => p.kind === 'text').map(p => p.text);
         if (textParts.length > 0) return textParts.join('\n');
@@ -690,24 +661,24 @@
       if (role === 'user') {
         el.innerHTML = `
           <div class="flex items-start gap-3 justify-end">
-            <div class="bg-blue-600 rounded-2xl rounded-tr-md px-4 py-3 max-w-[80%]">
-              <p class="text-sm leading-relaxed whitespace-pre-wrap">${escapeHtml(content)}</p>
+            <div class="bg-accent rounded-2xl rounded-tr-md px-4 py-3 max-w-[80%] shadow-sm">
+              <p class="text-sm leading-relaxed whitespace-pre-wrap text-white">${escapeHtml(content)}</p>
             </div>
-            <div class="w-8 h-8 rounded-lg bg-blue-600/30 flex items-center justify-center shrink-0">
-              <svg class="w-4 h-4 text-blue-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
+            <div class="w-8 h-8 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
+              <svg class="w-4 h-4 text-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
             </div>
           </div>`;
       } else if (role === 'assistant') {
         const rendered = streaming ? '' : renderMarkdown(content);
         el.innerHTML = `
           <div class="flex items-start gap-3">
-            <div class="w-8 h-8 rounded-lg bg-accent/20 flex items-center justify-center shrink-0">
-              <svg class="w-4 h-4 text-accent-light" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+            <div class="w-8 h-8 rounded-lg bg-accent/10 flex items-center justify-center shrink-0">
+              <svg class="w-4 h-4 text-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
             </div>
-            <div class="bg-slate-800 rounded-2xl rounded-tl-md px-4 py-3 max-w-[85%] border border-white/5 flex-1">
+            <div class="bg-white rounded-2xl rounded-tl-md px-4 py-3 max-w-[85%] border border-slate-200 shadow-sm flex-1">
               <div class="markdown-body text-sm leading-relaxed ${streaming ? 'cursor-blink' : ''}" ${streaming ? 'data-streaming="true"' : ''}>${rendered}</div>
               ${!streaming ? `<div class="mt-2 flex gap-2">
-                <button onclick="copyText(this)" class="text-xs text-slate-500 hover:text-slate-300 transition-colors flex items-center gap-1">
+                <button onclick="copyText(this)" class="text-xs text-slate-400 hover:text-slate-600 transition-colors flex items-center gap-1">
                   <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
                   复制
                 </button>
@@ -737,12 +708,11 @@
         body.classList.remove('cursor-blink');
         body.removeAttribute('data-streaming');
         body.innerHTML = renderMarkdown(content);
-        // Add copy button
         const wrapper = body.parentElement;
         if (!wrapper.querySelector('.mt-2')) {
           const btn = document.createElement('div');
           btn.className = 'mt-2 flex gap-2';
-          btn.innerHTML = `<button onclick="copyText(this)" class="text-xs text-slate-500 hover:text-slate-300 transition-colors flex items-center gap-1">
+          btn.innerHTML = `<button onclick="copyText(this)" class="text-xs text-slate-400 hover:text-slate-600 transition-colors flex items-center gap-1">
             <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
             复制
           </button>`;
@@ -779,7 +749,7 @@
     }
 
     function copyText(btn) {
-      const mdBody = btn.closest('.border-white\\/5').querySelector('.markdown-body');
+      const mdBody = btn.closest('.border-slate-200').querySelector('.markdown-body');
       if (mdBody) {
         navigator.clipboard.writeText(mdBody.innerText).then(() => {
           btn.innerHTML = '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg> 已复制';
@@ -792,25 +762,34 @@
 
     // ===== Status Check =====
     async function checkStatus() {
-      // Check Orchestrator (port 5000)
+      // Check Orchestrator (port 5000) - lightweight GET /health
       try {
-        const resp = await fetch('http://localhost:5000', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jsonrpc: '2.0', id: 'ping', method: 'message/send', params: { message: { role: 'user', parts: [{ kind: 'text', text: 'ping' }] } } }),
-          signal: AbortSignal.timeout(5000),
+        const resp = await fetch('http://localhost:5000/health', {
+          signal: AbortSignal.timeout(3000),
         });
-        setStatus('Orchestrator', true);
+        if (resp.ok) {
+          setStatus('Orchestrator', true);
+        } else {
+          setStatus('Orchestrator', false);
+        }
       } catch (e) {
-        setStatus('Orchestrator', false);
+        // Fallback: try agent-card endpoint (GET, no CORS issue)
+        try {
+          const resp2 = await fetch('http://localhost:5000/.well-known/agent-card.json', {
+            signal: AbortSignal.timeout(3000),
+          });
+          setStatus('Orchestrator', resp2.ok);
+        } catch {
+          setStatus('Orchestrator', false);
+        }
       }
 
       // Check gRPC HTTP Bridge (port 50052)
       try {
-        await fetch('http://localhost:50052/health', {
+        const resp = await fetch('http://localhost:50052/health', {
           signal: AbortSignal.timeout(3000),
         });
-        setStatus('Grpc', true);
+        setStatus('Grpc', resp.ok);
       } catch (e) {
         setStatus('Grpc', false, '未连接');
       }
@@ -822,65 +801,43 @@
       if (online) {
         dot.className = 'w-2 h-2 rounded-full bg-emerald-500 status-online';
         text.textContent = '运行中';
-        text.className = 'text-xs text-emerald-400';
+        text.className = 'text-xs text-emerald-600';
       } else {
-        dot.className = 'w-2 h-2 rounded-full bg-red-500';
+        dot.className = 'w-2 h-2 rounded-full bg-red-400';
         text.textContent = customText || '离线';
         text.className = 'text-xs text-red-400';
       }
     }
 
-    // ===== Markdown Renderer (minimal) =====
+    // ===== Markdown Renderer =====
     function renderMarkdown(text) {
       if (!text) return '';
       let html = escapeHtml(text);
 
-      // Code blocks
       html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
         return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
       });
 
-      // Inline code
       html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-      // Headers
       html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
       html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
       html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-
-      // Bold & Italic
       html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
       html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-      // Links
       html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-
-      // Blockquotes
       html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-
-      // Horizontal rule
       html = html.replace(/^---$/gm, '<hr>');
-
-      // Unordered lists
       html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
       html = html.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
-
-      // Ordered lists
       html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-
-      // Tables (simple)
       html = html.replace(/\|(.+)\|/g, (match) => {
         const cells = match.split('|').filter(c => c.trim());
         if (cells.every(c => /^[\s-]+$/.test(c))) return '';
         const tag = match.includes('---') ? 'th' : 'td';
         return '<tr>' + cells.map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
       });
-
-      // Paragraphs
       html = html.replace(/\n\n/g, '</p><p>');
       html = html.replace(/\n/g, '<br>');
-
-      // Clean up
       html = html.replace(/<p><\/p>/g, '');
       if (!html.startsWith('<')) html = '<p>' + html + '</p>';
 

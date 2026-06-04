@@ -119,14 +119,46 @@ private:
         if (body_pos != std::string::npos) {
             body = request.substr(body_pos + 4);
         }
-        
+
+        // CORS 预检请求 (OPTIONS)
+        if (method == "OPTIONS") {
+            std::ostringstream response;
+            response << "HTTP/1.1 204 No Content\r\n";
+            response << "Access-Control-Allow-Origin: *\r\n";
+            response << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+            response << "Access-Control-Allow-Headers: Content-Type, Accept\r\n";
+            response << "Access-Control-Max-Age: 86400\r\n";
+            response << "Content-Length: 0\r\n";
+            response << "\r\n";
+            std::string response_str = response.str();
+            write(client_fd, response_str.c_str(), response_str.length());
+            close(client_fd);
+            return;
+        }
+
+        // 健康检查端点 (GET /health)
+        if (method == "GET" && (path == "/health" || path == "/")) {
+            std::string health_body = "{\"status\":\"ok\"}";
+            std::ostringstream response;
+            response << "HTTP/1.1 200 OK\r\n";
+            response << "Content-Type: application/json\r\n";
+            response << "Content-Length: " << health_body.length() << "\r\n";
+            response << "Access-Control-Allow-Origin: *\r\n";
+            response << "\r\n";
+            response << health_body;
+            std::string response_str = response.str();
+            write(client_fd, response_str.c_str(), response_str.length());
+            close(client_fd);
+            return;
+        }
+
         // 检查是否需要流式响应（通过检查请求体中的 method）
         bool is_stream_request = false;
         if (!body.empty()) {
             // 简单检查是否包含 message/stream 方法
             is_stream_request = (body.find("\"message/stream\"") != std::string::npos);
         }
-        
+
         // 优先检查流式处理器
         auto stream_it = stream_handlers_.find(path);
         if (is_stream_request && stream_it != stream_handlers_.end()) {
@@ -137,7 +169,7 @@ private:
         // 查找普通处理器
         std::string response_body;
         int status_code = 200;
-        
+
         auto it = handlers_.find(path);
         if (it != handlers_.end()) {
             try {
@@ -150,19 +182,21 @@ private:
             status_code = 404;
             response_body = "{\"error\":\"Not Found\"}";
         }
-        
+
         // 构造 HTTP 响应
         std::ostringstream response;
         response << "HTTP/1.1 " << status_code << " OK\r\n";
         response << "Content-Type: application/json\r\n";
         response << "Content-Length: " << response_body.length() << "\r\n";
         response << "Access-Control-Allow-Origin: *\r\n";
+        response << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+        response << "Access-Control-Allow-Headers: Content-Type, Accept\r\n";
         response << "\r\n";
         response << response_body;
-        
+
         std::string response_str = response.str();
         write(client_fd, response_str.c_str(), response_str.length());
-        
+
         close(client_fd);
     }
     
@@ -177,6 +211,8 @@ private:
         header << "Cache-Control: no-cache\r\n";
         header << "Connection: keep-alive\r\n";
         header << "Access-Control-Allow-Origin: *\r\n";
+        header << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+        header << "Access-Control-Allow-Headers: Content-Type, Accept\r\n";
         header << "\r\n";
         
         std::string header_str = header.str();
