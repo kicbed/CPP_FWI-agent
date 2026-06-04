@@ -33,6 +33,7 @@
 | 文档 | 内容 |
 |------|------|
 | [upgrade-roadmap.md](upgrade-roadmap.md) | 升级路线图、2026 技术趋势 |
+| [cpp-api-integration.md](cpp-api-integration.md) | C++ API 接入详解 |
 | [embedding-upgrade.md](embedding-upgrade.md) | Embedding 升级、向量缓存、持久化策略 |
 
 ## 技术栈
