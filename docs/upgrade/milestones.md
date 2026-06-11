@@ -1,0 +1,203 @@
+# Lab Research Agent Upgrade Milestones
+
+This file is the long-running task board. Keep it updated after every upgrade
+session.
+
+Status markers:
+
+- `[ ]` not started
+- `[~]` in progress
+- `[x]` complete
+
+## Milestone 0: Baseline And Project Story
+
+Goal: make the current repository understandable and safe to upgrade.
+
+Tasks:
+
+- [ ] M0-T1: Run `ctest --test-dir build --output-on-failure` and record the result in `docs/upgrade/upgrade-log.md`.
+- [ ] M0-T2: Rewrite the top of `README.md` so the first screen says this is a lab research agent platform, not only an RPC framework.
+- [ ] M0-T3: Add a short architecture section that names the product layers: Client, Orchestrator, Agents, MCP Tools, Knowledge, Experiment Planning.
+- [ ] M0-T4: Document current limitations: no real CUDA/MPI execution, no cluster backend, no automatic code patch application.
+- [ ] M0-T5: Add quick demo commands for HTTP, gRPC bridge, Web UI, and local embedding.
+
+Acceptance:
+
+- `README.md` tells a recruiter and a lab user what the project is within one minute.
+- Existing tests pass.
+- No runtime behavior changes.
+
+## Milestone 1: Lightweight Product Structure
+
+Goal: keep existing code working while creating a cleaner product path.
+
+Tasks:
+
+- [ ] M1-T1: Add `apps/README.md` describing official app entry points.
+- [ ] M1-T2: Add `agents/README.md` describing agent responsibilities and registration tags.
+- [ ] M1-T3: Add `research/README.md` describing AlgorithmCard, ExperimentSpec, and JobBackend concepts.
+- [ ] M1-T4: Keep `examples/ai_orchestrator` runnable, but mark it as legacy/demo in docs.
+- [ ] M1-T5: Identify repeated agent runtime code in FWITheory, FWITeaching, GeneralResearch, and Math agents.
+- [ ] M1-T6: Create a follow-up refactor plan for shared `AgentRuntime`.
+
+Acceptance:
+
+- No executable needs to move in this milestone.
+- New directories clarify future ownership.
+- Existing start scripts still work.
+
+## Milestone 2: Code Agent MVP
+
+Goal: make the existing `code` intent route to a real agent instead of falling
+back to general chat.
+
+Tasks:
+
+- [ ] M2-T1: Add `ai_code_agent` executable to `examples/ai_orchestrator/CMakeLists.txt`.
+- [ ] M2-T2: Implement a Code Agent that registers with tag `code`.
+- [ ] M2-T3: Add read-only project inspection functions: list files, read file, search text.
+- [ ] M2-T4: Add prompt behavior for code explanation, error diagnosis, and patch proposal.
+- [ ] M2-T5: Update `examples/ai_orchestrator/start_system.sh` and `deploy/scripts/start.sh` to start Code Agent.
+- [ ] M2-T6: Add a test that verifies Code Agent registration data uses tag `code` and code-oriented skills.
+- [ ] M2-T7: Add a smoke-test command to docs for asking where Orchestrator routing lives.
+
+Acceptance:
+
+- Asking a coding question no longer falls back to the general handler when Code Agent is running.
+- Code Agent does not write files or execute arbitrary shell commands.
+- Tests pass.
+
+## Milestone 3: AlgorithmCard Registry
+
+Goal: represent lab algorithms as data so FWI, frequency extrapolation,
+post-stack algorithms, and future group methods can be added without changing
+the Orchestrator.
+
+Tasks:
+
+- [ ] M3-T1: Add C++ `AlgorithmCard` model with JSON serialization and validation.
+- [ ] M3-T2: Add `AlgorithmRegistry` that loads cards from `resources/algorithms/*.json`.
+- [ ] M3-T3: Add seed cards for CUDA-MPI FWI, frequency extrapolation, and post-stack inversion.
+- [ ] M3-T4: Add tests for valid card loading, invalid card rejection, and domain/tag filtering.
+- [ ] M3-T5: Add MCP or local tool entry for listing algorithms.
+
+Acceptance:
+
+- A new algorithm can be added by creating one JSON file.
+- Invalid cards fail validation with a clear message.
+- Tests pass.
+
+## Milestone 4: ExperimentSpec, JobSpec, And DryRunBackend
+
+Goal: plan experiments without executing real jobs.
+
+Tasks:
+
+- [ ] M4-T1: Add `ExperimentSpec` model for algorithm, dataset, parameters, resources, and expected outputs.
+- [ ] M4-T2: Add `JobSpec` model for command, working directory, environment, MPI process count, GPU count, time limit, and artifact paths.
+- [ ] M4-T3: Add `DryRunBackend` with `validate`, `render`, and `explain` methods.
+- [ ] M4-T4: Add tests for valid specs, missing algorithm ID, invalid GPU count, and command rendering.
+- [ ] M4-T5: Ensure rendered jobs include a clear `dry_run: true` marker.
+
+Acceptance:
+
+- The system can render an experiment command or Slurm-style script draft.
+- No command is executed.
+- Tests pass.
+
+## Milestone 5: Experiment Planner Agent
+
+Goal: turn research questions into structured experiment plans.
+
+Tasks:
+
+- [ ] M5-T1: Add `ExperimentPlannerAgent` executable and register it with tags `experiment`, `planning`, `research-computing`.
+- [ ] M5-T2: Retrieve relevant AlgorithmCards and knowledge documents for a user request.
+- [ ] M5-T3: Generate a structured answer with algorithm recommendation, parameter table, risk analysis, and next-step plan.
+- [ ] M5-T4: Generate an `ExperimentSpec` JSON block in the answer.
+- [ ] M5-T5: Generate a `JobSpec` dry-run block when the algorithm card declares job spec support.
+- [ ] M5-T6: Add tests for deterministic non-LLM pieces: card retrieval, spec validation, dry-run rendering.
+
+Acceptance:
+
+- A question about Marmousi multi-scale FWI produces a plan, parameters, risks, and dry-run job text.
+- The answer states that real CUDA/MPI execution is not enabled yet.
+- Tests pass.
+
+## Milestone 6: Research Knowledge Upgrade
+
+Goal: move beyond Markdown keyword search toward paper, algorithm, and
+experiment guidance.
+
+Tasks:
+
+- [ ] M6-T1: Add `resources/research_knowledge/papers`.
+- [ ] M6-T2: Add `resources/research_knowledge/algorithms`.
+- [ ] M6-T3: Add `resources/research_knowledge/experiments`.
+- [ ] M6-T4: Add `resources/research_knowledge/failure_cases`.
+- [ ] M6-T5: Add structured notes for multi-scale FWI, AWI, cycle skipping, and adjoint-state gradient.
+- [ ] M6-T6: Extend knowledge retrieval to include note type, method, assumptions, parameter advice, and failure modes.
+- [ ] M6-T7: Add tests for retrieving advice by failure mode and algorithm method.
+
+Acceptance:
+
+- The system can explain why a parameter recommendation was made.
+- Answers cite local knowledge categories, not only generic LLM knowledge.
+- Tests pass.
+
+## Milestone 7: Lab Workbench UI
+
+Goal: make the Web UI feel like a research workbench instead of a chat-only page.
+
+Tasks:
+
+- [ ] M7-T1: Rename UI branding to Lab Agent Workbench.
+- [ ] M7-T2: Add a right-side inspector for selected agent, tool calls, and generated specs.
+- [ ] M7-T3: Add an algorithm panel that lists AlgorithmCards.
+- [ ] M7-T4: Render ExperimentSpec and JobSpec blocks as tables/cards.
+- [ ] M7-T5: Add status indicators for Orchestrator, Registry, MCP, Embedding, and Code Agent.
+- [ ] M7-T6: Add UI smoke-test notes and screenshots to the upgrade log.
+
+Acceptance:
+
+- A demo viewer can see routing, tools, parameter plans, and dry-run job output.
+- UI still works on localhost with existing start scripts.
+
+## Milestone 8: JobBackend Interface Reservation
+
+Goal: reserve the future server execution interface without connecting real
+servers.
+
+Tasks:
+
+- [ ] M8-T1: Define `JobBackend` interface.
+- [ ] M8-T2: Make `DryRunBackend` implement `JobBackend`.
+- [ ] M8-T3: Add backend type enum values: `dry_run`, `local`, `ssh`, `slurm`, `pbs`.
+- [ ] M8-T4: Reject non-`dry_run` backends at runtime with a clear message.
+- [ ] M8-T5: Document how Slurm/PBS can be added later.
+
+Acceptance:
+
+- Future backends have a clear interface.
+- v0.2 cannot accidentally submit real jobs.
+- Tests pass.
+
+## Milestone 9: Real CUDA/MPI Server Integration
+
+Goal: connect lab execution after v0.2 is stable.
+
+Tasks:
+
+- [ ] M9-T1: Decide the first real backend: local server script, SSH, Slurm, or PBS.
+- [ ] M9-T2: Add authentication and access boundary design.
+- [ ] M9-T3: Add job workspace isolation.
+- [ ] M9-T4: Add log collection and artifact indexing.
+- [ ] M9-T5: Add loss curve and output model visualization.
+- [ ] M9-T6: Add audit logging for submitted jobs.
+
+Acceptance:
+
+- Only approved users can submit jobs.
+- Every job has a reproducible spec, logs, artifacts, and audit record.
+- Failure handling is tested before lab users rely on it.
+
