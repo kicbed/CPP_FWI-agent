@@ -69,3 +69,30 @@ Commit:
 
 Next task:
 - Continue with v0.2 implementation, starting from Code Agent MVP.
+
+## 2026-06-11: Add Version Roadmap
+
+Scope:
+- Added a committed version roadmap from v0.2 through v1.0.
+- Created an ignored local prompt file at `docs/upgrade/local-prompts.md` for copy-paste session prompts.
+
+Files changed:
+- `docs/upgrade/README.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+
+Tests run:
+- `git diff --check`
+- `git status --short --ignored docs/upgrade/local-prompts.md docs/upgrade/version-roadmap.md docs/upgrade/README.md docs/upgrade/upgrade-log.md`
+
+Result:
+- PASS. `git diff --check` produced no output. Local prompt file is ignored by git.
+
+Commit:
+- This version roadmap commit.
+
+Next task:
+- Continue v0.2 Code Agent MVP.

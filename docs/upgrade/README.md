@@ -33,6 +33,7 @@ Every new upgrade conversation should follow this sequence.
 2. Ask the agent to read these files first:
    - `docs/upgrade/README.md`
    - `docs/upgrade/milestones.md`
+   - `docs/upgrade/version-roadmap.md`
    - `docs/upgrade/upgrade-log.md`
    - the active implementation plan under `docs/superpowers/plans/`
 3. The agent checks `git status --short`.
