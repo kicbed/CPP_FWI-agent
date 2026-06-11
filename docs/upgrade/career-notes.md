@@ -37,8 +37,8 @@ Current architecture:
 - Protocol adapter layer: A2A adapter converts RPC requests into A2A JSON-RPC
   messages.
 - Orchestration layer: AI Orchestrator routes requests to specialized agents.
-- Agent layer: Math, FWI Theory, FWI Teaching, General Research, and Code
-  Agent; Experiment Planner is planned for v0.2.
+- Agent layer: Math, FWI Theory, FWI Teaching, General Research, Code Agent,
+  and Experiment Planner Agent.
 - Tool layer: MCP integrated server and plugins such as calculator and FWI
   metadata tools.
 - Retrieval layer: Agent-RAG for dynamic agent selection, Tool-RAG for tool
@@ -47,7 +47,7 @@ Current architecture:
 
 Planned v0.2 additions:
 
-- Experiment Planner Agent skeleton for structured planning answers.
+- Harden final demo docs and test report for the completed Lab Agent MVP.
 
 ## Technical Highlights
 
@@ -87,11 +87,14 @@ Use only bullets that match the completed implementation.
   read-only JSON summary for future agent or MCP tool use.
 - Added `ExperimentSpec`, `JobSpec`, and `DryRunBackend` abstractions with tests
   for dry-run rendering and validation.
+- Added an Experiment Planner Agent skeleton that registers as a planning
+  specialist and grounds prompts in local AlgorithmCards while preserving
+  dry-run-only execution boundaries.
 
 Planned after v0.2 completion:
 
-- Designed AlgorithmCard, ExperimentSpec, JobSpec, and DryRunBackend
-  abstractions to prepare safe integration with lab CUDA/MPI workflows.
+- Harden Experiment Planner output quality with deterministic spec generation
+  and richer knowledge retrieval.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -179,3 +182,9 @@ Add one short entry whenever a meaningful technical change lands.
 
 - Added structured experiment and job models plus a dry-run backend that renders
   command previews with `dry_run: true` without executing anything.
+
+### 2026-06-11: Experiment Planner Agent Skeleton
+
+- Added an Experiment Planner Agent executable and startup integration with
+  planning/research-computing registration tags and AlgorithmCard prompt
+  context.

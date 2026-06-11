@@ -77,7 +77,7 @@ done
 
 # 3. 通过进程名强制停止（兜底）
 echo -e "${YELLOW}[3/3] 清理残留进程...${NC}"
-for pattern in "ai_orchestrator" "ai_math_agent" "ai_registry_server" "ai_fwi_theory" "ai_fwi_teaching" "ai_general_research" "embedding_server" "rpc_server"; do
+for pattern in "ai_orchestrator" "ai_math_agent" "ai_registry_server" "ai_fwi_theory" "ai_fwi_teaching" "ai_general_research" "ai_experiment_planner" "embedding_server" "rpc_server"; do
     pids=$(pgrep -f "$pattern" 2>/dev/null)
     if [ -n "$pids" ]; then
         echo -e "  强制停止 $pattern (PIDs: $pids)"

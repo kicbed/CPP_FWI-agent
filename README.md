@@ -15,7 +15,7 @@ the backend interface for later Slurm/PBS/server integration.
 - **Client**: CLI client, Web UI, gRPC client, and HTTP bridge.
 - **Orchestrator**: Routes user requests to specialized agents and tools.
 - **Agents**: Math, FWI Theory, FWI Teaching, General Research, Code Agent, and
-  planned Experiment Planner agent.
+  Experiment Planner agent.
 - **MCP Tools**: Standardized tool discovery and invocation for calculators,
   FWI metadata, and future lab utilities.
 - **Knowledge**: Local Markdown/JSON knowledge retrieval plus embedding-based

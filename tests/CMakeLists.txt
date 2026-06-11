@@ -68,6 +68,19 @@ target_include_directories(test_code_agent_registration PRIVATE
 )
 add_test(NAME CodeAgentRegistrationTest COMMAND test_code_agent_registration)
 
+add_executable(test_experiment_planner_registration test_experiment_planner_registration.cpp)
+target_link_libraries(test_experiment_planner_registration
+    a2a
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_experiment_planner_registration PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/third_party
+)
+add_test(NAME ExperimentPlannerRegistrationTest COMMAND test_experiment_planner_registration)
+
 if(NOT TARGET ai_code_agent)
     message(FATAL_ERROR "ai_code_agent target is required for Code Agent MVP")
 endif()
@@ -75,6 +88,16 @@ add_test(
     NAME CodeAgentExecutableTargetTest
     COMMAND ${CMAKE_COMMAND}
         -DEXECUTABLE_PATH=$<TARGET_FILE:ai_code_agent>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check_executable.cmake
+)
+
+if(NOT TARGET ai_experiment_planner_agent)
+    message(FATAL_ERROR "ai_experiment_planner_agent target is required for v0.2 Experiment Planner skeleton")
+endif()
+add_test(
+    NAME ExperimentPlannerExecutableTargetTest
+    COMMAND ${CMAKE_COMMAND}
+        -DEXECUTABLE_PATH=$<TARGET_FILE:ai_experiment_planner_agent>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check_executable.cmake
 )
 

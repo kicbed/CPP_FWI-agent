@@ -35,7 +35,7 @@ if [ ! -f "$BIN_DIR/ai_orchestrator" ]; then
 fi
 
 # 检查 Redis
-echo -e "${YELLOW}[1/8] 检查 Redis...${NC}"
+echo -e "${YELLOW}[1/9] 检查 Redis...${NC}"
 if ! redis-cli ping > /dev/null 2>&1; then
     echo -e "${YELLOW}Redis 未运行，尝试启动...${NC}"
     redis-server --daemonize yes
@@ -95,6 +95,7 @@ FWI_THEORY_PORT=5002
 FWI_TEACHING_PORT=5003
 GENERAL_RESEARCH_PORT=5004
 CODE_AGENT_PORT=5010
+EXPERIMENT_PLANNER_AGENT_PORT=5011
 REDIS_HOST="127.0.0.1"
 REDIS_PORT=6379
 
@@ -113,7 +114,7 @@ echo "启动服务"
 echo -e "==========================================${NC}"
 
 # 1. Registry Server
-echo -e "${YELLOW}[2/8] 启动 Registry Server (port $REGISTRY_PORT)...${NC}"
+echo -e "${YELLOW}[2/9] 启动 Registry Server (port $REGISTRY_PORT)...${NC}"
 "$BIN_DIR/ai_registry_server" $REGISTRY_PORT > "$LOG_DIR/registry.log" 2>&1 &
 echo $! > "$PID_DIR/registry.pid"
 sleep 1
@@ -134,7 +135,7 @@ if [ "$ENABLE_RAG" = "true" ] && [ -n "$DASHSCOPE_API_KEY" ]; then
 fi
 
 # 2. Math Agent
-echo -e "${YELLOW}[3/8] 启动 Math Agent (port $MATH_AGENT_PORT)...${NC}"
+echo -e "${YELLOW}[3/9] 启动 Math Agent (port $MATH_AGENT_PORT)...${NC}"
 "$BIN_DIR/ai_math_agent" math-1 $MATH_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY \
   --redis-host $REDIS_HOST --redis-port $REDIS_PORT $MCP_ARGS $RAG_ARGS \
   > "$LOG_DIR/math_agent.log" 2>&1 &
@@ -143,7 +144,7 @@ sleep 1
 echo -e "${GREEN}Math Agent 启动完成${NC}"
 
 # 3. FWI Theory Agent
-echo -e "${YELLOW}[4/8] 启动 FWI Theory Agent (port $FWI_THEORY_PORT)...${NC}"
+echo -e "${YELLOW}[4/9] 启动 FWI Theory Agent (port $FWI_THEORY_PORT)...${NC}"
 "$BIN_DIR/ai_fwi_theory_agent" fwi-theory-1 $FWI_THEORY_PORT http://localhost:$REGISTRY_PORT $API_KEY \
   --redis-host $REDIS_HOST --redis-port $REDIS_PORT \
   > "$LOG_DIR/fwi_theory_agent.log" 2>&1 &
@@ -152,7 +153,7 @@ sleep 1
 echo -e "${GREEN}FWI Theory Agent 启动完成${NC}"
 
 # 4. FWI Teaching Agent
-echo -e "${YELLOW}[5/8] 启动 FWI Teaching Agent (port $FWI_TEACHING_PORT)...${NC}"
+echo -e "${YELLOW}[5/9] 启动 FWI Teaching Agent (port $FWI_TEACHING_PORT)...${NC}"
 "$BIN_DIR/ai_fwi_teaching_agent" fwi-teaching-1 $FWI_TEACHING_PORT http://localhost:$REGISTRY_PORT $API_KEY \
   --redis-host $REDIS_HOST --redis-port $REDIS_PORT \
   > "$LOG_DIR/fwi_teaching_agent.log" 2>&1 &
@@ -161,7 +162,7 @@ sleep 1
 echo -e "${GREEN}FWI Teaching Agent 启动完成${NC}"
 
 # 5. General Research Agent
-echo -e "${YELLOW}[6/8] 启动 General Research Agent (port $GENERAL_RESEARCH_PORT)...${NC}"
+echo -e "${YELLOW}[6/9] 启动 General Research Agent (port $GENERAL_RESEARCH_PORT)...${NC}"
 "$BIN_DIR/ai_general_research_agent" general-research-1 $GENERAL_RESEARCH_PORT http://localhost:$REGISTRY_PORT $API_KEY \
   --redis-host $REDIS_HOST --redis-port $REDIS_PORT \
   > "$LOG_DIR/general_research_agent.log" 2>&1 &
@@ -170,7 +171,7 @@ sleep 1
 echo -e "${GREEN}General Research Agent 启动完成${NC}"
 
 # 6. Code Agent
-echo -e "${YELLOW}[7/8] 启动 Code Agent (port $CODE_AGENT_PORT)...${NC}"
+echo -e "${YELLOW}[7/9] 启动 Code Agent (port $CODE_AGENT_PORT)...${NC}"
 "$BIN_DIR/ai_code_agent" code-agent-1 $CODE_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY \
   --redis-host $REDIS_HOST --redis-port $REDIS_PORT --project-root "$PROJECT_ROOT" \
   > "$LOG_DIR/code_agent.log" 2>&1 &
@@ -178,8 +179,17 @@ echo $! > "$PID_DIR/code_agent.pid"
 sleep 1
 echo -e "${GREEN}Code Agent 启动完成${NC}"
 
-# 7. Orchestrator
-echo -e "${YELLOW}[8/8] 启动 Orchestrator (port $ORCHESTRATOR_PORT)...${NC}"
+# 7. Experiment Planner Agent
+echo -e "${YELLOW}[8/9] 启动 Experiment Planner Agent (port $EXPERIMENT_PLANNER_AGENT_PORT)...${NC}"
+"$BIN_DIR/ai_experiment_planner_agent" experiment-planner-1 $EXPERIMENT_PLANNER_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY \
+  --redis-host $REDIS_HOST --redis-port $REDIS_PORT --algorithm-dir "$PROJECT_ROOT/resources/algorithms" \
+  > "$LOG_DIR/experiment_planner_agent.log" 2>&1 &
+echo $! > "$PID_DIR/experiment_planner_agent.pid"
+sleep 1
+echo -e "${GREEN}Experiment Planner Agent 启动完成${NC}"
+
+# 8. Orchestrator
+echo -e "${YELLOW}[9/9] 启动 Orchestrator (port $ORCHESTRATOR_PORT)...${NC}"
 "$BIN_DIR/ai_orchestrator" orch-1 $ORCHESTRATOR_PORT http://localhost:$REGISTRY_PORT $API_KEY \
   --redis-host $REDIS_HOST --redis-port $REDIS_PORT $MCP_ARGS $RAG_ARGS \
   > "$LOG_DIR/orchestrator.log" 2>&1 &
@@ -201,6 +211,7 @@ echo "  FWI Theory Agent:      http://localhost:$FWI_THEORY_PORT"
 echo "  FWI Teaching Agent:    http://localhost:$FWI_TEACHING_PORT"
 echo "  General Research Agent: http://localhost:$GENERAL_RESEARCH_PORT"
 echo "  Code Agent:            http://localhost:$CODE_AGENT_PORT"
+echo "  Experiment Planner:    http://localhost:$EXPERIMENT_PLANNER_AGENT_PORT"
 echo ""
 echo "使用方式:"
 echo "  # 交互式客户端"

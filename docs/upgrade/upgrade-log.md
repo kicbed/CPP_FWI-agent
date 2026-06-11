@@ -575,3 +575,57 @@ Commit:
 
 Next task:
 - Add Experiment Planner Agent skeleton.
+
+## 2026-06-11: Add Experiment Planner Agent Skeleton
+
+Scope:
+- Added `ai_experiment_planner_agent` executable.
+- Registered the planner with `experiment`, `planning`, `research-computing`,
+  and `fwi` tags.
+- Wired the planner into local and deploy startup scripts on port `5011`.
+- Added registration and executable-target tests.
+
+Files changed:
+- `README.md`
+- `examples/ai_orchestrator/experiment_planner_agent_main.cpp`
+- `examples/ai_orchestrator/CMakeLists.txt`
+- `examples/ai_orchestrator/start_system.sh`
+- `examples/ai_orchestrator/stop_system.sh`
+- `deploy/scripts/start.sh`
+- `tests/test_experiment_planner_registration.cpp`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- Startup scripts now launch an Experiment Planner Agent on local port `5011`.
+- Planner prompts include local AlgorithmCard summaries and require dry-run-only
+  JobSpec output when execution is requested.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, or remote execution was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `ai_experiment_planner_agent` target.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ExperimentPlanner --output-on-failure`
+- `bash -n examples/ai_orchestrator/start_system.sh`
+- `bash -n examples/ai_orchestrator/stop_system.sh`
+- `bash -n deploy/scripts/start.sh`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing planner executable target.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. Experiment Planner targeted tests passed 2/2.
+- PASS. Startup and stop scripts passed shell syntax checks.
+- PASS. Full `ctest` passed 20/20 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This Experiment Planner Agent skeleton commit.
+
+Next task:
+- Add v0.2 demo script and final docs.
