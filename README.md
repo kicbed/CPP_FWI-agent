@@ -70,6 +70,67 @@ AI: 123 × 456 = 56088
 [default] > /quit
 ```
 
+### 快速 demo 命令
+
+这些命令只启动本机 `localhost` 演示服务；不会执行真实 CUDA/MPI 作业，
+也不会连接 SSH、Slurm、PBS 或远程服务器。
+
+**HTTP 终端客户端**
+
+```bash
+./deploy/scripts/start_http.sh
+```
+
+Expected:
+
+- Starts local Embedding on `:6000`.
+- Starts the agent system with Orchestrator on `:5000`.
+- Opens `ai_client` against `http://localhost:5000`.
+
+**gRPC bridge**
+
+```bash
+# Terminal 1
+./deploy/scripts/start_grpc.sh
+
+# Terminal 2
+curl http://localhost:50052/health
+```
+
+Expected:
+
+- Starts `rpc_server` on gRPC `:50051`.
+- Starts the HTTP bridge on `:50052` for browser clients.
+- Opens `grpc_ai_client` against `localhost:50051`.
+
+**Web UI**
+
+```bash
+# Terminal 1
+./deploy/scripts/start_http.sh
+
+# Terminal 2
+./deploy/scripts/start_web.sh 8080
+```
+
+Open `http://localhost:8080` in a browser. Use HTTP mode for the direct
+Orchestrator path, or start `./deploy/scripts/start_grpc.sh` first and switch
+the UI to gRPC mode to exercise the bridge path.
+
+**Local embedding only**
+
+```bash
+mkdir -p deploy/logs
+nohup python3 deploy/scripts/embedding_server.py \
+  --model Qwen/Qwen3-Embedding-0.6B \
+  --port 6000 \
+  > deploy/logs/embedding.log 2>&1 &
+curl http://localhost:6000/health
+```
+
+Use this when you only want to verify local vector embedding before starting
+the full agent system.
+
 ### Code Agent 路由 smoke test
 
 启动系统并打开交互式客户端：

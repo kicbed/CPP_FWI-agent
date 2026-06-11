@@ -19,7 +19,7 @@ Tasks:
 - [x] M0-T2: Rewrite the top of `README.md` so the first screen says this is a lab research agent platform, not only an RPC framework.
 - [x] M0-T3: Add a short architecture section that names the product layers: Client, Orchestrator, Agents, MCP Tools, Knowledge, Experiment Planning.
 - [x] M0-T4: Document current limitations: no real CUDA/MPI execution, no cluster backend, no automatic code patch application.
-- [ ] M0-T5: Add quick demo commands for HTTP, gRPC bridge, Web UI, and local embedding.
+- [x] M0-T5: Add quick demo commands for HTTP, gRPC bridge, Web UI, and local embedding.
 
 Acceptance:
 

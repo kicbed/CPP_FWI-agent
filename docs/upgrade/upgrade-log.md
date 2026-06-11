@@ -353,3 +353,36 @@ Commit:
 
 Next task:
 - Backfill Milestone 0 quick demo commands, then continue Task 3 Research Library Skeleton.
+
+## 2026-06-11: Add Quick Demo Commands
+
+Scope:
+- Added README quick demo commands for HTTP terminal, gRPC bridge, Web UI, and
+  local embedding paths.
+- Marked the remaining Milestone 0 quick demo docs task complete.
+
+Files changed:
+- `README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- No runtime behavior changed.
+
+Tests run:
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 15/15 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This quick demo commands commit.
+
+Next task:
+- Continue Task 3 Research Library Skeleton.

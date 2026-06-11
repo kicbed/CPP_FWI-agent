@@ -139,3 +139,9 @@ Add one short entry whenever a meaningful technical change lands.
 
 - Added a documented smoke-test path for verifying that code intent routes to
   the read-only Code Agent and identifies the Orchestrator routing logic.
+
+### 2026-06-11: Quick Demo Command Map
+
+- Added recruiter- and demo-friendly README commands for HTTP, gRPC bridge, Web
+  UI, and local embedding entry points while preserving localhost-only safety
+  boundaries.
