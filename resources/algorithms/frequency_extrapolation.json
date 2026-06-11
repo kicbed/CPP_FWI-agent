@@ -1,0 +1,15 @@
+{
+  "id": "frequency-extrapolation",
+  "name": "Frequency Extrapolation",
+  "domain": "seismic signal processing",
+  "description": "Frequency extrapolation workflow for improving low-frequency content before inversion.",
+  "tags": ["frequency", "extrapolation", "low-frequency", "preprocessing"],
+  "parameters": ["input_band", "target_band", "regularization", "training_window"],
+  "inputs": ["shot_gather", "wavelet", "frequency_mask"],
+  "outputs": ["extrapolated_data", "quality_metrics"],
+  "failure_modes": ["overfit_spectrum", "phase_distortion", "noise_amplification"],
+  "execution": {
+    "backend": "dry_run",
+    "job_spec_supported": true
+  }
+}

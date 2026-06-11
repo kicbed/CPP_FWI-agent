@@ -22,7 +22,8 @@ Current status:
   project inspection, and patch proposal prompts; automatic patch application
   is not enabled.
 - Includes an initial `AlgorithmCard` C++ research model for JSON-backed
-  algorithm metadata and dry-run backend validation.
+  algorithm metadata, registry loading, seed cards, and dry-run backend
+  validation.
 - Real CUDA/MPI or cluster execution is not enabled yet.
 
 ## Architecture Talking Points
@@ -44,7 +45,8 @@ Current architecture:
 
 Planned v0.2 additions:
 
-- AlgorithmCard registry and seed cards for extensible lab algorithms.
+- AlgorithmCard listing entry for exposing registry contents to local tools or
+  agents.
 - ExperimentSpec and JobSpec for structured experiment planning.
 - DryRunBackend to render job commands/scripts without execution.
 
@@ -79,6 +81,9 @@ Use only bullets that match the completed implementation.
   startup script integration.
 - Added the first research-domain C++ model, `AlgorithmCard`, with JSON
   serialization and validation that rejects non-dry-run backends in v0.2.
+- Added an `AlgorithmRegistry` that loads algorithm metadata from JSON seed
+  cards and supports deterministic lookup/filtering without Orchestrator
+  changes.
 
 Planned after v0.2 completion:
 
@@ -155,3 +160,9 @@ Add one short entry whenever a meaningful technical change lands.
 - Added the `agent_rpc_research` library and an `AlgorithmCard` model for
   JSON-backed lab algorithm metadata, including validation that keeps execution
   constrained to `dry_run` in v0.2.
+
+### 2026-06-11: AlgorithmRegistry And Seed Cards
+
+- Added file-based AlgorithmCard loading from `resources/algorithms/*.json`,
+  seed cards for FWI, frequency extrapolation, and post-stack inversion, plus
+  tests for loading, filtering, and invalid backend rejection.

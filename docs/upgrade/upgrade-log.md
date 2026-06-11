@@ -431,3 +431,53 @@ Commit:
 
 Next task:
 - Add AlgorithmRegistry loading for `resources/algorithms/*.json`.
+
+## 2026-06-11: Add AlgorithmRegistry And Seed Cards
+
+Scope:
+- Added `AlgorithmRegistry` for loading AlgorithmCards from
+  `resources/algorithms/*.json`.
+- Added seed cards for CUDA-MPI FWI metadata, frequency extrapolation, and
+  post-stack inversion, all constrained to `dry_run`.
+- Added tests for seed loading, ID lookup, domain/tag filtering, and invalid
+  backend rejection.
+
+Files changed:
+- `research/CMakeLists.txt`
+- `research/include/agent_rpc/research/algorithm_registry.h`
+- `research/src/algorithm_registry.cpp`
+- `resources/algorithms/fwi_cuda_mpi.json`
+- `resources/algorithms/frequency_extrapolation.json`
+- `resources/algorithms/poststack_inversion.json`
+- `tests/test_algorithm_registry.cpp`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- Algorithm metadata can now be extended by adding JSON files under
+  `resources/algorithms`.
+- No job execution backend was added; seed cards use `dry_run` only.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `agent_rpc/research/algorithm_registry.h`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R AlgorithmRegistryTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing `AlgorithmRegistry` header.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `AlgorithmRegistryTest` passed 1/1.
+- PASS. Full `ctest` passed 17/17 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This AlgorithmRegistry and seed cards commit.
+
+Next task:
+- Add a local listing entry for AlgorithmRegistry contents.

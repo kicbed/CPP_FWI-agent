@@ -1,0 +1,15 @@
+{
+  "id": "fwi-cuda-mpi",
+  "name": "CUDA-MPI FWI",
+  "domain": "seismic inversion",
+  "description": "Full waveform inversion solver metadata for future CUDA/MPI lab integration. v0.2 only supports dry-run planning.",
+  "tags": ["fwi", "cuda", "mpi", "inversion"],
+  "parameters": ["frequency_band", "step_length", "niter", "regularization", "initial_model"],
+  "inputs": ["velocity_model", "shot_gather", "wavelet"],
+  "outputs": ["inverted_model", "loss_curve", "gradient"],
+  "failure_modes": ["cycle_skipping", "unstable_gradient", "mpi_runtime_error"],
+  "execution": {
+    "backend": "dry_run",
+    "job_spec_supported": true
+  }
+}

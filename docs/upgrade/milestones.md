@@ -76,9 +76,9 @@ the Orchestrator.
 Tasks:
 
 - [x] M3-T1: Add C++ `AlgorithmCard` model with JSON serialization and validation.
-- [ ] M3-T2: Add `AlgorithmRegistry` that loads cards from `resources/algorithms/*.json`.
-- [ ] M3-T3: Add seed cards for CUDA-MPI FWI, frequency extrapolation, and post-stack inversion.
-- [ ] M3-T4: Add tests for valid card loading, invalid card rejection, and domain/tag filtering.
+- [x] M3-T2: Add `AlgorithmRegistry` that loads cards from `resources/algorithms/*.json`.
+- [x] M3-T3: Add seed cards for CUDA-MPI FWI, frequency extrapolation, and post-stack inversion.
+- [x] M3-T4: Add tests for valid card loading, invalid card rejection, and domain/tag filtering.
 - [ ] M3-T5: Add MCP or local tool entry for listing algorithms.
 
 Acceptance:

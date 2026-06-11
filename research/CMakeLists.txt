@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.15)
 
 set(RESEARCH_SOURCES
     src/algorithm_card.cpp
+    src/algorithm_registry.cpp
 )
 
 add_library(agent_rpc_research STATIC ${RESEARCH_SOURCES})

@@ -1,0 +1,15 @@
+{
+  "id": "poststack-inversion",
+  "name": "Post-stack Inversion",
+  "domain": "seismic inversion",
+  "description": "Post-stack impedance inversion workflow for stacked seismic data.",
+  "tags": ["poststack", "impedance", "inversion"],
+  "parameters": ["wavelet", "low_frequency_model", "regularization", "niter"],
+  "inputs": ["stacked_seismic", "well_logs", "wavelet"],
+  "outputs": ["impedance_volume", "inversion_misfit"],
+  "failure_modes": ["wavelet_mismatch", "low_frequency_bias", "over_smoothing"],
+  "execution": {
+    "backend": "dry_run",
+    "job_spec_supported": true
+  }
+}
