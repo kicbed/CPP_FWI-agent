@@ -50,6 +50,7 @@ add_subdirectory(registry)
 add_subdirectory(a2a)
 add_subdirectory(a2a_adapter)
 add_subdirectory(orchestrator)
+add_subdirectory(research)
 # MCP模块 - 用于 AI Agent 工具集成
 add_subdirectory(mcp)
 # add_subdirectory(ai_interface)

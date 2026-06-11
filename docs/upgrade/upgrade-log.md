@@ -386,3 +386,48 @@ Commit:
 
 Next task:
 - Continue Task 3 Research Library Skeleton.
+
+## 2026-06-11: Add Research AlgorithmCard Model
+
+Scope:
+- Added the initial `agent_rpc_research` C++ library.
+- Added an `AlgorithmCard` model with JSON serialization, parsing, and
+  validation for required fields and dry-run-only backend safety.
+- Added focused GoogleTest coverage for JSON round-tripping and validation.
+
+Files changed:
+- `CMakeLists.txt`
+- `research/CMakeLists.txt`
+- `research/include/agent_rpc/research/algorithm_card.h`
+- `research/src/algorithm_card.cpp`
+- `tests/test_algorithm_card.cpp`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- New `agent_rpc_research` static library exposes `AlgorithmCard`.
+- No runtime agent behavior changed and no job execution was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `agent_rpc/research/algorithm_card.h`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R AlgorithmCardTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing `AlgorithmCard` header.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `AlgorithmCardTest` passed 1/1.
+- PASS. Full `ctest` passed 16/16 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This research AlgorithmCard model commit.
+
+Next task:
+- Add AlgorithmRegistry loading for `resources/algorithms/*.json`.

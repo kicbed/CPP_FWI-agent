@@ -90,6 +90,18 @@ target_include_directories(test_code_agent_tools PRIVATE
 )
 add_test(NAME CodeAgentToolsTest COMMAND test_code_agent_tools)
 
+add_executable(test_algorithm_card test_algorithm_card.cpp)
+target_link_libraries(test_algorithm_card
+    agent_rpc_research
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_algorithm_card PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../research/include
+)
+add_test(NAME AlgorithmCardTest COMMAND test_algorithm_card)
+
 # Proto序列化往返属性测试
 # **Feature: a2a-integration, Property 11: Protobuf Serialization Round-Trip**
 # **Validates: Requirements 11.5**

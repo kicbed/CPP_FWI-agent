@@ -21,6 +21,8 @@ Current status:
 - Includes a Code Agent MVP executable for read-only code Q&A, error diagnosis,
   project inspection, and patch proposal prompts; automatic patch application
   is not enabled.
+- Includes an initial `AlgorithmCard` C++ research model for JSON-backed
+  algorithm metadata and dry-run backend validation.
 - Real CUDA/MPI or cluster execution is not enabled yet.
 
 ## Architecture Talking Points
@@ -42,7 +44,7 @@ Current architecture:
 
 Planned v0.2 additions:
 
-- AlgorithmCard registry for extensible lab algorithms.
+- AlgorithmCard registry and seed cards for extensible lab algorithms.
 - ExperimentSpec and JobSpec for structured experiment planning.
 - DryRunBackend to render job commands/scripts without execution.
 
@@ -75,6 +77,8 @@ Use only bullets that match the completed implementation.
 - Added a read-only Code Agent MVP executable for code Q&A, error diagnosis,
   repository list/read/search context, and patch proposal prompts, with local
   startup script integration.
+- Added the first research-domain C++ model, `AlgorithmCard`, with JSON
+  serialization and validation that rejects non-dry-run backends in v0.2.
 
 Planned after v0.2 completion:
 
@@ -145,3 +149,9 @@ Add one short entry whenever a meaningful technical change lands.
 - Added recruiter- and demo-friendly README commands for HTTP, gRPC bridge, Web
   UI, and local embedding entry points while preserving localhost-only safety
   boundaries.
+
+### 2026-06-11: AlgorithmCard Model
+
+- Added the `agent_rpc_research` library and an `AlgorithmCard` model for
+  JSON-backed lab algorithm metadata, including validation that keeps execution
+  constrained to `dry_run` in v0.2.
