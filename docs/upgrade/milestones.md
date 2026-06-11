@@ -15,10 +15,10 @@ Goal: make the current repository understandable and safe to upgrade.
 
 Tasks:
 
-- [ ] M0-T1: Run `ctest --test-dir build --output-on-failure` and record the result in `docs/upgrade/upgrade-log.md`.
-- [ ] M0-T2: Rewrite the top of `README.md` so the first screen says this is a lab research agent platform, not only an RPC framework.
-- [ ] M0-T3: Add a short architecture section that names the product layers: Client, Orchestrator, Agents, MCP Tools, Knowledge, Experiment Planning.
-- [ ] M0-T4: Document current limitations: no real CUDA/MPI execution, no cluster backend, no automatic code patch application.
+- [x] M0-T1: Run `ctest --test-dir build --output-on-failure` and record the result in `docs/upgrade/upgrade-log.md`.
+- [x] M0-T2: Rewrite the top of `README.md` so the first screen says this is a lab research agent platform, not only an RPC framework.
+- [x] M0-T3: Add a short architecture section that names the product layers: Client, Orchestrator, Agents, MCP Tools, Knowledge, Experiment Planning.
+- [x] M0-T4: Document current limitations: no real CUDA/MPI execution, no cluster backend, no automatic code patch application.
 - [ ] M0-T5: Add quick demo commands for HTTP, gRPC bridge, Web UI, and local embedding.
 
 Acceptance:
@@ -200,4 +200,3 @@ Acceptance:
 - Only approved users can submit jobs.
 - Every job has a reproducible spec, logs, artifacts, and audit record.
 - Failure handling is tested before lab users rely on it.
-

@@ -1,8 +1,34 @@
-# Agent Communication RPC Framework
+# Lab Research Agent Platform
 
-基于 C++ 和 gRPC 的高性能 AI Agent 通信框架，支持多 Agent 协作、MCP 工具调用和 RAG 智能工具选择。
+FWI-first research computing agent workbench built on C++, gRPC, A2A, MCP, RAG,
+and multi-agent orchestration.
+
+The current version supports research Q&A, FWI knowledge retrieval, MCP tool
+calling, multi-agent routing, and Web/CLI access. Real CUDA/MPI or cluster job
+execution is not enabled yet; v0.2 adds dry-run experiment planning and reserves
+the backend interface for later Slurm/PBS/server integration.
 
 **首个落地场景**: FWI（全波形反演）科研助手平台
+
+## 产品层次
+
+- **Client**: CLI client, Web UI, gRPC client, and HTTP bridge.
+- **Orchestrator**: Routes user requests to specialized agents and tools.
+- **Agents**: Math, FWI Theory, FWI Teaching, General Research, and planned Code
+  Agent / Experiment Planner agents.
+- **MCP Tools**: Standardized tool discovery and invocation for calculators,
+  FWI metadata, and future lab utilities.
+- **Knowledge**: Local Markdown/JSON knowledge retrieval plus embedding-based
+  routing support.
+- **Experiment Planning**: Planned v0.2 AlgorithmCard, ExperimentSpec, JobSpec,
+  and DryRunBackend models for safe dry-run planning.
+
+## 当前限制
+
+- 不执行真实 CUDA/MPI 作业。
+- 不连接 SSH、Slurm、PBS 或远程服务器。
+- 不从用户输入执行任意 shell 命令。
+- Code Agent 默认只读；可以生成补丁建议，但不会自动应用补丁。
 
 ## 核心特性
 

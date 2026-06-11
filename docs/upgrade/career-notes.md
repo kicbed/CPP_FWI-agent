@@ -105,3 +105,9 @@ Add one short entry whenever a meaningful technical change lands.
   roadmap.
 - Current next engineering target is Code Agent MVP.
 
+### 2026-06-11: README Product Positioning
+
+- Reframed the README first screen as a Lab Research Agent Platform rather than
+  only an RPC framework.
+- Documented the product layers and current safety boundaries for recruiter,
+  lab user, and demo audiences.

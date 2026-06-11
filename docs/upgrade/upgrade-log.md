@@ -126,3 +126,35 @@ Commit:
 
 Next task:
 - Start v0.2 Code Agent MVP in a new conversation.
+
+## 2026-06-11: Baseline README Positioning
+
+Scope:
+- Updated README first-screen positioning for the Lab Research Agent Platform.
+- Recorded completed Milestone 0 baseline positioning items and career notes.
+
+Files changed:
+- `README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- No runtime behavior changed.
+
+Tests run:
+- `ctest --test-dir build --output-on-failure`
+- `cmake --build build -j2`
+- `git diff --check`
+
+Result:
+- PASS. `ctest` passed 12/12 tests before and after the docs update.
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This baseline README positioning commit.
+
+Next task:
+- Add the Code Agent registration contract test.
