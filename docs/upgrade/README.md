@@ -28,7 +28,8 @@ backend milestone after the product and safety boundaries are stable.
 
 Every new upgrade conversation should follow this sequence.
 
-1. Paste one prompt from [new-session-prompts.md](new-session-prompts.md).
+1. Keep any copy-paste prompts in a local ignored file, for example
+   `docs/upgrade/local-prompts.md`.
 2. Ask the agent to read these files first:
    - `docs/upgrade/README.md`
    - `docs/upgrade/milestones.md`
@@ -123,3 +124,7 @@ docs/superpowers/plans/YYYY-MM-DD-<feature-name>.md
 
 Each plan should produce working, testable software on its own.
 
+## Local Prompts
+
+Do not commit personal copy-paste upgrade prompts. If a prompt needs to be saved
+locally, store it in `docs/upgrade/local-prompts.md`, which is ignored by git.

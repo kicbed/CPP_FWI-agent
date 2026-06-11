@@ -52,3 +52,7 @@ Thumbs.db
 
 # ==================== Claude Code ====================
 .claude/
+
+# ==================== 本地升级提示词 ====================
+docs/upgrade/*prompts*.md
+docs/upgrade/local-*.md
