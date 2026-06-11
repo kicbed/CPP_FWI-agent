@@ -14,8 +14,8 @@ the backend interface for later Slurm/PBS/server integration.
 
 - **Client**: CLI client, Web UI, gRPC client, and HTTP bridge.
 - **Orchestrator**: Routes user requests to specialized agents and tools.
-- **Agents**: Math, FWI Theory, FWI Teaching, General Research, and planned Code
-  Agent / Experiment Planner agents.
+- **Agents**: Math, FWI Theory, FWI Teaching, General Research, Code Agent, and
+  planned Experiment Planner agent.
 - **MCP Tools**: Standardized tool discovery and invocation for calculators,
   FWI metadata, and future lab utilities.
 - **Knowledge**: Local Markdown/JSON knowledge retrieval plus embedding-based
@@ -69,6 +69,30 @@ AI: 123 × 456 = 56088
 
 [default] > /quit
 ```
+
+### Code Agent 路由 smoke test
+
+启动系统并打开交互式客户端：
+
+```bash
+./examples/ai_orchestrator/start_system.sh
+./build/examples/ai_orchestrator/ai_client http://localhost:5000
+```
+
+在客户端输入：
+
+```text
+[default] > 这个项目里 Orchestrator 的 code intent 路由在哪里？请指出文件和逻辑。
+```
+
+Expected:
+
+- Routes to the Code Agent when `ai_code_agent` is running instead of falling
+  back to the general handler.
+- References `examples/ai_orchestrator/orchestrator_main.cpp`.
+- Explains that `intent == "code"` calls `call_code_agent(...)`, which then
+  finds an agent through `call_agent_by_tag("code", ...)`.
+- Does not claim that files were changed or commands were executed.
 
 ## 模型切换指南
 

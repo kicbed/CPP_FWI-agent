@@ -320,3 +320,36 @@ Commit:
 
 Next task:
 - Add a smoke-test command to docs for asking where Orchestrator routing lives.
+
+## 2026-06-11: Add Code Agent Smoke-Test Docs
+
+Scope:
+- Added a README smoke-test command for verifying that a code-routing question
+  reaches the Code Agent.
+- Marked the final Code Agent MVP documentation task complete.
+
+Files changed:
+- `README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- No runtime behavior changed.
+
+Tests run:
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 15/15 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This Code Agent smoke-test docs commit.
+
+Next task:
+- Backfill Milestone 0 quick demo commands, then continue Task 3 Research Library Skeleton.

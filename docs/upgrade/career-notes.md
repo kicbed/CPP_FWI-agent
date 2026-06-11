@@ -134,3 +134,8 @@ Add one short entry whenever a meaningful technical change lands.
   reading, and text search inside the project root.
 - Wired Code Agent prompts to include deterministic project context while still
   preventing shell execution and automatic patch application.
+
+### 2026-06-11: Code Agent Smoke Test Docs
+
+- Added a documented smoke-test path for verifying that code intent routes to
+  the read-only Code Agent and identifies the Orchestrator routing logic.
