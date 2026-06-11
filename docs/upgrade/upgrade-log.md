@@ -96,3 +96,33 @@ Commit:
 
 Next task:
 - Continue v0.2 Code Agent MVP.
+
+## 2026-06-11: Add Career Notes Requirement
+
+Scope:
+- Added career notes for architecture, technical highlights, resume bullets, and
+  interview talking points.
+- Updated the upgrade workflow so meaningful architecture or technical changes
+  also update career notes.
+
+Files changed:
+- `docs/upgrade/README.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+
+Tests run:
+- `git diff --check`
+- `git status --short --ignored docs/upgrade/local-prompts.md`
+
+Result:
+- PASS. `git diff --check` produced no output. Local prompt file remains ignored by git.
+
+Commit:
+- This career notes commit.
+
+Next task:
+- Start v0.2 Code Agent MVP in a new conversation.

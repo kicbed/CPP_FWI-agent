@@ -33,6 +33,7 @@ Every new upgrade conversation should follow this sequence.
 2. Ask the agent to read these files first:
    - `docs/upgrade/README.md`
    - `docs/upgrade/milestones.md`
+   - `docs/upgrade/career-notes.md`
    - `docs/upgrade/version-roadmap.md`
    - `docs/upgrade/upgrade-log.md`
    - the active implementation plan under `docs/superpowers/plans/`
@@ -41,8 +42,10 @@ Every new upgrade conversation should follow this sequence.
 5. The agent implements only that task or one tightly related batch.
 6. The agent runs the required validation commands.
 7. The agent updates `docs/upgrade/upgrade-log.md`.
-8. The agent commits the completed work to git.
-9. The final response includes:
+8. If the change adds architecture, a technical capability, tests, deployment,
+   or product story, the agent updates `docs/upgrade/career-notes.md`.
+9. The agent commits the completed work to git.
+10. The final response includes:
    - what changed
    - which tests ran
    - commit hash

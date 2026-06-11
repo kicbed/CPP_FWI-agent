@@ -200,10 +200,11 @@ At the start of a new upgrade session, read these files:
 
 - `docs/upgrade/README.md`
 - `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
 - `docs/upgrade/version-roadmap.md`
 - `docs/upgrade/upgrade-log.md`
 - the active plan in `docs/superpowers/plans/`
 
 Then continue the first incomplete task for the current version. Validate the
-change, update `upgrade-log.md`, and commit.
-
+change, update `upgrade-log.md`, update `career-notes.md` when the change adds
+architecture or technical talking points, and commit.
