@@ -68,6 +68,16 @@ target_include_directories(test_code_agent_registration PRIVATE
 )
 add_test(NAME CodeAgentRegistrationTest COMMAND test_code_agent_registration)
 
+if(NOT TARGET ai_code_agent)
+    message(FATAL_ERROR "ai_code_agent target is required for Code Agent MVP")
+endif()
+add_test(
+    NAME CodeAgentExecutableTargetTest
+    COMMAND ${CMAKE_COMMAND}
+        -DEXECUTABLE_PATH=$<TARGET_FILE:ai_code_agent>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check_executable.cmake
+)
+
 # Proto序列化往返属性测试
 # **Feature: a2a-integration, Property 11: Protobuf Serialization Round-Trip**
 # **Validates: Requirements 11.5**

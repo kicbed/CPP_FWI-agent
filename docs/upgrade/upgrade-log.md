@@ -208,3 +208,59 @@ Commit:
 
 Next task:
 - Add the read-only Code Agent executable.
+
+## 2026-06-11: Add Read-Only Code Agent Executable
+
+Scope:
+- Added the `ai_code_agent` executable with Code Agent registration metadata,
+  code explanation, error diagnosis, and patch proposal prompt behavior.
+- Added startup entries for Code Agent in local and deploy start scripts.
+- Added a CTest contract that verifies the Code Agent executable target exists
+  and can enter its usage path.
+
+Files changed:
+- `examples/ai_orchestrator/code_agent_main.cpp`
+- `examples/ai_orchestrator/CMakeLists.txt`
+- `examples/ai_orchestrator/start_system.sh`
+- `deploy/scripts/start.sh`
+- `tests/check_executable.cmake`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- Code Agent can now be built and started locally on port `5010`.
+- Startup scripts launch Code Agent before Orchestrator and record
+  `code_agent.pid`.
+- Deploy startup now passes the resolved `$API_KEY` consistently instead of
+  `$QWEN_API_KEY` directly.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `ai_code_agent` target.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R "CodeAgent.*Test" --output-on-failure`
+- `bash -n examples/ai_orchestrator/start_system.sh`
+- `bash -n deploy/scripts/start.sh`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing `ai_code_agent` target.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. Code Agent targeted tests passed 2/2.
+- PASS. Full `ctest` passed after the new executable target was added.
+- NOTE. Full `ctest` initially failed inside the restricted sandbox because the
+  gRPC integration test could not create a local socket; the same command
+  passed when rerun with approved non-sandbox execution.
+- PASS. Both start scripts passed `bash -n`.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This read-only Code Agent executable commit.
+
+Next task:
+- Add read-only Code Agent project inspection functions: list files, read file,
+  and search text.

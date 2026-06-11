@@ -47,6 +47,11 @@ add_executable(ai_general_research_agent general_research_agent_main.cpp ${CMAKE
 target_include_directories(ai_general_research_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/include ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/include/a2a/examples ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/third_party ${CMAKE_CURRENT_SOURCE_DIR}/../../common/include ${CMAKE_BINARY_DIR}/proto ${HIREDIS_INCLUDE_DIRS})
 target_link_libraries(ai_general_research_agent a2a proto_lib ${GRPC_LIBRARIES} ${PROTOBUF_LIBRARIES} CURL::libcurl Threads::Threads ${HIREDIS_LIBRARIES})
 
+# Code Agent
+add_executable(ai_code_agent code_agent_main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/src/examples/redis_task_store.cpp)
+target_include_directories(ai_code_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/include ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/include/a2a/examples ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/third_party ${CMAKE_CURRENT_SOURCE_DIR}/../../common/include ${CMAKE_BINARY_DIR}/proto ${HIREDIS_INCLUDE_DIRS})
+target_link_libraries(ai_code_agent a2a proto_lib ${GRPC_LIBRARIES} ${PROTOBUF_LIBRARIES} CURL::libcurl Threads::Threads ${HIREDIS_LIBRARIES})
+
 # Interactive Client (new version with conversation list)
 add_executable(ai_client ai_client.cpp)
 target_include_directories(ai_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/include ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/include/a2a/examples ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a/third_party ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a_adapter/include ${CMAKE_BINARY_DIR}/proto)

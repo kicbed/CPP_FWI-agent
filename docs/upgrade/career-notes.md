@@ -18,6 +18,8 @@ Current status:
 - Supports gRPC/A2A communication, agent registry, MCP tool integration,
   Agent-RAG routing, Tool-RAG, Redis-backed conversation memory, local knowledge
   retrieval, and Web UI.
+- Includes a Code Agent MVP executable for read-only code Q&A, error diagnosis,
+  and patch proposal prompts; automatic patch application is not enabled.
 - Real CUDA/MPI or cluster execution is not enabled yet.
 
 ## Architecture Talking Points
@@ -29,8 +31,8 @@ Current architecture:
 - Protocol adapter layer: A2A adapter converts RPC requests into A2A JSON-RPC
   messages.
 - Orchestration layer: AI Orchestrator routes requests to specialized agents.
-- Agent layer: Math, FWI Theory, FWI Teaching, General Research; Code Agent and
-  Experiment Planner are planned for v0.2.
+- Agent layer: Math, FWI Theory, FWI Teaching, General Research, and Code
+  Agent; Experiment Planner is planned for v0.2.
 - Tool layer: MCP integrated server and plugins such as calculator and FWI
   metadata tools.
 - Retrieval layer: Agent-RAG for dynamic agent selection, Tool-RAG for tool
@@ -39,7 +41,7 @@ Current architecture:
 
 Planned v0.2 additions:
 
-- Code Agent MVP for read-only repository analysis and patch suggestions.
+- Read-only Code Agent project inspection tools for list/read/search.
 - AlgorithmCard registry for extensible lab algorithms.
 - ExperimentSpec and JobSpec for structured experiment planning.
 - DryRunBackend to render job commands/scripts without execution.
@@ -70,11 +72,11 @@ Use only bullets that match the completed implementation.
   specialized FWI agents, and metadata tools for velocity models and datasets.
 - Added automated test coverage across RPC serialization, A2A adapters,
   registry behavior, routing, MCP integration, and RAG properties.
+- Added a read-only Code Agent MVP executable for code Q&A, error diagnosis,
+  and patch proposal prompts, with local startup script integration.
 
 Planned after v0.2 completion:
 
-- Added a read-only Code Agent for code navigation, error diagnosis, and patch
-  proposal.
 - Designed AlgorithmCard, ExperimentSpec, JobSpec, and DryRunBackend
   abstractions to prepare safe integration with lab CUDA/MPI workflows.
 
@@ -117,3 +119,10 @@ Add one short entry whenever a meaningful technical change lands.
 - Added a GoogleTest contract for Code Agent registration metadata, including
   the `code` tag, code-oriented skills, tool-calling capability, and AgentCard
   serialization expectations.
+
+### 2026-06-11: Code Agent Executable
+
+- Added the `ai_code_agent` executable, Code Agent startup integration, and a
+  CTest executable-target contract.
+- The Code Agent is prompt-only and read-only in this step; repository
+  list/read/search tools remain the next Code Agent milestone.

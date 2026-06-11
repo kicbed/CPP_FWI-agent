@@ -22,6 +22,7 @@ MATH_AGENT_PORT=5001
 FWI_THEORY_PORT=5002
 FWI_TEACHING_PORT=5003
 GENERAL_RESEARCH_PORT=5004
+CODE_AGENT_PORT=5010
 REDIS_HOST="127.0.0.1"
 REDIS_PORT=6379
 
@@ -80,7 +81,7 @@ mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/pids"
 # 注意：进程名在 Linux 上被截断为 15 字符，所以用 -f 匹配完整命令行
 # 但 -f 会匹配脚本自身路径（包含 ai_orchestrator），必须精确匹配二进制路径
 echo "清理旧进程..."
-for port in $REGISTRY_PORT $ORCHESTRATOR_PORT $MATH_AGENT_PORT $FWI_THEORY_PORT $FWI_TEACHING_PORT $GENERAL_RESEARCH_PORT; do
+for port in $REGISTRY_PORT $ORCHESTRATOR_PORT $MATH_AGENT_PORT $FWI_THEORY_PORT $FWI_TEACHING_PORT $GENERAL_RESEARCH_PORT $CODE_AGENT_PORT; do
     # 找出占用端口的进程 PID 并 kill
     fuser -k "$port/tcp" 2>/dev/null || true
 done
@@ -90,7 +91,7 @@ echo "=========================================="
 echo "AI Agent 系统启动"
 echo "=========================================="
 
-echo "[1/6] 启动 Registry Server..."
+echo "[1/7] 启动 Registry Server..."
 nohup "$BIN_DIR/ai_registry_server" $REGISTRY_PORT > "$SCRIPT_DIR/logs/registry.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/pids/registry.pid"
 sleep 1
@@ -102,31 +103,37 @@ if [ "$ENABLE_MCP" == "true" ] && [ -f "$MCP_SERVER" ]; then
     echo "MCP 已启用: $MCP_SERVER"
 fi
 
-echo "[2/6] 启动 Math Agent..."
+echo "[2/7] 启动 Math Agent..."
 nohup "$BIN_DIR/ai_math_agent" math-1 $MATH_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT $MCP_ARGS > "$SCRIPT_DIR/logs/math_agent.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/pids/math_agent.pid"
 sleep 1
 echo "Math Agent 启动完成 (端口: $MATH_AGENT_PORT)"
 
-echo "[3/6] 启动 FWI Theory Agent..."
+echo "[3/7] 启动 FWI Theory Agent..."
 nohup "$BIN_DIR/ai_fwi_theory_agent" fwi-theory-1 $FWI_THEORY_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT > "$SCRIPT_DIR/logs/fwi_theory_agent.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/pids/fwi_theory_agent.pid"
 sleep 1
 echo "FWI Theory Agent 启动完成 (端口: $FWI_THEORY_PORT)"
 
-echo "[4/6] 启动 FWI Teaching Agent..."
+echo "[4/7] 启动 FWI Teaching Agent..."
 nohup "$BIN_DIR/ai_fwi_teaching_agent" fwi-teaching-1 $FWI_TEACHING_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT > "$SCRIPT_DIR/logs/fwi_teaching_agent.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/pids/fwi_teaching_agent.pid"
 sleep 1
 echo "FWI Teaching Agent 启动完成 (端口: $FWI_TEACHING_PORT)"
 
-echo "[5/6] 启动 General Research Agent..."
+echo "[5/7] 启动 General Research Agent..."
 nohup "$BIN_DIR/ai_general_research_agent" general-research-1 $GENERAL_RESEARCH_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT > "$SCRIPT_DIR/logs/general_research_agent.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/pids/general_research_agent.pid"
 sleep 1
 echo "General Research Agent 启动完成 (端口: $GENERAL_RESEARCH_PORT)"
 
-echo "[6/6] 启动 Orchestrator..."
+echo "[6/7] 启动 Code Agent..."
+nohup "$BIN_DIR/ai_code_agent" code-agent-1 $CODE_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT > "$SCRIPT_DIR/logs/code_agent.log" 2>&1 &
+echo $! > "$SCRIPT_DIR/pids/code_agent.pid"
+sleep 1
+echo "Code Agent 启动完成 (端口: $CODE_AGENT_PORT)"
+
+echo "[7/7] 启动 Orchestrator..."
 nohup "$BIN_DIR/ai_orchestrator" orch-1 $ORCHESTRATOR_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT $MCP_ARGS > "$SCRIPT_DIR/logs/orchestrator.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/pids/orchestrator.pid"
 sleep 1
@@ -144,6 +151,7 @@ echo "  Math Agent:            http://localhost:$MATH_AGENT_PORT"
 echo "  FWI Theory Agent:      http://localhost:$FWI_THEORY_PORT"
 echo "  FWI Teaching Agent:    http://localhost:$FWI_TEACHING_PORT"
 echo "  General Research Agent: http://localhost:$GENERAL_RESEARCH_PORT"
+echo "  Code Agent:            http://localhost:$CODE_AGENT_PORT"
 echo ""
 echo "停止系统: $SCRIPT_DIR/stop_system.sh"
 
