@@ -54,6 +54,14 @@ Every new upgrade conversation should follow this sequence.
    - which tests ran
    - commit hash
    - next recommended task
+   - a detailed Chinese knowledge summary for learning and interview prep when
+     the task finishes a version, adds major architecture, or produces a test
+     report
+
+Knowledge summaries should be written in Chinese and should be detailed enough
+for later study and interview preparation. Prefer this structure: problem being
+solved, implementation approach, key files/tests, safety or product boundary,
+and a short interview-ready explanation.
 
 ## Required Validation
 

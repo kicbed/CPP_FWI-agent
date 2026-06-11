@@ -675,3 +675,35 @@ Commit:
 
 Next task:
 - Start v0.3 Research Knowledge Base.
+
+## 2026-06-11: Rewrite v0.2 Knowledge Summary In Chinese
+
+Scope:
+- Rewrote the v0.2 test report knowledge summary in Chinese with detailed
+  learning and interview-prep notes.
+- Added a standing upgrade-guide rule that future version completions, test
+  reports, and major architecture changes should include detailed Chinese
+  knowledge summaries.
+- Updated the local ignored prompt file with the same knowledge-summary
+  requirement for future copy-paste upgrade sessions.
+
+Files changed:
+- `docs/upgrade/test-report-v0.2.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/local-prompts.md` (ignored local prompt file)
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+
+Tests run:
+- `git diff --check`
+
+Result:
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This Chinese knowledge summary rewrite commit.
+
+Next task:
+- Start v0.3 Research Knowledge Base.
