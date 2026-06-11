@@ -55,6 +55,19 @@ add_test(NAME RpcFrameworkTest COMMAND test_rpc_framework)
 add_test(NAME SerializationTest COMMAND test_serialization)
 add_test(NAME A2AIntegrationTest COMMAND test_a2a_integration)
 
+add_executable(test_code_agent_registration test_code_agent_registration.cpp)
+target_link_libraries(test_code_agent_registration
+    a2a
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_code_agent_registration PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/third_party
+)
+add_test(NAME CodeAgentRegistrationTest COMMAND test_code_agent_registration)
+
 # Proto序列化往返属性测试
 # **Feature: a2a-integration, Property 11: Protobuf Serialization Round-Trip**
 # **Validates: Requirements 11.5**

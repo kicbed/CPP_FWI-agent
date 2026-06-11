@@ -58,7 +58,7 @@ Tasks:
 - [ ] M2-T3: Add read-only project inspection functions: list files, read file, search text.
 - [ ] M2-T4: Add prompt behavior for code explanation, error diagnosis, and patch proposal.
 - [ ] M2-T5: Update `examples/ai_orchestrator/start_system.sh` and `deploy/scripts/start.sh` to start Code Agent.
-- [ ] M2-T6: Add a test that verifies Code Agent registration data uses tag `code` and code-oriented skills.
+- [x] M2-T6: Add a test that verifies Code Agent registration data uses tag `code` and code-oriented skills.
 - [ ] M2-T7: Add a smoke-test command to docs for asking where Orchestrator routing lives.
 
 Acceptance:

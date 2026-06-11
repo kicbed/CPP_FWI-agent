@@ -111,3 +111,9 @@ Add one short entry whenever a meaningful technical change lands.
   only an RPC framework.
 - Documented the product layers and current safety boundaries for recruiter,
   lab user, and demo audiences.
+
+### 2026-06-11: Code Agent Registration Contract
+
+- Added a GoogleTest contract for Code Agent registration metadata, including
+  the `code` tag, code-oriented skills, tool-calling capability, and AgentCard
+  serialization expectations.

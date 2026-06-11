@@ -158,3 +158,53 @@ Commit:
 
 Next task:
 - Add the Code Agent registration contract test.
+
+## 2026-06-11: CodeGraph Setup And Code Agent Registration Test
+
+Scope:
+- Installed CodeGraph CLI globally and enabled the CodeGraph MCP server for
+  Codex global configuration on this machine.
+- Initialized the current repository's local `.codegraph/` index and ignored
+  that generated index directory.
+- Added a Code Agent registration contract test for the planned v0.2 Code
+  Agent.
+
+Files changed:
+- `.gitignore`
+- `tests/test_code_agent_registration.cpp`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- No runtime agent behavior changed.
+- Local developer tooling changed: CodeGraph is installed globally and the
+  repository has a local ignored CodeGraph index.
+
+Tests run:
+- `npm view @colbymchenry/codegraph version`
+- `npm install -g @colbymchenry/codegraph@0.9.9`
+- `codegraph install --target=codex --location=global --yes`
+- `codegraph init -i`
+- `codegraph sync`
+- `codegraph status`
+- `cmake --build build -j2`
+- `ctest --test-dir build -R CodeAgentRegistrationTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. CodeGraph CLI version `0.9.9` installed globally; `codegraph status`
+  reports an up-to-date index with 178 files, 7,528 nodes, and 16,692 edges.
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. `CodeAgentRegistrationTest` passed 1/1.
+- PASS. Full `ctest` passed after the new test was added.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This CodeGraph setup and Code Agent registration test commit.
+
+Next task:
+- Add the read-only Code Agent executable.
