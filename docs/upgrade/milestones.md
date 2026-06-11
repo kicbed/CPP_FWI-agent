@@ -93,11 +93,11 @@ Goal: plan experiments without executing real jobs.
 
 Tasks:
 
-- [ ] M4-T1: Add `ExperimentSpec` model for algorithm, dataset, parameters, resources, and expected outputs.
-- [ ] M4-T2: Add `JobSpec` model for command, working directory, environment, MPI process count, GPU count, time limit, and artifact paths.
-- [ ] M4-T3: Add `DryRunBackend` with `validate`, `render`, and `explain` methods.
-- [ ] M4-T4: Add tests for valid specs, missing algorithm ID, invalid GPU count, and command rendering.
-- [ ] M4-T5: Ensure rendered jobs include a clear `dry_run: true` marker.
+- [x] M4-T1: Add `ExperimentSpec` model for algorithm, dataset, parameters, resources, and expected outputs.
+- [x] M4-T2: Add `JobSpec` model for command, working directory, environment, MPI process count, GPU count, time limit, and artifact paths.
+- [x] M4-T3: Add `DryRunBackend` with `validate`, `render`, and `explain` methods.
+- [x] M4-T4: Add tests for valid specs, missing algorithm ID, invalid GPU count, and command rendering.
+- [x] M4-T5: Ensure rendered jobs include a clear `dry_run: true` marker.
 
 Acceptance:
 

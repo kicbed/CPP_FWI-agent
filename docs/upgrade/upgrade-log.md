@@ -524,3 +524,54 @@ Commit:
 
 Next task:
 - Add ExperimentSpec, JobSpec, and DryRunBackend.
+
+## 2026-06-11: Add Dry-Run Experiment Specs
+
+Scope:
+- Added `ExperimentSpec`, `JobSpec`, and `DryRunBackend` to the research
+  library.
+- Added validation for missing algorithms, missing job command/working
+  directory, invalid GPU counts, and invalid MPI process counts.
+- Added dry-run rendering with an explicit `dry_run: true` marker.
+
+Files changed:
+- `research/CMakeLists.txt`
+- `research/include/agent_rpc/research/experiment_spec.h`
+- `research/include/agent_rpc/research/job_spec.h`
+- `research/include/agent_rpc/research/job_backend.h`
+- `research/src/experiment_spec.cpp`
+- `research/src/job_spec.cpp`
+- `research/src/dry_run_backend.cpp`
+- `tests/test_experiment_spec.cpp`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- Research code can now validate experiment specs and render dry-run job
+  previews.
+- No command execution, real CUDA/MPI, SSH, Slurm, PBS, or remote execution was
+  added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `agent_rpc/research/experiment_spec.h`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ExperimentSpec --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing `ExperimentSpec` header.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `ExperimentSpecTest` passed 1/1.
+- PASS. Full `ctest` passed 18/18 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This dry-run experiment specs commit.
+
+Next task:
+- Add Experiment Planner Agent skeleton.

@@ -24,6 +24,8 @@ Current status:
 - Includes an initial `AlgorithmCard` C++ research model for JSON-backed
   algorithm metadata, registry loading, seed cards, and dry-run backend
   validation.
+- Includes `ExperimentSpec`, `JobSpec`, and `DryRunBackend` models for safe
+  experiment planning without submitting jobs.
 - Real CUDA/MPI or cluster execution is not enabled yet.
 
 ## Architecture Talking Points
@@ -45,10 +47,7 @@ Current architecture:
 
 Planned v0.2 additions:
 
-- AlgorithmCard listing entry for exposing registry contents to local tools or
-  agents.
-- ExperimentSpec and JobSpec for structured experiment planning.
-- DryRunBackend to render job commands/scripts without execution.
+- Experiment Planner Agent skeleton for structured planning answers.
 
 ## Technical Highlights
 
@@ -86,6 +85,8 @@ Use only bullets that match the completed implementation.
   changes.
 - Added a local algorithm listing helper that exposes registry contents as a
   read-only JSON summary for future agent or MCP tool use.
+- Added `ExperimentSpec`, `JobSpec`, and `DryRunBackend` abstractions with tests
+  for dry-run rendering and validation.
 
 Planned after v0.2 completion:
 
@@ -173,3 +174,8 @@ Add one short entry whenever a meaningful technical change lands.
 
 - Added a deterministic local listing helper for AlgorithmRegistry summaries,
   preserving a read-only metadata boundary before any MCP exposure.
+
+### 2026-06-11: ExperimentSpec, JobSpec, And DryRunBackend
+
+- Added structured experiment and job models plus a dry-run backend that renders
+  command previews with `dry_run: true` without executing anything.

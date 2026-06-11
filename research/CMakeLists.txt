@@ -4,6 +4,9 @@ set(RESEARCH_SOURCES
     src/algorithm_card.cpp
     src/algorithm_listing_tool.cpp
     src/algorithm_registry.cpp
+    src/dry_run_backend.cpp
+    src/experiment_spec.cpp
+    src/job_spec.cpp
 )
 
 add_library(agent_rpc_research STATIC ${RESEARCH_SOURCES})
