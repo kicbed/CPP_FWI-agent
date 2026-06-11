@@ -78,6 +78,18 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check_executable.cmake
 )
 
+add_executable(test_code_agent_tools test_code_agent_tools.cpp)
+target_link_libraries(test_code_agent_tools
+    ai_code_agent_tools
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_code_agent_tools PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../examples/ai_orchestrator
+)
+add_test(NAME CodeAgentToolsTest COMMAND test_code_agent_tools)
+
 # Proto序列化往返属性测试
 # **Feature: a2a-integration, Property 11: Protobuf Serialization Round-Trip**
 # **Validates: Requirements 11.5**

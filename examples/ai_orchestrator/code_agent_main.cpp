@@ -2,6 +2,7 @@
 #include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
+#include "code_agent_tools.hpp"
 
 #include <a2a/models/agent_message.hpp>
 #include <a2a/models/agent_task.hpp>
@@ -13,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -26,12 +28,13 @@ class CodeAgent {
 public:
     CodeAgent(const std::string& agent_id, const std::string& listen_address,
               const std::string& registry_url, const std::string& api_key,
-              const std::string& redis_host, int redis_port)
+              const std::string& redis_host, int redis_port, const std::string& project_root)
         : agent_id_(agent_id),
           listen_address_(listen_address),
           task_store_(std::make_shared<RedisTaskStore>(redis_host, redis_port)),
           llm_client_(api_key, LLMProvider::DEEPSEEK),
-          registry_client_(registry_url) {
+          registry_client_(registry_url),
+          inspector_(project_root) {
         std::cout << "[CodeAgent] 初始化完成" << std::endl;
     }
 
@@ -56,7 +59,7 @@ public:
         registration.description = "Read-only code analysis agent for repository navigation, error diagnosis, and patch suggestions.";
         registration.capabilities = {false, true, false};
         registration.skills = {
-            {"code_navigation", "Locate files and explain code paths", {"where is orchestrator routing implemented?"}},
+            {"code_navigation", "List files, read repository files, search text, and explain code paths", {"where is orchestrator routing implemented?"}},
             {"error_diagnosis", "Analyze compiler and runtime errors", {"explain this C++ build error"}},
             {"patch_proposal", "Propose safe patches without applying them", {"suggest a fix for this function"}}
         };
@@ -121,6 +124,7 @@ private:
             history_text += role_str + ": " + text + "\n";
         }
 
+        const std::string project_context = inspector_.summarize_for_query(query);
         const std::string system_prompt =
             "You are a read-only Code Agent for this repository.\n"
             "You may explain files, diagnose errors, and propose patches.\n"
@@ -128,6 +132,7 @@ private:
             "Do not execute commands.\n"
             "When suggesting a patch, explain risk and validation.\n"
             "Prefer file paths and line-level references when available.\n\n"
+            "## Read-only project inspection context\n" + project_context + "\n"
             "Conversation history:\n" + history_text;
 
         return llm_client_.chat(system_prompt, query);
@@ -158,7 +163,7 @@ private:
             {"skills", json::array({
                 {
                     {"name", "code_navigation"},
-                    {"description", "Locate files and explain code paths"},
+                    {"description", "List files, read repository files, search text, and explain code paths"},
                     {"input_modes", json::array({"text"})},
                     {"output_modes", json::array({"text"})}
                 },
@@ -188,12 +193,13 @@ private:
     std::shared_ptr<RedisTaskStore> task_store_;
     LLMClient llm_client_;
     RegistryClient registry_client_;
+    code_agent::ProjectInspector inspector_;
 };
 
 int main(int argc, char* argv[]) {
     if (argc < 5) {
         std::cerr << "用法: " << argv[0]
-                  << " <agent_id> <port> <registry_url> <api_key> [--redis-host <host>] [--redis-port <port>]"
+                  << " <agent_id> <port> <registry_url> <api_key> [--redis-host <host>] [--redis-port <port>] [--project-root <path>]"
                   << std::endl;
         return 1;
     }
@@ -204,6 +210,7 @@ int main(int argc, char* argv[]) {
     std::string api_key = argv[4];
     std::string redis_host = "127.0.0.1";
     int redis_port = 6379;
+    std::string project_root = std::filesystem::current_path().string();
 
     for (int i = 5; i < argc; ++i) {
         std::string arg = argv[i];
@@ -211,12 +218,14 @@ int main(int argc, char* argv[]) {
             redis_host = argv[++i];
         } else if (arg == "--redis-port" && i + 1 < argc) {
             redis_port = std::stoi(argv[++i]);
+        } else if (arg == "--project-root" && i + 1 < argc) {
+            project_root = argv[++i];
         }
     }
 
     std::string listen_address = "http://localhost:" + std::to_string(port);
     try {
-        CodeAgent agent(agent_id, listen_address, registry_url, api_key, redis_host, redis_port);
+        CodeAgent agent(agent_id, listen_address, registry_url, api_key, redis_host, redis_port, project_root);
         agent.start(port);
     } catch (const std::exception& e) {
         std::cerr << "错误: " << e.what() << std::endl;

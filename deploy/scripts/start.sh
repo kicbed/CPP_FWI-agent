@@ -172,7 +172,7 @@ echo -e "${GREEN}General Research Agent 启动完成${NC}"
 # 6. Code Agent
 echo -e "${YELLOW}[7/8] 启动 Code Agent (port $CODE_AGENT_PORT)...${NC}"
 "$BIN_DIR/ai_code_agent" code-agent-1 $CODE_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY \
-  --redis-host $REDIS_HOST --redis-port $REDIS_PORT \
+  --redis-host $REDIS_HOST --redis-port $REDIS_PORT --project-root "$PROJECT_ROOT" \
   > "$LOG_DIR/code_agent.log" 2>&1 &
 echo $! > "$PID_DIR/code_agent.pid"
 sleep 1

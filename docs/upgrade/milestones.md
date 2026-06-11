@@ -55,7 +55,7 @@ Tasks:
 
 - [x] M2-T1: Add `ai_code_agent` executable to `examples/ai_orchestrator/CMakeLists.txt`.
 - [x] M2-T2: Implement a Code Agent that registers with tag `code`.
-- [ ] M2-T3: Add read-only project inspection functions: list files, read file, search text.
+- [x] M2-T3: Add read-only project inspection functions: list files, read file, search text.
 - [x] M2-T4: Add prompt behavior for code explanation, error diagnosis, and patch proposal.
 - [x] M2-T5: Update `examples/ai_orchestrator/start_system.sh` and `deploy/scripts/start.sh` to start Code Agent.
 - [x] M2-T6: Add a test that verifies Code Agent registration data uses tag `code` and code-oriented skills.

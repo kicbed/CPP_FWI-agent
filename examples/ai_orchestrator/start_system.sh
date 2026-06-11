@@ -128,7 +128,7 @@ sleep 1
 echo "General Research Agent 启动完成 (端口: $GENERAL_RESEARCH_PORT)"
 
 echo "[6/7] 启动 Code Agent..."
-nohup "$BIN_DIR/ai_code_agent" code-agent-1 $CODE_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT > "$SCRIPT_DIR/logs/code_agent.log" 2>&1 &
+nohup "$BIN_DIR/ai_code_agent" code-agent-1 $CODE_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT --project-root "$PROJECT_ROOT" > "$SCRIPT_DIR/logs/code_agent.log" 2>&1 &
 echo $! > "$SCRIPT_DIR/pids/code_agent.pid"
 sleep 1
 echo "Code Agent 启动完成 (端口: $CODE_AGENT_PORT)"

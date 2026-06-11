@@ -12,7 +12,7 @@ TEST(CodeAgentRegistrationTest, RegistrationUsesCodeTagAndSkills) {
     registration.description = "Read-only code analysis agent for repository navigation, error diagnosis, and patch suggestions.";
     registration.capabilities = {false, true, false};
     registration.skills = {
-        {"code_navigation", "Locate files and explain code paths", {"where is orchestrator routing implemented?"}},
+        {"code_navigation", "List files, read repository files, search text, and explain code paths", {"where is orchestrator routing implemented?"}},
         {"error_diagnosis", "Analyze compiler and runtime errors", {"explain this C++ build error"}},
         {"patch_proposal", "Propose safe patches without applying them", {"suggest a fix for this function"}}
     };

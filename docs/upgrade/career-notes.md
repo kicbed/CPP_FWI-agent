@@ -19,7 +19,8 @@ Current status:
   Agent-RAG routing, Tool-RAG, Redis-backed conversation memory, local knowledge
   retrieval, and Web UI.
 - Includes a Code Agent MVP executable for read-only code Q&A, error diagnosis,
-  and patch proposal prompts; automatic patch application is not enabled.
+  project inspection, and patch proposal prompts; automatic patch application
+  is not enabled.
 - Real CUDA/MPI or cluster execution is not enabled yet.
 
 ## Architecture Talking Points
@@ -41,7 +42,6 @@ Current architecture:
 
 Planned v0.2 additions:
 
-- Read-only Code Agent project inspection tools for list/read/search.
 - AlgorithmCard registry for extensible lab algorithms.
 - ExperimentSpec and JobSpec for structured experiment planning.
 - DryRunBackend to render job commands/scripts without execution.
@@ -73,7 +73,8 @@ Use only bullets that match the completed implementation.
 - Added automated test coverage across RPC serialization, A2A adapters,
   registry behavior, routing, MCP integration, and RAG properties.
 - Added a read-only Code Agent MVP executable for code Q&A, error diagnosis,
-  and patch proposal prompts, with local startup script integration.
+  repository list/read/search context, and patch proposal prompts, with local
+  startup script integration.
 
 Planned after v0.2 completion:
 
@@ -126,3 +127,10 @@ Add one short entry whenever a meaningful technical change lands.
   CTest executable-target contract.
 - The Code Agent is prompt-only and read-only in this step; repository
   list/read/search tools remain the next Code Agent milestone.
+
+### 2026-06-11: Code Agent Read-Only Inspection Tools
+
+- Added C++ read-only project inspection helpers for file listing, safe file
+  reading, and text search inside the project root.
+- Wired Code Agent prompts to include deterministic project context while still
+  preventing shell execution and automatic patch application.

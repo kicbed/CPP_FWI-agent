@@ -264,3 +264,59 @@ Commit:
 Next task:
 - Add read-only Code Agent project inspection functions: list files, read file,
   and search text.
+
+## 2026-06-11: Add Code Agent Read-Only Inspection Tools
+
+Scope:
+- Added a `ai_code_agent_tools` C++ helper library for read-only file listing,
+  safe file reading, and text search inside the configured project root.
+- Wired Code Agent startup to pass `--project-root` and include deterministic
+  project inspection context in the LLM system prompt.
+- Added unit tests for safe relative paths, path escape rejection, and sorted
+  search matches.
+
+Files changed:
+- `examples/ai_orchestrator/code_agent_tools.hpp`
+- `examples/ai_orchestrator/code_agent_tools.cpp`
+- `examples/ai_orchestrator/code_agent_main.cpp`
+- `examples/ai_orchestrator/CMakeLists.txt`
+- `examples/ai_orchestrator/start_system.sh`
+- `deploy/scripts/start.sh`
+- `tests/test_code_agent_tools.cpp`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- Code Agent now has deterministic, read-only list/read/search project
+  inspection helpers.
+- Code Agent prompt context includes project file paths and search hints derived
+  from the user query.
+- Absolute paths and `../` path escapes are rejected; no shell commands are
+  executed.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `code_agent_tools.hpp`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R CodeAgentToolsTest --output-on-failure`
+- `bash -n examples/ai_orchestrator/start_system.sh`
+- `bash -n deploy/scripts/start.sh`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing `code_agent_tools.hpp`.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `CodeAgentToolsTest` passed.
+- PASS. Full `ctest` passed after the new helper library was added.
+- PASS. Both start scripts passed `bash -n`.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This Code Agent read-only inspection tools commit.
+
+Next task:
+- Add a smoke-test command to docs for asking where Orchestrator routing lives.
