@@ -155,6 +155,18 @@ Expected:
   finds an agent through `call_agent_by_tag("code", ...)`.
 - Does not claim that files were changed or commands were executed.
 
+### v0.2 Demo
+
+Use the scripted v0.2 runbook for a complete local demo:
+
+- [v0.2 demo script](docs/upgrade/demo-script-v0.2.md)
+- [v0.2 test report](docs/upgrade/test-report-v0.2.md)
+
+The demo covers FWI knowledge Q&A, Code Agent routing, and direct dry-run
+experiment planning through the Experiment Planner Agent. It stays on
+`localhost` and does not execute CUDA/MPI jobs or connect to SSH, Slurm, PBS, or
+remote servers.
+
 ## 模型切换指南
 
 ### LLM API 切换

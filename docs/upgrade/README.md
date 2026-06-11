@@ -12,7 +12,7 @@ Upgrade the project from a rough multi-agent/FWI demo into:
 
 > Lab Research Agent Platform for Seismic Computing
 
-The first production-quality target is `v0.2 Lab Agent MVP`:
+`v0.2 Lab Agent MVP` is complete as of 2026-06-11:
 
 - Real Code Agent MVP.
 - AlgorithmCard registry.
@@ -20,6 +20,10 @@ The first production-quality target is `v0.2 Lab Agent MVP`:
 - Dry-run experiment planning.
 - Better README and roadmap.
 - No real CUDA/MPI or cluster execution yet.
+
+The next target is `v0.3 Research Knowledge Base`: structured paper notes,
+algorithm notes, experiment notes, failure cases, and parameter-advice
+retrieval.
 
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.

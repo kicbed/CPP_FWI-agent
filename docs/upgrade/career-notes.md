@@ -26,6 +26,8 @@ Current status:
   validation.
 - Includes `ExperimentSpec`, `JobSpec`, and `DryRunBackend` models for safe
   experiment planning without submitting jobs.
+- Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
+  routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
 
 ## Architecture Talking Points
@@ -45,9 +47,11 @@ Current architecture:
   selection, and local FWI knowledge retrieval.
 - Memory layer: Redis-backed session history, agent memory, and task state.
 
-Planned v0.2 additions:
+Current v0.2 state:
 
-- Harden final demo docs and test report for the completed Lab Agent MVP.
+- Lab Agent MVP scope is complete: Code Agent, AlgorithmCard registry,
+  ExperimentSpec, JobSpec, DryRunBackend, Experiment Planner skeleton, demo
+  script, and test report.
 
 ## Technical Highlights
 
@@ -188,3 +192,11 @@ Add one short entry whenever a meaningful technical change lands.
 - Added an Experiment Planner Agent executable and startup integration with
   planning/research-computing registration tags and AlgorithmCard prompt
   context.
+
+### 2026-06-11: v0.2 Demo And Test Report
+
+- Added a v0.2 demo script that separates Orchestrator demos from the direct
+  Experiment Planner Agent dry-run smoke test.
+- Added a v0.2 test report and knowledge summary covering routing contracts,
+  research metadata modeling, dry-run planning boundaries, and verification
+  practice.

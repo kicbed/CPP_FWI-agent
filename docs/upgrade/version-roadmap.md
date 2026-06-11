@@ -20,6 +20,8 @@ Personal prompts should stay in ignored local files such as
 
 ## v0.2: Lab Agent MVP
 
+Status: Completed on 2026-06-11 for the MVP scope listed below.
+
 Purpose:
 
 - Turn the project from a rough FWI/multi-agent demo into a usable research
@@ -40,10 +42,15 @@ Not included:
 - SSH, Slurm, PBS, or remote server execution.
 - Automatic code patch application.
 
-Recommended first task:
+Historical first task:
 
 - Start with Code Agent MVP because the Orchestrator already has a `code`
   intent branch, but no real Code Agent implementation.
+
+Next target after v0.2:
+
+- Start v0.3 Research Knowledge Base so planner advice can be grounded in
+  structured paper, algorithm, experiment, and failure-case notes.
 
 ## v0.3: Research Knowledge Base
 

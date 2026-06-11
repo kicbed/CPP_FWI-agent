@@ -629,3 +629,49 @@ Commit:
 
 Next task:
 - Add v0.2 demo script and final docs.
+
+## 2026-06-11: Add v0.2 Demo Script And Test Report
+
+Scope:
+- Added a v0.2 demo script for FWI knowledge Q&A, Code Agent routing, and
+  direct Experiment Planner Agent dry-run planning.
+- Added a v0.2 test report with coverage summary, safety boundaries, and
+  knowledge-point summary.
+- Updated upgrade docs to mark the v0.2 Lab Agent MVP scope complete and point
+  the next upgrade session to v0.3 Research Knowledge Base.
+
+Files changed:
+- `README.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/demo-script-v0.2.md`
+- `docs/upgrade/test-report-v0.2.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- No runtime behavior changed.
+- Demo docs now explicitly separate Orchestrator demos from direct
+  Experiment Planner Agent smoke testing on `localhost:5011`.
+
+Tests run:
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `bash -n examples/ai_orchestrator/start_system.sh`
+- `bash -n examples/ai_orchestrator/stop_system.sh`
+- `bash -n deploy/scripts/start.sh`
+- `git diff --check`
+
+Result:
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 20/20 tests.
+- PASS. Startup and stop scripts passed shell syntax checks.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.2 demo script and test report commit.
+
+Next task:
+- Start v0.3 Research Knowledge Base.

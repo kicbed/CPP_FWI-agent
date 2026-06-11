@@ -9,6 +9,14 @@ Status markers:
 - `[~]` in progress
 - `[x]` complete
 
+Version status:
+
+- v0.2 Lab Agent MVP is complete as of 2026-06-11 according to
+  `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md` and
+  `docs/upgrade/version-roadmap.md`.
+- Remaining planner quality tasks below are future hardening work for v0.3/v0.4,
+  not blockers for the v0.2 MVP completion.
+
 ## Milestone 0: Baseline And Project Story
 
 Goal: make the current repository understandable and safe to upgrade.
@@ -108,6 +116,10 @@ Acceptance:
 ## Milestone 5: Experiment Planner Agent
 
 Goal: turn research questions into structured experiment plans.
+
+v0.2 scope note: the MVP completed the agent skeleton, AlgorithmCard prompt
+context, dry-run boundary, startup integration, and tests for registration and
+target availability. The unchecked items are the next planner-quality upgrades.
 
 Tasks:
 
