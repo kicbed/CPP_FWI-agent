@@ -84,6 +84,8 @@ Use only bullets that match the completed implementation.
 - Added an `AlgorithmRegistry` that loads algorithm metadata from JSON seed
   cards and supports deterministic lookup/filtering without Orchestrator
   changes.
+- Added a local algorithm listing helper that exposes registry contents as a
+  read-only JSON summary for future agent or MCP tool use.
 
 Planned after v0.2 completion:
 
@@ -166,3 +168,8 @@ Add one short entry whenever a meaningful technical change lands.
 - Added file-based AlgorithmCard loading from `resources/algorithms/*.json`,
   seed cards for FWI, frequency extrapolation, and post-stack inversion, plus
   tests for loading, filtering, and invalid backend rejection.
+
+### 2026-06-11: Algorithm Listing Tool Entry
+
+- Added a deterministic local listing helper for AlgorithmRegistry summaries,
+  preserving a read-only metadata boundary before any MCP exposure.

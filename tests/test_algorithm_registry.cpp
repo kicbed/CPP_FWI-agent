@@ -1,4 +1,5 @@
 #include <agent_rpc/research/algorithm_registry.h>
+#include <agent_rpc/research/algorithm_listing_tool.h>
 
 #include <gtest/gtest.h>
 
@@ -63,4 +64,21 @@ TEST(AlgorithmRegistryTest, RejectsInvalidCardsWithClearError) {
     EXPECT_NE(error.find("only dry_run backend is enabled in v0.2"), std::string::npos);
 
     std::filesystem::remove_all(temp_dir);
+}
+
+TEST(AlgorithmListingToolTest, ListsAlgorithmSummariesAsToolJson) {
+    AlgorithmRegistry registry;
+    std::string error;
+    ASSERT_TRUE(registry.load_from_directory(repo_root() / "resources" / "algorithms", &error))
+        << error;
+
+    const auto result = agent_rpc::research::list_algorithms_for_tool(registry);
+
+    EXPECT_EQ(result["tool"], "list_algorithms");
+    EXPECT_EQ(result["count"], 3);
+    ASSERT_TRUE(result["algorithms"].is_array());
+    EXPECT_EQ(result["algorithms"][0]["backend"], "dry_run");
+    EXPECT_TRUE(result["algorithms"][0].contains("id"));
+    EXPECT_TRUE(result["algorithms"][0].contains("tags"));
+    EXPECT_FALSE(result["algorithms"][0].contains("parameters"));
 }

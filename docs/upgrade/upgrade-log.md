@@ -481,3 +481,46 @@ Commit:
 
 Next task:
 - Add a local listing entry for AlgorithmRegistry contents.
+
+## 2026-06-11: Add Algorithm Listing Tool Entry
+
+Scope:
+- Added a local read-only listing helper for AlgorithmRegistry contents.
+- Extended registry tests to verify the tool-facing JSON summary shape.
+- Marked Milestone 3 complete.
+
+Files changed:
+- `research/CMakeLists.txt`
+- `research/include/agent_rpc/research/algorithm_listing_tool.h`
+- `research/src/algorithm_listing_tool.cpp`
+- `tests/test_algorithm_registry.cpp`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Behavior changed:
+- Local code can expose AlgorithmRegistry contents through a stable JSON
+  summary.
+- No runtime agent behavior changed and no job execution was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `agent_rpc/research/algorithm_listing_tool.h`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R AlgorithmRegistryTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing listing helper header.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `AlgorithmRegistryTest` passed 1/1.
+- PASS. Full `ctest` passed 17/17 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This algorithm listing tool entry commit.
+
+Next task:
+- Add ExperimentSpec, JobSpec, and DryRunBackend.
