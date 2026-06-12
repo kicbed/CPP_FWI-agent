@@ -112,7 +112,7 @@ Use only bullets that match the completed implementation.
 Planned after v0.3 start:
 
 - Add remaining structured notes for AWI, adjoint-state gradients, and broader
-  parameter/failure guidance.
+- Add dataset-based knowledge retrieval to complete the v0.3 roadmap contract.
 - Wire structured knowledge retrieval into the Experiment Planner response
   path before hardening planner output quality.
 
@@ -223,3 +223,10 @@ Add one short entry whenever a meaningful technical change lands.
   models for typed paper, algorithm, experiment, and failure-case notes.
 - Added deterministic retrieval tests for note type, method, failure mode, and
   parameter advice without enabling any real execution backend.
+
+### 2026-06-12: AWI And Gradient Knowledge Notes
+
+- Added structured AWI and adjoint-state gradient notes for cycle-skipping
+  diagnosis, misfit-function choice, and gradient-check advice.
+- Extended deterministic knowledge tests so v0.3 content coverage is protected
+  by method, failure-mode, and parameter-advice retrieval assertions.

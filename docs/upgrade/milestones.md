@@ -149,9 +149,10 @@ Tasks:
 - [x] M6-T2: Add `resources/research_knowledge/algorithms`.
 - [x] M6-T3: Add `resources/research_knowledge/experiments`.
 - [x] M6-T4: Add `resources/research_knowledge/failure_cases`.
-- [ ] M6-T5: Add structured notes for multi-scale FWI, AWI, cycle skipping, and adjoint-state gradient.
+- [x] M6-T5: Add structured notes for multi-scale FWI, AWI, cycle skipping, and adjoint-state gradient.
 - [x] M6-T6: Extend knowledge retrieval to include note type, method, assumptions, parameter advice, and failure modes.
 - [x] M6-T7: Add tests for retrieving advice by failure mode and algorithm method.
+- [ ] M6-T8: Add dataset-based knowledge retrieval and tests.
 
 Acceptance:
 

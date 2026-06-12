@@ -760,3 +760,43 @@ Next task:
 - Add the remaining structured v0.3 notes for AWI, adjoint-state gradient, and
   broader parameter/failure guidance, then wire retrieval into the Experiment
   Planner path.
+
+## 2026-06-12: Add AWI And Gradient Knowledge Notes
+
+Scope:
+- Added structured v0.3 knowledge notes for AWI and adjoint-state gradient
+  sanity checks.
+- Extended ResearchKnowledge tests to require AWI, adjoint-state-gradient,
+  cycle-skipping, and finite-difference gradient-check retrieval coverage.
+
+Files changed:
+- `resources/research_knowledge/algorithms/awi.json`
+- `resources/research_knowledge/papers/adjoint_state_gradient.json`
+- `tests/test_research_knowledge.cpp`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Local research knowledge retrieval now includes AWI and adjoint-state
+  gradient guidance for planner grounding.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, or remote execution was added.
+
+Tests run:
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ResearchKnowledge --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED target test failed for the expected missing `algorithm.awi` note.
+- PASS. Targeted `ResearchKnowledgeTest` passed 1/1 after adding the notes.
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 21/21 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This AWI and gradient knowledge notes commit.
+
+Next task:
+- Add dataset-based knowledge retrieval and tests for v0.3 roadmap completion.

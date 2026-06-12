@@ -1,0 +1,21 @@
+{
+  "id": "paper.adjoint_state_gradient",
+  "title": "Adjoint-state Gradient Sanity Checks",
+  "note_type": "paper",
+  "summary": "Adjoint-state gradients make large-scale FWI practical, but implementation errors should be caught with deterministic gradient checks before experiment scaling.",
+  "methods": ["adjoint-state-gradient", "fwi"],
+  "datasets": ["marmousi", "synthetic-shot-gather"],
+  "assumptions": [
+    "forward and adjoint wavefields use compatible discretization choices",
+    "the dry-run plan records expected gradient and loss artifacts before execution exists"
+  ],
+  "parameters": ["gradient_check", "time_step", "boundary_condition", "regularization"],
+  "failure_modes": ["unstable_gradient", "wrong_gradient_sign", "boundary_reflection"],
+  "parameter_advice": {
+    "gradient_check": "Run a finite-difference directional derivative check on a tiny synthetic case before trusting large inversion gradients.",
+    "time_step": "Keep the time step consistent with the forward solver stability limit before interpreting gradient instability.",
+    "regularization": "Separate numerical gradient bugs from regularization choices by checking an unregularized tiny case first."
+  },
+  "tags": ["adjoint-state", "gradient", "fwi", "verification"],
+  "source": "local v0.3 seed note"
+}

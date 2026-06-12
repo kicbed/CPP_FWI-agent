@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -73,6 +74,38 @@ TEST(ResearchKnowledgeBaseTest, RetrievesAdviceByFailureModeAndMethod) {
     const auto advice = knowledge.parameter_advice_for("multi-scale-fwi", "frequency_band");
     ASSERT_FALSE(advice.empty());
     EXPECT_NE(advice[0].find("lowest reliable"), std::string::npos);
+}
+
+TEST(ResearchKnowledgeBaseTest, CoversAwiAndAdjointStateGradientNotes) {
+    ResearchKnowledgeBase knowledge;
+    std::string error;
+    ASSERT_TRUE(knowledge.load_from_directory(
+        repo_root() / "resources" / "research_knowledge", &error)) << error;
+
+    ASSERT_NE(knowledge.find_by_id("algorithm.awi"), nullptr);
+    EXPECT_EQ(knowledge.find_by_id("algorithm.awi")->note_type, "algorithm");
+
+    ASSERT_NE(knowledge.find_by_id("paper.adjoint_state_gradient"), nullptr);
+    EXPECT_EQ(knowledge.find_by_id("paper.adjoint_state_gradient")->note_type, "paper");
+
+    const auto awi_notes = knowledge.filter_by_method("awi");
+    EXPECT_FALSE(awi_notes.empty());
+
+    const auto gradient_notes = knowledge.filter_by_method("adjoint-state-gradient");
+    EXPECT_FALSE(gradient_notes.empty());
+
+    const auto gradient_advice = knowledge.parameter_advice_for(
+        "adjoint-state-gradient", "gradient_check");
+    ASSERT_FALSE(gradient_advice.empty());
+    EXPECT_NE(gradient_advice[0].find("finite-difference"), std::string::npos);
+
+    const auto cycle_skipping_notes = knowledge.find_by_failure_mode("cycle_skipping");
+    const auto awi_diagnostic = std::find_if(
+        cycle_skipping_notes.begin(), cycle_skipping_notes.end(),
+        [](const ResearchKnowledgeNote& note) {
+            return note.id == "algorithm.awi";
+        });
+    EXPECT_NE(awi_diagnostic, cycle_skipping_notes.end());
 }
 
 TEST(ResearchKnowledgeBaseTest, RejectsInvalidNotesWithClearError) {

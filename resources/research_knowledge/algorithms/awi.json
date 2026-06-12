@@ -1,0 +1,21 @@
+{
+  "id": "algorithm.awi",
+  "title": "Adaptive Waveform Inversion Guidance",
+  "note_type": "algorithm",
+  "summary": "Adaptive waveform inversion can be considered when conventional waveform-difference FWI is vulnerable to cycle skipping.",
+  "methods": ["awi", "fwi"],
+  "datasets": ["marmousi", "field-shot-gather"],
+  "assumptions": [
+    "observed and synthetic data can be compared through an adaptive matching filter",
+    "cycle-skipping risk is diagnosed before switching the objective"
+  ],
+  "parameters": ["misfit_function", "frequency_band", "regularization", "matching_filter_length"],
+  "failure_modes": ["cycle_skipping", "missing_low_frequency", "local_minimum"],
+  "parameter_advice": {
+    "misfit_function": "Use AWI-style objectives when waveform-difference FWI is likely to compare events that are more than half a cycle apart.",
+    "matching_filter_length": "Start with a conservative matching-filter window and inspect whether the recovered filter concentrates near zero lag.",
+    "frequency_band": "Pair AWI with the lowest reliable frequencies first, then compare against a multi-scale FWI baseline."
+  },
+  "tags": ["awi", "cycle-skipping", "misfit-function", "inversion"],
+  "source": "local v0.3 seed note"
+}
