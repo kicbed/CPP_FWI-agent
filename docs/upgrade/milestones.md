@@ -14,6 +14,8 @@ Version status:
 - v0.2 Lab Agent MVP is complete as of 2026-06-11 according to
   `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md` and
   `docs/upgrade/version-roadmap.md`.
+- v0.3 Research Knowledge Base started on 2026-06-12 with structured local
+  knowledge notes, deterministic file loading, and retrieval tests.
 - Remaining planner quality tasks below are future hardening work for v0.3/v0.4,
   not blockers for the v0.2 MVP completion.
 
@@ -143,13 +145,13 @@ experiment guidance.
 
 Tasks:
 
-- [ ] M6-T1: Add `resources/research_knowledge/papers`.
-- [ ] M6-T2: Add `resources/research_knowledge/algorithms`.
-- [ ] M6-T3: Add `resources/research_knowledge/experiments`.
-- [ ] M6-T4: Add `resources/research_knowledge/failure_cases`.
+- [x] M6-T1: Add `resources/research_knowledge/papers`.
+- [x] M6-T2: Add `resources/research_knowledge/algorithms`.
+- [x] M6-T3: Add `resources/research_knowledge/experiments`.
+- [x] M6-T4: Add `resources/research_knowledge/failure_cases`.
 - [ ] M6-T5: Add structured notes for multi-scale FWI, AWI, cycle skipping, and adjoint-state gradient.
-- [ ] M6-T6: Extend knowledge retrieval to include note type, method, assumptions, parameter advice, and failure modes.
-- [ ] M6-T7: Add tests for retrieving advice by failure mode and algorithm method.
+- [x] M6-T6: Extend knowledge retrieval to include note type, method, assumptions, parameter advice, and failure modes.
+- [x] M6-T7: Add tests for retrieving advice by failure mode and algorithm method.
 
 Acceptance:
 

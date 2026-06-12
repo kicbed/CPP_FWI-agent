@@ -54,6 +54,9 @@ Next target after v0.2:
 
 ## v0.3: Research Knowledge Base
 
+Status: Started on 2026-06-12 with JSON-backed local research knowledge notes,
+typed directories, deterministic loading, and retrieval tests.
+
 Purpose:
 
 - Make parameter advice grounded in local paper notes, algorithm notes,

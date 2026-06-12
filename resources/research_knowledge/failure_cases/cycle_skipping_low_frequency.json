@@ -1,0 +1,20 @@
+{
+  "id": "failure_case.cycle_skipping_low_frequency",
+  "title": "Cycle Skipping With Missing Low Frequencies",
+  "note_type": "failure_case",
+  "summary": "When low frequencies are missing, conventional high-frequency FWI can converge to a wrong local minimum.",
+  "methods": ["multi-scale-fwi", "awi", "frequency-extrapolation"],
+  "datasets": ["marmousi", "field-shot-gather"],
+  "assumptions": [
+    "observed and synthetic events may differ by more than half a cycle",
+    "the user has not enabled a real execution backend"
+  ],
+  "parameters": ["frequency_band", "initial_model", "misfit_function"],
+  "failure_modes": ["cycle_skipping", "missing_low_frequency"],
+  "parameter_advice": {
+    "frequency_band": "Start from the lowest reliable frequency content; if it is absent, compare AWI or frequency extrapolation before high-frequency FWI.",
+    "misfit_function": "Consider AWI-style objectives when travel-time mismatch is too large for waveform-difference FWI."
+  },
+  "tags": ["cycle-skipping", "low-frequency", "diagnosis"],
+  "source": "local v0.3 seed note"
+}

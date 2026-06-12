@@ -26,6 +26,9 @@ Current status:
   validation.
 - Includes `ExperimentSpec`, `JobSpec`, and `DryRunBackend` models for safe
   experiment planning without submitting jobs.
+- Includes an initial v0.3 `ResearchKnowledgeNote` and `ResearchKnowledgeBase`
+  for JSON-backed paper, algorithm, experiment, and failure-case notes with
+  deterministic local retrieval.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -44,7 +47,8 @@ Current architecture:
 - Tool layer: MCP integrated server and plugins such as calculator and FWI
   metadata tools.
 - Retrieval layer: Agent-RAG for dynamic agent selection, Tool-RAG for tool
-  selection, and local FWI knowledge retrieval.
+  selection, local FWI knowledge retrieval, and structured v0.3 research
+  knowledge retrieval by note type, method, failure mode, and parameter advice.
 - Memory layer: Redis-backed session history, agent memory, and task state.
 
 Current v0.2 state:
@@ -52,6 +56,12 @@ Current v0.2 state:
 - Lab Agent MVP scope is complete: Code Agent, AlgorithmCard registry,
   ExperimentSpec, JobSpec, DryRunBackend, Experiment Planner skeleton, demo
   script, and test report.
+
+Current v0.3 state:
+
+- Research Knowledge Base has started with typed local JSON notes under
+  `resources/research_knowledge`, deterministic C++ loading, validation, and
+  tests for method and failure-mode advice retrieval.
 
 ## Technical Highlights
 
@@ -62,6 +72,8 @@ Current v0.2 state:
   calls, and RAG-based tool retrieval.
 - Redis-backed task and conversation memory.
 - Local and API-based embedding support.
+- JSON-backed local research knowledge notes for paper, algorithm, experiment,
+  and failure-case guidance.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -94,11 +106,15 @@ Use only bullets that match the completed implementation.
 - Added an Experiment Planner Agent skeleton that registers as a planning
   specialist and grounds prompts in local AlgorithmCards while preserving
   dry-run-only execution boundaries.
+- Added a structured research knowledge base with typed JSON notes and tested
+  retrieval by method, failure mode, and parameter advice for FWI planning.
 
-Planned after v0.2 completion:
+Planned after v0.3 start:
 
-- Harden Experiment Planner output quality with deterministic spec generation
-  and richer knowledge retrieval.
+- Add remaining structured notes for AWI, adjoint-state gradients, and broader
+  parameter/failure guidance.
+- Wire structured knowledge retrieval into the Experiment Planner response
+  path before hardening planner output quality.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -200,3 +216,10 @@ Add one short entry whenever a meaningful technical change lands.
 - Added a v0.2 test report and knowledge summary covering routing contracts,
   research metadata modeling, dry-run planning boundaries, and verification
   practice.
+
+### 2026-06-12: Research Knowledge Base Skeleton
+
+- Added JSON-backed `ResearchKnowledgeNote` and `ResearchKnowledgeBase` C++
+  models for typed paper, algorithm, experiment, and failure-case notes.
+- Added deterministic retrieval tests for note type, method, failure mode, and
+  parameter advice without enabling any real execution backend.

@@ -707,3 +707,56 @@ Commit:
 
 Next task:
 - Start v0.3 Research Knowledge Base.
+
+## 2026-06-12: Start Research Knowledge Base
+
+Scope:
+- Started v0.3 with structured local research knowledge notes and a C++ loader.
+- Added seed paper, algorithm, experiment, and failure-case notes for
+  multi-scale FWI planning and cycle-skipping diagnosis.
+
+Files changed:
+- `research/include/agent_rpc/research/research_knowledge.h`
+- `research/src/research_knowledge.cpp`
+- `research/CMakeLists.txt`
+- `resources/research_knowledge/papers/multiscale_fwi_practice.json`
+- `resources/research_knowledge/algorithms/multiscale_fwi.json`
+- `resources/research_knowledge/experiments/marmousi_multiscale_fwi_dry_run.json`
+- `resources/research_knowledge/failure_cases/cycle_skipping_low_frequency.json`
+- `tests/test_research_knowledge.cpp`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Local code can load typed research knowledge notes from
+  `resources/research_knowledge`.
+- Retrieval now supports note type, method, failure mode, and parameter-advice
+  lookup for deterministic non-LLM planner grounding.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, or remote execution was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `agent_rpc/research/research_knowledge.h`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ResearchKnowledge --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing `ResearchKnowledge` header.
+- PASS. Targeted `ResearchKnowledgeTest` passed 1/1 after implementation.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. Full `ctest` passed 21/21 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This Research Knowledge Base skeleton commit.
+
+Next task:
+- Add the remaining structured v0.3 notes for AWI, adjoint-state gradient, and
+  broader parameter/failure guidance, then wire retrieval into the Experiment
+  Planner path.

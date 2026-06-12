@@ -21,9 +21,10 @@ Upgrade the project from a rough multi-agent/FWI demo into:
 - Better README and roadmap.
 - No real CUDA/MPI or cluster execution yet.
 
-The next target is `v0.3 Research Knowledge Base`: structured paper notes,
+The current target is `v0.3 Research Knowledge Base`: structured paper notes,
 algorithm notes, experiment notes, failure cases, and parameter-advice
-retrieval.
+retrieval. v0.3 started on 2026-06-12 with JSON-backed local knowledge notes
+and deterministic retrieval tests.
 
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.

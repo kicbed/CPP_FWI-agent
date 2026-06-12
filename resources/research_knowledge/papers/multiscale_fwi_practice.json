@@ -1,0 +1,20 @@
+{
+  "id": "paper.multiscale_fwi_practice",
+  "title": "Multi-scale FWI Practice Note",
+  "note_type": "paper",
+  "summary": "Multi-scale FWI reduces cycle-skipping risk by introducing lower-frequency information before higher-frequency updates.",
+  "methods": ["multi-scale-fwi", "fwi"],
+  "datasets": ["marmousi"],
+  "assumptions": [
+    "the starting velocity model is close enough for early arrivals",
+    "the first usable frequency band is identified before inversion"
+  ],
+  "parameters": ["frequency_band", "initial_model", "niter"],
+  "failure_modes": ["cycle_skipping", "missing_low_frequency"],
+  "parameter_advice": {
+    "frequency_band": "Start from the lowest reliable band and only add higher frequencies after the low-frequency stage stabilizes.",
+    "initial_model": "Prefer a smoothed background model before high-frequency FWI."
+  },
+  "tags": ["fwi", "cycle-skipping", "low-frequency"],
+  "source": "local v0.3 seed note"
+}

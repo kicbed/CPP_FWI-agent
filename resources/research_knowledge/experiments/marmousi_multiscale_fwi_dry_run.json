@@ -1,0 +1,20 @@
+{
+  "id": "experiment.marmousi_multiscale_fwi_dry_run",
+  "title": "Marmousi Multi-scale FWI Dry-run Baseline",
+  "note_type": "experiment",
+  "summary": "A dry-run planning record for Marmousi-style multi-scale FWI before enabling any real CUDA/MPI backend.",
+  "methods": ["multi-scale-fwi", "fwi"],
+  "datasets": ["marmousi"],
+  "assumptions": [
+    "the experiment is rendered as a dry-run JobSpec only",
+    "loss curves and model artifacts are expected outputs but are not produced by v0.3"
+  ],
+  "parameters": ["frequency_band", "niter", "gpu_count", "mpi_processes"],
+  "failure_modes": ["cycle_skipping", "mpi_runtime_error"],
+  "parameter_advice": {
+    "niter": "Use a small iteration count for the first dry-run plan and expand only after validation.",
+    "gpu_count": "Keep GPU requests explicit in the spec even though v0.3 does not allocate hardware."
+  },
+  "tags": ["marmousi", "dry-run", "experiment-note"],
+  "source": "local v0.3 seed note"
+}

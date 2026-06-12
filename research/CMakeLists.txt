@@ -7,6 +7,7 @@ set(RESEARCH_SOURCES
     src/dry_run_backend.cpp
     src/experiment_spec.cpp
     src/job_spec.cpp
+    src/research_knowledge.cpp
 )
 
 add_library(agent_rpc_research STATIC ${RESEARCH_SOURCES})

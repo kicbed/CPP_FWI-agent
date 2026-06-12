@@ -1,0 +1,21 @@
+{
+  "id": "algorithm.multi_scale_fwi",
+  "title": "Multi-scale FWI Algorithm Guidance",
+  "note_type": "algorithm",
+  "summary": "Use staged frequency bands, conservative step lengths, and loss-curve checks to make FWI planning reproducible.",
+  "methods": ["multi-scale-fwi", "fwi"],
+  "datasets": ["marmousi", "marmousi2"],
+  "assumptions": [
+    "shots, wavelet, and initial model are registered to the same grid",
+    "dry-run job rendering is used before any real execution backend exists"
+  ],
+  "parameters": ["frequency_band", "step_length", "niter", "regularization"],
+  "failure_modes": ["cycle_skipping", "unstable_gradient"],
+  "parameter_advice": {
+    "frequency_band": "Use the lowest reliable frequency band first, then move upward in small stages.",
+    "step_length": "Start conservatively and inspect loss reduction before increasing step length.",
+    "regularization": "Use stronger smoothing when gradients are unstable or the starting model is rough."
+  },
+  "tags": ["fwi", "inversion", "planning"],
+  "source": "local v0.3 seed note"
+}
