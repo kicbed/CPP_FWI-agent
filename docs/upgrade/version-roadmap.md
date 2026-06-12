@@ -83,6 +83,9 @@ Next target after v0.3:
 
 ## v0.4: Experiment Planner
 
+Status: Started on 2026-06-12 with deterministic PlannerContext retrieval for
+AlgorithmCards, research knowledge notes, failure modes, and parameter advice.
+
 Purpose:
 
 - Make the planner useful enough for junior lab members to draft experiments.

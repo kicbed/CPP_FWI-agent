@@ -18,6 +18,9 @@ Version status:
   knowledge notes, deterministic file loading, and retrieval tests.
 - v0.3 Research Knowledge Base is complete as of 2026-06-12 according to
   `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.3.md`.
+- v0.4 Experiment Planner started on 2026-06-12 with deterministic
+  PlannerContext retrieval that combines AlgorithmCards, research knowledge
+  notes, and parameter advice before LLM prompting.
 - Remaining planner quality tasks below are future hardening work for v0.4,
   not blockers for the v0.2 MVP completion.
 
@@ -128,7 +131,7 @@ target availability. The unchecked items are the next planner-quality upgrades.
 Tasks:
 
 - [x] M5-T1: Add `ExperimentPlannerAgent` executable and register it with tags `experiment`, `planning`, `research-computing`.
-- [ ] M5-T2: Retrieve relevant AlgorithmCards and knowledge documents for a user request.
+- [x] M5-T2: Retrieve relevant AlgorithmCards and knowledge documents for a user request.
 - [ ] M5-T3: Generate a structured answer with algorithm recommendation, parameter table, risk analysis, and next-step plan.
 - [ ] M5-T4: Generate an `ExperimentSpec` JSON block in the answer.
 - [ ] M5-T5: Generate a `JobSpec` dry-run block when the algorithm card declares job spec support.

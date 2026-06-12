@@ -30,6 +30,9 @@ Current status:
   JSON-backed paper, algorithm, experiment, and failure-case notes with
   deterministic local retrieval by method, failure mode, parameter advice, and
   dataset.
+- Includes an initial v0.4 `PlannerContext` layer that deterministically
+  combines AlgorithmCards, ResearchKnowledge notes, failure-mode evidence, and
+  parameter advice before the Experiment Planner calls an LLM.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -51,6 +54,9 @@ Current architecture:
   selection, local FWI knowledge retrieval, and structured v0.3 research
   knowledge retrieval by note type, method, failure mode, parameter advice, and
   dataset.
+- Planner context layer: v0.4 deterministic request inference and context
+  construction select AlgorithmCards and local research notes for the Planner
+  prompt before LLM generation.
 - Memory layer: Redis-backed session history, agent memory, and task state.
 
 Current v0.2 state:
@@ -65,6 +71,12 @@ Current v0.3 state:
   `resources/research_knowledge`, deterministic C++ loading, validation, and
   tests for method, failure-mode, parameter-advice, and dataset retrieval.
 
+Current v0.4 state:
+
+- Experiment Planner has started: `PlannerContext` infers FWI planning signals
+  from a request, retrieves matching AlgorithmCards and knowledge notes, and
+  injects a dry-run-only context into the Planner Agent prompt.
+
 ## Technical Highlights
 
 - C++17/C++20 multi-module project with CMake.
@@ -76,6 +88,9 @@ Current v0.3 state:
 - Local and API-based embedding support.
 - JSON-backed local research knowledge notes for paper, algorithm, experiment,
   and failure-case guidance.
+- Deterministic planner grounding that turns a user request into selected
+  AlgorithmCards, local knowledge notes, parameter advice, and explicit
+  dry-run safety boundaries before LLM generation.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -111,11 +126,15 @@ Use only bullets that match the completed implementation.
 - Added a structured research knowledge base with typed JSON notes and tested
   retrieval by method, failure mode, parameter advice, and dataset for FWI
   planning.
+- Added a deterministic PlannerContext layer that grounds Experiment Planner
+  prompts in AlgorithmCards, local research knowledge, failure-case notes, and
+  parameter advice while preserving dry-run-only execution boundaries.
 
-Planned after v0.3 completion:
+Planned during v0.4:
 
-- Wire structured knowledge retrieval into the Experiment Planner response
-  path before hardening planner output quality.
+- Harden Planner output into structured algorithm recommendations, parameter
+  tables, risk analysis, ExperimentSpec JSON, dry-run JobSpec text, and
+  reproducible experiment records.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -236,3 +255,12 @@ Add one short entry whenever a meaningful technical change lands.
 
 - Added dataset-based research knowledge retrieval and marked v0.3 complete.
 - Added a v0.3 test report with Chinese learning and interview-prep summary.
+
+### 2026-06-12: v0.4 PlannerContext Retrieval
+
+- Added deterministic PlannerContext retrieval for the Experiment Planner,
+  combining AlgorithmCards, structured research notes, failure-mode evidence,
+  and parameter advice before LLM prompting.
+- Preserved the dry-run-only boundary: the Planner context explicitly marks
+  real execution disabled and forbids CUDA/MPI, SSH, Slurm/PBS, remote jobs, and
+  shell execution.

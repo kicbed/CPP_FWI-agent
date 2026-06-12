@@ -850,6 +850,55 @@ Next task:
 - Start v0.4 Experiment Planner by wiring AlgorithmCard and
   ResearchKnowledgeBase retrieval into deterministic planner context.
 
+## 2026-06-12: Start v0.4 PlannerContext Retrieval
+
+Scope:
+- Added deterministic PlannerContext retrieval for the Experiment Planner.
+- Wired Planner Agent prompts to include request-specific AlgorithmCards,
+  research knowledge notes, failure-mode evidence, parameter advice, and
+  dry-run safety boundaries.
+
+Files changed:
+- `research/include/agent_rpc/research/planner_context.h`
+- `research/src/planner_context.cpp`
+- `research/CMakeLists.txt`
+- `examples/ai_orchestrator/experiment_planner_agent_main.cpp`
+- `tests/test_planner_context.cpp`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Experiment Planner now builds a deterministic context from the user request
+  before calling the LLM instead of sending only a static algorithm list.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, arbitrary
+  shell execution, or automatic code patch application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `agent_rpc/research/planner_context.h`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R PlannerContext --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing `PlannerContext` header.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. Targeted `PlannerContextTest` passed 1/1 after implementation.
+- PASS. Full `ctest` passed 22/22 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.4 PlannerContext retrieval commit.
+
+Next task:
+- Generate a structured Planner answer with algorithm recommendation,
+  parameter table, assumption list, risk analysis, and next-step plan from the
+  deterministic PlannerContext.
+
 ## 2026-06-12: Expand v0.3 Learning Summary Prompt
 
 Scope:

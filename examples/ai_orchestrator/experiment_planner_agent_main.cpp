@@ -3,8 +3,9 @@
 #include "http_server.hpp"
 #include "registry_client.hpp"
 
-#include <agent_rpc/research/algorithm_listing_tool.h>
 #include <agent_rpc/research/algorithm_registry.h>
+#include <agent_rpc/research/planner_context.h>
+#include <agent_rpc/research/research_knowledge.h>
 
 #include <a2a/models/agent_message.hpp>
 #include <a2a/models/agent_task.hpp>
@@ -33,13 +34,14 @@ public:
                            const std::string& api_key,
                            const std::string& redis_host,
                            int redis_port,
-                           const std::string& algorithm_dir)
+                           const std::string& algorithm_dir,
+                           const std::string& knowledge_dir)
         : agent_id_(agent_id),
           listen_address_(listen_address),
           task_store_(std::make_shared<RedisTaskStore>(redis_host, redis_port)),
           llm_client_(api_key, LLMProvider::DEEPSEEK),
-          registry_client_(registry_url),
-          algorithm_context_(load_algorithm_context(algorithm_dir)) {
+          registry_client_(registry_url) {
+        planner_context_status_ = load_planner_sources(algorithm_dir, knowledge_dir);
         std::cout << "[ExperimentPlannerAgent] 初始化完成" << std::endl;
     }
 
@@ -81,13 +83,30 @@ public:
     }
 
 private:
-    static std::string load_algorithm_context(const std::string& algorithm_dir) {
-        agent_rpc::research::AlgorithmRegistry registry;
+    std::string load_planner_sources(const std::string& algorithm_dir,
+                                     const std::string& knowledge_dir) {
         std::string error;
-        if (!registry.load_from_directory(algorithm_dir, &error)) {
+        if (!algorithm_registry_.load_from_directory(algorithm_dir, &error)) {
             return "Algorithm registry unavailable: " + error;
         }
-        return agent_rpc::research::list_algorithms_for_tool(registry).dump(2);
+        if (!knowledge_base_.load_from_directory(knowledge_dir, &error)) {
+            return "Research knowledge base unavailable: " + error;
+        }
+        return "";
+    }
+
+    std::string build_context_for_query(const std::string& query) const {
+        if (!planner_context_status_.empty()) {
+            return "dry_run_only: true\n"
+                   "real_execution_enabled: false\n"
+                   "Planner context unavailable: " + planner_context_status_;
+        }
+
+        const auto request =
+            agent_rpc::research::infer_planner_context_request(query);
+        const auto context = agent_rpc::research::build_planner_context(
+            algorithm_registry_, knowledge_base_, request);
+        return context.render_prompt_context();
     }
 
     std::string handle_request(const std::string& body) {
@@ -145,7 +164,8 @@ private:
             "Do not claim that any CUDA/MPI job was executed.\n"
             "When execution is requested, output a dry-run JobSpec only.\n"
             "All execution plans must clearly state dry_run: true.\n\n"
-            "## Available AlgorithmCards\n" + algorithm_context_ + "\n\n"
+            "## Deterministic Planner Context\n" +
+            build_context_for_query(query) + "\n\n"
             "## Conversation history\n" + history_text;
 
         return llm_client_.chat(system_prompt, query);
@@ -207,7 +227,9 @@ private:
     std::shared_ptr<RedisTaskStore> task_store_;
     LLMClient llm_client_;
     RegistryClient registry_client_;
-    std::string algorithm_context_;
+    agent_rpc::research::AlgorithmRegistry algorithm_registry_;
+    agent_rpc::research::ResearchKnowledgeBase knowledge_base_;
+    std::string planner_context_status_;
 };
 
 int main(int argc, char* argv[]) {
@@ -215,7 +237,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "用法: " << argv[0]
                   << " <agent_id> <port> <registry_url> <api_key>"
                   << " [--redis-host <host>] [--redis-port <port>]"
-                  << " [--algorithm-dir <path>]"
+                  << " [--algorithm-dir <path>] [--knowledge-dir <path>]"
                   << std::endl;
         return 1;
     }
@@ -228,6 +250,8 @@ int main(int argc, char* argv[]) {
     int redis_port = 6379;
     std::string algorithm_dir =
         (std::filesystem::current_path() / "resources" / "algorithms").string();
+    std::string knowledge_dir =
+        (std::filesystem::current_path() / "resources" / "research_knowledge").string();
 
     for (int i = 5; i < argc; ++i) {
         std::string arg = argv[i];
@@ -237,13 +261,16 @@ int main(int argc, char* argv[]) {
             redis_port = std::stoi(argv[++i]);
         } else if (arg == "--algorithm-dir" && i + 1 < argc) {
             algorithm_dir = argv[++i];
+        } else if (arg == "--knowledge-dir" && i + 1 < argc) {
+            knowledge_dir = argv[++i];
         }
     }
 
     std::string listen_address = "http://localhost:" + std::to_string(port);
     try {
         ExperimentPlannerAgent agent(agent_id, listen_address, registry_url, api_key,
-                                     redis_host, redis_port, algorithm_dir);
+                                     redis_host, redis_port, algorithm_dir,
+                                     knowledge_dir);
         agent.start(port);
     } catch (const std::exception& e) {
         std::cerr << "错误: " << e.what() << std::endl;
