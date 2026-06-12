@@ -65,10 +65,22 @@ Every new upgrade conversation should follow this sequence.
      the task finishes a version, adds major architecture, or produces a test
      report
 
-Knowledge summaries should be written in Chinese and should be detailed enough
-for later study and interview preparation. Prefer this structure: problem being
-solved, implementation approach, key files/tests, safety or product boundary,
-and a short interview-ready explanation.
+Knowledge summaries should be written in Chinese and detailed enough for later
+study and interview preparation. Do not write only a few generic bullets. Use
+sectioned prose with concrete engineering details. For version completions, test
+reports, major architecture work, or meaningful technical capability changes,
+include at least:
+
+- The problem being solved and why the previous version was insufficient.
+- The implementation approach, including data flow, API shape, important
+  design tradeoffs, and why simpler or more complex alternatives were not used.
+- Key files, tests, resources, and what each test protects.
+- Safety or product boundaries, especially around CUDA/MPI, SSH, Slurm/PBS,
+  remote execution, shell execution, and Code Agent write permissions.
+- Debugging or TDD evidence when relevant: what failed first, what changed, and
+  what verification proved.
+- Interview preparation material: a short project pitch, a technical deep dive,
+  likely follow-up questions with answers, and a STAR-style explanation.
 
 ## Required Validation
 

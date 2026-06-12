@@ -849,3 +849,36 @@ Commit:
 Next task:
 - Start v0.4 Experiment Planner by wiring AlgorithmCard and
   ResearchKnowledgeBase retrieval into deterministic planner context.
+
+## 2026-06-12: Expand v0.3 Learning Summary Prompt
+
+Scope:
+- Rewrote the v0.3 knowledge summary with more detailed learning and
+  interview-prep notes.
+- Strengthened the upgrade-guide summary requirements so future reports include
+  problem context, implementation details, test coverage, safety boundaries,
+  TDD evidence, interview Q&A, and STAR-style explanations.
+- Updated the ignored local prompt file with the same detailed-summary
+  requirement for future copy-paste upgrade sessions.
+
+Files changed:
+- `docs/upgrade/test-report-v0.3.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/local-prompts.md` (ignored local prompt file)
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+
+Tests run:
+- `git diff --check`
+
+Result:
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This expanded v0.3 learning summary prompt commit.
+
+Next task:
+- Start v0.4 Experiment Planner by wiring AlgorithmCard and
+  ResearchKnowledgeBase retrieval into deterministic planner context.
