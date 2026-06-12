@@ -33,6 +33,10 @@ Current status:
 - Includes an initial v0.4 `PlannerContext` layer that deterministically
   combines AlgorithmCards, ResearchKnowledge notes, failure-mode evidence, and
   parameter advice before the Experiment Planner calls an LLM.
+- Includes a v0.4 `PlannerAnswer` layer that turns PlannerContext into
+  structured algorithm recommendations, assumptions, parameter tables, risk
+  analysis, ExperimentSpec JSON, dry-run JobSpec text, and reproducible
+  experiment records.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -73,9 +77,10 @@ Current v0.3 state:
 
 Current v0.4 state:
 
-- Experiment Planner has started: `PlannerContext` infers FWI planning signals
-  from a request, retrieves matching AlgorithmCards and knowledge notes, and
-  injects a dry-run-only context into the Planner Agent prompt.
+- Experiment Planner is complete for the v0.4 scope: `PlannerContext` infers
+  FWI planning signals from a request, retrieves matching AlgorithmCards and
+  knowledge notes, and `PlannerAnswer` creates a structured dry-run plan and
+  reproducible experiment record.
 
 ## Technical Highlights
 
@@ -91,6 +96,9 @@ Current v0.4 state:
 - Deterministic planner grounding that turns a user request into selected
   AlgorithmCards, local knowledge notes, parameter advice, and explicit
   dry-run safety boundaries before LLM generation.
+- Structured dry-run experiment planning that produces parameter tables, risk
+  analysis, ExperimentSpec JSON, dry-run JobSpec previews, and versioned
+  experiment records without executing jobs.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -129,12 +137,15 @@ Use only bullets that match the completed implementation.
 - Added a deterministic PlannerContext layer that grounds Experiment Planner
   prompts in AlgorithmCards, local research knowledge, failure-case notes, and
   parameter advice while preserving dry-run-only execution boundaries.
+- Added a PlannerAnswer layer that converts grounded planner context into
+  structured dry-run experiment plans, including ExperimentSpec, JobSpec, risk
+  analysis, and reproducible records.
 
-Planned during v0.4:
+Planned after v0.4:
 
-- Harden Planner output into structured algorithm recommendations, parameter
-  tables, risk analysis, ExperimentSpec JSON, dry-run JobSpec text, and
-  reproducible experiment records.
+- Upgrade the Web UI into a Lab Workbench that renders route traces,
+  AlgorithmCards, parameter tables, ExperimentSpec, JobSpec, dry-run jobs, and
+  status panels.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -264,3 +275,11 @@ Add one short entry whenever a meaningful technical change lands.
 - Preserved the dry-run-only boundary: the Planner context explicitly marks
   real execution disabled and forbids CUDA/MPI, SSH, Slurm/PBS, remote jobs, and
   shell execution.
+
+### 2026-06-12: v0.4 Experiment Planner Completion
+
+- Added PlannerAnswer generation for structured algorithm recommendations,
+  assumptions, parameter tables, risk analysis, next steps, ExperimentSpec,
+  dry-run JobSpec, and reproducible experiment records.
+- Updated the Experiment Planner Agent prompt path so deterministic structured
+  scaffolds are available before LLM generation.

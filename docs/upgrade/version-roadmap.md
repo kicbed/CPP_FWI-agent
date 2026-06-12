@@ -83,8 +83,8 @@ Next target after v0.3:
 
 ## v0.4: Experiment Planner
 
-Status: Started on 2026-06-12 with deterministic PlannerContext retrieval for
-AlgorithmCards, research knowledge notes, failure modes, and parameter advice.
+Status: Completed on 2026-06-12 with deterministic PlannerContext retrieval and
+PlannerAnswer generation for structured dry-run experiment plans.
 
 Purpose:
 
@@ -104,6 +104,21 @@ Example user value:
 
 - "Plan a Marmousi multi-scale FWI experiment and explain what to adjust if
   loss does not decrease."
+
+Completed scope:
+
+- Retrieve request-specific AlgorithmCards and ResearchKnowledge notes.
+- Generate algorithm recommendation, assumptions, parameter table, risk
+  analysis, and next-step plan.
+- Generate ExperimentSpec JSON.
+- Generate dry-run JobSpec text.
+- Generate reproducible experiment records.
+
+Next target after v0.4:
+
+- Start v0.5 Lab Workbench UI so users can inspect routing, tool calls,
+  AlgorithmCards, ExperimentSpec, JobSpec, parameter tables, dry-run jobs, and
+  service status from the browser.
 
 ## v0.5: Lab Workbench UI
 

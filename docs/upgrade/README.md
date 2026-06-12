@@ -28,9 +28,18 @@ Upgrade the project from a rough multi-agent/FWI demo into:
 - Retrieval by note type, method, failure mode, parameter advice, and dataset.
 - v0.3 test report and Chinese learning summary.
 
-The next target is `v0.4 Experiment Planner`: structured experiment planning,
-risk analysis, dry-run jobs, and reproducible experiment records grounded in
-AlgorithmCards and the v0.3 knowledge base.
+`v0.4 Experiment Planner` is complete as of 2026-06-12:
+
+- Deterministic PlannerContext retrieval from user requests.
+- Structured PlannerAnswer with algorithm recommendation, assumptions,
+  parameter table, risk analysis, and next-step plan.
+- ExperimentSpec JSON, dry-run JobSpec text, and reproducible experiment
+  records grounded in AlgorithmCards and the v0.3 knowledge base.
+- v0.4 test report and Chinese learning summary.
+
+The next target is `v0.5 Lab Workbench UI`: make the Web UI show routing,
+tool calls, AlgorithmCards, ExperimentSpec, JobSpec, parameter tables, dry-run
+jobs, and service status panels.
 
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.

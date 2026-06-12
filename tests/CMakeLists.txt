@@ -173,6 +173,18 @@ target_include_directories(test_planner_context PRIVATE
 )
 add_test(NAME PlannerContextTest COMMAND test_planner_context)
 
+add_executable(test_planner_answer test_planner_answer.cpp)
+target_link_libraries(test_planner_answer
+    agent_rpc_research
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_planner_answer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../research/include
+)
+add_test(NAME PlannerAnswerTest COMMAND test_planner_answer)
+
 # Proto序列化往返属性测试
 # **Feature: a2a-integration, Property 11: Protobuf Serialization Round-Trip**
 # **Validates: Requirements 11.5**

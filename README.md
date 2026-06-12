@@ -5,8 +5,9 @@ and multi-agent orchestration.
 
 The current version supports research Q&A, structured research knowledge
 retrieval, MCP tool calling, multi-agent routing, dry-run experiment planning,
-and Web/CLI access. Real CUDA/MPI or cluster job execution is not enabled yet;
-the current backend boundary reserves later Slurm/PBS/server integration.
+reproducible experiment records, and Web/CLI access. Real CUDA/MPI or cluster
+job execution is not enabled yet; the current backend boundary reserves later
+Slurm/PBS/server integration.
 
 **首个落地场景**: FWI（全波形反演）科研助手平台
 
@@ -174,6 +175,21 @@ experiment notes, failure cases, parameter advice, and retrieval by method,
 failure mode, parameter, and dataset:
 
 - [v0.3 test report](docs/upgrade/test-report-v0.3.md)
+
+### v0.4 Experiment Planner Report
+
+v0.4 adds deterministic Experiment Planner grounding and structured dry-run
+outputs:
+
+- request-specific AlgorithmCard and ResearchKnowledge retrieval
+- algorithm recommendation, assumptions, parameter table, risk analysis, and
+  next-step plan
+- ExperimentSpec JSON, dry-run JobSpec text, and reproducible experiment record
+- [v0.4 test report](docs/upgrade/test-report-v0.4.md)
+
+The report and generated plans stay dry-run only. They do not execute CUDA/MPI
+jobs, submit to SSH/Slurm/PBS, call remote servers, or run shell commands from
+user input.
 
 ## 模型切换指南
 

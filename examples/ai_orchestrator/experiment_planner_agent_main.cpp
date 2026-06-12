@@ -4,6 +4,7 @@
 #include "registry_client.hpp"
 
 #include <agent_rpc/research/algorithm_registry.h>
+#include <agent_rpc/research/planner_answer.h>
 #include <agent_rpc/research/planner_context.h>
 #include <agent_rpc/research/research_knowledge.h>
 
@@ -106,7 +107,11 @@ private:
             agent_rpc::research::infer_planner_context_request(query);
         const auto context = agent_rpc::research::build_planner_context(
             algorithm_registry_, knowledge_base_, request);
-        return context.render_prompt_context();
+        const auto answer =
+            agent_rpc::research::build_planner_answer(request, context);
+        return context.render_prompt_context() +
+            "\n\nstructured_planner_scaffold:\n" +
+            answer.render_markdown();
     }
 
     std::string handle_request(const std::string& body) {
