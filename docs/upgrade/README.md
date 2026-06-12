@@ -37,9 +37,10 @@ Upgrade the project from a rough multi-agent/FWI demo into:
   records grounded in AlgorithmCards and the v0.3 knowledge base.
 - v0.4 test report and Chinese learning summary.
 
-The next target is `v0.5 Lab Workbench UI`: make the Web UI show routing,
+The current target is `v0.5 Lab Workbench UI`: make the Web UI show routing,
 tool calls, AlgorithmCards, ExperimentSpec, JobSpec, parameter tables, dry-run
-jobs, and service status panels.
+jobs, and service status panels. The first v0.5 step renamed the generic Web UI
+brand to Lab Agent Workbench.
 
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.

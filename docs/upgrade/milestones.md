@@ -23,6 +23,8 @@ Version status:
   notes, and parameter advice before LLM prompting.
 - v0.4 Experiment Planner is complete as of 2026-06-12 according to
   `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.4.md`.
+- v0.5 Lab Workbench UI started on 2026-06-12 with Web UI branding renamed from
+  a generic orchestrator chat page to Lab Agent Workbench.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -171,7 +173,7 @@ Goal: make the Web UI feel like a research workbench instead of a chat-only page
 
 Tasks:
 
-- [ ] M7-T1: Rename UI branding to Lab Agent Workbench.
+- [x] M7-T1: Rename UI branding to Lab Agent Workbench.
 - [ ] M7-T2: Add a right-side inspector for selected agent, tool calls, and generated specs.
 - [ ] M7-T3: Add an algorithm panel that lists AlgorithmCards.
 - [ ] M7-T4: Render ExperimentSpec and JobSpec blocks as tables/cards.

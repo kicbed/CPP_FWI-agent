@@ -185,6 +185,14 @@ target_include_directories(test_planner_answer PRIVATE
 )
 add_test(NAME PlannerAnswerTest COMMAND test_planner_answer)
 
+add_test(
+    NAME WebBrandingTest
+    COMMAND ${CMAKE_COMMAND}
+        -DWEB_INDEX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../web/index.html
+        -DWEB_SERVER_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../web/serve.py
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check_web_branding.cmake
+)
+
 # Proto序列化往返属性测试
 # **Feature: a2a-integration, Property 11: Protobuf Serialization Round-Trip**
 # **Validates: Requirements 11.5**

@@ -122,6 +122,8 @@ Next target after v0.4:
 
 ## v0.5: Lab Workbench UI
 
+Status: Started on 2026-06-12 with UI branding renamed to Lab Agent Workbench.
+
 Purpose:
 
 - Make the system look and feel like a research workbench, not a generic chat

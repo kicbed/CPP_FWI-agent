@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Web UI HTTP Server for AI Agent Orchestrator.
+Lab Agent Workbench HTTP Server.
 
 Serves the frontend and provides a simple HTTP server.
 Usage: python3 web/serve.py [port]
@@ -55,7 +55,7 @@ def main():
     with socketserver.TCPServer(("", port), Handler) as httpd:
         url = f"http://localhost:{port}"
         print(f"\033[1;36m┌─────────────────────────────────────────┐\033[0m")
-        print(f"\033[1;36m│\033[0m  🌐 Web UI 服务器已启动                  \033[1;36m│\033[0m")
+        print(f"\033[1;36m│\033[0m  🌐 Lab Agent Workbench 已启动          \033[1;36m│\033[0m")
         print(f"\033[1;36m│\033[0m  📍 {url:<33} \033[1;36m│\033[0m")
         print(f"\033[1;36m│\033[0m  按 Ctrl+C 停止                         \033[1;36m│\033[0m")
         print(f"\033[1;36m└─────────────────────────────────────────┘\033[0m")

@@ -37,6 +37,8 @@ Current status:
   structured algorithm recommendations, assumptions, parameter tables, risk
   analysis, ExperimentSpec JSON, dry-run JobSpec text, and reproducible
   experiment records.
+- Starts the v0.5 Lab Agent Workbench UI direction by renaming the browser
+  surface from a generic orchestrator chat page to a research workbench brand.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -81,6 +83,11 @@ Current v0.4 state:
   FWI planning signals from a request, retrieves matching AlgorithmCards and
   knowledge notes, and `PlannerAnswer` creates a structured dry-run plan and
   reproducible experiment record.
+
+Current v0.5 state:
+
+- Lab Workbench UI has started: the static Web UI title, sidebar brand, welcome
+  state, footer, and local server banner now use Lab Agent Workbench branding.
 
 ## Technical Highlights
 
@@ -140,6 +147,8 @@ Use only bullets that match the completed implementation.
 - Added a PlannerAnswer layer that converts grounded planner context into
   structured dry-run experiment plans, including ExperimentSpec, JobSpec, risk
   analysis, and reproducible records.
+- Renamed the Web UI brand to Lab Agent Workbench and added a CTest guard for
+  the static UI and server branding text.
 
 Planned after v0.4:
 
@@ -283,3 +292,10 @@ Add one short entry whenever a meaningful technical change lands.
   dry-run JobSpec, and reproducible experiment records.
 - Updated the Experiment Planner Agent prompt path so deterministic structured
   scaffolds are available before LLM generation.
+
+### 2026-06-12: Lab Agent Workbench Branding
+
+- Renamed the static Web UI title, sidebar, welcome state, footer, and local
+  server banner to Lab Agent Workbench.
+- Added a CTest branding guard so future UI work does not regress to generic
+  orchestrator-chat wording.

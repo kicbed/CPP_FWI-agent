@@ -987,3 +987,55 @@ Commit:
 Next task:
 - Start v0.4 Experiment Planner by wiring AlgorithmCard and
   ResearchKnowledgeBase retrieval into deterministic planner context.
+
+## 2026-06-12: Start v0.5 Lab Agent Workbench Branding
+
+Scope:
+- Started v0.5 Lab Workbench UI with a focused branding rename.
+- Added a static Web branding CTest guard.
+
+Files changed:
+- `web/index.html`
+- `web/serve.py`
+- `tests/check_web_branding.cmake`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Browser title, sidebar brand, welcome state, footer, and local Web server
+  startup banner now say Lab Agent Workbench instead of generic orchestrator
+  chat branding.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, arbitrary
+  shell execution, or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  `WebBrandingTest` missing `<title>Lab Agent Workbench</title>`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R WebBrandingTest --output-on-failure`
+- `python3 web/serve.py 18080` plus `curl http://localhost:18080/`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED `WebBrandingTest` failed for the expected missing Lab Agent
+  Workbench title before implementation.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `WebBrandingTest` passed after the UI and server branding rename.
+- PASS. `curl` against `http://localhost:18080/` found the new title,
+  sidebar/welcome text, research-workbench copy, and footer branding. The
+  container could not open a graphical browser through `xdg-open`, so the smoke
+  check used curl.
+- PASS. Full `ctest` passed 24/24 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This Lab Agent Workbench branding commit.
+
+Next task:
+- Add the first Lab Workbench inspector panel for selected agent, tool calls,
+  and generated specs.
