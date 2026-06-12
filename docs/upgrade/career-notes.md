@@ -26,9 +26,10 @@ Current status:
   validation.
 - Includes `ExperimentSpec`, `JobSpec`, and `DryRunBackend` models for safe
   experiment planning without submitting jobs.
-- Includes an initial v0.3 `ResearchKnowledgeNote` and `ResearchKnowledgeBase`
-  for JSON-backed paper, algorithm, experiment, and failure-case notes with
-  deterministic local retrieval.
+- Includes a v0.3 `ResearchKnowledgeNote` and `ResearchKnowledgeBase` for
+  JSON-backed paper, algorithm, experiment, and failure-case notes with
+  deterministic local retrieval by method, failure mode, parameter advice, and
+  dataset.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -48,7 +49,8 @@ Current architecture:
   metadata tools.
 - Retrieval layer: Agent-RAG for dynamic agent selection, Tool-RAG for tool
   selection, local FWI knowledge retrieval, and structured v0.3 research
-  knowledge retrieval by note type, method, failure mode, and parameter advice.
+  knowledge retrieval by note type, method, failure mode, parameter advice, and
+  dataset.
 - Memory layer: Redis-backed session history, agent memory, and task state.
 
 Current v0.2 state:
@@ -59,9 +61,9 @@ Current v0.2 state:
 
 Current v0.3 state:
 
-- Research Knowledge Base has started with typed local JSON notes under
+- Research Knowledge Base is complete: typed local JSON notes under
   `resources/research_knowledge`, deterministic C++ loading, validation, and
-  tests for method and failure-mode advice retrieval.
+  tests for method, failure-mode, parameter-advice, and dataset retrieval.
 
 ## Technical Highlights
 
@@ -107,12 +109,11 @@ Use only bullets that match the completed implementation.
   specialist and grounds prompts in local AlgorithmCards while preserving
   dry-run-only execution boundaries.
 - Added a structured research knowledge base with typed JSON notes and tested
-  retrieval by method, failure mode, and parameter advice for FWI planning.
+  retrieval by method, failure mode, parameter advice, and dataset for FWI
+  planning.
 
-Planned after v0.3 start:
+Planned after v0.3 completion:
 
-- Add remaining structured notes for AWI, adjoint-state gradients, and broader
-- Add dataset-based knowledge retrieval to complete the v0.3 roadmap contract.
 - Wire structured knowledge retrieval into the Experiment Planner response
   path before hardening planner output quality.
 
@@ -230,3 +231,8 @@ Add one short entry whenever a meaningful technical change lands.
   diagnosis, misfit-function choice, and gradient-check advice.
 - Extended deterministic knowledge tests so v0.3 content coverage is protected
   by method, failure-mode, and parameter-advice retrieval assertions.
+
+### 2026-06-12: v0.3 Research Knowledge Completion
+
+- Added dataset-based research knowledge retrieval and marked v0.3 complete.
+- Added a v0.3 test report with Chinese learning and interview-prep summary.

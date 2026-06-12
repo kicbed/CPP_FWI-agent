@@ -16,7 +16,9 @@ Version status:
   `docs/upgrade/version-roadmap.md`.
 - v0.3 Research Knowledge Base started on 2026-06-12 with structured local
   knowledge notes, deterministic file loading, and retrieval tests.
-- Remaining planner quality tasks below are future hardening work for v0.3/v0.4,
+- v0.3 Research Knowledge Base is complete as of 2026-06-12 according to
+  `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.3.md`.
+- Remaining planner quality tasks below are future hardening work for v0.4,
   not blockers for the v0.2 MVP completion.
 
 ## Milestone 0: Baseline And Project Story
@@ -152,7 +154,7 @@ Tasks:
 - [x] M6-T5: Add structured notes for multi-scale FWI, AWI, cycle skipping, and adjoint-state gradient.
 - [x] M6-T6: Extend knowledge retrieval to include note type, method, assumptions, parameter advice, and failure modes.
 - [x] M6-T7: Add tests for retrieving advice by failure mode and algorithm method.
-- [ ] M6-T8: Add dataset-based knowledge retrieval and tests.
+- [x] M6-T8: Add dataset-based knowledge retrieval and tests.
 
 Acceptance:
 

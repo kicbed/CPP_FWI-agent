@@ -21,10 +21,16 @@ Upgrade the project from a rough multi-agent/FWI demo into:
 - Better README and roadmap.
 - No real CUDA/MPI or cluster execution yet.
 
-The current target is `v0.3 Research Knowledge Base`: structured paper notes,
-algorithm notes, experiment notes, failure cases, and parameter-advice
-retrieval. v0.3 started on 2026-06-12 with JSON-backed local knowledge notes
-and deterministic retrieval tests.
+`v0.3 Research Knowledge Base` is complete as of 2026-06-12:
+
+- JSON-backed paper, algorithm, experiment, and failure-case notes.
+- Deterministic local loading and validation.
+- Retrieval by note type, method, failure mode, parameter advice, and dataset.
+- v0.3 test report and Chinese learning summary.
+
+The next target is `v0.4 Experiment Planner`: structured experiment planning,
+risk analysis, dry-run jobs, and reproducible experiment records grounded in
+AlgorithmCards and the v0.3 knowledge base.
 
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.

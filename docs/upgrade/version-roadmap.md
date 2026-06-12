@@ -54,8 +54,8 @@ Next target after v0.2:
 
 ## v0.3: Research Knowledge Base
 
-Status: Started on 2026-06-12 with JSON-backed local research knowledge notes,
-typed directories, deterministic loading, and retrieval tests.
+Status: Completed on 2026-06-12 with JSON-backed local research knowledge
+notes, typed directories, deterministic loading, and retrieval tests.
 
 Purpose:
 
@@ -74,6 +74,12 @@ Example user value:
 
 - "Low frequency is missing. Should I use multi-scale FWI, AWI, envelope
   inversion, or frequency extrapolation?"
+
+Next target after v0.3:
+
+- Start v0.4 Experiment Planner so user requests can produce structured
+  algorithm recommendations, parameter tables, risk analysis, dry-run JobSpecs,
+  and reproducible experiment records grounded in v0.3 knowledge.
 
 ## v0.4: Experiment Planner
 

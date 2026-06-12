@@ -202,6 +202,16 @@ std::vector<ResearchKnowledgeNote> ResearchKnowledgeBase::filter_by_method(
     return matches;
 }
 
+std::vector<ResearchKnowledgeNote> ResearchKnowledgeBase::filter_by_dataset(
+    const std::string& dataset) const {
+    std::vector<ResearchKnowledgeNote> matches;
+    std::copy_if(notes_.begin(), notes_.end(), std::back_inserter(matches),
+                 [&dataset](const ResearchKnowledgeNote& note) {
+                     return contains(note.datasets, dataset);
+                 });
+    return matches;
+}
+
 std::vector<ResearchKnowledgeNote> ResearchKnowledgeBase::find_by_failure_mode(
     const std::string& failure_mode) const {
     std::vector<ResearchKnowledgeNote> matches;

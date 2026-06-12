@@ -42,6 +42,8 @@ public:
         const std::string& note_type) const;
     std::vector<ResearchKnowledgeNote> filter_by_method(
         const std::string& method) const;
+    std::vector<ResearchKnowledgeNote> filter_by_dataset(
+        const std::string& dataset) const;
     std::vector<ResearchKnowledgeNote> find_by_failure_mode(
         const std::string& failure_mode) const;
     std::vector<std::string> parameter_advice_for(

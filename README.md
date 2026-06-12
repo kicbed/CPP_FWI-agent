@@ -3,10 +3,10 @@
 FWI-first research computing agent workbench built on C++, gRPC, A2A, MCP, RAG,
 and multi-agent orchestration.
 
-The current version supports research Q&A, FWI knowledge retrieval, MCP tool
-calling, multi-agent routing, and Web/CLI access. Real CUDA/MPI or cluster job
-execution is not enabled yet; v0.2 adds dry-run experiment planning and reserves
-the backend interface for later Slurm/PBS/server integration.
+The current version supports research Q&A, structured research knowledge
+retrieval, MCP tool calling, multi-agent routing, dry-run experiment planning,
+and Web/CLI access. Real CUDA/MPI or cluster job execution is not enabled yet;
+the current backend boundary reserves later Slurm/PBS/server integration.
 
 **首个落地场景**: FWI（全波形反演）科研助手平台
 
@@ -18,10 +18,10 @@ the backend interface for later Slurm/PBS/server integration.
   Experiment Planner agent.
 - **MCP Tools**: Standardized tool discovery and invocation for calculators,
   FWI metadata, and future lab utilities.
-- **Knowledge**: Local Markdown/JSON knowledge retrieval plus embedding-based
-  routing support.
-- **Experiment Planning**: Planned v0.2 AlgorithmCard, ExperimentSpec, JobSpec,
-  and DryRunBackend models for safe dry-run planning.
+- **Knowledge**: Local Markdown plus structured JSON research notes for papers,
+  algorithms, experiments, failure cases, and parameter advice.
+- **Experiment Planning**: AlgorithmCard, ExperimentSpec, JobSpec, and
+  DryRunBackend models for safe dry-run planning.
 
 ## 当前限制
 
@@ -166,6 +166,14 @@ The demo covers FWI knowledge Q&A, Code Agent routing, and direct dry-run
 experiment planning through the Experiment Planner Agent. It stays on
 `localhost` and does not execute CUDA/MPI jobs or connect to SSH, Slurm, PBS, or
 remote servers.
+
+### v0.3 Research Knowledge Report
+
+v0.3 adds structured local research knowledge for paper notes, algorithm notes,
+experiment notes, failure cases, parameter advice, and retrieval by method,
+failure mode, parameter, and dataset:
+
+- [v0.3 test report](docs/upgrade/test-report-v0.3.md)
 
 ## 模型切换指南
 

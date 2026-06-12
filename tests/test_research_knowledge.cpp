@@ -108,6 +108,33 @@ TEST(ResearchKnowledgeBaseTest, CoversAwiAndAdjointStateGradientNotes) {
     EXPECT_NE(awi_diagnostic, cycle_skipping_notes.end());
 }
 
+TEST(ResearchKnowledgeBaseTest, RetrievesNotesByDataset) {
+    ResearchKnowledgeBase knowledge;
+    std::string error;
+    ASSERT_TRUE(knowledge.load_from_directory(
+        repo_root() / "resources" / "research_knowledge", &error)) << error;
+
+    const auto marmousi_notes = knowledge.filter_by_dataset("marmousi");
+    EXPECT_GE(marmousi_notes.size(), 4u);
+    EXPECT_TRUE(std::all_of(
+        marmousi_notes.begin(), marmousi_notes.end(),
+        [](const ResearchKnowledgeNote& note) {
+            return std::find(note.datasets.begin(), note.datasets.end(), "marmousi") !=
+                note.datasets.end();
+        }));
+
+    const auto field_notes = knowledge.filter_by_dataset("field-shot-gather");
+    ASSERT_FALSE(field_notes.empty());
+    EXPECT_NE(std::find_if(
+        field_notes.begin(), field_notes.end(),
+        [](const ResearchKnowledgeNote& note) {
+            return note.id == "algorithm.awi";
+        }), field_notes.end());
+
+    const auto unknown_notes = knowledge.filter_by_dataset("unknown-dataset");
+    EXPECT_TRUE(unknown_notes.empty());
+}
+
 TEST(ResearchKnowledgeBaseTest, RejectsInvalidNotesWithClearError) {
     const auto temp_root = std::filesystem::temp_directory_path() /
         "agent_rpc_research_knowledge_invalid_test";

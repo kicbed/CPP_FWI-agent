@@ -800,3 +800,52 @@ Commit:
 
 Next task:
 - Add dataset-based knowledge retrieval and tests for v0.3 roadmap completion.
+
+## 2026-06-12: Complete v0.3 Research Knowledge Base
+
+Scope:
+- Added dataset-based retrieval to `ResearchKnowledgeBase`.
+- Added v0.3 completion docs and a v0.3 test report with Chinese learning and
+  interview-prep notes.
+- Updated upgrade docs to move the next target to v0.4 Experiment Planner.
+
+Files changed:
+- `README.md`
+- `research/include/agent_rpc/research/research_knowledge.h`
+- `research/src/research_knowledge.cpp`
+- `tests/test_research_knowledge.cpp`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/test-report-v0.3.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Research knowledge retrieval now supports dataset lookup in addition to note
+  type, method, failure mode, and parameter-advice lookup.
+- v0.3 Research Knowledge Base is documented as complete.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, or remote execution was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  undefined `ResearchKnowledgeBase::filter_by_dataset`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ResearchKnowledge --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED build failed for the expected missing
+  `ResearchKnowledgeBase::filter_by_dataset` implementation.
+- PASS. Targeted `ResearchKnowledgeTest` passed 1/1 after implementation.
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 21/21 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.3 Research Knowledge completion commit.
+
+Next task:
+- Start v0.4 Experiment Planner by wiring AlgorithmCard and
+  ResearchKnowledgeBase retrieval into deterministic planner context.
