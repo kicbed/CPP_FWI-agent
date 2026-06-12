@@ -100,6 +100,28 @@
     .markdown-body hr { border: none; border-top: 1px solid #E2E8F0; margin: 16px 0; }
     .markdown-body strong { color: #0F172A; }
 
+    .workbench-card {
+      background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px;
+    }
+    .workbench-card.active { border-color: #4F46E5; background: #EEF2FF; }
+    .data-pill {
+      display: inline-flex; align-items: center; gap: 4px; border-radius: 999px;
+      padding: 2px 8px; font-size: 11px; font-weight: 600;
+      background: #ECFDF5; color: #047857;
+    }
+    .data-pill.warning { background: #FFFBEB; color: #B45309; }
+    .kv-grid {
+      display: grid; grid-template-columns: minmax(96px, 38%) 1fr;
+      border: 1px solid #E2E8F0; border-radius: 8px; overflow: hidden;
+    }
+    .kv-grid dt, .kv-grid dd {
+      padding: 7px 9px; border-bottom: 1px solid #E2E8F0; font-size: 12px;
+    }
+    .kv-grid dt { background: #F8FAFC; color: #64748B; font-weight: 600; }
+    .kv-grid dd { color: #1E293B; overflow-wrap: anywhere; }
+    .kv-grid dt:last-of-type, .kv-grid dd:last-of-type { border-bottom: 0; }
+    .status-dot { width: 8px; height: 8px; border-radius: 999px; background: #CBD5E1; }
+
     @keyframes pulse-green {
       0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.4); }
       50% { box-shadow: 0 0 0 6px rgba(16,185,129,0); }
@@ -160,10 +182,22 @@
       </button>
     </div>
 
+    <!-- Algorithm Cards -->
+    <div class="px-4 pt-4">
+      <p class="text-xs text-slate-400 uppercase tracking-wider mb-2 font-medium">算法库</p>
+      <div id="algorithmList" class="space-y-2"></div>
+    </div>
+
     <!-- Chat History -->
-    <div class="flex-1 overflow-y-auto px-4 pt-4">
+    <div class="flex-1 overflow-y-auto px-4 pt-4 min-h-0">
       <p class="text-xs text-slate-400 uppercase tracking-wider mb-2 font-medium">历史对话</p>
       <div id="chatHistory" class="space-y-1"></div>
+    </div>
+
+    <!-- Experiment History -->
+    <div class="px-4 pt-3 pb-3 border-t border-slate-100">
+      <p class="text-xs text-slate-400 uppercase tracking-wider mb-2 font-medium">实验历史</p>
+      <div id="experimentHistory" class="space-y-2"></div>
     </div>
 
     <!-- System Status -->
@@ -182,6 +216,41 @@
           <div class="flex items-center gap-1.5">
             <div id="statusGrpc" class="w-2 h-2 rounded-full bg-slate-300"></div>
             <span id="statusGrpcText" class="text-xs text-slate-400">检测中</span>
+          </div>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-500">Registry</span>
+          <div class="flex items-center gap-1.5">
+            <div id="statusRegistry" class="status-dot"></div>
+            <span id="statusRegistryText" class="text-xs text-slate-400">检测中</span>
+          </div>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-500">MCP</span>
+          <div class="flex items-center gap-1.5">
+            <div id="statusMcp" class="status-dot"></div>
+            <span id="statusMcpText" class="text-xs text-slate-400">本地 stdio</span>
+          </div>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-500">Embedding</span>
+          <div class="flex items-center gap-1.5">
+            <div id="statusEmbedding" class="status-dot"></div>
+            <span id="statusEmbeddingText" class="text-xs text-slate-400">检测中</span>
+          </div>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-500">Code Agent</span>
+          <div class="flex items-center gap-1.5">
+            <div id="statusCodeAgent" class="status-dot"></div>
+            <span id="statusCodeAgentText" class="text-xs text-slate-400">检测中</span>
+          </div>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-500">Planner Agent</span>
+          <div class="flex items-center gap-1.5">
+            <div id="statusPlannerAgent" class="status-dot"></div>
+            <span id="statusPlannerAgentText" class="text-xs text-slate-400">检测中</span>
           </div>
         </div>
         <div class="flex items-center justify-between">
@@ -217,17 +286,29 @@
         <h3 class="font-heading text-xl font-bold mb-2 text-slate-900">Lab Agent Workbench</h3>
         <p class="text-slate-400 text-sm max-w-md mb-6">FWI-first research computing workbench，支持 HTTP 直连和 gRPC 两种通信模式。输入你的科研问题开始规划、检索或对话。</p>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg w-full">
-          <button onclick="sendQuick('说一说数字孪生地球')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm">
-            <span class="text-accent">🌏</span> <span class="text-slate-700">数字孪生地球</span>
+          <button onclick="sendQuick('说一说数字孪生地球')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm flex items-center gap-2">
+            <span class="w-5 h-5 rounded-md bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" stroke-width="2"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></svg>
+            </span>
+            <span class="text-slate-700">数字孪生地球</span>
           </button>
-          <button onclick="sendQuick('说说最先进的工程agent')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm">
-            <span class="text-accent">🤖</span> <span class="text-slate-700">最先进的工程 Agent</span>
+          <button onclick="sendQuick('说说最先进的工程agent')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm flex items-center gap-2">
+            <span class="w-5 h-5 rounded-md bg-indigo-50 text-accent flex items-center justify-center shrink-0">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="5" y="7" width="14" height="11" rx="2" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M9 11h.01M15 11h.01M12 4v3"/></svg>
+            </span>
+            <span class="text-slate-700">最先进的工程 Agent</span>
           </button>
-          <button onclick="sendQuick('解释一下FWI理论')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm">
-            <span class="text-accent">📡</span> <span class="text-slate-700">FWI 理论</span>
+          <button onclick="sendQuick('解释一下FWI理论')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm flex items-center gap-2">
+            <span class="w-5 h-5 rounded-md bg-cyan-50 text-cyan-700 flex items-center justify-center shrink-0">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 19c4-10 12-10 16 0M8 19c2-5 6-5 8 0M12 19v-7"/></svg>
+            </span>
+            <span class="text-slate-700">FWI 理论</span>
           </button>
-          <button onclick="sendQuick('帮我解一个微分方程')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm">
-            <span class="text-accent">📐</span> <span class="text-slate-700">微分方程</span>
+          <button onclick="sendQuick('帮我解一个微分方程')" class="p-3 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-left text-sm transition-all duration-200 hover:border-accent/30 hover:shadow-sm flex items-center gap-2">
+            <span class="w-5 h-5 rounded-md bg-amber-50 text-amber-700 flex items-center justify-center shrink-0">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19h14M7 16l5-11 5 11M9 12h6"/></svg>
+            </span>
+            <span class="text-slate-700">微分方程</span>
           </button>
         </div>
       </div>
@@ -288,6 +369,57 @@
     </div>
   </main>
 
+  <!-- Workbench Inspector -->
+  <aside id="workbenchInspector" class="hidden xl:flex w-96 bg-white border-l border-slate-200 h-full shrink-0 flex-col">
+    <div class="h-14 border-b border-slate-200 px-5 flex items-center justify-between shrink-0">
+      <div>
+        <h2 class="font-heading text-sm font-semibold text-slate-900">Workbench Inspector</h2>
+        <p class="text-xs text-slate-400">dry-run research state</p>
+      </div>
+      <span class="data-pill warning">dry_run: true</span>
+    </div>
+
+    <div class="flex-1 overflow-y-auto p-4 space-y-4">
+      <section class="workbench-card p-3">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-xs uppercase tracking-wider text-slate-500 font-semibold">Service Status</h3>
+          <span class="text-[11px] text-slate-400">localhost</span>
+        </div>
+        <div id="inspectorStatusGrid" class="grid grid-cols-2 gap-2 text-xs"></div>
+      </section>
+
+      <section class="workbench-card p-3">
+        <h3 class="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3">Route Trace</h3>
+        <div id="routeTrace" class="space-y-2"></div>
+      </section>
+
+      <section class="workbench-card p-3">
+        <h3 class="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3">Tool Calls</h3>
+        <div id="toolCalls" class="space-y-2"></div>
+      </section>
+
+      <section class="workbench-card p-3">
+        <h3 class="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3">AlgorithmCard</h3>
+        <div id="selectedAlgorithmCard"></div>
+      </section>
+
+      <section class="workbench-card p-3">
+        <h3 class="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3">Parameter Table</h3>
+        <div id="parameterTable"></div>
+      </section>
+
+      <section class="workbench-card p-3">
+        <h3 class="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3">ExperimentSpec</h3>
+        <div id="experimentSpecPanel"></div>
+      </section>
+
+      <section class="workbench-card p-3">
+        <h3 class="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3">JobSpec</h3>
+        <div id="jobSpecPanel"></div>
+      </section>
+    </div>
+  </aside>
+
   <!-- Toast notification -->
   <div id="toast" class="fixed bottom-20 left-1/2 -translate-x-1/2 px-4 py-2 bg-slate-900 text-white border border-slate-700 rounded-lg text-sm shadow-xl transition-all duration-300 opacity-0 translate-y-2 pointer-events-none z-50"></div>
 
@@ -300,6 +432,7 @@
       streaming: false,
       abortController: null,
       contextId: null,
+      selectedAlgorithmId: 'fwi-cuda-mpi',
     };
 
     const CONFIG = {
@@ -307,9 +440,126 @@
       grpc: { url: 'http://localhost:50052', label: 'gRPC :50052' },
     };
 
+    const ALGORITHM_CARDS = [
+      {
+        id: 'fwi-cuda-mpi',
+        name: 'CUDA-MPI FWI',
+        domain: 'seismic inversion',
+        description: 'Full waveform inversion dry-run planning card for future CUDA/MPI lab integration.',
+        tags: ['fwi', 'cuda', 'mpi', 'inversion'],
+        parameters: [
+          ['frequency_band', 'Start low, then widen by stage'],
+          ['step_length', 'Use conservative line search before trusting loss trends'],
+          ['niter', 'Keep early dry-runs short and inspect gradients'],
+          ['regularization', 'Stabilize updates when low frequency is missing'],
+          ['initial_model', 'Smooth Marmousi-style starting model']
+        ],
+        inputs: ['velocity_model', 'shot_gather', 'wavelet'],
+        outputs: ['inverted_model', 'loss_curve', 'gradient'],
+        failure_modes: ['cycle_skipping', 'unstable_gradient', 'mpi_runtime_error'],
+        backend: 'dry_run',
+        job_spec_supported: true
+      },
+      {
+        id: 'frequency-extrapolation',
+        name: 'Frequency Extrapolation',
+        domain: 'seismic signal processing',
+        description: 'Low-frequency reconstruction planning card before inversion.',
+        tags: ['frequency', 'extrapolation', 'low-frequency', 'preprocessing'],
+        parameters: [
+          ['input_band', 'Observed usable frequency band'],
+          ['target_band', 'Synthetic low-frequency target'],
+          ['regularization', 'Prevent spectrum overfit'],
+          ['training_window', 'Window used to fit extrapolation model']
+        ],
+        inputs: ['shot_gather', 'wavelet', 'frequency_mask'],
+        outputs: ['extrapolated_data', 'quality_metrics'],
+        failure_modes: ['overfit_spectrum', 'phase_distortion', 'noise_amplification'],
+        backend: 'dry_run',
+        job_spec_supported: true
+      },
+      {
+        id: 'poststack-inversion',
+        name: 'Post-stack Inversion',
+        domain: 'seismic inversion',
+        description: 'Impedance inversion planning card for stacked seismic data.',
+        tags: ['poststack', 'impedance', 'inversion'],
+        parameters: [
+          ['wavelet', 'Estimated wavelet for stacked trace matching'],
+          ['low_frequency_model', 'Background impedance trend'],
+          ['regularization', 'Smoothness or blockiness constraint'],
+          ['niter', 'Iteration budget for dry-run plan']
+        ],
+        inputs: ['stacked_seismic', 'well_logs', 'wavelet'],
+        outputs: ['impedance_volume', 'inversion_misfit'],
+        failure_modes: ['wavelet_mismatch', 'low_frequency_bias', 'over_smoothing'],
+        backend: 'dry_run',
+        job_spec_supported: true
+      }
+    ];
+
+    const DEFAULT_EXPERIMENT_SPEC = {
+      algorithm_id: 'fwi-cuda-mpi',
+      dataset_id: 'marmousi2-dry-run',
+      parameters: {
+        frequency_band: '3-8 Hz then 8-12 Hz',
+        step_length: 'line_search',
+        niter: '10',
+        regularization: 'tv_smoothing',
+        initial_model: 'smooth_marmousi'
+      },
+      resources: {
+        mpi_processes: 4,
+        gpu_count: 0,
+        time_limit_minutes: 60
+      },
+      expected_outputs: ['loss_curve.json', 'gradient_norm.csv', 'model_preview.vti']
+    };
+
+    const DEFAULT_JOB_SPEC = {
+      dry_run: true,
+      backend: 'dry_run',
+      command: './fwi_solver --config marmousi_multiscale.json',
+      working_dir: './experiments/marmousi-dry-run',
+      mpi_processes: 4,
+      gpu_count: 0,
+      time_limit_minutes: 60,
+      artifacts: ['loss_curve.json', 'gradient_norm.csv', 'model_preview.vti']
+    };
+
+    const DEFAULT_ROUTE_TRACE = [
+      ['User Request', 'FWI planning intent'],
+      ['Orchestrator', 'routes to experiment-planner'],
+      ['Experiment Planner', 'grounds answer in AlgorithmCards and knowledge notes'],
+      ['DryRunBackend', 'renders JobSpec preview only']
+    ];
+
+    const DEFAULT_TOOL_CALLS = [
+      ['algorithm_registry.list', 'read-only AlgorithmCard metadata'],
+      ['research_knowledge.retrieve', 'local notes by method, dataset, and failure mode'],
+      ['dry_run_backend.render', 'JobSpec preview with dry_run boundary']
+    ];
+
+    const SERVICE_STATUS_ITEMS = [
+      ['Orchestrator', 'statusOrchestrator'],
+      ['Registry', 'statusRegistry'],
+      ['MCP', 'statusMcp'],
+      ['Embedding', 'statusEmbedding'],
+      ['Code Agent', 'statusCodeAgent'],
+      ['Planner Agent', 'statusPlannerAgent']
+    ];
+
     // ===== Init =====
     document.addEventListener('DOMContentLoaded', () => {
       switchMode(state.mode);
+      renderAlgorithmList();
+      renderExperimentHistory();
+      renderInspectorStatusGrid();
+      selectAlgorithm(state.selectedAlgorithmId);
+      renderRouteTrace(DEFAULT_ROUTE_TRACE);
+      renderToolCalls(DEFAULT_TOOL_CALLS);
+      renderExperimentSpec(DEFAULT_EXPERIMENT_SPEC);
+      renderJobSpec(DEFAULT_JOB_SPEC);
       renderHistory();
       checkStatus();
       setInterval(checkStatus, 15000);
@@ -345,6 +595,7 @@
       document.getElementById('messages').classList.add('hidden');
       document.getElementById('welcomeMsg').classList.remove('hidden');
       document.getElementById('chatTitle').textContent = '新对话';
+      resetWorkbenchDemo();
       renderHistory();
     }
 
@@ -354,6 +605,7 @@
       msgs.classList.add('hidden');
       document.getElementById('welcomeMsg').classList.remove('hidden');
       state.contextId = null;
+      resetWorkbenchDemo();
     }
 
     function loadChat(chatId) {
@@ -691,6 +943,9 @@
       }
 
       msgs.appendChild(el);
+      if (role === 'assistant' && !streaming) {
+        updateInspectorFromAnswer(content);
+      }
       return el;
     }
 
@@ -718,7 +973,265 @@
           </button>`;
           wrapper.appendChild(btn);
         }
+        updateInspectorFromAnswer(content);
       }
+    }
+
+    // ===== Workbench Inspector =====
+    function resetWorkbenchDemo() {
+      selectAlgorithm('fwi-cuda-mpi');
+      renderRouteTrace(DEFAULT_ROUTE_TRACE);
+      renderToolCalls(DEFAULT_TOOL_CALLS);
+      renderExperimentSpec(DEFAULT_EXPERIMENT_SPEC);
+      renderJobSpec(DEFAULT_JOB_SPEC);
+    }
+
+    function renderAlgorithmList() {
+      const container = document.getElementById('algorithmList');
+      if (!container) return;
+      container.innerHTML = ALGORITHM_CARDS.map(card => {
+        const active = card.id === state.selectedAlgorithmId ? 'active' : '';
+        return `<button onclick="selectAlgorithm('${card.id}')" class="workbench-card ${active} w-full p-2 text-left transition-colors">
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-xs font-semibold text-slate-800">${escapeHtml(card.name)}</span>
+            <span class="text-[10px] uppercase tracking-wide text-emerald-700">${escapeHtml(card.backend)}</span>
+          </div>
+          <p class="text-[11px] text-slate-500 mt-1 truncate">${escapeHtml(card.domain)}</p>
+        </button>`;
+      }).join('');
+    }
+
+    function renderExperimentHistory() {
+      const container = document.getElementById('experimentHistory');
+      if (!container) return;
+      container.innerHTML = `<button onclick="resetWorkbenchDemo()" class="workbench-card w-full p-2 text-left hover:border-accent/40 transition-colors">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-slate-700">marmousi2 dry-run</span>
+          <span class="data-pill warning">queued draft</span>
+        </div>
+        <p class="text-[11px] text-slate-500 mt-1">ExperimentSpec + JobSpec preview</p>
+      </button>`;
+    }
+
+    function selectAlgorithm(id) {
+      const card = ALGORITHM_CARDS.find(item => item.id === id) || ALGORITHM_CARDS[0];
+      state.selectedAlgorithmId = card.id;
+      renderAlgorithmList();
+      renderAlgorithmCard(card);
+      renderParameterTable(card.parameters);
+      renderRouteTrace([
+        ['User Request', `${card.name} planning context`],
+        ['Orchestrator', `selected tag: ${card.tags[0]}`],
+        ['AlgorithmRegistry', card.id],
+        ['DryRunBackend', 'dry_run preview only']
+      ]);
+    }
+
+    function renderAlgorithmCard(card) {
+      const container = document.getElementById('selectedAlgorithmCard');
+      if (!container) return;
+      container.innerHTML = `
+        <div class="space-y-3">
+          <div>
+            <div class="flex items-center justify-between gap-2">
+              <h4 class="text-sm font-semibold text-slate-900">${escapeHtml(card.name)}</h4>
+              <span class="data-pill">${escapeHtml(card.backend)}</span>
+            </div>
+            <p class="text-xs text-slate-500 mt-1">${escapeHtml(card.description)}</p>
+          </div>
+          <div class="flex flex-wrap gap-1">${renderPills(card.tags)}</div>
+          ${renderKeyValueGrid([
+            ['id', card.id],
+            ['domain', card.domain],
+            ['inputs', card.inputs.join(', ')],
+            ['outputs', card.outputs.join(', ')],
+            ['failure_modes', card.failure_modes.join(', ')],
+            ['job_spec_supported', String(card.job_spec_supported)]
+          ])}
+        </div>`;
+    }
+
+    function renderRouteTrace(steps) {
+      const container = document.getElementById('routeTrace');
+      if (!container) return;
+      container.innerHTML = steps.map(([name, detail], index) => `
+        <div class="flex gap-2">
+          <div class="flex flex-col items-center">
+            <div class="w-5 h-5 rounded-full bg-accent/10 text-accent text-[11px] font-semibold flex items-center justify-center">${index + 1}</div>
+            ${index < steps.length - 1 ? '<div class="w-px flex-1 bg-slate-200 my-1"></div>' : ''}
+          </div>
+          <div class="pb-2 min-w-0">
+            <p class="text-xs font-semibold text-slate-800">${escapeHtml(name)}</p>
+            <p class="text-[11px] text-slate-500 break-words">${escapeHtml(detail)}</p>
+          </div>
+        </div>`).join('');
+    }
+
+    function renderToolCalls(calls) {
+      const container = document.getElementById('toolCalls');
+      if (!container) return;
+      container.innerHTML = calls.map(([name, detail]) => `
+        <div class="rounded-lg border border-slate-200 px-2.5 py-2">
+          <div class="flex items-center justify-between gap-2">
+            <code class="text-[11px]">${escapeHtml(name)}</code>
+            <span class="data-pill">read-only</span>
+          </div>
+          <p class="text-[11px] text-slate-500 mt-1">${escapeHtml(detail)}</p>
+        </div>`).join('');
+    }
+
+    function renderParameterTable(parameters) {
+      const container = document.getElementById('parameterTable');
+      if (!container) return;
+      const rows = Array.isArray(parameters) ? parameters : Object.entries(parameters || {});
+      container.innerHTML = rows.length ? `
+        <table class="w-full text-xs border-collapse">
+          <thead><tr><th class="text-left p-2 bg-slate-50 border border-slate-200">parameter</th><th class="text-left p-2 bg-slate-50 border border-slate-200">advice</th></tr></thead>
+          <tbody>${rows.map(([key, value]) => `<tr><td class="p-2 border border-slate-200 font-mono text-accent">${escapeHtml(key)}</td><td class="p-2 border border-slate-200 text-slate-600">${escapeHtml(String(value))}</td></tr>`).join('')}</tbody>
+        </table>` : '<p class="text-xs text-slate-400">No parameters detected.</p>';
+    }
+
+    function renderExperimentSpec(spec) {
+      const container = document.getElementById('experimentSpecPanel');
+      if (!container) return;
+      const resources = spec.resources || {};
+      container.innerHTML = `
+        ${renderKeyValueGrid([
+          ['algorithm_id', spec.algorithm_id || ''],
+          ['dataset_id', spec.dataset_id || ''],
+          ['mpi_processes', String(resources.mpi_processes ?? '')],
+          ['gpu_count', String(resources.gpu_count ?? '')],
+          ['time_limit_minutes', String(resources.time_limit_minutes ?? '')],
+          ['expected_outputs', (spec.expected_outputs || []).join(', ')]
+        ])}
+        <div class="mt-3">${renderParameterTableInline(spec.parameters || {})}</div>`;
+    }
+
+    function renderJobSpec(job) {
+      const container = document.getElementById('jobSpecPanel');
+      if (!container) return;
+      container.innerHTML = `
+        <div class="mb-2 flex items-center justify-between">
+          <span class="data-pill warning">dry_run: ${String(job.dry_run ?? true)}</span>
+          <span class="text-[11px] text-slate-400">${escapeHtml(job.backend || 'dry_run')}</span>
+        </div>
+        ${renderKeyValueGrid([
+          ['command', job.command || ''],
+          ['working_dir', job.working_dir || ''],
+          ['mpi_processes', String(job.mpi_processes ?? '')],
+          ['gpu_count', String(job.gpu_count ?? '')],
+          ['time_limit_minutes', String(job.time_limit_minutes ?? '')],
+          ['artifacts', (job.artifacts || job.artifact_paths || []).join(', ')]
+        ])}`;
+    }
+
+    function updateInspectorFromAnswer(content) {
+      if (!content) return;
+      const lower = content.toLowerCase();
+      if (lower.includes('frequency-extrapolation') || lower.includes('frequency extrapolation')) {
+        selectAlgorithm('frequency-extrapolation');
+      } else if (lower.includes('poststack') || lower.includes('post-stack')) {
+        selectAlgorithm('poststack-inversion');
+      } else if (lower.includes('fwi') || lower.includes('marmousi')) {
+        selectAlgorithm('fwi-cuda-mpi');
+      }
+
+      const spec = extractExperimentSpec(content);
+      if (spec) {
+        renderExperimentSpec(spec);
+        if (spec.parameters) renderParameterTable(spec.parameters);
+      }
+
+      const job = extractJobSpec(content);
+      if (job) renderJobSpec(job);
+
+      renderToolCalls(DEFAULT_TOOL_CALLS);
+    }
+
+    function extractExperimentSpec(text) {
+      const objects = extractJsonObjects(text);
+      return objects.find(obj => obj && typeof obj === 'object' && obj.algorithm_id && obj.dataset_id) || null;
+    }
+
+    function extractJobSpec(text) {
+      const fenced = [...text.matchAll(/```(?:yaml|yml|text)?\n([\s\S]*?)```/gi)]
+        .map(match => match[1])
+        .find(block => /dry_run:\s*true/i.test(block));
+      const block = fenced || ((text.match(/dry_run:\s*true[\s\S]*/i) || [])[0]);
+      if (!block) return null;
+
+      const job = { dry_run: true, backend: 'dry_run' };
+      const listValues = {};
+      let currentList = null;
+      block.split('\n').forEach(rawLine => {
+        const line = rawLine.trim();
+        if (!line) return;
+        const kv = line.match(/^([A-Za-z_]+):\s*(.*)$/);
+        if (kv) {
+          currentList = null;
+          const key = kv[1];
+          const value = kv[2];
+          if (['mpi_processes', 'gpu_count', 'time_limit_minutes'].includes(key)) {
+            job[key] = Number(value);
+          } else if (key === 'artifacts' || key === 'artifact_paths') {
+            currentList = 'artifacts';
+            listValues[currentList] = [];
+          } else if (key !== 'dry_run') {
+            job[key] = value;
+          }
+        } else if (currentList && line.startsWith('- ')) {
+          listValues[currentList].push(line.slice(2));
+        }
+      });
+      Object.assign(job, listValues);
+      return job;
+    }
+
+    function extractJsonObjects(text) {
+      const candidates = [...text.matchAll(/```(?:json)?\n([\s\S]*?)```/gi)].map(match => match[1].trim());
+      const objects = [];
+      candidates.forEach(candidate => {
+        try {
+          const parsed = JSON.parse(candidate);
+          if (Array.isArray(parsed)) {
+            objects.push(...parsed);
+          } else {
+            objects.push(parsed);
+          }
+        } catch (e) {}
+      });
+      return objects;
+    }
+
+    function renderInspectorStatusGrid() {
+      const container = document.getElementById('inspectorStatusGrid');
+      if (!container) return;
+      container.innerHTML = SERVICE_STATUS_ITEMS.map(([label, id]) => `
+        <div class="rounded-lg border border-slate-200 px-2 py-1.5 flex items-center justify-between gap-2">
+          <span class="text-slate-600">${escapeHtml(label)}</span>
+          <span class="flex items-center gap-1.5">
+            <span class="status-dot" data-status-mirror="${id}"></span>
+            <span class="text-[11px] text-slate-400" data-status-text-mirror="${id}">检测中</span>
+          </span>
+        </div>`).join('');
+    }
+
+    function renderPills(items) {
+      return (items || []).map(item => `<span class="data-pill">${escapeHtml(item)}</span>`).join('');
+    }
+
+    function renderKeyValueGrid(rows) {
+      return `<dl class="kv-grid">${rows.map(([key, value]) => `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(String(value))}</dd>`).join('')}</dl>`;
+    }
+
+    function renderParameterTableInline(parameters) {
+      const rows = Object.entries(parameters);
+      if (!rows.length) return '';
+      return `<div class="rounded-lg border border-slate-200 overflow-hidden">${rows.map(([key, value]) => `
+        <div class="grid grid-cols-[42%_1fr] text-xs border-b border-slate-200 last:border-b-0">
+          <span class="p-2 bg-slate-50 font-mono text-accent">${escapeHtml(key)}</span>
+          <span class="p-2 text-slate-600">${escapeHtml(String(value))}</span>
+        </div>`).join('')}</div>`;
     }
 
     function showTyping(show) {
@@ -793,12 +1306,34 @@
       } catch (e) {
         setStatus('Grpc', false, '未连接');
       }
+
+      await checkHttpStatus('Registry', 'http://localhost:8500/v1/agent/cards');
+      await checkHttpStatus('Embedding', 'http://localhost:6000/health');
+      await checkHttpStatus('CodeAgent', 'http://localhost:5010/.well-known/agent-card.json');
+      await checkHttpStatus('PlannerAgent', 'http://localhost:5011/.well-known/agent-card.json');
+      setStatus('Mcp', null, '本地 stdio');
+    }
+
+    async function checkHttpStatus(name, url) {
+      try {
+        const resp = await fetch(url, { signal: AbortSignal.timeout(2500) });
+        setStatus(name, resp.ok);
+      } catch (e) {
+        setStatus(name, false, '未连接');
+      }
     }
 
     function setStatus(name, online, customText) {
       const dot = document.getElementById(`status${name}`);
       const text = document.getElementById(`status${name}Text`);
-      if (online) {
+      const mirrorDots = document.querySelectorAll(`[data-status-mirror="status${name}"]`);
+      const mirrorTexts = document.querySelectorAll(`[data-status-text-mirror="status${name}"]`);
+      if (!dot || !text) return;
+      if (online === null) {
+        dot.className = 'w-2 h-2 rounded-full bg-amber-400';
+        text.textContent = customText || '待配置';
+        text.className = 'text-xs text-amber-600';
+      } else if (online) {
         dot.className = 'w-2 h-2 rounded-full bg-emerald-500 status-online';
         text.textContent = '运行中';
         text.className = 'text-xs text-emerald-600';
@@ -807,6 +1342,11 @@
         text.textContent = customText || '离线';
         text.className = 'text-xs text-red-400';
       }
+      mirrorDots.forEach(item => { item.className = dot.className; });
+      mirrorTexts.forEach(item => {
+        item.textContent = text.textContent;
+        item.className = text.className.replace('text-xs', 'text-[11px]');
+      });
     }
 
     // ===== Markdown Renderer =====

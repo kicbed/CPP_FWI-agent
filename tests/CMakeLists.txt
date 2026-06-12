@@ -190,6 +190,7 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         -DWEB_INDEX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../web/index.html
         -DWEB_SERVER_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../web/serve.py
+        -DV05_REPORT_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../docs/upgrade/test-report-v0.5.md
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check_web_branding.cmake
 )
 

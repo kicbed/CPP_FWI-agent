@@ -37,10 +37,19 @@ Upgrade the project from a rough multi-agent/FWI demo into:
   records grounded in AlgorithmCards and the v0.3 knowledge base.
 - v0.4 test report and Chinese learning summary.
 
-The current target is `v0.5 Lab Workbench UI`: make the Web UI show routing,
-tool calls, AlgorithmCards, ExperimentSpec, JobSpec, parameter tables, dry-run
-jobs, and service status panels. The first v0.5 step renamed the generic Web UI
-brand to Lab Agent Workbench.
+`v0.5 Lab Workbench UI` is complete as of 2026-06-12:
+
+- Browser surface renamed to Lab Agent Workbench.
+- Left-side sessions, AlgorithmCards, and experiment-history entry points.
+- Center conversation surface preserved for HTTP and gRPC modes.
+- Right-side inspector for route trace, tool calls, selected AlgorithmCard,
+  parameter table, ExperimentSpec, JobSpec, dry-run artifacts, and service
+  status.
+- Static parsing helpers for ExperimentSpec JSON and dry-run JobSpec text.
+- v0.5 smoke notes, screenshot path, test report, and Chinese learning summary.
+
+The next target is `v0.6 Lab Code Adapter`: adapt to lab code configs, logs,
+loss curves, and common failure recognizers without submitting jobs.
 
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.
@@ -157,9 +166,12 @@ These rules stay in effect until the real server backend milestone.
 
 ## Active Plans
 
-Start with:
+Historical starting plan:
 
 - `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+
+Next session should create or follow a v0.6 Lab Code Adapter plan before
+touching config-template, log-parser, loss-curve, or failure-recognizer code.
 
 When a milestone becomes too large, create a new plan in:
 

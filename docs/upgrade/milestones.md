@@ -25,6 +25,8 @@ Version status:
   `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.4.md`.
 - v0.5 Lab Workbench UI started on 2026-06-12 with Web UI branding renamed from
   a generic orchestrator chat page to Lab Agent Workbench.
+- v0.5 Lab Workbench UI is complete as of 2026-06-12 according to
+  `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.5.md`.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -174,11 +176,11 @@ Goal: make the Web UI feel like a research workbench instead of a chat-only page
 Tasks:
 
 - [x] M7-T1: Rename UI branding to Lab Agent Workbench.
-- [ ] M7-T2: Add a right-side inspector for selected agent, tool calls, and generated specs.
-- [ ] M7-T3: Add an algorithm panel that lists AlgorithmCards.
-- [ ] M7-T4: Render ExperimentSpec and JobSpec blocks as tables/cards.
-- [ ] M7-T5: Add status indicators for Orchestrator, Registry, MCP, Embedding, and Code Agent.
-- [ ] M7-T6: Add UI smoke-test notes and screenshots to the upgrade log.
+- [x] M7-T2: Add a right-side inspector for selected agent, tool calls, and generated specs.
+- [x] M7-T3: Add an algorithm panel that lists AlgorithmCards.
+- [x] M7-T4: Render ExperimentSpec and JobSpec blocks as tables/cards.
+- [x] M7-T5: Add status indicators for Orchestrator, Registry, MCP, Embedding, and Code Agent.
+- [x] M7-T6: Add UI smoke-test notes and screenshots to the upgrade log.
 
 Acceptance:
 

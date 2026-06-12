@@ -122,7 +122,8 @@ Next target after v0.4:
 
 ## v0.5: Lab Workbench UI
 
-Status: Started on 2026-06-12 with UI branding renamed to Lab Agent Workbench.
+Status: Completed on 2026-06-12 with static Lab Agent Workbench panels,
+inspector rendering, status indicators, smoke notes, and v0.5 test report.
 
 Purpose:
 
@@ -141,6 +142,23 @@ Example user value:
 
 - A demo viewer can see how agents reason, which tools were used, and what dry
   run would be executed.
+
+Completed scope:
+
+- Left panel includes sessions, AlgorithmCards, and experiment-history entry
+  points.
+- Center panel keeps the HTTP/gRPC conversation workflow.
+- Right inspector shows route trace, tool calls, selected AlgorithmCard,
+  parameter table, ExperimentSpec, JobSpec, and dry-run state.
+- Status indicators cover Orchestrator, Registry, MCP, Embedding, Code Agent,
+  Planner Agent, and gRPC bridge.
+- Static frontend helpers parse ExperimentSpec JSON blocks and dry-run JobSpec
+  text blocks from planner answers without submitting jobs.
+
+Next target after v0.5:
+
+- Start v0.6 Lab Code Adapter so users can inspect lab-style config templates,
+  logs, loss curves, and common failure patterns without running jobs.
 
 ## v0.6: Lab Code Adapter
 

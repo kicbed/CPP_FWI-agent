@@ -1039,3 +1039,70 @@ Commit:
 Next task:
 - Add the first Lab Workbench inspector panel for selected agent, tool calls,
   and generated specs.
+
+## 2026-06-12: Complete v0.5 Lab Workbench UI
+
+Scope:
+- Completed v0.5 Lab Workbench UI as one tightly related frontend batch.
+- Added left-side AlgorithmCard and experiment-history panels.
+- Added right-side inspector for route trace, tool calls, selected
+  AlgorithmCard, parameter table, ExperimentSpec, JobSpec, dry-run state, and
+  service status.
+- Added static parser/render helpers for ExperimentSpec JSON and dry-run
+  JobSpec text blocks.
+- Added v0.5 test report with detailed Chinese learning and interview-prep
+  summary.
+
+Files changed:
+- `web/index.html`
+- `tests/check_web_branding.cmake`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/test-report-v0.5.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/upgrade/screenshots/lab-workbench-v0.5-smoke.png`
+
+Behavior changed:
+- The browser UI now presents the system as a research workbench instead of a
+  chat-only page.
+- Demo viewers can inspect selected algorithms, route trace, read-only tool
+  calls, parameter advice, dry-run ExperimentSpec, dry-run JobSpec, artifacts,
+  and local service status from one screen.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, arbitrary
+  shell execution, or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  `WebBrandingTest` missing `id="algorithmList"`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R WebBrandingTest --output-on-failure`
+- `python3 web/serve.py 18080` plus `curl http://localhost:18080/`
+- Playwright screenshot smoke for
+  `docs/upgrade/screenshots/lab-workbench-v0.5-smoke.png`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. RED `WebBrandingTest` failed for the expected missing
+  `id="algorithmList"` before implementation.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. Targeted `WebBrandingTest` passed after the workbench panels and v0.5
+  report were added.
+- PASS. `curl` against `http://localhost:18080/` found the Lab Agent
+  Workbench title, algorithm panel, inspector, route trace, tool calls,
+  ExperimentSpec, JobSpec, service status, dry-run marker, and render/parser
+  helpers.
+- PASS. Playwright generated
+  `docs/upgrade/screenshots/lab-workbench-v0.5-smoke.png` as a 1440x1000 PNG.
+- PASS. Full `ctest` passed 24/24 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.5 Lab Workbench UI completion commit.
+
+Next task:
+- Start v0.6 Lab Code Adapter for config templates, log parsing, loss curve
+  parsing, and failure recognizers without submitting jobs.

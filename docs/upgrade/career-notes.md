@@ -37,8 +37,9 @@ Current status:
   structured algorithm recommendations, assumptions, parameter tables, risk
   analysis, ExperimentSpec JSON, dry-run JobSpec text, and reproducible
   experiment records.
-- Starts the v0.5 Lab Agent Workbench UI direction by renaming the browser
-  surface from a generic orchestrator chat page to a research workbench brand.
+- Includes a v0.5 Lab Agent Workbench UI that exposes sessions, AlgorithmCards,
+  experiment history, route trace, tool calls, parameter tables, ExperimentSpec,
+  JobSpec, dry-run state, and service status panels in the browser.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -86,8 +87,11 @@ Current v0.4 state:
 
 Current v0.5 state:
 
-- Lab Workbench UI has started: the static Web UI title, sidebar brand, welcome
-  state, footer, and local server banner now use Lab Agent Workbench branding.
+- Lab Workbench UI is complete for the v0.5 scope: the browser surface keeps
+  chat interaction but adds research-workbench panels for AlgorithmCards,
+  experiment history, route/tool inspection, parameter planning,
+  ExperimentSpec/JobSpec rendering, dry-run boundaries, and local service
+  status.
 
 ## Technical Highlights
 
@@ -106,6 +110,8 @@ Current v0.5 state:
 - Structured dry-run experiment planning that produces parameter tables, risk
   analysis, ExperimentSpec JSON, dry-run JobSpec previews, and versioned
   experiment records without executing jobs.
+- Static browser workbench that renders planner artifacts into inspectable
+  panels and keeps execution state visible as `dry_run: true`.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -149,12 +155,15 @@ Use only bullets that match the completed implementation.
   analysis, and reproducible records.
 - Renamed the Web UI brand to Lab Agent Workbench and added a CTest guard for
   the static UI and server branding text.
+- Upgraded the Web UI into a Lab Agent Workbench that renders route traces,
+  tool calls, AlgorithmCards, parameter tables, ExperimentSpec, JobSpec,
+  dry-run state, experiment history, and service status panels.
 
-Planned after v0.4:
+Planned after v0.5:
 
-- Upgrade the Web UI into a Lab Workbench that renders route traces,
-  AlgorithmCards, parameter tables, ExperimentSpec, JobSpec, dry-run jobs, and
-  status panels.
+- Add a Lab Code Adapter for reading lab-style config templates, parsing logs,
+  plotting loss curves, and recognizing common FWI failure patterns without job
+  submission.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -299,3 +308,14 @@ Add one short entry whenever a meaningful technical change lands.
   server banner to Lab Agent Workbench.
 - Added a CTest branding guard so future UI work does not regress to generic
   orchestrator-chat wording.
+
+### 2026-06-12: v0.5 Lab Workbench UI Completion
+
+- Added a browser-side research workbench layout with AlgorithmCards,
+  experiment history, route trace, tool calls, selected AlgorithmCard,
+  parameter table, ExperimentSpec, JobSpec, and service status panels.
+- Added static parsing helpers for ExperimentSpec JSON blocks and dry-run
+  JobSpec text blocks, preserving a preview-only boundary.
+- Added a v0.5 test report and Chinese learning summary for product story,
+  implementation details, verification evidence, safety boundaries, and
+  interview preparation.
