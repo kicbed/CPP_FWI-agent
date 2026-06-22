@@ -302,7 +302,9 @@ Next target after v0.8:
 
 - Start controlled real backend integration only after lab approval, a selected
   backend, credential handling, workspace root, authorization policy, audit
-  retention, and operator responsibilities are known.
+  retention, and operator responsibilities are known. As a preflight step, the
+  code now has a metadata-only `BackendApprovalDecision` validator that records
+  those prerequisites without enabling `local`, `ssh`, `slurm`, or `pbs`.
 
 ## v1.0: Lab-Usable Platform
 

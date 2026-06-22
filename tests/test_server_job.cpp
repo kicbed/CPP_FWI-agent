@@ -97,3 +97,61 @@ TEST(ServerJobTest, AppendsLifecycleEventWithoutExecutingCommands) {
     ASSERT_EQ(record.status_events.size(), 1u);
     EXPECT_NE(record.status_events[0].find("queued by fake backend"), std::string::npos);
 }
+
+TEST(ServerJobTest, RejectsRealBackendApprovalWithoutLabDecisionInputs) {
+    BackendApprovalDecision decision;
+    decision.backend_type = JobBackendType::Local;
+
+    const auto errors = validate_backend_approval_decision(decision);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "lab approval is required before selecting a real backend"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "approval_reference is required"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "workspace_root is required"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "authorization_policy is required"),
+        errors.end());
+}
+
+TEST(ServerJobTest, RejectsDryRunAsRealBackendApprovalDecision) {
+    BackendApprovalDecision decision;
+    decision.backend_type = JobBackendType::DryRun;
+    decision.lab_approved = true;
+    decision.approved_by = "lab-pi";
+    decision.approval_reference = "approval-2026-06-22";
+    decision.workspace_root = "/lab/workspaces/agent";
+    decision.credential_reference = "vault://lab/backend/local";
+    decision.authorization_policy = "lab-members-only";
+    decision.audit_retention_policy = "retain-180-days";
+    decision.operator_contact = "lab-ops";
+
+    const auto errors = validate_backend_approval_decision(decision);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "real backend approval must select local, ssh, slurm, or pbs"),
+        errors.end());
+}
+
+TEST(ServerJobTest, CompleteApprovalRecordDoesNotEnableRuntimeBackend) {
+    BackendApprovalDecision decision;
+    decision.backend_type = JobBackendType::Local;
+    decision.lab_approved = true;
+    decision.approved_by = "lab-pi";
+    decision.approval_reference = "approval-2026-06-22";
+    decision.workspace_root = "/lab/workspaces/agent";
+    decision.credential_reference = "vault://lab/backend/local";
+    decision.authorization_policy = "lab-members-only";
+    decision.audit_retention_policy = "retain-180-days";
+    decision.operator_contact = "lab-ops";
+
+    EXPECT_TRUE(validate_backend_approval_decision(decision).empty());
+
+    const auto runtime_errors = validate_backend_enabled(decision.backend_type);
+    ASSERT_FALSE(runtime_errors.empty());
+    EXPECT_NE(runtime_errors[0].find("only dry_run is enabled"), std::string::npos);
+}

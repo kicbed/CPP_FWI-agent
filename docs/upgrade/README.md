@@ -79,6 +79,15 @@ Upgrade the project from a rough multi-agent/FWI demo into:
 - Runtime remains dry-run only; non-`dry_run` backend values are still
   rejected.
 
+`Milestone 11 preflight` started on 2026-06-22:
+
+- Metadata-only backend approval decision validation.
+- Requires lab approval, approval reference, workspace root, credential
+  reference, authorization policy, audit retention, and operator contact before
+  any real backend can be considered selected.
+- Runtime remains dry-run only; `local`, `ssh`, `slurm`, and `pbs` are still
+  rejected by the shared backend guard.
+
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.
 

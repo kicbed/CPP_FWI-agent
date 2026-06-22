@@ -52,6 +52,10 @@ Current status:
 - Includes v0.8 C++ server-job safety models and tests for dry-run default
   requests, approved template validation, workspace traversal rejection, and
   in-memory lifecycle records.
+- Includes a Milestone 11 preflight approval gate for future real backend
+  selection; the gate requires lab approval, approval reference, workspace root,
+  credential reference, authorization policy, audit retention, and operator
+  contact, but still does not enable real execution.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -128,6 +132,13 @@ Current v0.8 state:
   validation, workspace traversal rejection, and in-memory lifecycle helpers.
   No real execution backend is enabled yet.
 
+Current Milestone 11 preflight state:
+
+- Backend approval decision validation exists as a metadata-only safety gate.
+  It records the prerequisites needed before selecting a real backend, while
+  the shared runtime backend guard continues to reject `local`, `ssh`, `slurm`,
+  and `pbs`.
+
 ## Technical Highlights
 
 - C++17/C++20 multi-module project with CMake.
@@ -161,6 +172,9 @@ Current v0.8 state:
   including `JobSubmissionRequest`, `JobRecord`, `ApprovedJobTemplate`,
   workspace path validation, and lifecycle history helpers while keeping all
   real backends disabled.
+- Added a tested backend approval decision gate for future M11 backend
+  selection, separating prerequisite validation from runtime backend
+  enablement.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -221,6 +235,9 @@ Use only bullets that match the completed implementation.
   submissions, approved template validation, workspace path traversal
   rejection, and in-memory lifecycle event tracking without enabling real
   execution.
+- Added a metadata-only backend approval decision gate for future real backend
+  selection, proving that complete approval records still do not bypass the
+  dry-run-only runtime guard.
 
 Planned after v0.8:
 

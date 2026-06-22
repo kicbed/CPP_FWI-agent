@@ -53,6 +53,18 @@ struct ApprovedJobTemplate {
     int max_mpi_ranks = 1;
 };
 
+struct BackendApprovalDecision {
+    JobBackendType backend_type = JobBackendType::Unknown;
+    bool lab_approved = false;
+    std::string approved_by;
+    std::string approval_reference;
+    std::string workspace_root;
+    std::string credential_reference;
+    std::string authorization_policy;
+    std::string audit_retention_policy;
+    std::string operator_contact;
+};
+
 std::string to_string(JobLifecycleState state);
 JobLifecycleState parse_job_lifecycle_state(const std::string& value);
 std::vector<std::string> validate_submission_boundary(
@@ -63,6 +75,8 @@ std::vector<std::string> validate_approved_template(
 std::vector<std::string> validate_workspace_path(
     const std::string& workspace_root,
     const std::string& job_directory_name);
+std::vector<std::string> validate_backend_approval_decision(
+    const BackendApprovalDecision& decision);
 JobRecord make_rejected_job_record(
     const std::string& job_id,
     const JobSubmissionRequest& request,

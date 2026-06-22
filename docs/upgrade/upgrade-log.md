@@ -1590,3 +1590,56 @@ Next task:
 - Do not connect real execution by default. Start Milestone 11 only after the
   lab selects a backend and confirms credentials, workspace root, authorization
   policy, audit retention, and operator responsibilities.
+
+## 2026-06-22: Add Backend Approval Preflight Gate
+
+Scope:
+- Started a safe Milestone 11 preflight step without selecting or enabling a
+  real backend.
+- Added a metadata-only backend approval decision model and validator.
+- Recorded that M11-T1 remains blocked on real lab approval and backend
+  selection.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Future real backend selection now has a tested prerequisite record requiring
+  lab approval, approval reference, workspace root, credential reference,
+  authorization policy, audit retention policy, and operator contact.
+- A complete approval record does not bypass the shared runtime guard:
+  `local`, `ssh`, `slurm`, and `pbs` remain rejected until a later approved
+  backend milestone changes that guard.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credentials, or automatic Code Agent
+  patch application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `BackendApprovalDecision` and
+  `validate_backend_approval_decision`.
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `cmake --build build -j2 && ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before backend approval APIs existed.
+- PASS. `ServerJobTest` passed after adding the metadata-only approval gate.
+- PASS. Full `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This backend approval preflight gate commit.
+
+Next task:
+- Do not connect real execution yet. Continue M11-T1 only after the lab selects
+  a backend and confirms credentials, workspace root, authorization policy,
+  audit retention, and operator responsibilities.

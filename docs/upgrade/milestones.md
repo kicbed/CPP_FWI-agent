@@ -40,6 +40,8 @@ Version status:
 - v0.8 Server Backend Safety Foundation is complete as of 2026-06-22
   according to `docs/upgrade/version-roadmap.md` and
   `docs/upgrade/test-report-v0.8.md`.
+- Milestone 11 preflight started on 2026-06-22 with a metadata-only backend
+  approval decision gate. This does not select or enable a real backend.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -273,6 +275,10 @@ complete and a lab-approved backend is selected.
 
 Tasks:
 
+- [x] M11-T0: Add a metadata-only backend approval decision gate that requires
+  lab approval, workspace root, credential reference, authorization policy,
+  audit retention, and operator contact before any real backend can be
+  considered selected.
 - [ ] M11-T1: Decide the first real backend with lab approval: local wrapper,
   SSH, Slurm, or PBS.
 - [ ] M11-T2: Add authentication and access control implementation.

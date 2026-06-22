@@ -101,6 +101,46 @@ std::vector<std::string> validate_workspace_path(
     return errors;
 }
 
+std::vector<std::string> validate_backend_approval_decision(
+    const BackendApprovalDecision& decision) {
+    std::vector<std::string> errors;
+
+    if (decision.backend_type != JobBackendType::Local &&
+        decision.backend_type != JobBackendType::Ssh &&
+        decision.backend_type != JobBackendType::Slurm &&
+        decision.backend_type != JobBackendType::Pbs) {
+        errors.push_back(
+            "real backend approval must select local, ssh, slurm, or pbs");
+    }
+    if (!decision.lab_approved) {
+        errors.push_back(
+            "lab approval is required before selecting a real backend");
+    }
+    if (decision.approved_by.empty()) {
+        errors.push_back("approved_by is required");
+    }
+    if (decision.approval_reference.empty()) {
+        errors.push_back("approval_reference is required");
+    }
+    if (decision.workspace_root.empty()) {
+        errors.push_back("workspace_root is required");
+    }
+    if (decision.credential_reference.empty()) {
+        errors.push_back("credential_reference is required");
+    }
+    if (decision.authorization_policy.empty()) {
+        errors.push_back("authorization_policy is required");
+    }
+    if (decision.audit_retention_policy.empty()) {
+        errors.push_back("audit_retention_policy is required");
+    }
+    if (decision.operator_contact.empty()) {
+        errors.push_back("operator_contact is required");
+    }
+
+    return errors;
+}
+
 JobRecord make_rejected_job_record(
     const std::string& job_id,
     const JobSubmissionRequest& request,
