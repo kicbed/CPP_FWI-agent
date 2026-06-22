@@ -20,6 +20,14 @@ enum class JobLifecycleState {
     Cancelled,
 };
 
+enum class JobAuditEventType {
+    SubmissionRequested,
+    SubmissionRejected,
+    LifecycleChanged,
+    ArtifactIndexed,
+    OperatorNote,
+};
+
 struct JobSubmissionRequest {
     std::string request_id;
     std::string user_id;
@@ -41,6 +49,16 @@ struct JobRecord {
     std::vector<std::string> status_events;
     std::vector<std::string> log_paths;
     std::vector<std::string> artifact_paths;
+};
+
+struct JobAuditEvent {
+    std::string job_id;
+    std::string request_id;
+    std::string user_id;
+    JobAuditEventType event_type = JobAuditEventType::OperatorNote;
+    std::string message;
+    std::string timestamp;
+    JobBackendType backend_type = JobBackendType::DryRun;
 };
 
 struct ApprovedJobTemplate {
@@ -81,6 +99,13 @@ std::vector<std::string> validate_backend_approval_decision(
 std::vector<std::string> validate_submitter_authorization(
     const JobSubmissionRequest& request,
     const BackendApprovalDecision& decision);
+std::vector<std::string> validate_job_audit_event(const JobAuditEvent& event);
+JobAuditEvent make_job_audit_event(
+    const std::string& job_id,
+    const JobSubmissionRequest& request,
+    JobAuditEventType event_type,
+    const std::string& message,
+    const std::string& timestamp);
 JobRecord make_rejected_job_record(
     const std::string& job_id,
     const JobSubmissionRequest& request,

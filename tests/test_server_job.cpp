@@ -242,3 +242,60 @@ TEST(ServerJobTest, AcceptsAuthorizedSubmitterForApprovedBackend) {
 
     EXPECT_TRUE(validate_submitter_authorization(request, decision).empty());
 }
+
+TEST(ServerJobTest, CreatesMetadataOnlyAuditEventFromRequest) {
+    JobSubmissionRequest request;
+    request.request_id = "req-42";
+    request.user_id = "researcher-a";
+    request.backend_type = JobBackendType::DryRun;
+
+    const auto event = make_job_audit_event(
+        "job-42",
+        request,
+        JobAuditEventType::SubmissionRejected,
+        "dry-run backend only",
+        "2026-06-22T12:00:00Z");
+
+    EXPECT_EQ(event.job_id, "job-42");
+    EXPECT_EQ(event.request_id, "req-42");
+    EXPECT_EQ(event.user_id, "researcher-a");
+    EXPECT_EQ(event.event_type, JobAuditEventType::SubmissionRejected);
+    EXPECT_EQ(event.message, "dry-run backend only");
+    EXPECT_EQ(event.timestamp, "2026-06-22T12:00:00Z");
+    EXPECT_EQ(event.backend_type, JobBackendType::DryRun);
+    EXPECT_TRUE(validate_job_audit_event(event).empty());
+}
+
+TEST(ServerJobTest, RejectsIncompleteAuditEventMetadata) {
+    JobAuditEvent event;
+    event.backend_type = JobBackendType::DryRun;
+
+    const auto errors = validate_job_audit_event(event);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(), "job_id is required"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(), "request_id is required"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(), "user_id is required"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(), "message is required"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(), "timestamp is required"),
+        errors.end());
+}
+
+TEST(ServerJobTest, RejectsRealBackendAuditEventWhileRuntimeIsDryRunOnly) {
+    JobAuditEvent event;
+    event.job_id = "job-42";
+    event.request_id = "req-42";
+    event.user_id = "researcher-a";
+    event.event_type = JobAuditEventType::SubmissionRequested;
+    event.message = "operator requested submission";
+    event.timestamp = "2026-06-22T12:00:00Z";
+    event.backend_type = JobBackendType::Slurm;
+
+    const auto errors = validate_job_audit_event(event);
+
+    ASSERT_FALSE(errors.empty());
+    EXPECT_NE(errors[0].find("only dry_run is enabled"), std::string::npos);
+}

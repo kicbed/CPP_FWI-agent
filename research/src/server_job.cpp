@@ -224,6 +224,43 @@ std::vector<std::string> validate_submitter_authorization(
         "' is not authorized by backend approval decision"};
 }
 
+std::vector<std::string> validate_job_audit_event(const JobAuditEvent& event) {
+    std::vector<std::string> errors = validate_backend_enabled(event.backend_type);
+    if (event.job_id.empty()) {
+        errors.push_back("job_id is required");
+    }
+    if (event.request_id.empty()) {
+        errors.push_back("request_id is required");
+    }
+    if (event.user_id.empty()) {
+        errors.push_back("user_id is required");
+    }
+    if (event.message.empty()) {
+        errors.push_back("message is required");
+    }
+    if (event.timestamp.empty()) {
+        errors.push_back("timestamp is required");
+    }
+    return errors;
+}
+
+JobAuditEvent make_job_audit_event(
+    const std::string& job_id,
+    const JobSubmissionRequest& request,
+    JobAuditEventType event_type,
+    const std::string& message,
+    const std::string& timestamp) {
+    JobAuditEvent event;
+    event.job_id = job_id;
+    event.request_id = request.request_id;
+    event.user_id = request.user_id;
+    event.event_type = event_type;
+    event.message = message;
+    event.timestamp = timestamp;
+    event.backend_type = request.backend_type;
+    return event;
+}
+
 JobRecord make_rejected_job_record(
     const std::string& job_id,
     const JobSubmissionRequest& request,

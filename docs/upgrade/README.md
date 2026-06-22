@@ -88,6 +88,8 @@ Detailed learning note:
 `Milestone 11 preflight` started on 2026-06-22:
 
 - Metadata-only backend approval decision validation.
+- Metadata-only job audit event model for future submission, rejection,
+  lifecycle, artifact, and operator-note records.
 - Requires lab approval, approval reference, workspace root, credential
   reference, authorization policy, authorized submitter list, audit retention,
   and operator contact before any real backend can be considered selected.
