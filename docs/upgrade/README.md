@@ -79,6 +79,10 @@ Upgrade the project from a rough multi-agent/FWI demo into:
 - Runtime remains dry-run only; non-`dry_run` backend values are still
   rejected.
 
+Detailed learning note:
+
+- `docs/upgrade/learning-summary-v0.8.md`
+
 `Milestone 11 preflight` started on 2026-06-22:
 
 - Metadata-only backend approval decision validation.

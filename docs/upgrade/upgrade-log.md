@@ -1643,3 +1643,41 @@ Next task:
 - Do not connect real execution yet. Continue M11-T1 only after the lab selects
   a backend and confirms credentials, workspace root, authorization policy,
   audit retention, and operator responsibilities.
+
+## 2026-06-22: Finalize v0.8 Learning Summary
+
+Scope:
+- Added a standalone Chinese v0.8 learning and interview-review summary.
+- Marked the v0.8 safety design document as completed for the safety-foundation
+  scope.
+- Linked the learning summary from the upgrade guide and v0.8 test report.
+
+Files changed:
+- `docs/upgrade/learning-summary-v0.8.md`
+- `docs/upgrade/server-backend-safety-v0.8.md`
+- `docs/upgrade/test-report-v0.8.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credentials, or automatic Code Agent
+  patch application was added.
+
+Tests run:
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.8 learning summary completion commit.
+
+Next task:
+- Keep real execution disabled. Continue M11-T1 only after lab backend
+  approval and operational prerequisites are known.

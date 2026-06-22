@@ -159,6 +159,9 @@ but this version does not give it permission to apply patches automatically.
 
 ## Chinese Learning Summary
 
+For a fuller study and interview-review version, see
+`docs/upgrade/learning-summary-v0.8.md`.
+
 ### 1. 解决的问题
 
 v0.7 已经把 `JobBackend` 抽象和 `dry_run/local/ssh/slurm/pbs` 后端枚举建好，

@@ -1,8 +1,8 @@
 # v0.8 Server Backend Safety Design
 
-Status: started on 2026-06-22. This document is the safety gate before any
-real CUDA/MPI, SSH, Slurm, PBS, remote server, or local wrapper execution is
-implemented.
+Status: completed on 2026-06-22 for the v0.8 safety-foundation scope. This
+document remains the safety gate before any real CUDA/MPI, SSH, Slurm, PBS,
+remote server, or local wrapper execution is implemented.
 
 ## Purpose
 
