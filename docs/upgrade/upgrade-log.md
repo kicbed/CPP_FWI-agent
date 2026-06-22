@@ -1407,3 +1407,48 @@ Commit:
 
 Next task:
 - Continue v0.8 Task 3: add approved job template validation.
+
+## 2026-06-22: Validate Approved Job Templates
+
+Scope:
+- Added approved job template data and validation for the v0.8 server backend
+  safety layer.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Future job submission requests can now be checked against a versioned
+  approved template list.
+- Unknown templates are rejected, and matching templates validate backend type
+  and optional template version.
+- The validation remains metadata-only and does not submit jobs or render shell
+  commands.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, or automatic Code Agent patch
+  application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `ApprovedJobTemplate` and `validate_approved_template`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before approved-template APIs existed.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `ServerJobTest` passed.
+- PASS. Full `ctest` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This approved job template validation commit.
+
+Next task:
+- Continue v0.8 Task 4: add workspace path isolation and traversal rejection.

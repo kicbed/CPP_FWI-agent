@@ -61,4 +61,26 @@ std::vector<std::string> validate_submission_boundary(
     return errors;
 }
 
+std::vector<std::string> validate_approved_template(
+    const JobSubmissionRequest& request,
+    const std::vector<ApprovedJobTemplate>& approved_templates) {
+    for (const auto& approved : approved_templates) {
+        if (approved.template_id != request.template_id) {
+            continue;
+        }
+
+        std::vector<std::string> errors;
+        if (!request.template_version.empty() &&
+            approved.version != request.template_version) {
+            errors.push_back("template version mismatch for '" + request.template_id + "'");
+        }
+        if (approved.backend_type != request.backend_type) {
+            errors.push_back("template backend does not match requested backend");
+        }
+        return errors;
+    }
+
+    return {"unknown approved template '" + request.template_id + "'"};
+}
+
 }  // namespace agent_rpc::research

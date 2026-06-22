@@ -43,9 +43,22 @@ struct JobRecord {
     std::vector<std::string> artifact_paths;
 };
 
+struct ApprovedJobTemplate {
+    std::string template_id;
+    std::string version;
+    JobBackendType backend_type = JobBackendType::DryRun;
+    std::vector<std::string> allowed_arguments;
+    std::vector<std::string> allowed_input_roots;
+    int max_gpus = 0;
+    int max_mpi_ranks = 1;
+};
+
 std::string to_string(JobLifecycleState state);
 JobLifecycleState parse_job_lifecycle_state(const std::string& value);
 std::vector<std::string> validate_submission_boundary(
     const JobSubmissionRequest& request);
+std::vector<std::string> validate_approved_template(
+    const JobSubmissionRequest& request,
+    const std::vector<ApprovedJobTemplate>& approved_templates);
 
 }  // namespace agent_rpc::research

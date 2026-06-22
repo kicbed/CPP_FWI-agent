@@ -29,3 +29,31 @@ TEST(ServerJobTest, RejectsNonDryRunSubmissionBeforeBackendsAreEnabled) {
     ASSERT_FALSE(errors.empty());
     EXPECT_NE(errors[0].find("only dry_run is enabled"), std::string::npos);
 }
+
+TEST(ServerJobTest, RequiresApprovedTemplateForSubmission) {
+    JobSubmissionRequest request;
+    request.template_id = "unknown_template";
+
+    ApprovedJobTemplate approved;
+    approved.template_id = "fwi_multiscale_dry_run";
+    approved.version = "1";
+    approved.backend_type = JobBackendType::DryRun;
+
+    const auto errors = validate_approved_template(request, {approved});
+    ASSERT_FALSE(errors.empty());
+    EXPECT_NE(errors[0].find("unknown approved template"), std::string::npos);
+}
+
+TEST(ServerJobTest, AcceptsMatchingDryRunTemplate) {
+    JobSubmissionRequest request;
+    request.template_id = "fwi_multiscale_dry_run";
+    request.template_version = "1";
+
+    ApprovedJobTemplate approved;
+    approved.template_id = "fwi_multiscale_dry_run";
+    approved.version = "1";
+    approved.backend_type = JobBackendType::DryRun;
+    approved.allowed_arguments = {"model", "dataset", "max_iter"};
+
+    EXPECT_TRUE(validate_approved_template(request, {approved}).empty());
+}
