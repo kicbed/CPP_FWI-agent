@@ -57,7 +57,8 @@ Current status:
   credential reference, authorization policy, audit retention, and operator
   contact, rejects placeholder approval values, validates concrete authorized
   submitters, defines metadata-only job audit events and in-memory audit log
-  validation, but still does not enable real execution.
+  validation, and exposes a unified preflight readiness report, but still does
+  not enable real execution.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -146,7 +147,9 @@ Current Milestone 11 preflight state:
   decision. The preflight layer also has a metadata-only `JobAuditEvent` model
   for future submission, rejection, lifecycle, artifact, and operator-note
   records, plus an in-memory `JobAuditLog` helper that validates event batches
-  before a future persistence layer exists.
+  before a future persistence layer exists. `BackendPreflightReport` now
+  aggregates these checks and separates metadata readiness from runtime backend
+  enablement.
 
 ## Technical Highlights
 
@@ -195,6 +198,9 @@ Current Milestone 11 preflight state:
   backend type while keeping real backends disabled.
 - Added metadata-only in-memory audit log validation and append helpers so
   future audit persistence starts from validated same-job event batches.
+- Added a unified metadata-only backend preflight report that aggregates
+  approval, authorization, dry-run submission boundary, approved template,
+  workspace, and audit-log checks while preserving the runtime backend guard.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -268,6 +274,9 @@ Use only bullets that match the completed implementation.
   guard.
 - Added tested in-memory job audit log helpers that reject empty logs,
   cross-job events, and invalid audit events before appending metadata.
+- Added a tested backend preflight readiness report, making it possible to
+  explain why a future backend package is metadata-ready while real execution
+  remains disabled.
 
 Planned after v0.8:
 

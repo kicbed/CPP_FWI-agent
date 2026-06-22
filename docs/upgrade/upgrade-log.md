@@ -1926,6 +1926,70 @@ Next task:
   authorization, audit persistence design, workspace, and lifecycle
   prerequisites until lab backend approval and operational details are known.
 
+## 2026-06-22: Complete M11 Preflight Readiness
+
+Scope:
+- Finished the metadata-only M11 preflight phase without selecting or enabling
+  a real backend.
+- Added a unified backend preflight readiness report.
+- Added M11 preflight test report, completion audit, and Chinese learning
+  summary.
+- Defined when v0.9 can start.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/upgrade/test-report-m11-preflight.md`
+- `docs/upgrade/m11-preflight-completion-audit.md`
+- `docs/upgrade/learning-summary-m11-preflight.md`
+
+Behavior changed:
+- Added `BackendPreflightPackage` and `BackendPreflightReport`.
+- Added `evaluate_backend_preflight` to aggregate approval decision,
+  submitter authorization, dry-run submission boundary, approved-template,
+  workspace, and audit-log validation.
+- The report separates `metadata_ready` from `runtime_enabled`, so a complete
+  approval metadata package still does not enable reserved real backends.
+- Runtime backend enablement did not change: `local`, `ssh`, `slurm`, and
+  `pbs` remain rejected by the shared backend guard.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credentials, audit persistence service,
+  or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+  before implementation, expected RED failure: missing
+  `BackendPreflightPackage`, `BackendPreflightReport`, and
+  `evaluate_backend_preflight`.
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before the unified preflight report APIs
+  existed.
+- PASS. `ServerJobTest` passed after adding metadata-only preflight report
+  helpers.
+- PASS. Full `cmake --build build -j2` exited 0.
+- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This M11 preflight completion commit.
+
+Next task:
+- Enter v0.9 only for non-executing backend readiness/review work. Do not
+  implement real backend execution until M11-T1 has a lab-approved backend,
+  credential policy, workspace root, authorization policy, audit retention,
+  operator rules, and operator contact.
+
 ## 2026-06-22: Add Job Audit Log Preflight
 
 Scope:

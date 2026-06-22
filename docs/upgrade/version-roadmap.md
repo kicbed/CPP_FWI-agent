@@ -17,6 +17,7 @@ Personal prompts should stay in ignored local files such as
 | v0.6 | Lab Code Adapter | Integrate with lab code shape without submitting jobs: config templates, log parsing, loss analysis |
 | v0.7 | JobBackend Reservation | Reserve backend interface and reject all non-dry-run execution choices |
 | v0.8 | Server Backend | Add the safety foundation for controlled execution: approved templates, workspaces, lifecycle records, and audit boundaries |
+| v0.9 | Backend Readiness Review | Turn preflight metadata into non-executing review, packet preview, audit preview, and operator checklist flows |
 | v1.0 | Lab-Usable Platform | New lab members can learn, plan, run, monitor, and analyze real research experiments safely |
 
 ## v0.2: Lab Agent MVP
@@ -307,6 +308,43 @@ Next target after v0.8:
   those prerequisites, an authorized submitter list, job audit event metadata,
   and in-memory audit log validation without enabling `local`, `ssh`, `slurm`,
   or `pbs`.
+
+## v0.9: Backend Readiness Review
+
+Status: Ready to start after the 2026-06-22 M11 preflight completion audit, if
+the scope remains non-executing.
+
+Purpose:
+
+- Turn the M11 preflight metadata into reviewable product flows before any real
+  backend adapter is connected.
+
+Must have:
+
+- Display or generate a backend readiness report from `BackendPreflightReport`.
+- Preview a dry-run submission packet for operator review.
+- Preview audit events and same-job audit logs without writing to a production
+  audit store.
+- Show workspace and artifact path plans without creating remote directories.
+- Keep the runtime guard visible: `local`, `ssh`, `slurm`, and `pbs` remain
+  reserved until M11-T1 is approved.
+
+Not included:
+
+- Real CUDA/MPI execution.
+- SSH, Slurm, PBS, local wrapper, or remote server execution.
+- Credential loading or cluster account handling.
+- Arbitrary shell execution from user text.
+- Automatic Code Agent patch application.
+
+Entry rule:
+
+- v0.9 can start now for non-executing readiness/review work because M11
+  preflight has a completion audit and test report.
+- v0.9 cannot become real backend implementation unless M11-T1 receives a lab
+  decision package with selected backend, credentials policy, workspace root,
+  authorization policy, audit retention, quota/operator rules, and operator
+  contact.
 
 ## v1.0: Lab-Usable Platform
 

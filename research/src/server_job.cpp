@@ -278,6 +278,63 @@ std::vector<std::string> append_job_audit_event(
     return errors;
 }
 
+BackendPreflightReport evaluate_backend_preflight(
+    const BackendPreflightPackage& package) {
+    BackendPreflightReport report;
+    report.safety_boundaries = {
+        "preflight report does not submit jobs",
+        "runtime backend guard still controls enablement",
+        "audit log is in-memory metadata only",
+    };
+
+    const auto approval_errors =
+        validate_backend_approval_decision(package.approval);
+    report.validation_errors.insert(
+        report.validation_errors.end(),
+        approval_errors.begin(),
+        approval_errors.end());
+
+    const auto authorization_errors =
+        validate_submitter_authorization(package.request, package.approval);
+    report.validation_errors.insert(
+        report.validation_errors.end(),
+        authorization_errors.begin(),
+        authorization_errors.end());
+
+    const auto submission_errors = validate_submission_boundary(package.request);
+    report.validation_errors.insert(
+        report.validation_errors.end(),
+        submission_errors.begin(),
+        submission_errors.end());
+
+    const auto template_errors = validate_approved_template(
+        package.request,
+        package.approved_templates);
+    report.validation_errors.insert(
+        report.validation_errors.end(),
+        template_errors.begin(),
+        template_errors.end());
+
+    const auto workspace_errors = validate_workspace_path(
+        package.approval.workspace_root,
+        package.job_directory_name);
+    report.validation_errors.insert(
+        report.validation_errors.end(),
+        workspace_errors.begin(),
+        workspace_errors.end());
+
+    const auto audit_errors = validate_job_audit_log(package.audit_log);
+    report.validation_errors.insert(
+        report.validation_errors.end(),
+        audit_errors.begin(),
+        audit_errors.end());
+
+    report.runtime_blockers = validate_backend_enabled(package.approval.backend_type);
+    report.metadata_ready = report.validation_errors.empty();
+    report.runtime_enabled = report.runtime_blockers.empty();
+    return report;
+}
+
 JobAuditEvent make_job_audit_event(
     const std::string& job_id,
     const JobSubmissionRequest& request,

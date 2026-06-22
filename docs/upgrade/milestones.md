@@ -40,10 +40,10 @@ Version status:
 - v0.8 Server Backend Safety Foundation is complete as of 2026-06-22
   according to `docs/upgrade/version-roadmap.md` and
   `docs/upgrade/test-report-v0.8.md`.
-- Milestone 11 preflight started on 2026-06-22 with a metadata-only backend
+- Milestone 11 preflight is complete as of 2026-06-22 with a metadata-only backend
   approval decision gate, submitter authorization validation, and audit-event
-  metadata plus in-memory audit log validation. This does not select or enable
-  a real backend.
+  metadata plus in-memory audit log validation and a unified preflight readiness
+  report. This does not select or enable a real backend.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -287,6 +287,8 @@ Tasks:
   future submission, rejection, lifecycle, artifact, and operator-note records.
 - [x] M11-T0C: Add metadata-only in-memory audit log validation and append
   helpers for future audit persistence boundaries.
+- [x] M11-T0D: Add a unified metadata-only backend preflight readiness report
+  that separates metadata readiness from runtime backend enablement.
 - [ ] M11-T1: Decide the first real backend with lab approval: local wrapper,
   SSH, Slurm, or PBS.
 - [ ] M11-T2: Add authentication and access control implementation.

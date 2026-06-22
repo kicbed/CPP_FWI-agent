@@ -89,6 +89,22 @@ struct BackendApprovalDecision {
     std::string operator_contact;
 };
 
+struct BackendPreflightPackage {
+    JobSubmissionRequest request;
+    BackendApprovalDecision approval;
+    std::vector<ApprovedJobTemplate> approved_templates;
+    std::string job_directory_name;
+    JobAuditLog audit_log;
+};
+
+struct BackendPreflightReport {
+    bool metadata_ready = false;
+    bool runtime_enabled = false;
+    std::vector<std::string> validation_errors;
+    std::vector<std::string> runtime_blockers;
+    std::vector<std::string> safety_boundaries;
+};
+
 std::string to_string(JobLifecycleState state);
 JobLifecycleState parse_job_lifecycle_state(const std::string& value);
 std::vector<std::string> validate_submission_boundary(
@@ -109,6 +125,8 @@ std::vector<std::string> validate_job_audit_log(const JobAuditLog& log);
 std::vector<std::string> append_job_audit_event(
     JobAuditLog& log,
     const JobAuditEvent& event);
+BackendPreflightReport evaluate_backend_preflight(
+    const BackendPreflightPackage& package);
 JobAuditEvent make_job_audit_event(
     const std::string& job_id,
     const JobSubmissionRequest& request,

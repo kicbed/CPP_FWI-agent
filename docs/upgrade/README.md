@@ -85,18 +85,26 @@ Detailed learning note:
 - `docs/upgrade/learning-summary-v0.8.md`
 - `docs/upgrade/v0.8-completion-audit.md`
 
-`Milestone 11 preflight` started on 2026-06-22:
+`Milestone 11 preflight` is complete as of 2026-06-22:
 
 - Metadata-only backend approval decision validation.
 - Metadata-only job audit event model for future submission, rejection,
   lifecycle, artifact, and operator-note records.
 - Metadata-only in-memory job audit log validation and append helpers for
   future audit persistence boundaries.
+- Unified metadata-only backend preflight readiness report that separates
+  metadata readiness from runtime backend enablement.
 - Requires lab approval, approval reference, workspace root, credential
   reference, authorization policy, authorized submitter list, audit retention,
   and operator contact before any real backend can be considered selected.
 - Runtime remains dry-run only; `local`, `ssh`, `slurm`, and `pbs` are still
   rejected by the shared backend guard.
+
+Detailed M11 preflight notes:
+
+- `docs/upgrade/test-report-m11-preflight.md`
+- `docs/upgrade/m11-preflight-completion-audit.md`
+- `docs/upgrade/learning-summary-m11-preflight.md`
 
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.
@@ -223,9 +231,11 @@ Active plan:
 
 - `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md` (complete)
 
-Next session should not connect real execution by default. Start Milestone 11
-only after the first real backend, credentials, workspace root, authorization
-policy, and lab approval are known.
+Next session can start v0.9 only if v0.9 is scoped as a non-executing backend
+readiness and review version. Do not connect real execution by default. Continue
+M11-T1 real backend selection only after the first real backend, credentials,
+workspace root, authorization policy, audit retention, operator ownership, and
+lab approval are known.
 
 When a milestone becomes too large, create a new plan in:
 

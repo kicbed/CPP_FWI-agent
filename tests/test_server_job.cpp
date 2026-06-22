@@ -370,3 +370,73 @@ TEST(ServerJobTest, DoesNotAppendInvalidAuditEvent) {
         errors.end());
     EXPECT_TRUE(log.events.empty());
 }
+
+TEST(ServerJobTest, ReportsIncompleteBackendPreflightPackage) {
+    BackendPreflightPackage package;
+
+    const auto report = evaluate_backend_preflight(package);
+
+    EXPECT_FALSE(report.metadata_ready);
+    EXPECT_FALSE(report.runtime_enabled);
+    EXPECT_NE(std::find(report.validation_errors.begin(),
+                  report.validation_errors.end(),
+                  "lab approval is required before selecting a real backend"),
+        report.validation_errors.end());
+    EXPECT_NE(std::find(report.validation_errors.begin(),
+                  report.validation_errors.end(),
+                  "authorized_submitters must include at least one submitter"),
+        report.validation_errors.end());
+    EXPECT_NE(std::find(report.validation_errors.begin(),
+                  report.validation_errors.end(),
+                  "job directory name is required"),
+        report.validation_errors.end());
+    EXPECT_NE(std::find(report.validation_errors.begin(),
+                  report.validation_errors.end(),
+                  "job audit log must include at least one event"),
+        report.validation_errors.end());
+    ASSERT_FALSE(report.runtime_blockers.empty());
+    EXPECT_NE(report.runtime_blockers[0].find("unknown backend"), std::string::npos);
+}
+
+TEST(ServerJobTest, CompletePreflightPackageDoesNotEnableRuntimeBackend) {
+    BackendPreflightPackage package;
+    package.approval = make_complete_local_approval();
+    package.approval.authorized_submitters = {"researcher-a"};
+    package.job_directory_name = "job-20260622-0042";
+
+    package.request.request_id = "req-42";
+    package.request.user_id = "researcher-a";
+    package.request.template_id = "fwi_multiscale_dry_run";
+    package.request.template_version = "1";
+    package.request.backend_type = JobBackendType::DryRun;
+    package.request.dry_run = true;
+
+    ApprovedJobTemplate approved;
+    approved.template_id = "fwi_multiscale_dry_run";
+    approved.version = "1";
+    approved.backend_type = JobBackendType::DryRun;
+    package.approved_templates.push_back(approved);
+
+    package.audit_log.job_id = "job-42";
+    ASSERT_TRUE(append_job_audit_event(package.audit_log,
+        make_job_audit_event(
+            "job-42",
+            package.request,
+            JobAuditEventType::OperatorNote,
+            "operator completed metadata-only preflight review",
+            "2026-06-22T12:10:00Z"))
+                    .empty());
+
+    const auto report = evaluate_backend_preflight(package);
+
+    EXPECT_TRUE(report.metadata_ready);
+    EXPECT_FALSE(report.runtime_enabled);
+    EXPECT_TRUE(report.validation_errors.empty());
+    ASSERT_FALSE(report.runtime_blockers.empty());
+    EXPECT_NE(report.runtime_blockers[0].find("only dry_run is enabled"),
+        std::string::npos);
+    EXPECT_NE(std::find(report.safety_boundaries.begin(),
+                  report.safety_boundaries.end(),
+                  "preflight report does not submit jobs"),
+        report.safety_boundaries.end());
+}
