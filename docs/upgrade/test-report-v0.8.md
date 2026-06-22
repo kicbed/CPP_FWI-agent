@@ -161,7 +161,8 @@ but this version does not give it permission to apply patches automatically.
 
 For a reading order, code guide, test-risk map, and self-check questions, see
 `docs/upgrade/study-pack-v0.8.md`. For a fuller study and interview-review
-version, see `docs/upgrade/learning-summary-v0.8.md`.
+version, see `docs/upgrade/learning-summary-v0.8.md`. For the final acceptance
+audit, see `docs/upgrade/v0.8-completion-audit.md`.
 
 ### 1. 解决的问题
 

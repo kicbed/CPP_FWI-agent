@@ -83,6 +83,7 @@ Detailed learning note:
 
 - `docs/upgrade/study-pack-v0.8.md`
 - `docs/upgrade/learning-summary-v0.8.md`
+- `docs/upgrade/v0.8-completion-audit.md`
 
 `Milestone 11 preflight` started on 2026-06-22:
 

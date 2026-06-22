@@ -22,6 +22,8 @@ Recommended reading order:
 5. Read `tests/test_server_job.cpp` and map every test to a risk.
 6. Read `docs/upgrade/learning-summary-v0.8.md` for the long Chinese review.
 7. Read `docs/upgrade/test-report-v0.8.md` for verification evidence.
+8. Read `docs/upgrade/v0.8-completion-audit.md` for the final acceptance
+   checklist.
 
 Fast path if you only have 30 minutes:
 
@@ -440,4 +442,3 @@ The next engineering step should be one of these:
 The next code step must not connect CUDA/MPI, SSH, Slurm, PBS, remote servers,
 local wrappers, credentials, or arbitrary shell execution unless M11-T1 is
 explicitly approved with operational details.
-
