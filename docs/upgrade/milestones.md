@@ -34,6 +34,9 @@ Version status:
 - v0.7 JobBackend Interface Reservation is complete as of 2026-06-22
   according to `docs/upgrade/version-roadmap.md` and
   `docs/upgrade/test-report-v0.7.md`.
+- v0.8 Server Backend Safety Design started on 2026-06-22 with
+  `docs/upgrade/server-backend-safety-v0.8.md` and
+  `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -237,18 +240,44 @@ Acceptance:
 - v0.2 cannot accidentally submit real jobs.
 - Tests pass.
 
-## Milestone 10: Real CUDA/MPI Server Integration
+## Milestone 10: Server Backend Safety Design
 
-Goal: connect lab execution after v0.2 is stable.
+Goal: design and test the controlled server backend boundary before any real
+execution adapter is connected.
 
 Tasks:
 
-- [ ] M10-T1: Decide the first real backend: local server script, SSH, Slurm, or PBS.
-- [ ] M10-T2: Add authentication and access boundary design.
-- [ ] M10-T3: Add job workspace isolation.
-- [ ] M10-T4: Add log collection and artifact indexing.
-- [ ] M10-T5: Add loss curve and output model visualization.
-- [ ] M10-T6: Add audit logging for submitted jobs.
+- [x] M10-T1: Write the v0.8 server-backend safety design and implementation plan.
+- [ ] M10-T2: Add server job submission and lifecycle record models.
+- [ ] M10-T3: Add approved job template validation.
+- [ ] M10-T4: Add workspace path isolation and traversal rejection.
+- [ ] M10-T5: Add fake backend or lifecycle test helpers that never execute commands.
+- [ ] M10-T6: Add v0.8 test report and Chinese learning summary.
+
+Acceptance:
+
+- Runtime still rejects all non-`dry_run` backend values.
+- User text cannot become a shell command.
+- Server-job models, approved templates, workspace guards, lifecycle records,
+  and audit boundaries are tested before any real backend work starts.
+- No CUDA/MPI, SSH, Slurm, PBS, remote server, local wrapper, or arbitrary shell
+  execution is added.
+
+## Milestone 11: Controlled Real Backend Integration
+
+Goal: connect lab execution only after v0.8 safety models and tests are
+complete and a lab-approved backend is selected.
+
+Tasks:
+
+- [ ] M11-T1: Decide the first real backend with lab approval: local wrapper,
+  SSH, Slurm, or PBS.
+- [ ] M11-T2: Add authentication and access control implementation.
+- [ ] M11-T3: Add job workspace creation and cleanup.
+- [ ] M11-T4: Add job submission, status polling, and cancellation.
+- [ ] M11-T5: Add log collection and artifact indexing.
+- [ ] M11-T6: Add loss curve and output model visualization.
+- [ ] M11-T7: Add audit logging for submitted jobs.
 
 Acceptance:
 

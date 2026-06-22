@@ -46,6 +46,9 @@ Current status:
 - Includes a v0.7 `JobBackend` reservation layer so future execution backends
   share the same validate/render/explain/type contract while the only enabled
   backend remains `DryRunBackend`.
+- Includes a v0.8 server-backend safety design that defines the threat model,
+  approved-template boundary, workspace isolation, lifecycle records, artifact
+  collection, and audit requirements before real execution is enabled.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -114,6 +117,14 @@ Current v0.7 state:
   `AlgorithmCard` validation uses the same guard. `DryRunBackend` remains the
   only concrete and enabled backend.
 
+Current v0.8 state:
+
+- Server Backend Safety Design is started for the v0.8 scope: the design
+  separates dry-run previews from future submission APIs, requires approved
+  templates instead of raw user commands, defines server-job request and record
+  shapes, and lists workspace, lifecycle, artifact, and audit validation gates.
+  No real execution backend is enabled yet.
+
 ## Technical Highlights
 
 - C++17/C++20 multi-module project with CMake.
@@ -139,6 +150,10 @@ Current v0.7 state:
 - Reserved a C++ `JobBackend` abstraction and backend type enum for future
   execution backends while preserving dry-run-only behavior through runtime
   rejection of `local`, `ssh`, `slurm`, and `pbs`.
+- Wrote a server-backend safety design for future controlled execution,
+  covering command-injection prevention, approved job templates, workspace path
+  boundaries, lifecycle states, artifact collection, and audit records before
+  any scheduler or remote adapter is connected.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -191,12 +206,15 @@ Use only bullets that match the completed implementation.
 - Reserved the future `JobBackend` interface, backend type enum, and shared
   runtime guard; made `DryRunBackend` polymorphic while rejecting `local`,
   `ssh`, `slurm`, and `pbs` until server execution has a safety design.
+- Wrote the v0.8 server-backend safety design and implementation plan for
+  approved templates, workspace isolation, lifecycle records, artifact
+  collection, and audit logging before enabling real CUDA/MPI or cluster
+  execution.
 
-Planned after v0.7:
+Current v0.8 plan:
 
-- Design the controlled v0.8 server backend with authentication, workspace
-  isolation, approved job templates, status tracking, artifact collection, and
-  audit logging before enabling any real execution.
+- Implement server-job safety models, approved-template validation, workspace
+  guards, and lifecycle/audit tests while keeping all real execution disabled.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -393,3 +411,14 @@ Add one short entry whenever a meaningful technical change lands.
 - Reused the backend guard in `AlgorithmCard` validation so JSON metadata
   cannot accidentally enable real execution.
 - Added a v0.7 test report with Chinese learning and interview-prep summary.
+
+### 2026-06-22: v0.8 Server Backend Safety Design
+
+- Started v0.8 with a written safety design and implementation plan before any
+  real execution code.
+- Defined the future server backend boundary around approved templates,
+  structured submission records, workspace isolation, lifecycle state, artifact
+  collection, and audit logging.
+- Kept the product claim explicit: real CUDA/MPI, SSH, Slurm, PBS, remote
+  execution, local wrapper execution, arbitrary shell execution, and automatic
+  Code Agent patch application are still not enabled.

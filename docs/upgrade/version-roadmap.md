@@ -16,7 +16,7 @@ Personal prompts should stay in ignored local files such as
 | v0.5 | Lab Workbench UI | Web workbench with routing, tool calls, specs, parameter tables, dry-run jobs, and status panels |
 | v0.6 | Lab Code Adapter | Integrate with lab code shape without submitting jobs: config templates, log parsing, loss analysis |
 | v0.7 | JobBackend Reservation | Reserve backend interface and reject all non-dry-run execution choices |
-| v0.8 | Server Backend | Add controlled Slurm/PBS/SSH/server execution with auth, isolation, logs, and artifacts |
+| v0.8 | Server Backend | Add the safety foundation for controlled execution: approved templates, workspaces, lifecycle records, and audit boundaries |
 | v1.0 | Lab-Usable Platform | New lab members can learn, plan, run, monitor, and analyze real research experiments safely |
 
 ## v0.2: Lab Agent MVP
@@ -257,6 +257,9 @@ Next target after v0.7:
 
 ## v0.8: Server Backend
 
+Status: Started on 2026-06-22 with a written safety design and implementation
+plan. No real execution backend is enabled yet.
+
 Purpose:
 
 - Connect controlled real execution after the planning and safety boundaries are
@@ -277,6 +280,23 @@ Must have:
 Example user value:
 
 - "Submit this approved FWI dry-run plan to the lab queue and monitor it."
+
+Current safety-design scope:
+
+- Keep `validate_backend_enabled` rejecting all non-`dry_run` backend values.
+- Define server-job submission and lifecycle record models before submission
+  code exists.
+- Require approved templates instead of raw user commands.
+- Validate workspace paths so job files cannot escape the configured root.
+- Treat fake backends as test-only helpers that never execute commands.
+
+Not included in the current v0.8 start:
+
+- Real CUDA/MPI execution.
+- SSH, Slurm, PBS, remote server, or local wrapper execution.
+- Credentials or cluster account handling.
+- Arbitrary shell execution from user input.
+- Automatic Code Agent patch application.
 
 ## v1.0: Lab-Usable Platform
 
@@ -317,8 +337,8 @@ Use this order:
    v0.6.
 6. If lab code adapter works but the backend boundary is not reserved and
    hardened, start v0.7.
-7. If v0.7 is complete and the lab is ready for controlled execution, start
-   v0.8 with a written safety design.
+7. If v0.7 is complete, start v0.8 with a written safety design and tested
+   server-job safety models before enabling controlled execution.
 8. If real execution is stable, harden toward v1.0.
 
 ## Handoff Rule For New Sessions

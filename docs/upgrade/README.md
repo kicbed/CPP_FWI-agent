@@ -67,6 +67,15 @@ Upgrade the project from a rough multi-agent/FWI demo into:
 - `AlgorithmCard` backend validation now uses the shared backend guard.
 - v0.7 test report and Chinese learning summary.
 
+`v0.8 Server Backend Safety Design` is in progress as of 2026-06-22:
+
+- Written safety design for auth, approved templates, workspace isolation, job
+  lifecycle state, artifact collection, and audit logging.
+- New implementation plan for server-job models and validation before any real
+  backend adapter is connected.
+- Runtime remains dry-run only; non-`dry_run` backend values must still be
+  rejected.
+
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.
 
@@ -173,7 +182,8 @@ These rules stay in effect until the real server backend milestone.
 - Do not execute real CUDA/MPI jobs.
 - Do not run arbitrary shell commands from user input.
 - Do not write or delete files outside the repository from an agent tool.
-- Do not add SSH, Slurm, PBS, or remote execution as part of v0.2.
+- Do not add SSH, Slurm, PBS, or remote execution until a reviewed v0.8 safety
+  implementation explicitly enables a backend.
 - Use `DryRunBackend` first. It may render commands and scripts, but it must not
   submit or execute them.
 - Code Agent MVP should be read-only by default. Patch generation is allowed as
@@ -185,13 +195,14 @@ These rules stay in effect until the real server backend milestone.
 Historical starting plan:
 
 - `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
+- `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`
 
 Active plan:
 
-- `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`
+- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`
 
-Next session should follow the roadmap after v0.7. The recommended next target
-is the v0.8 server-backend safety design before any real execution work.
+Next session should continue v0.8 Task 2: add the server job model contract,
+while keeping all execution dry-run only.
 
 When a milestone becomes too large, create a new plan in:
 

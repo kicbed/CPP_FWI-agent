@@ -1321,3 +1321,43 @@ Next task:
 - Start v0.8 only after writing a server-backend safety design for auth,
   workspace isolation, approved templates, job lifecycle, artifact collection,
   and audit logging.
+
+## 2026-06-22: Start v0.8 Server Backend Safety Design
+
+Scope:
+- Started v0.8 with a server-backend safety design and implementation plan.
+- Reframed the next milestone around safety models before any real execution
+  adapter is connected.
+
+Files changed:
+- `docs/upgrade/server-backend-safety-v0.8.md`
+- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, or automatic Code Agent patch
+  application was added.
+- Runtime is still expected to reject all non-`dry_run` backend values.
+
+Tests run:
+- `git diff --check`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+
+Result:
+- PASS. `git diff --check` produced no output.
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 25/25 tests.
+
+Commit:
+- This v0.8 server backend safety design commit.
+
+Next task:
+- Continue v0.8 Task 2: add server job submission and lifecycle record models,
+  with tests proving non-`dry_run` submissions remain rejected.
