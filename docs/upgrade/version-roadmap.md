@@ -15,6 +15,7 @@ Personal prompts should stay in ignored local files such as
 | v0.4 | Experiment Planner | Structured experiment planning, risk analysis, dry-run jobs, reproducible experiment records |
 | v0.5 | Lab Workbench UI | Web workbench with routing, tool calls, specs, parameter tables, dry-run jobs, and status panels |
 | v0.6 | Lab Code Adapter | Integrate with lab code shape without submitting jobs: config templates, log parsing, loss analysis |
+| v0.7 | JobBackend Reservation | Reserve backend interface and reject all non-dry-run execution choices |
 | v0.8 | Server Backend | Add controlled Slurm/PBS/SSH/server execution with auth, isolation, logs, and artifacts |
 | v1.0 | Lab-Usable Platform | New lab members can learn, plan, run, monitor, and analyze real research experiments safely |
 
@@ -207,6 +208,53 @@ Next target after v0.6:
 - Reserve the future JobBackend interface and keep non-`dry_run` backends
   rejected until server execution receives an explicit safety design.
 
+## v0.7: JobBackend Reservation
+
+Status: Completed on 2026-06-22 with a `JobBackend` interface, explicit
+backend type enum values, shared runtime rejection for non-`dry_run` backends,
+and `docs/upgrade/test-report-v0.7.md`.
+
+Purpose:
+
+- Make the future execution boundary explicit before any real backend exists.
+
+Must have:
+
+- `JobBackend` interface for validate/render/explain behavior.
+- Backend type enum values for `dry_run`, `local`, `ssh`, `slurm`, and `pbs`.
+- Shared parsing and validation helpers for backend values.
+- Runtime rejection for all non-`dry_run` or unknown backend choices.
+- Documentation for how Slurm/PBS can be added later without turning user
+  input into shell execution.
+
+Not included:
+
+- Real CUDA/MPI execution.
+- SSH, Slurm, PBS, local server execution, remote execution, or arbitrary shell
+  execution.
+- Automatic Code Agent patch application.
+
+Example user value:
+
+- "Show me the dry-run job boundary and explain why this cannot submit to the
+  cluster yet."
+
+Completed scope:
+
+- Added `JobBackendType` values for `dry_run`, `local`, `ssh`, `slurm`, `pbs`,
+  and `unknown`.
+- Added `parse_job_backend_type`, `to_string`,
+  `supported_job_backend_names`, and `validate_backend_enabled`.
+- Made `DryRunBackend` expose its backend type through the interface.
+- Reused the shared backend guard in `AlgorithmCard` validation so JSON cards
+  cannot silently enable reserved backends.
+
+Next target after v0.7:
+
+- Start v0.8 only after writing the server-backend safety design for auth,
+  workspace isolation, approved templates, audit logging, job status, and
+  artifact collection.
+
 ## v0.8: Server Backend
 
 Purpose:
@@ -267,9 +315,11 @@ Use this order:
 4. If planner works but the UI still looks like chat, start v0.5.
 5. If UI works but lab code configs/logs/loss curves are not integrated, start
    v0.6.
-6. If lab code adapter works and the lab is ready for controlled execution,
-   start v0.8.
-7. If real execution is stable, harden toward v1.0.
+6. If lab code adapter works but the backend boundary is not reserved and
+   hardened, start v0.7.
+7. If v0.7 is complete and the lab is ready for controlled execution, start
+   v0.8 with a written safety design.
+8. If real execution is stable, harden toward v1.0.
 
 ## Handoff Rule For New Sessions
 

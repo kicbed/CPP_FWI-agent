@@ -43,9 +43,9 @@ Current status:
 - Includes a v0.6 Lab Code Adapter for local config-template loading, dry-run
   config previews, supplied log parsing, loss curve extraction, common failure
   recognition, and Planner-facing diagnostic summaries.
-- Includes an initial `JobBackend` interface reservation so future execution
-  backends can share the same validate/render/explain contract while the only
-  implemented backend remains `DryRunBackend`.
+- Includes a v0.7 `JobBackend` reservation layer so future execution backends
+  share the same validate/render/explain/type contract while the only enabled
+  backend remains `DryRunBackend`.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -106,12 +106,13 @@ Current v0.6 state:
   curves, common failure recognizers, and Planner-facing summaries. No real
   execution backend was added.
 
-Current JobBackend reservation state:
+Current v0.7 state:
 
-- A `JobBackend` interface now defines the future backend contract through
-  `validate`, `render`, and `explain`; `DryRunBackend` implements that contract
-  and remains the only concrete backend. Non-dry-run backend enum values and
-  runtime rejection are still planned before any server execution milestone.
+- JobBackend Reservation is complete for the v0.7 scope: `JobBackendType`
+  names `dry_run`, `local`, `ssh`, `slurm`, and `pbs`; shared backend parsing
+  and validation reject all non-`dry_run` or unknown values at runtime; and
+  `AlgorithmCard` validation uses the same guard. `DryRunBackend` remains the
+  only concrete and enabled backend.
 
 ## Technical Highlights
 
@@ -135,8 +136,9 @@ Current JobBackend reservation state:
 - Deterministic lab-code adapter that converts config templates and supplied
   FWI log text into structured dry-run diagnostics, loss curves, failure
   findings, and Planner-facing summaries.
-- Reserved a C++ `JobBackend` abstraction for future execution backends while
-  preserving dry-run-only behavior through the existing `DryRunBackend`.
+- Reserved a C++ `JobBackend` abstraction and backend type enum for future
+  execution backends while preserving dry-run-only behavior through runtime
+  rejection of `local`, `ssh`, `slurm`, and `pbs`.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -186,14 +188,15 @@ Use only bullets that match the completed implementation.
 - Added a Lab Code Adapter for reading lab-style config templates, rendering
   dry-run config previews, parsing supplied logs, extracting loss curves, and
   recognizing common FWI failure patterns without job submission.
-- Reserved the future `JobBackend` interface and made `DryRunBackend`
-  polymorphic through that interface without adding any real execution backend.
+- Reserved the future `JobBackend` interface, backend type enum, and shared
+  runtime guard; made `DryRunBackend` polymorphic while rejecting `local`,
+  `ssh`, `slurm`, and `pbs` until server execution has a safety design.
 
-Planned after v0.6:
+Planned after v0.7:
 
-- Finish hardening the future backend boundary with explicit backend type enum
-  values and runtime rejection for all non-`dry_run` choices until server
-  execution has an explicit safety design.
+- Design the controlled v0.8 server backend with authentication, workspace
+  isolation, approved job templates, status tracking, artifact collection, and
+  audit logging before enabling any real execution.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -380,3 +383,13 @@ Add one short entry whenever a meaningful technical change lands.
 - Preserved the execution boundary: no real CUDA/MPI execution, SSH, Slurm/PBS,
   remote execution, arbitrary shell execution, or automatic Code Agent patch
   application was added.
+
+### 2026-06-22: v0.7 JobBackend Reservation Completion
+
+- Added `JobBackendType` values for `dry_run`, `local`, `ssh`, `slurm`, `pbs`,
+  and `unknown`, plus stable string parsing and rendering helpers.
+- Added shared runtime validation that accepts only `dry_run` and rejects
+  reserved or unknown backends with clear messages.
+- Reused the backend guard in `AlgorithmCard` validation so JSON metadata
+  cannot accidentally enable real execution.
+- Added a v0.7 test report with Chinese learning and interview-prep summary.

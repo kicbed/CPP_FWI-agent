@@ -31,6 +31,9 @@ Version status:
   `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`.
 - v0.6 Lab Code Adapter is complete as of 2026-06-22 according to
   `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.6.md`.
+- v0.7 JobBackend Interface Reservation is complete as of 2026-06-22
+  according to `docs/upgrade/version-roadmap.md` and
+  `docs/upgrade/test-report-v0.7.md`.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -224,9 +227,9 @@ Tasks:
 
 - [x] M9-T1: Define `JobBackend` interface.
 - [x] M9-T2: Make `DryRunBackend` implement `JobBackend`.
-- [ ] M9-T3: Add backend type enum values: `dry_run`, `local`, `ssh`, `slurm`, `pbs`.
-- [ ] M9-T4: Reject non-`dry_run` backends at runtime with a clear message.
-- [ ] M9-T5: Document how Slurm/PBS can be added later.
+- [x] M9-T3: Add backend type enum values: `dry_run`, `local`, `ssh`, `slurm`, `pbs`.
+- [x] M9-T4: Reject non-`dry_run` backends at runtime with a clear message.
+- [x] M9-T5: Document how Slurm/PBS can be added later.
 
 Acceptance:
 

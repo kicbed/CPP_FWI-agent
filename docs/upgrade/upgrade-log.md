@@ -1257,3 +1257,67 @@ Commit:
 Next task:
 - Add backend type enum values for `dry_run`, `local`, `ssh`, `slurm`, and
   `pbs`, then reject non-`dry_run` choices at runtime with clear messages.
+
+## 2026-06-22: Complete v0.7 JobBackend Reservation
+
+Scope:
+- Completed the JobBackend interface reservation batch.
+- Added explicit backend type values and runtime rejection for non-`dry_run`
+  backends.
+- Added v0.7 documentation and a detailed Chinese learning summary.
+
+Files changed:
+- `research/include/agent_rpc/research/job_backend.h`
+- `research/src/job_backend.cpp`
+- `research/src/dry_run_backend.cpp`
+- `research/src/algorithm_card.cpp`
+- `research/CMakeLists.txt`
+- `tests/test_experiment_spec.cpp`
+- `tests/test_algorithm_card.cpp`
+- `tests/test_algorithm_registry.cpp`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/test-report-v0.7.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Research code now has `JobBackendType` values for `dry_run`, `local`, `ssh`,
+  `slurm`, `pbs`, and `unknown`.
+- Shared backend parsing and validation accepts only `dry_run`; reserved or
+  unknown backends are rejected with clear messages.
+- `AlgorithmCard` backend validation now uses the shared backend guard.
+- No real CUDA/MPI execution, SSH, Slurm/PBS, remote execution, arbitrary shell
+  execution, or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `JobBackendType`, `parse_job_backend_type`, and
+  `validate_backend_enabled`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R "(ExperimentSpecTest|AlgorithmCardTest)" --output-on-failure`
+- `cmake --build build -j2 && ctest --test-dir build --output-on-failure`
+  initially exposed a stale `AlgorithmRegistryTest` assertion for the old v0.2
+  backend error message.
+- `cmake --build build -j2 && ctest --test-dir build -R AlgorithmRegistryTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before the new backend enum and guard
+  APIs existed.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. Targeted `AlgorithmCardTest` and `ExperimentSpecTest` passed 2/2.
+- PASS. The stale `AlgorithmRegistryTest` assertion was migrated to the shared
+  guard message and then passed.
+- PASS. Full `ctest` passed 25/25 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.7 JobBackend reservation completion commit.
+
+Next task:
+- Start v0.8 only after writing a server-backend safety design for auth,
+  workspace isolation, approved templates, job lifecycle, artifact collection,
+  and audit logging.

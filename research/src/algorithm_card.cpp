@@ -1,4 +1,5 @@
 #include "agent_rpc/research/algorithm_card.h"
+#include "agent_rpc/research/job_backend.h"
 
 namespace agent_rpc::research {
 
@@ -50,9 +51,8 @@ std::vector<std::string> AlgorithmCard::validate() const {
     if (parameters.empty()) errors.push_back("parameters must not be empty");
     if (inputs.empty()) errors.push_back("inputs must not be empty");
     if (outputs.empty()) errors.push_back("outputs must not be empty");
-    if (backend != "dry_run") {
-        errors.push_back("only dry_run backend is enabled in v0.2");
-    }
+    const auto backend_errors = validate_backend_enabled(backend);
+    errors.insert(errors.end(), backend_errors.begin(), backend_errors.end());
 
     return errors;
 }

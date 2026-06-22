@@ -44,7 +44,7 @@ TEST(AlgorithmCardTest, RejectsMissingRequiredFieldsAndUnsafeBackend) {
     const auto errors = card.validate();
 
     EXPECT_NE(std::find(errors.begin(), errors.end(),
-                        "only dry_run backend is enabled in v0.2"),
+                        "backend 'slurm' is reserved for future server execution; only dry_run is enabled"),
               errors.end());
 
     const auto missing = AlgorithmCard::from_json(json::object());
@@ -56,4 +56,23 @@ TEST(AlgorithmCardTest, RejectsMissingRequiredFieldsAndUnsafeBackend) {
     EXPECT_NE(std::find(missing_errors.begin(), missing_errors.end(),
                         "name is required"),
               missing_errors.end());
+}
+
+TEST(AlgorithmCardTest, RejectsUnknownBackendWithSupportedValues) {
+    const json value = {
+        {"id", "unknown-backend"},
+        {"name", "Unknown Backend"},
+        {"domain", "seismic inversion"},
+        {"parameters", {"niter"}},
+        {"inputs", {"shot_gather"}},
+        {"outputs", {"model"}},
+        {"execution", {{"backend", "kubernetes"}, {"job_spec_supported", true}}}
+    };
+
+    const auto card = AlgorithmCard::from_json(value);
+    const auto errors = card.validate();
+
+    ASSERT_EQ(errors.size(), 1u);
+    EXPECT_NE(errors[0].find("unknown backend 'kubernetes'"), std::string::npos);
+    EXPECT_NE(errors[0].find("dry_run, local, ssh, slurm, pbs"), std::string::npos);
 }

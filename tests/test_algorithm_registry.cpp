@@ -61,7 +61,8 @@ TEST(AlgorithmRegistryTest, RejectsInvalidCardsWithClearError) {
     std::string error;
     EXPECT_FALSE(registry.load_from_directory(temp_dir, &error));
     EXPECT_NE(error.find("unsafe.json"), std::string::npos);
-    EXPECT_NE(error.find("only dry_run backend is enabled in v0.2"), std::string::npos);
+    EXPECT_NE(error.find("backend 'slurm' is reserved"), std::string::npos);
+    EXPECT_NE(error.find("only dry_run is enabled"), std::string::npos);
 
     std::filesystem::remove_all(temp_dir);
 }

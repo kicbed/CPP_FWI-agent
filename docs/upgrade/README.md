@@ -57,6 +57,16 @@ Upgrade the project from a rough multi-agent/FWI demo into:
 - Planner-facing diagnostic summaries that keep all execution dry-run only.
 - v0.6 test report and Chinese learning summary.
 
+`v0.7 JobBackend Reservation` is complete as of 2026-06-22:
+
+- `JobBackend` interface with `validate`, `render`, `explain`, and backend type
+  identity.
+- Backend type enum values for `dry_run`, `local`, `ssh`, `slurm`, and `pbs`.
+- Runtime guard that allows only `dry_run` and rejects all reserved or unknown
+  backend values with clear messages.
+- `AlgorithmCard` backend validation now uses the shared backend guard.
+- v0.7 test report and Chinese learning summary.
+
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.
 
@@ -180,8 +190,8 @@ Active plan:
 
 - `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`
 
-Next session should follow the roadmap after v0.6. The recommended next target
-is JobBackend interface reservation before any real server backend work.
+Next session should follow the roadmap after v0.7. The recommended next target
+is the v0.8 server-backend safety design before any real execution work.
 
 When a milestone becomes too large, create a new plan in:
 

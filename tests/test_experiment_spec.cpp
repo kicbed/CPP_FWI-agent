@@ -79,6 +79,8 @@ TEST(JobBackendInterfaceTest, DryRunBackendCanBeUsedThroughInterface) {
     DryRunBackend dry_run_backend;
     const JobBackend& backend = dry_run_backend;
 
+    EXPECT_EQ(backend.type(), JobBackendType::DryRun);
+
     const auto errors = backend.validate(job);
     const auto rendered = backend.render(job);
     const auto explanation = backend.explain(job);
@@ -87,4 +89,43 @@ TEST(JobBackendInterfaceTest, DryRunBackendCanBeUsedThroughInterface) {
     EXPECT_NE(rendered.find("dry_run: true"), std::string::npos);
     EXPECT_NE(rendered.find("backend: dry_run"), std::string::npos);
     EXPECT_NE(explanation.find("does not execute anything"), std::string::npos);
+}
+
+TEST(JobBackendTypeTest, ParsesAllReservedBackendNames) {
+    EXPECT_EQ(parse_job_backend_type("dry_run"), JobBackendType::DryRun);
+    EXPECT_EQ(parse_job_backend_type("local"), JobBackendType::Local);
+    EXPECT_EQ(parse_job_backend_type("ssh"), JobBackendType::Ssh);
+    EXPECT_EQ(parse_job_backend_type("slurm"), JobBackendType::Slurm);
+    EXPECT_EQ(parse_job_backend_type("pbs"), JobBackendType::Pbs);
+    EXPECT_EQ(parse_job_backend_type("kubernetes"), JobBackendType::Unknown);
+
+    EXPECT_EQ(to_string(JobBackendType::DryRun), "dry_run");
+    EXPECT_EQ(to_string(JobBackendType::Local), "local");
+    EXPECT_EQ(to_string(JobBackendType::Ssh), "ssh");
+    EXPECT_EQ(to_string(JobBackendType::Slurm), "slurm");
+    EXPECT_EQ(to_string(JobBackendType::Pbs), "pbs");
+    EXPECT_EQ(to_string(JobBackendType::Unknown), "unknown");
+}
+
+TEST(JobBackendSafetyTest, RejectsReservedNonDryRunBackendsAtRuntime) {
+    const std::vector<std::string> reserved_backends = {"local", "ssh", "slurm", "pbs"};
+
+    EXPECT_TRUE(validate_backend_enabled("dry_run").empty());
+
+    for (const auto& backend : reserved_backends) {
+        const auto errors = validate_backend_enabled(backend);
+        ASSERT_EQ(errors.size(), 1u) << backend;
+        EXPECT_NE(errors[0].find("backend '" + backend + "' is reserved"),
+                  std::string::npos);
+        EXPECT_NE(errors[0].find("only dry_run is enabled"),
+                  std::string::npos);
+    }
+}
+
+TEST(JobBackendSafetyTest, RejectsUnknownBackendValuesWithSupportedList) {
+    const auto errors = validate_backend_enabled("kubernetes");
+
+    ASSERT_EQ(errors.size(), 1u);
+    EXPECT_NE(errors[0].find("unknown backend 'kubernetes'"), std::string::npos);
+    EXPECT_NE(errors[0].find("dry_run, local, ssh, slurm, pbs"), std::string::npos);
 }

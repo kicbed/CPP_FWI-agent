@@ -4,6 +4,10 @@
 
 namespace agent_rpc::research {
 
+JobBackendType DryRunBackend::type() const {
+    return JobBackendType::DryRun;
+}
+
 std::vector<std::string> DryRunBackend::validate(const JobSpec& job) const {
     return job.validate();
 }
