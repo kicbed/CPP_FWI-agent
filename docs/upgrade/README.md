@@ -90,6 +90,8 @@ Detailed learning note:
 - Metadata-only backend approval decision validation.
 - Metadata-only job audit event model for future submission, rejection,
   lifecycle, artifact, and operator-note records.
+- Metadata-only in-memory job audit log validation and append helpers for
+  future audit persistence boundaries.
 - Requires lab approval, approval reference, workspace root, credential
   reference, authorization policy, authorized submitter list, audit retention,
   and operator contact before any real backend can be considered selected.

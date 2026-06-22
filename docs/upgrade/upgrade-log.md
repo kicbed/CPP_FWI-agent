@@ -1925,3 +1925,57 @@ Next task:
 - Keep real execution disabled. Continue M11 only with metadata,
   authorization, audit persistence design, workspace, and lifecycle
   prerequisites until lab backend approval and operational details are known.
+
+## 2026-06-22: Add Job Audit Log Preflight
+
+Scope:
+- Continued safe Milestone 11 preflight work without selecting or enabling a
+  real backend.
+- Added metadata-only in-memory job audit log validation and append helpers for
+  future audit persistence boundaries.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Added `JobAuditLog` as an in-memory collection of same-job audit events.
+- Added `validate_job_audit_log` to reject empty logs, invalid audit events,
+  and audit events whose `job_id` does not match the log.
+- Added `append_job_audit_event` so future persistence code can append only
+  validated audit metadata.
+- Runtime backend enablement did not change: `local`, `ssh`, `slurm`, and
+  `pbs` remain rejected by the shared backend guard.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credentials, audit persistence service,
+  or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+  before implementation, expected RED failure: missing `JobAuditLog`,
+  `validate_job_audit_log`, and `append_job_audit_event`.
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before audit log APIs existed.
+- PASS. `ServerJobTest` passed after adding metadata-only audit log helpers.
+- PASS. Full `cmake --build build -j2` exited 0.
+- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This job audit log preflight commit.
+
+Next task:
+- Keep real execution disabled. Continue M11 only with metadata,
+  authorization, audit persistence design, workspace, and lifecycle
+  prerequisites until lab backend approval and operational details are known.

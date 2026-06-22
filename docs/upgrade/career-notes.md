@@ -56,8 +56,8 @@ Current status:
   selection; the gate requires lab approval, approval reference, workspace root,
   credential reference, authorization policy, audit retention, and operator
   contact, rejects placeholder approval values, validates concrete authorized
-  submitters, defines metadata-only job audit events, but still does not enable
-  real execution.
+  submitters, defines metadata-only job audit events and in-memory audit log
+  validation, but still does not enable real execution.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -145,7 +145,8 @@ Current Milestone 11 preflight state:
   reject a `JobSubmissionRequest.user_id` that is not named in the approval
   decision. The preflight layer also has a metadata-only `JobAuditEvent` model
   for future submission, rejection, lifecycle, artifact, and operator-note
-  records.
+  records, plus an in-memory `JobAuditLog` helper that validates event batches
+  before a future persistence layer exists.
 
 ## Technical Highlights
 
@@ -192,6 +193,8 @@ Current Milestone 11 preflight state:
 - Added a metadata-only `JobAuditEvent` schema for future controlled execution
   records, covering job, request, user, event type, message, timestamp, and
   backend type while keeping real backends disabled.
+- Added metadata-only in-memory audit log validation and append helpers so
+  future audit persistence starts from validated same-job event batches.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -263,6 +266,8 @@ Use only bullets that match the completed implementation.
 - Added tested job audit event metadata for future real backend work, including
   validation that keeps audit records aligned with the dry-run-only backend
   guard.
+- Added tested in-memory job audit log helpers that reject empty logs,
+  cross-job events, and invalid audit events before appending metadata.
 
 Planned after v0.8:
 

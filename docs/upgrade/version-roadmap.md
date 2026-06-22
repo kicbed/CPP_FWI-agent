@@ -304,8 +304,9 @@ Next target after v0.8:
   backend, credential handling, workspace root, authorization policy, audit
   retention, and operator responsibilities are known. As a preflight step, the
   code now has a metadata-only `BackendApprovalDecision` validator that records
-  those prerequisites, an authorized submitter list, and job audit event
-  metadata without enabling `local`, `ssh`, `slurm`, or `pbs`.
+  those prerequisites, an authorized submitter list, job audit event metadata,
+  and in-memory audit log validation without enabling `local`, `ssh`, `slurm`,
+  or `pbs`.
 
 ## v1.0: Lab-Usable Platform
 

@@ -61,6 +61,11 @@ struct JobAuditEvent {
     JobBackendType backend_type = JobBackendType::DryRun;
 };
 
+struct JobAuditLog {
+    std::string job_id;
+    std::vector<JobAuditEvent> events;
+};
+
 struct ApprovedJobTemplate {
     std::string template_id;
     std::string version;
@@ -100,6 +105,10 @@ std::vector<std::string> validate_submitter_authorization(
     const JobSubmissionRequest& request,
     const BackendApprovalDecision& decision);
 std::vector<std::string> validate_job_audit_event(const JobAuditEvent& event);
+std::vector<std::string> validate_job_audit_log(const JobAuditLog& log);
+std::vector<std::string> append_job_audit_event(
+    JobAuditLog& log,
+    const JobAuditEvent& event);
 JobAuditEvent make_job_audit_event(
     const std::string& job_id,
     const JobSubmissionRequest& request,

@@ -299,3 +299,74 @@ TEST(ServerJobTest, RejectsRealBackendAuditEventWhileRuntimeIsDryRunOnly) {
     ASSERT_FALSE(errors.empty());
     EXPECT_NE(errors[0].find("only dry_run is enabled"), std::string::npos);
 }
+
+TEST(ServerJobTest, RejectsAuditLogWithoutEvents) {
+    JobAuditLog log;
+    log.job_id = "job-42";
+
+    const auto errors = validate_job_audit_log(log);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "job audit log must include at least one event"),
+        errors.end());
+}
+
+TEST(ServerJobTest, RejectsMismatchedAuditEventJobId) {
+    JobAuditLog log;
+    log.job_id = "job-42";
+
+    JobAuditEvent event;
+    event.job_id = "job-99";
+    event.request_id = "req-42";
+    event.user_id = "researcher-a";
+    event.message = "operator rejected submission";
+    event.timestamp = "2026-06-22T12:00:00Z";
+    event.backend_type = JobBackendType::DryRun;
+    log.events.push_back(event);
+
+    const auto errors = validate_job_audit_log(log);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "audit event job_id must match audit log job_id"),
+        errors.end());
+}
+
+TEST(ServerJobTest, AppendsValidatedAuditEventToLog) {
+    JobAuditLog log;
+    log.job_id = "job-42";
+
+    JobSubmissionRequest request;
+    request.request_id = "req-42";
+    request.user_id = "researcher-a";
+
+    const auto event = make_job_audit_event(
+        "job-42",
+        request,
+        JobAuditEventType::OperatorNote,
+        "operator added review note",
+        "2026-06-22T12:05:00Z");
+
+    EXPECT_TRUE(append_job_audit_event(log, event).empty());
+
+    ASSERT_EQ(log.events.size(), 1u);
+    EXPECT_EQ(log.events[0].message, "operator added review note");
+    EXPECT_TRUE(validate_job_audit_log(log).empty());
+}
+
+TEST(ServerJobTest, DoesNotAppendInvalidAuditEvent) {
+    JobAuditLog log;
+    log.job_id = "job-42";
+
+    JobAuditEvent event;
+    event.job_id = "job-42";
+    event.request_id = "req-42";
+    event.user_id = "researcher-a";
+    event.timestamp = "2026-06-22T12:05:00Z";
+    event.backend_type = JobBackendType::DryRun;
+
+    const auto errors = append_job_audit_event(log, event);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(), "message is required"),
+        errors.end());
+    EXPECT_TRUE(log.events.empty());
+}

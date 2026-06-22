@@ -244,6 +244,40 @@ std::vector<std::string> validate_job_audit_event(const JobAuditEvent& event) {
     return errors;
 }
 
+std::vector<std::string> validate_job_audit_log(const JobAuditLog& log) {
+    std::vector<std::string> errors;
+    if (log.job_id.empty()) {
+        errors.push_back("job_id is required");
+    }
+    if (log.events.empty()) {
+        errors.push_back("job audit log must include at least one event");
+    }
+
+    for (const auto& event : log.events) {
+        const auto event_errors = validate_job_audit_event(event);
+        errors.insert(errors.end(), event_errors.begin(), event_errors.end());
+        if (!log.job_id.empty() &&
+            !event.job_id.empty() &&
+            event.job_id != log.job_id) {
+            errors.push_back("audit event job_id must match audit log job_id");
+        }
+    }
+    return errors;
+}
+
+std::vector<std::string> append_job_audit_event(
+    JobAuditLog& log,
+    const JobAuditEvent& event) {
+    JobAuditLog candidate = log;
+    candidate.events.push_back(event);
+
+    const auto errors = validate_job_audit_log(candidate);
+    if (errors.empty()) {
+        log.events.push_back(event);
+    }
+    return errors;
+}
+
 JobAuditEvent make_job_audit_event(
     const std::string& job_id,
     const JobSubmissionRequest& request,
