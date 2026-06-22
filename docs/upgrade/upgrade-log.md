@@ -2092,3 +2092,64 @@ Commit:
 Next task:
 - Continue v0.9 M12-T2: preview a dry-run submission packet for operator
   review, without connecting real backend execution.
+
+## 2026-06-22: Complete v0.9 Backend Readiness Review
+
+Scope:
+- Completed the remaining v0.9 non-executing backend readiness/review tasks.
+- Added dry-run submission packet, audit log, and workspace/artifact plan
+  previews.
+- Added v0.9 test report and Chinese learning summary.
+- Documented the gate for entering v1.0 implementation.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- `docs/upgrade/test-report-v0.9.md`
+- `docs/upgrade/learning-summary-v0.9.md`
+
+Behavior changed:
+- Added `render_dry_run_submission_packet` for operator review of request,
+  experiment, template, resource, and command-preview metadata.
+- Added `render_job_audit_log_preview` for metadata-only audit event review
+  without production persistence.
+- Added `render_workspace_artifact_plan` for workspace and artifact path review
+  without creating local or remote directories.
+- Runtime backend enablement did not change: `local`, `ssh`, `slurm`, and
+  `pbs` remain rejected by the shared backend guard.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credential loading, production audit
+  store, or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `render_dry_run_submission_packet`,
+  `render_job_audit_log_preview`, and `render_workspace_artifact_plan`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before the remaining v0.9 preview APIs
+  existed.
+- PASS. `ServerJobTest` passed after adding the preview helpers.
+- PASS. Full `cmake --build build -j2` exited 0.
+- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.9 completion commit.
+
+Next task:
+- Do not enter v1.0 implementation yet. First complete M11 controlled real
+  backend integration with lab approval, credentials policy, workspace root,
+  authorization policy, audit retention, operator rules, auth/access control,
+  workspace lifecycle, submission/status/cancellation, artifact collection,
+  visualization, audit logging, and passing tests.

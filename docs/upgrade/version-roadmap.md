@@ -311,8 +311,9 @@ Next target after v0.8:
 
 ## v0.9: Backend Readiness Review
 
-Status: Started on 2026-06-22 with operator-facing rendering for
-`BackendPreflightReport`. The scope remains non-executing.
+Status: Completed on 2026-06-22 with non-executing readiness report rendering,
+dry-run submission packet preview, audit log preview, workspace/artifact path
+preview, and `docs/upgrade/test-report-v0.9.md`.
 
 Purpose:
 
@@ -343,15 +344,24 @@ Completed scope:
   can be displayed as stable operator-facing text with metadata readiness,
   runtime enablement state, validation errors, runtime blockers, and safety
   boundaries.
+- Added `render_dry_run_submission_packet` for operator review of request,
+  experiment, template, resource, and command-preview metadata without
+  submitting or executing a job.
+- Added `render_job_audit_log_preview` for same-job audit event preview without
+  writing to a production audit store.
+- Added `render_workspace_artifact_plan` for workspace and artifact path review
+  without creating local or remote directories.
 
-Entry rule:
+v1.0 entry gate:
 
-- v0.9 can start now for non-executing readiness/review work because M11
-  preflight has a completion audit and test report.
-- v0.9 cannot become real backend implementation unless M11-T1 receives a lab
-  decision package with selected backend, credentials policy, workspace root,
-  authorization policy, audit retention, quota/operator rules, and operator
-  contact.
+- v1.0 implementation should start only after M11-T1 has a lab decision package
+  with selected backend, credential policy, workspace root, authorization
+  policy, audit retention, quota/operator rules, and operator contact.
+- M11-T2 through M11-T7 must then implement and test authentication/access
+  control, workspace lifecycle, submission/status/cancellation, log and
+  artifact collection, visualization, and audit logging.
+- Until those controls exist, the project can continue docs-only or
+  non-executing review work, but should not claim v1.0 lab-usable execution.
 
 ## v1.0: Lab-Usable Platform
 

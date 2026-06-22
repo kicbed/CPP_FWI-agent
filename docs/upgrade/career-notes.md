@@ -63,6 +63,9 @@ Current status:
   `BackendPreflightReport` into stable operator-facing text with metadata
   readiness, runtime enablement state, validation errors, runtime blockers, and
   safety boundaries.
+- Includes v0.9 non-executing review previews for dry-run submission packets,
+  audit logs, workspace paths, and artifact paths without enabling real
+  execution.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -157,10 +160,10 @@ Current Milestone 11 preflight state:
 
 Current v0.9 state:
 
-- Backend Readiness Review has started with an operator-facing report renderer.
-  The renderer consumes the structured `BackendPreflightReport` produced by M11
-  preflight and displays metadata readiness, runtime enablement, validation
-  errors, runtime blockers, and safety boundaries without submitting jobs or
+- Backend Readiness Review is complete for the v0.9 scope. The review helpers
+  consume structured M11 preflight metadata and render readiness status,
+  dry-run submission packets, audit log previews, and workspace/artifact plans
+  without submitting jobs, persisting audit records, creating directories, or
   enabling any reserved backend.
 
 ## Technical Highlights
@@ -215,6 +218,9 @@ Current v0.9 state:
   workspace, and audit-log checks while preserving the runtime backend guard.
 - Added an operator-facing backend readiness report renderer so v0.9 can expose
   M11 preflight status in stable text while keeping runtime blockers visible.
+- Added non-executing v0.9 preview renderers for dry-run submission packets,
+  audit logs, and workspace/artifact plans so operators can review a future
+  backend package before runtime enablement changes.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -293,8 +299,10 @@ Use only bullets that match the completed implementation.
   remains disabled.
 - Added a tested operator-facing backend readiness report renderer for v0.9
   review workflows without enabling any real execution path.
+- Completed v0.9 backend readiness review with tested non-executing previews
+  for submission packets, audit logs, and workspace/artifact plans.
 
-Planned after the current v0.9 readiness work:
+Planned after v0.9:
 
 - Controlled real backend integration only after a lab-approved backend,
   credential model, workspace root, authorization policy, audit retention, and
@@ -529,3 +537,14 @@ Add one short entry whenever a meaningful technical change lands.
   remote execution, local wrapper execution, arbitrary shell execution,
   credential loading, production audit store, or automatic Code Agent patch
   application was added.
+
+### 2026-06-22: v0.9 Backend Readiness Review Completion
+
+- Added non-executing preview renderers for dry-run submission packets, audit
+  logs, and workspace/artifact plans.
+- Added v0.9 test report and Chinese learning summary for future study and
+  interview preparation.
+- Clarified that v1.0 implementation should wait until M11 controlled real
+  backend integration has lab approval, auth, workspace lifecycle, submission
+  controls, artifact collection, visualization, audit logging, and passing
+  tests.

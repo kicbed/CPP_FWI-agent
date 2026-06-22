@@ -22,6 +22,54 @@ BackendApprovalDecision make_complete_local_approval() {
     return decision;
 }
 
+BackendPreflightPackage make_complete_preflight_package() {
+    BackendPreflightPackage package;
+    package.approval = make_complete_local_approval();
+    package.approval.authorized_submitters = {"researcher-a"};
+    package.job_directory_name = "job-20260622-0042";
+
+    package.request.request_id = "req-42";
+    package.request.user_id = "researcher-a";
+    package.request.experiment_id = "exp-marmousi-001";
+    package.request.template_id = "fwi_multiscale_dry_run";
+    package.request.template_version = "1";
+    package.request.backend_type = JobBackendType::DryRun;
+    package.request.dry_run = true;
+    package.request.experiment.algorithm_id = "fwi_cuda_mpi";
+    package.request.experiment.dataset_id = "marmousi";
+    package.request.experiment.expected_outputs = {
+        "loss_curve",
+        "final_velocity_model",
+    };
+    package.request.job.command = "fwi_solver --config config.json";
+    package.request.job.working_dir = "/preview/workspace";
+    package.request.job.mpi_processes = 4;
+    package.request.job.gpu_count = 2;
+    package.request.job.time_limit_minutes = 120;
+    package.request.job.artifact_paths = {
+        "outputs/loss.csv",
+        "outputs/final_model.bin",
+    };
+
+    ApprovedJobTemplate approved;
+    approved.template_id = "fwi_multiscale_dry_run";
+    approved.version = "1";
+    approved.backend_type = JobBackendType::DryRun;
+    package.approved_templates.push_back(approved);
+
+    package.audit_log.job_id = "job-42";
+    EXPECT_TRUE(append_job_audit_event(package.audit_log,
+        make_job_audit_event(
+            "job-42",
+            package.request,
+            JobAuditEventType::OperatorNote,
+            "operator completed metadata-only preflight review",
+            "2026-06-22T12:10:00Z"))
+                    .empty());
+
+    return package;
+}
+
 }  // namespace
 
 TEST(ServerJobTest, SubmissionRequestDefaultsToDryRun) {
@@ -464,4 +512,53 @@ TEST(ServerJobTest, RendersOperatorFacingBackendReadinessReport) {
     EXPECT_NE(rendered.find("Safety boundaries:"), std::string::npos);
     EXPECT_NE(rendered.find("- preflight report does not submit jobs"),
         std::string::npos);
+}
+
+TEST(ServerJobTest, RendersDryRunSubmissionPacketForOperatorReview) {
+    const auto package = make_complete_preflight_package();
+
+    const auto rendered = render_dry_run_submission_packet(package);
+
+    EXPECT_NE(rendered.find("Dry-Run Submission Packet"), std::string::npos);
+    EXPECT_NE(rendered.find("request_id: req-42"), std::string::npos);
+    EXPECT_NE(rendered.find("user_id: researcher-a"), std::string::npos);
+    EXPECT_NE(rendered.find("experiment_id: exp-marmousi-001"), std::string::npos);
+    EXPECT_NE(rendered.find("request_backend: dry_run"), std::string::npos);
+    EXPECT_NE(rendered.find("approval_backend: local"), std::string::npos);
+    EXPECT_NE(rendered.find("dry_run: true"), std::string::npos);
+    EXPECT_NE(rendered.find("execution: disabled"), std::string::npos);
+    EXPECT_NE(rendered.find("template: fwi_multiscale_dry_run@1"), std::string::npos);
+    EXPECT_NE(rendered.find("command_preview: fwi_solver --config config.json"),
+        std::string::npos);
+}
+
+TEST(ServerJobTest, RendersAuditLogPreviewWithoutPersistence) {
+    const auto package = make_complete_preflight_package();
+
+    const auto rendered = render_job_audit_log_preview(package.audit_log);
+
+    EXPECT_NE(rendered.find("Job Audit Log Preview"), std::string::npos);
+    EXPECT_NE(rendered.find("job_id: job-42"), std::string::npos);
+    EXPECT_NE(rendered.find("event_count: 1"), std::string::npos);
+    EXPECT_NE(rendered.find("event_type: operator_note"), std::string::npos);
+    EXPECT_NE(rendered.find("timestamp: 2026-06-22T12:10:00Z"), std::string::npos);
+    EXPECT_NE(rendered.find("backend: dry_run"), std::string::npos);
+    EXPECT_NE(rendered.find("persistence: disabled"), std::string::npos);
+}
+
+TEST(ServerJobTest, RendersWorkspaceArtifactPlanWithoutCreatingDirectories) {
+    const auto package = make_complete_preflight_package();
+
+    const auto rendered = render_workspace_artifact_plan(package);
+
+    EXPECT_NE(rendered.find("Workspace Artifact Plan"), std::string::npos);
+    EXPECT_NE(rendered.find("workspace_root: /lab/workspaces/agent"), std::string::npos);
+    EXPECT_NE(rendered.find("job_directory_name: job-20260622-0042"), std::string::npos);
+    EXPECT_NE(rendered.find("planned_workspace_path: /lab/workspaces/agent/job-20260622-0042"),
+        std::string::npos);
+    EXPECT_NE(rendered.find("directories_created: false"), std::string::npos);
+    EXPECT_NE(rendered.find("- outputs/loss.csv"), std::string::npos);
+    EXPECT_NE(rendered.find("- outputs/final_model.bin"), std::string::npos);
+    EXPECT_NE(rendered.find("- loss_curve"), std::string::npos);
+    EXPECT_NE(rendered.find("- final_velocity_model"), std::string::npos);
 }

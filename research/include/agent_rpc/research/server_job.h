@@ -129,6 +129,11 @@ BackendPreflightReport evaluate_backend_preflight(
     const BackendPreflightPackage& package);
 std::string render_backend_preflight_report(
     const BackendPreflightReport& report);
+std::string render_dry_run_submission_packet(
+    const BackendPreflightPackage& package);
+std::string render_job_audit_log_preview(const JobAuditLog& log);
+std::string render_workspace_artifact_plan(
+    const BackendPreflightPackage& package);
 JobAuditEvent make_job_audit_event(
     const std::string& job_id,
     const JobSubmissionRequest& request,

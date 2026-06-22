@@ -56,6 +56,55 @@ void require_concrete_approval_value(
     }
 }
 
+const char* bool_text(bool value) {
+    return value ? "true" : "false";
+}
+
+std::string audit_event_type_name(JobAuditEventType event_type) {
+    switch (event_type) {
+        case JobAuditEventType::SubmissionRequested:
+            return "submission_requested";
+        case JobAuditEventType::SubmissionRejected:
+            return "submission_rejected";
+        case JobAuditEventType::LifecycleChanged:
+            return "lifecycle_changed";
+        case JobAuditEventType::ArtifactIndexed:
+            return "artifact_indexed";
+        case JobAuditEventType::OperatorNote:
+            return "operator_note";
+    }
+    return "operator_note";
+}
+
+void append_list_section(
+    std::ostringstream& out,
+    const std::string& title,
+    const std::vector<std::string>& values) {
+    out << title << ":\n";
+    if (values.empty()) {
+        out << "- none\n";
+        return;
+    }
+    for (const auto& value : values) {
+        out << "- " << value << "\n";
+    }
+}
+
+std::string join_workspace_preview_path(
+    const std::string& workspace_root,
+    const std::string& job_directory_name) {
+    if (workspace_root.empty()) {
+        return job_directory_name;
+    }
+    if (job_directory_name.empty()) {
+        return workspace_root;
+    }
+    if (workspace_root.back() == '/') {
+        return workspace_root + job_directory_name;
+    }
+    return workspace_root + "/" + job_directory_name;
+}
+
 }  // namespace
 
 std::string to_string(JobLifecycleState state) {
@@ -339,24 +388,83 @@ BackendPreflightReport evaluate_backend_preflight(
 std::string render_backend_preflight_report(
     const BackendPreflightReport& report) {
     std::ostringstream out;
-    const auto render_list =
-        [&out](const std::string& title, const std::vector<std::string>& values) {
-            out << title << ":\n";
-            if (values.empty()) {
-                out << "- none\n";
-                return;
-            }
-            for (const auto& value : values) {
-                out << "- " << value << "\n";
-            }
-        };
-
     out << "Backend Readiness Report\n";
-    out << "metadata_ready: " << (report.metadata_ready ? "true" : "false") << "\n";
-    out << "runtime_enabled: " << (report.runtime_enabled ? "true" : "false") << "\n";
-    render_list("Validation errors", report.validation_errors);
-    render_list("Runtime blockers", report.runtime_blockers);
-    render_list("Safety boundaries", report.safety_boundaries);
+    out << "metadata_ready: " << bool_text(report.metadata_ready) << "\n";
+    out << "runtime_enabled: " << bool_text(report.runtime_enabled) << "\n";
+    append_list_section(out, "Validation errors", report.validation_errors);
+    append_list_section(out, "Runtime blockers", report.runtime_blockers);
+    append_list_section(out, "Safety boundaries", report.safety_boundaries);
+    return out.str();
+}
+
+std::string render_dry_run_submission_packet(
+    const BackendPreflightPackage& package) {
+    std::ostringstream out;
+    out << "Dry-Run Submission Packet\n";
+    out << "request_id: " << package.request.request_id << "\n";
+    out << "user_id: " << package.request.user_id << "\n";
+    out << "experiment_id: " << package.request.experiment_id << "\n";
+    out << "algorithm_id: " << package.request.experiment.algorithm_id << "\n";
+    out << "dataset_id: " << package.request.experiment.dataset_id << "\n";
+    out << "request_backend: " << to_string(package.request.backend_type) << "\n";
+    out << "approval_backend: " << to_string(package.approval.backend_type) << "\n";
+    out << "dry_run: " << bool_text(package.request.dry_run) << "\n";
+    out << "execution: disabled\n";
+    out << "template: " << package.request.template_id
+        << "@" << package.request.template_version << "\n";
+    out << "command_preview: " << package.request.job.command << "\n";
+    out << "working_dir_preview: " << package.request.job.working_dir << "\n";
+    out << "mpi_processes: " << package.request.job.mpi_processes << "\n";
+    out << "gpu_count: " << package.request.job.gpu_count << "\n";
+    out << "time_limit_minutes: " << package.request.job.time_limit_minutes << "\n";
+    out << "safety_boundary: packet preview only; no command is submitted or executed\n";
+    return out.str();
+}
+
+std::string render_job_audit_log_preview(const JobAuditLog& log) {
+    std::ostringstream out;
+    out << "Job Audit Log Preview\n";
+    out << "job_id: " << log.job_id << "\n";
+    out << "event_count: " << log.events.size() << "\n";
+    out << "persistence: disabled\n";
+    for (std::size_t i = 0; i < log.events.size(); ++i) {
+        const auto& event = log.events[i];
+        out << "event[" << i << "]:\n";
+        out << "  request_id: " << event.request_id << "\n";
+        out << "  user_id: " << event.user_id << "\n";
+        out << "  event_type: " << audit_event_type_name(event.event_type) << "\n";
+        out << "  message: " << event.message << "\n";
+        out << "  timestamp: " << event.timestamp << "\n";
+        out << "  backend: " << to_string(event.backend_type) << "\n";
+    }
+    return out.str();
+}
+
+std::string render_workspace_artifact_plan(
+    const BackendPreflightPackage& package) {
+    std::ostringstream out;
+    const auto workspace_errors = validate_workspace_path(
+        package.approval.workspace_root,
+        package.job_directory_name);
+
+    out << "Workspace Artifact Plan\n";
+    out << "workspace_root: " << package.approval.workspace_root << "\n";
+    out << "job_directory_name: " << package.job_directory_name << "\n";
+    out << "planned_workspace_path: "
+        << join_workspace_preview_path(
+               package.approval.workspace_root,
+               package.job_directory_name)
+        << "\n";
+    out << "directories_created: false\n";
+    out << "workspace_validation: "
+        << (workspace_errors.empty() ? "valid" : "invalid") << "\n";
+    append_list_section(out, "workspace_errors", workspace_errors);
+    append_list_section(out, "artifact_paths", package.request.job.artifact_paths);
+    append_list_section(
+        out,
+        "expected_outputs",
+        package.request.experiment.expected_outputs);
+    out << "safety_boundary: preview only; no local or remote directories are created\n";
     return out.str();
 }
 

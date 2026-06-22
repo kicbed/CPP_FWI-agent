@@ -106,13 +106,21 @@ Detailed M11 preflight notes:
 - `docs/upgrade/m11-preflight-completion-audit.md`
 - `docs/upgrade/learning-summary-m11-preflight.md`
 
-`v0.9 Backend Readiness Review` started on 2026-06-22:
+`v0.9 Backend Readiness Review` is complete as of 2026-06-22:
 
 - Operator-facing rendering for `BackendPreflightReport`.
+- Dry-run submission packet preview for operator review.
+- Metadata-only audit log preview without persistence.
+- Workspace and artifact path preview without directory creation.
 - Readiness output shows metadata readiness, runtime enablement state,
   validation errors, runtime blockers, and safety boundaries.
 - Runtime remains dry-run only; `local`, `ssh`, `slurm`, and `pbs` are still
   rejected by the shared backend guard.
+
+Detailed v0.9 notes:
+
+- `docs/upgrade/test-report-v0.9.md`
+- `docs/upgrade/learning-summary-v0.9.md`
 
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.
@@ -239,16 +247,17 @@ Active plan:
 
 - `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md` (complete)
 
-Current version:
+Current version state:
 
-- v0.9 Backend Readiness Review, tracked under Milestone 12 in
-  `docs/upgrade/milestones.md`.
+- v0.9 Backend Readiness Review is complete.
+- v1.0 should not start as implementation until M11 controlled real backend
+  integration has a lab-approved backend, credentials policy, workspace root,
+  authorization policy, audit retention, quota/operator rules, operator
+  contact, and passing tests for auth, workspace lifecycle, submission/status,
+  artifact collection, visualization, and audit logging.
 
-Next session should continue v0.9 only as non-executing backend readiness and
-review work. Do not connect real execution by default. Continue M11-T1 real
-backend selection only after the first real backend, credentials, workspace
-root, authorization policy, audit retention, operator ownership, and lab
-approval are known.
+Next session should either prepare the M11 lab decision package as docs only or
+continue non-executing review polish. Do not connect real execution by default.
 
 When a milestone becomes too large, create a new plan in:
 

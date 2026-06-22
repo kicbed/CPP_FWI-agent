@@ -44,8 +44,9 @@ Version status:
   approval decision gate, submitter authorization validation, and audit-event
   metadata plus in-memory audit log validation and a unified preflight readiness
   report. This does not select or enable a real backend.
-- v0.9 Backend Readiness Review started on 2026-06-22 with a non-executing
-  operator-facing renderer for `BackendPreflightReport`.
+- v0.9 Backend Readiness Review is complete as of 2026-06-22 with
+  non-executing readiness report rendering, dry-run submission packet preview,
+  audit log preview, workspace/artifact path preview, and v0.9 report docs.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -315,12 +316,12 @@ Tasks:
 
 - [x] M12-T1: Render an operator-facing backend readiness report from
   `BackendPreflightReport`.
-- [ ] M12-T2: Preview a dry-run submission packet for operator review.
-- [ ] M12-T3: Preview audit events and same-job audit logs without writing to a
+- [x] M12-T2: Preview a dry-run submission packet for operator review.
+- [x] M12-T3: Preview audit events and same-job audit logs without writing to a
   production audit store.
-- [ ] M12-T4: Show workspace and artifact path plans without creating remote
+- [x] M12-T4: Show workspace and artifact path plans without creating remote
   directories.
-- [ ] M12-T5: Add v0.9 test report and Chinese learning summary.
+- [x] M12-T5: Add v0.9 test report and Chinese learning summary.
 
 Acceptance:
 
@@ -332,3 +333,21 @@ Acceptance:
 - No CUDA/MPI, SSH, Slurm, PBS, local wrapper, remote execution, credential
   loading, production audit store, arbitrary shell execution, or automatic Code
   Agent patch application is added.
+
+## v1.0 Entry Gate
+
+The project can enter v1.0 implementation only after M11 controlled real backend
+integration is approved and completed.
+
+Required before v1.0 implementation starts:
+
+- Lab decision package for M11-T1 names the first backend and includes
+  credential policy, workspace root, authorization policy, audit retention,
+  quota/operator rules, and operator contact.
+- Authentication and access control are implemented and tested.
+- Workspace creation and cleanup are implemented and tested.
+- Job submission, status polling, and cancellation are implemented and tested.
+- Log collection, artifact indexing, loss-curve/output visualization, and audit
+  logging are implemented and tested.
+- The runtime backend guard is intentionally changed only after the above
+  controls exist and pass review.
