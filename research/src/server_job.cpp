@@ -1,6 +1,61 @@
 #include "agent_rpc/research/server_job.h"
 
+#include <algorithm>
+#include <cctype>
+
 namespace agent_rpc::research {
+namespace {
+
+std::string normalized_approval_value(const std::string& value) {
+    const auto begin = std::find_if_not(
+        value.begin(),
+        value.end(),
+        [](unsigned char ch) { return std::isspace(ch); });
+    const auto end = std::find_if_not(
+        value.rbegin(),
+        value.rend(),
+        [](unsigned char ch) { return std::isspace(ch); }).base();
+
+    if (begin >= end) {
+        return "";
+    }
+
+    std::string normalized(begin, end);
+    std::transform(
+        normalized.begin(),
+        normalized.end(),
+        normalized.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+    return normalized;
+}
+
+bool is_placeholder_approval_value(const std::string& value) {
+    const auto normalized = normalized_approval_value(value);
+    return normalized == "tbd" ||
+           normalized == "todo" ||
+           normalized == "pending" ||
+           normalized == "unknown" ||
+           normalized == "n/a" ||
+           normalized == "na" ||
+           normalized == "none";
+}
+
+void require_concrete_approval_value(
+    const std::string& field_name,
+    const std::string& value,
+    std::vector<std::string>& errors) {
+    if (normalized_approval_value(value).empty()) {
+        errors.push_back(field_name + " is required");
+        return;
+    }
+    if (is_placeholder_approval_value(value)) {
+        errors.push_back(field_name + " must be a concrete approval value");
+    }
+}
+
+}  // namespace
 
 std::string to_string(JobLifecycleState state) {
     switch (state) {
@@ -116,27 +171,28 @@ std::vector<std::string> validate_backend_approval_decision(
         errors.push_back(
             "lab approval is required before selecting a real backend");
     }
-    if (decision.approved_by.empty()) {
-        errors.push_back("approved_by is required");
-    }
-    if (decision.approval_reference.empty()) {
-        errors.push_back("approval_reference is required");
-    }
-    if (decision.workspace_root.empty()) {
-        errors.push_back("workspace_root is required");
-    }
-    if (decision.credential_reference.empty()) {
-        errors.push_back("credential_reference is required");
-    }
-    if (decision.authorization_policy.empty()) {
-        errors.push_back("authorization_policy is required");
-    }
-    if (decision.audit_retention_policy.empty()) {
-        errors.push_back("audit_retention_policy is required");
-    }
-    if (decision.operator_contact.empty()) {
-        errors.push_back("operator_contact is required");
-    }
+    require_concrete_approval_value("approved_by", decision.approved_by, errors);
+    require_concrete_approval_value(
+        "approval_reference",
+        decision.approval_reference,
+        errors);
+    require_concrete_approval_value("workspace_root", decision.workspace_root, errors);
+    require_concrete_approval_value(
+        "credential_reference",
+        decision.credential_reference,
+        errors);
+    require_concrete_approval_value(
+        "authorization_policy",
+        decision.authorization_policy,
+        errors);
+    require_concrete_approval_value(
+        "audit_retention_policy",
+        decision.audit_retention_policy,
+        errors);
+    require_concrete_approval_value(
+        "operator_contact",
+        decision.operator_contact,
+        errors);
 
     return errors;
 }

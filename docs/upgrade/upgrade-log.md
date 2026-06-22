@@ -1758,3 +1758,52 @@ Commit:
 Next task:
 - Stop v0.8 work. Continue only with v0.8 study/review or M11 prerequisites;
   do not enable real execution without lab approval.
+
+## 2026-06-22: Harden Backend Approval Placeholder Checks
+
+Scope:
+- Continued safe Milestone 11 preflight work without selecting or enabling a
+  real backend.
+- Hardened backend approval decision validation so placeholder metadata cannot
+  be treated as a complete approval packet.
+
+Files changed:
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- `validate_backend_approval_decision` now rejects blank or placeholder values
+  such as `TBD`, `todo`, `pending`, `unknown`, `n/a`, `na`, and `none` for
+  required approval metadata.
+- Runtime backend enablement did not change: `local`, `ssh`, `slurm`, and
+  `pbs` remain rejected by the shared backend guard.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credentials, or automatic Code Agent
+  patch application was added.
+
+Tests run:
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+  before implementation, expected RED failure:
+  `RejectsPlaceholderApprovalDecisionValues` did not receive placeholder
+  validation errors.
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED test failed before placeholder validation existed.
+- PASS. `ServerJobTest` passed after adding concrete approval-value checks.
+- PASS. Full `cmake --build build -j2` exited 0.
+- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This backend approval placeholder hardening commit.
+
+Next task:
+- Keep real execution disabled. Continue M11 only with metadata, authorization,
+  audit, and workspace prerequisites until lab backend approval and operational
+  details are known.

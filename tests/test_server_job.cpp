@@ -2,6 +2,8 @@
 
 #include <agent_rpc/research/server_job.h>
 
+#include <algorithm>
+
 using namespace agent_rpc::research;
 
 TEST(ServerJobTest, SubmissionRequestDefaultsToDryRun) {
@@ -134,6 +136,43 @@ TEST(ServerJobTest, RejectsDryRunAsRealBackendApprovalDecision) {
 
     EXPECT_NE(std::find(errors.begin(), errors.end(),
                   "real backend approval must select local, ssh, slurm, or pbs"),
+        errors.end());
+}
+
+TEST(ServerJobTest, RejectsPlaceholderApprovalDecisionValues) {
+    BackendApprovalDecision decision;
+    decision.backend_type = JobBackendType::Slurm;
+    decision.lab_approved = true;
+    decision.approved_by = "TBD";
+    decision.approval_reference = "pending";
+    decision.workspace_root = "unknown";
+    decision.credential_reference = "todo";
+    decision.authorization_policy = "n/a";
+    decision.audit_retention_policy = "none";
+    decision.operator_contact = "   ";
+
+    const auto errors = validate_backend_approval_decision(decision);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "approved_by must be a concrete approval value"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "approval_reference must be a concrete approval value"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "workspace_root must be a concrete approval value"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "credential_reference must be a concrete approval value"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "authorization_policy must be a concrete approval value"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "audit_retention_policy must be a concrete approval value"),
+        errors.end());
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "operator_contact is required"),
         errors.end());
 }
 

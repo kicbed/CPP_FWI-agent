@@ -55,7 +55,8 @@ Current status:
 - Includes a Milestone 11 preflight approval gate for future real backend
   selection; the gate requires lab approval, approval reference, workspace root,
   credential reference, authorization policy, audit retention, and operator
-  contact, but still does not enable real execution.
+  contact, rejects placeholder approval values, but still does not enable real
+  execution.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -137,7 +138,9 @@ Current Milestone 11 preflight state:
 - Backend approval decision validation exists as a metadata-only safety gate.
   It records the prerequisites needed before selecting a real backend, while
   the shared runtime backend guard continues to reject `local`, `ssh`, `slurm`,
-  and `pbs`.
+  and `pbs`. The preflight gate also rejects placeholder values such as `TBD`,
+  `pending`, `unknown`, `n/a`, or `none` so an incomplete approval packet cannot
+  look valid.
 
 ## Technical Highlights
 
@@ -175,6 +178,8 @@ Current Milestone 11 preflight state:
 - Added a tested backend approval decision gate for future M11 backend
   selection, separating prerequisite validation from runtime backend
   enablement.
+- Hardened the M11 approval decision gate so blank or placeholder approval
+  metadata is rejected before any future backend selection can be considered.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -238,6 +243,8 @@ Use only bullets that match the completed implementation.
 - Added a metadata-only backend approval decision gate for future real backend
   selection, proving that complete approval records still do not bypass the
   dry-run-only runtime guard.
+- Hardened the backend approval preflight validator to reject placeholder
+  approval metadata such as `TBD`, `pending`, `unknown`, `n/a`, or `none`.
 
 Planned after v0.8:
 
