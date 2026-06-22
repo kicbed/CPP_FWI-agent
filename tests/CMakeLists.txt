@@ -197,6 +197,18 @@ target_include_directories(test_lab_code_adapter PRIVATE
 )
 add_test(NAME LabCodeAdapterTest COMMAND test_lab_code_adapter)
 
+add_executable(test_server_job test_server_job.cpp)
+target_link_libraries(test_server_job
+    agent_rpc_research
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_server_job PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../research/include
+)
+add_test(NAME ServerJobTest COMMAND test_server_job)
+
 add_test(
     NAME WebBrandingTest
     COMMAND ${CMAKE_COMMAND}

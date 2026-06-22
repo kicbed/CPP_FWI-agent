@@ -1361,3 +1361,49 @@ Commit:
 Next task:
 - Continue v0.8 Task 2: add server job submission and lifecycle record models,
   with tests proving non-`dry_run` submissions remain rejected.
+
+## 2026-06-22: Add Server Job Safety Model
+
+Scope:
+- Added the first v0.8 server job model contract.
+- Added lifecycle state parsing and a submission-boundary validator that keeps
+  non-`dry_run` backends rejected.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `research/CMakeLists.txt`
+- `tests/test_server_job.cpp`
+- `tests/CMakeLists.txt`
+- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Research code now has `JobSubmissionRequest`, `JobRecord`, and
+  `JobLifecycleState` models for future server job tracking.
+- `validate_submission_boundary` reuses the existing backend guard, so
+  reserved backend values such as `slurm` remain rejected.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, or automatic Code Agent patch
+  application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `agent_rpc/research/server_job.h`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before `server_job.h` existed.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `ServerJobTest` passed 1/1.
+- PASS. Full `ctest` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This server job safety model commit.
+
+Next task:
+- Continue v0.8 Task 3: add approved job template validation.

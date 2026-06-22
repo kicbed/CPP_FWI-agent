@@ -129,7 +129,7 @@ git commit -m "docs: start v0.8 server backend safety design"
 - Modify: `tests/CMakeLists.txt`
 - Modify: `docs/upgrade/upgrade-log.md`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/test_server_job.cpp`:
 
@@ -167,7 +167,7 @@ TEST(ServerJobTest, RejectsNonDryRunSubmissionBeforeBackendsAreEnabled) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 
@@ -181,7 +181,7 @@ Expected:
 fatal error: agent_rpc/research/server_job.h: No such file or directory
 ```
 
-- [ ] **Step 3: Implement the model**
+- [x] **Step 3: Implement the model**
 
 Create `research/include/agent_rpc/research/server_job.h`:
 
@@ -296,7 +296,7 @@ std::vector<std::string> validate_submission_boundary(
 Update CMake files so `server_job.cpp` is part of `agent_rpc_research` and
 `test_server_job` is registered as `ServerJobTest`.
 
-- [ ] **Step 4: Run targeted and full tests**
+- [x] **Step 4: Run targeted and full tests**
 
 Run:
 
@@ -315,7 +315,7 @@ full ctest passes
 git diff --check produces no output
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add research/include/agent_rpc/research/server_job.h \
