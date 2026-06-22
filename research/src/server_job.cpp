@@ -101,4 +101,24 @@ std::vector<std::string> validate_workspace_path(
     return errors;
 }
 
+JobRecord make_rejected_job_record(
+    const std::string& job_id,
+    const JobSubmissionRequest& request,
+    const std::vector<std::string>& validation_messages) {
+    JobRecord record;
+    record.job_id = job_id;
+    record.state = JobLifecycleState::Rejected;
+    record.request = request;
+    record.validation_messages = validation_messages;
+    return record;
+}
+
+void append_lifecycle_event(
+    JobRecord& record,
+    JobLifecycleState next_state,
+    const std::string& message) {
+    record.state = next_state;
+    record.status_events.push_back(to_string(next_state) + ": " + message);
+}
+
 }  // namespace agent_rpc::research

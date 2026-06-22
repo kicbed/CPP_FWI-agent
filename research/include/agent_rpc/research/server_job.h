@@ -63,5 +63,13 @@ std::vector<std::string> validate_approved_template(
 std::vector<std::string> validate_workspace_path(
     const std::string& workspace_root,
     const std::string& job_directory_name);
+JobRecord make_rejected_job_record(
+    const std::string& job_id,
+    const JobSubmissionRequest& request,
+    const std::vector<std::string>& validation_messages);
+void append_lifecycle_event(
+    JobRecord& record,
+    JobLifecycleState next_state,
+    const std::string& message);
 
 }  // namespace agent_rpc::research

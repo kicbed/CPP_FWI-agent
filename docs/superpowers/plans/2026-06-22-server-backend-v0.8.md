@@ -567,7 +567,7 @@ git commit -m "feat: guard server job workspaces"
 - Modify: `tests/test_server_job.cpp`
 - Modify: `docs/upgrade/upgrade-log.md`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/test_server_job.cpp`:
 
@@ -599,7 +599,7 @@ TEST(ServerJobTest, AppendsLifecycleEventWithoutExecutingCommands) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 
@@ -613,7 +613,7 @@ Expected:
 error: use of undeclared identifier 'make_rejected_job_record'
 ```
 
-- [ ] **Step 3: Implement lifecycle helpers**
+- [x] **Step 3: Implement lifecycle helpers**
 
 Add to `server_job.h`:
 
@@ -656,7 +656,7 @@ void append_lifecycle_event(
 These helpers mutate only in-memory records. They must not call `std::system`,
 `popen`, SSH, Slurm, PBS, MPI launchers, or local scripts.
 
-- [ ] **Step 4: Run targeted and full tests**
+- [x] **Step 4: Run targeted and full tests**
 
 Run:
 
@@ -675,7 +675,7 @@ full ctest passes
 git diff --check produces no output
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add research/include/agent_rpc/research/server_job.h \

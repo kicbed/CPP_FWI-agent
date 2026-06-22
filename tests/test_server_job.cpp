@@ -71,3 +71,29 @@ TEST(ServerJobTest, AcceptsGeneratedWorkspaceName) {
         "/tmp/lab-agent/jobs",
         "job-20260622-0001").empty());
 }
+
+TEST(ServerJobTest, CreatesRejectedRecordFromValidationErrors) {
+    JobSubmissionRequest request;
+    request.request_id = "req-1";
+
+    const auto record = make_rejected_job_record(
+        "job-1",
+        request,
+        {"only dry_run is enabled"});
+
+    EXPECT_EQ(record.job_id, "job-1");
+    EXPECT_EQ(record.state, JobLifecycleState::Rejected);
+    ASSERT_EQ(record.validation_messages.size(), 1u);
+    EXPECT_EQ(record.validation_messages[0], "only dry_run is enabled");
+}
+
+TEST(ServerJobTest, AppendsLifecycleEventWithoutExecutingCommands) {
+    JobRecord record;
+    record.job_id = "job-1";
+
+    append_lifecycle_event(record, JobLifecycleState::Queued, "queued by fake backend");
+
+    EXPECT_EQ(record.state, JobLifecycleState::Queued);
+    ASSERT_EQ(record.status_events.size(), 1u);
+    EXPECT_NE(record.status_events[0].find("queued by fake backend"), std::string::npos);
+}

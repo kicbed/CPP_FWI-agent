@@ -1497,3 +1497,48 @@ Commit:
 Next task:
 - Continue v0.8 Task 5: add lifecycle record helpers that mutate only
   in-memory records and never execute commands.
+
+## 2026-06-22: Add Server Job Lifecycle Helpers
+
+Scope:
+- Added in-memory lifecycle helper functions for v0.8 server job records.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- `make_rejected_job_record` creates a rejected job record from validation
+  errors before any future submission attempt.
+- `append_lifecycle_event` updates in-memory state and status history for
+  future job lifecycle tracking.
+- These helpers do not call shell execution, scheduler clients, SSH, MPI
+  launchers, local wrappers, or filesystem mutation APIs.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, or automatic Code Agent patch
+  application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `make_rejected_job_record` and `append_lifecycle_event`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before lifecycle helper APIs existed.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `ServerJobTest` passed.
+- PASS. Full `ctest` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This server job lifecycle helper commit.
+
+Next task:
+- Continue v0.8 Task 6: add the v0.8 test report, Chinese learning summary,
+  and final milestone documentation.
