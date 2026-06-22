@@ -222,8 +222,8 @@ servers.
 
 Tasks:
 
-- [ ] M9-T1: Define `JobBackend` interface.
-- [ ] M9-T2: Make `DryRunBackend` implement `JobBackend`.
+- [x] M9-T1: Define `JobBackend` interface.
+- [x] M9-T2: Make `DryRunBackend` implement `JobBackend`.
 - [ ] M9-T3: Add backend type enum values: `dry_run`, `local`, `ssh`, `slurm`, `pbs`.
 - [ ] M9-T4: Reject non-`dry_run` backends at runtime with a clear message.
 - [ ] M9-T5: Document how Slurm/PBS can be added later.

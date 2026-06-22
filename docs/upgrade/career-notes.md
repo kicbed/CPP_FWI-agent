@@ -43,6 +43,9 @@ Current status:
 - Includes a v0.6 Lab Code Adapter for local config-template loading, dry-run
   config previews, supplied log parsing, loss curve extraction, common failure
   recognition, and Planner-facing diagnostic summaries.
+- Includes an initial `JobBackend` interface reservation so future execution
+  backends can share the same validate/render/explain contract while the only
+  implemented backend remains `DryRunBackend`.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -103,6 +106,13 @@ Current v0.6 state:
   curves, common failure recognizers, and Planner-facing summaries. No real
   execution backend was added.
 
+Current JobBackend reservation state:
+
+- A `JobBackend` interface now defines the future backend contract through
+  `validate`, `render`, and `explain`; `DryRunBackend` implements that contract
+  and remains the only concrete backend. Non-dry-run backend enum values and
+  runtime rejection are still planned before any server execution milestone.
+
 ## Technical Highlights
 
 - C++17/C++20 multi-module project with CMake.
@@ -125,6 +135,8 @@ Current v0.6 state:
 - Deterministic lab-code adapter that converts config templates and supplied
   FWI log text into structured dry-run diagnostics, loss curves, failure
   findings, and Planner-facing summaries.
+- Reserved a C++ `JobBackend` abstraction for future execution backends while
+  preserving dry-run-only behavior through the existing `DryRunBackend`.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -174,11 +186,14 @@ Use only bullets that match the completed implementation.
 - Added a Lab Code Adapter for reading lab-style config templates, rendering
   dry-run config previews, parsing supplied logs, extracting loss curves, and
   recognizing common FWI failure patterns without job submission.
+- Reserved the future `JobBackend` interface and made `DryRunBackend`
+  polymorphic through that interface without adding any real execution backend.
 
 Planned after v0.6:
 
-- Reserve and harden the future `JobBackend` interface while keeping non-dry-run
-  backends rejected until server execution has an explicit safety design.
+- Finish hardening the future backend boundary with explicit backend type enum
+  values and runtime rejection for all non-`dry_run` choices until server
+  execution has an explicit safety design.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -352,6 +367,16 @@ Add one short entry whenever a meaningful technical change lands.
 - Added fixture-backed tests for execution-field rejection, loss parsing,
   stagnation, NaN/Inf, cycle-skipping risk, resource-limit recognition, and
   dry-run safety boundary summaries.
+- Preserved the execution boundary: no real CUDA/MPI execution, SSH, Slurm/PBS,
+  remote execution, arbitrary shell execution, or automatic Code Agent patch
+  application was added.
+
+### 2026-06-22: JobBackend Interface Reservation
+
+- Added a C++ `JobBackend` abstraction with `validate`, `render`, and `explain`
+  methods for future execution-backend substitution.
+- Made `DryRunBackend` implement the interface and added a contract test that
+  exercises dry-run rendering through `const JobBackend&`.
 - Preserved the execution boundary: no real CUDA/MPI execution, SSH, Slurm/PBS,
   remote execution, arbitrary shell execution, or automatic Code Agent patch
   application was added.

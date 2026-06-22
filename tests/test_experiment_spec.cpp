@@ -68,3 +68,23 @@ TEST(DryRunBackendTest, RenderIncludesDryRunMarkerAndNeverExecutes) {
     EXPECT_NE(rendered.find("loss.csv"), std::string::npos);
     EXPECT_TRUE(backend.validate(job).empty());
 }
+
+TEST(JobBackendInterfaceTest, DryRunBackendCanBeUsedThroughInterface) {
+    JobSpec job;
+    job.command = "mpirun -np 4 ./fwi_solver --config experiment.json";
+    job.working_dir = "runs/dry-run";
+    job.mpi_processes = 4;
+    job.gpu_count = 1;
+
+    DryRunBackend dry_run_backend;
+    const JobBackend& backend = dry_run_backend;
+
+    const auto errors = backend.validate(job);
+    const auto rendered = backend.render(job);
+    const auto explanation = backend.explain(job);
+
+    EXPECT_TRUE(errors.empty());
+    EXPECT_NE(rendered.find("dry_run: true"), std::string::npos);
+    EXPECT_NE(rendered.find("backend: dry_run"), std::string::npos);
+    EXPECT_NE(explanation.find("does not execute anything"), std::string::npos);
+}

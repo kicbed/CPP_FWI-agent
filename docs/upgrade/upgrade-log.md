@@ -1213,3 +1213,47 @@ Next task:
 - Start JobBackend interface reservation: define the future backend interface,
   make DryRunBackend implement it, and keep all non-`dry_run` backend choices
   rejected until the server execution milestone has a safety design.
+
+## 2026-06-22: Reserve JobBackend Interface
+
+Scope:
+- Started the JobBackend interface reservation milestone with a small
+  interface-focused batch.
+- Added the abstract backend contract and made the existing dry-run backend
+  implement it.
+
+Files changed:
+- `research/include/agent_rpc/research/job_backend.h`
+- `tests/test_experiment_spec.cpp`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Research code can now call `DryRunBackend` through a `JobBackend` interface
+  with the same validate/render/explain behavior.
+- No real CUDA/MPI execution, SSH, Slurm/PBS, remote execution, arbitrary shell
+  execution, or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `JobBackend` type.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ExperimentSpecTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed because `JobBackend` did not exist yet.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `ExperimentSpecTest` passed after `DryRunBackend` implemented
+  `JobBackend`.
+- PASS. Full `ctest` passed 25/25 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This JobBackend interface reservation commit.
+
+Next task:
+- Add backend type enum values for `dry_run`, `local`, `ssh`, `slurm`, and
+  `pbs`, then reject non-`dry_run` choices at runtime with clear messages.
