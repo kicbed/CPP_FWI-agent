@@ -1807,3 +1807,64 @@ Next task:
 - Keep real execution disabled. Continue M11 only with metadata, authorization,
   audit, and workspace prerequisites until lab backend approval and operational
   details are known.
+
+## 2026-06-22: Add Submitter Authorization Preflight
+
+Scope:
+- Continued safe Milestone 11 preflight work without selecting or enabling a
+  real backend.
+- Added metadata-only submitter authorization checks to the backend approval
+  decision model.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- `BackendApprovalDecision` now records `authorized_submitters`.
+- `validate_backend_approval_decision` rejects approval packets without at
+  least one concrete authorized submitter and rejects placeholder submitter
+  values.
+- `validate_submitter_authorization` rejects a `JobSubmissionRequest.user_id`
+  that is not listed in the approval decision.
+- Runtime backend enablement did not change: `local`, `ssh`, `slurm`, and
+  `pbs` remain rejected by the shared backend guard.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credentials, or automatic Code Agent
+  patch application was added.
+
+Tests run:
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+  before implementation, expected RED failure: missing
+  `authorized_submitters` and `validate_submitter_authorization`.
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+  before placeholder-entry validation, expected RED failure:
+  `RejectsPlaceholderAuthorizedSubmitters` failed.
+- `cmake --build build -j2 && ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before submitter authorization APIs
+  existed.
+- PASS. The expected RED test failed before placeholder submitter checks
+  existed.
+- PASS. `ServerJobTest` passed after adding authorized submitter validation.
+- PASS. Full `cmake --build build -j2` exited 0.
+- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This submitter authorization preflight commit.
+
+Next task:
+- Keep real execution disabled. Continue M11 only with metadata,
+  authorization, audit, workspace, and lifecycle prerequisites until lab backend
+  approval and operational details are known.

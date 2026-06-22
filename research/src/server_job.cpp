@@ -185,6 +185,18 @@ std::vector<std::string> validate_backend_approval_decision(
         "authorization_policy",
         decision.authorization_policy,
         errors);
+    if (decision.authorized_submitters.empty()) {
+        errors.push_back("authorized_submitters must include at least one submitter");
+    } else if (std::any_of(
+                   decision.authorized_submitters.begin(),
+                   decision.authorized_submitters.end(),
+                   [](const std::string& submitter) {
+                       return normalized_approval_value(submitter).empty() ||
+                              is_placeholder_approval_value(submitter);
+                   })) {
+        errors.push_back(
+            "authorized_submitters must contain only concrete submitter ids");
+    }
     require_concrete_approval_value(
         "audit_retention_policy",
         decision.audit_retention_policy,
@@ -195,6 +207,21 @@ std::vector<std::string> validate_backend_approval_decision(
         errors);
 
     return errors;
+}
+
+std::vector<std::string> validate_submitter_authorization(
+    const JobSubmissionRequest& request,
+    const BackendApprovalDecision& decision) {
+    if (std::find(
+            decision.authorized_submitters.begin(),
+            decision.authorized_submitters.end(),
+            request.user_id) != decision.authorized_submitters.end()) {
+        return {};
+    }
+
+    return {
+        "user_id '" + request.user_id +
+        "' is not authorized by backend approval decision"};
 }
 
 JobRecord make_rejected_job_record(

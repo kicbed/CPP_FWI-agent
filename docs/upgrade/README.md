@@ -89,8 +89,8 @@ Detailed learning note:
 
 - Metadata-only backend approval decision validation.
 - Requires lab approval, approval reference, workspace root, credential
-  reference, authorization policy, audit retention, and operator contact before
-  any real backend can be considered selected.
+  reference, authorization policy, authorized submitter list, audit retention,
+  and operator contact before any real backend can be considered selected.
 - Runtime remains dry-run only; `local`, `ssh`, `slurm`, and `pbs` are still
   rejected by the shared backend guard.
 

@@ -41,7 +41,8 @@ Version status:
   according to `docs/upgrade/version-roadmap.md` and
   `docs/upgrade/test-report-v0.8.md`.
 - Milestone 11 preflight started on 2026-06-22 with a metadata-only backend
-  approval decision gate. This does not select or enable a real backend.
+  approval decision gate and submitter authorization validation. This does not
+  select or enable a real backend.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -279,6 +280,8 @@ Tasks:
   lab approval, workspace root, credential reference, authorization policy,
   audit retention, and operator contact before any real backend can be
   considered selected.
+- [x] M11-T0A: Add a metadata-only authorized submitter list and request-user
+  validation for future real backend approvals.
 - [ ] M11-T1: Decide the first real backend with lab approval: local wrapper,
   SSH, Slurm, or PBS.
 - [ ] M11-T2: Add authentication and access control implementation.

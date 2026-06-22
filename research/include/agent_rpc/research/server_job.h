@@ -61,6 +61,7 @@ struct BackendApprovalDecision {
     std::string workspace_root;
     std::string credential_reference;
     std::string authorization_policy;
+    std::vector<std::string> authorized_submitters;
     std::string audit_retention_policy;
     std::string operator_contact;
 };
@@ -76,6 +77,9 @@ std::vector<std::string> validate_workspace_path(
     const std::string& workspace_root,
     const std::string& job_directory_name);
 std::vector<std::string> validate_backend_approval_decision(
+    const BackendApprovalDecision& decision);
+std::vector<std::string> validate_submitter_authorization(
+    const JobSubmissionRequest& request,
     const BackendApprovalDecision& decision);
 JobRecord make_rejected_job_record(
     const std::string& job_id,

@@ -55,8 +55,8 @@ Current status:
 - Includes a Milestone 11 preflight approval gate for future real backend
   selection; the gate requires lab approval, approval reference, workspace root,
   credential reference, authorization policy, audit retention, and operator
-  contact, rejects placeholder approval values, but still does not enable real
-  execution.
+  contact, rejects placeholder approval values, validates concrete authorized
+  submitters, but still does not enable real execution.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -140,7 +140,9 @@ Current Milestone 11 preflight state:
   the shared runtime backend guard continues to reject `local`, `ssh`, `slurm`,
   and `pbs`. The preflight gate also rejects placeholder values such as `TBD`,
   `pending`, `unknown`, `n/a`, or `none` so an incomplete approval packet cannot
-  look valid.
+  look valid. It now also requires a concrete authorized submitter list and can
+  reject a `JobSubmissionRequest.user_id` that is not named in the approval
+  decision.
 
 ## Technical Highlights
 
@@ -180,6 +182,10 @@ Current Milestone 11 preflight state:
   enablement.
 - Hardened the M11 approval decision gate so blank or placeholder approval
   metadata is rejected before any future backend selection can be considered.
+- Added metadata-only submitter authorization checks for future backend
+  approvals, linking `JobSubmissionRequest.user_id` to an approved submitter
+  list and rejecting placeholder submitter entries without introducing
+  credentials, remote calls, or execution.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -245,6 +251,9 @@ Use only bullets that match the completed implementation.
   dry-run-only runtime guard.
 - Hardened the backend approval preflight validator to reject placeholder
   approval metadata such as `TBD`, `pending`, `unknown`, `n/a`, or `none`.
+- Added a tested submitter authorization preflight check so future backend
+  approvals must name concrete users who may submit jobs before runtime
+  execution is ever enabled.
 
 Planned after v0.8:
 

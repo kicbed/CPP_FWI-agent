@@ -6,6 +6,24 @@
 
 using namespace agent_rpc::research;
 
+namespace {
+
+BackendApprovalDecision make_complete_local_approval() {
+    BackendApprovalDecision decision;
+    decision.backend_type = JobBackendType::Local;
+    decision.lab_approved = true;
+    decision.approved_by = "lab-pi";
+    decision.approval_reference = "approval-2026-06-22";
+    decision.workspace_root = "/lab/workspaces/agent";
+    decision.credential_reference = "vault://lab/backend/local";
+    decision.authorization_policy = "lab-members-only";
+    decision.audit_retention_policy = "retain-180-days";
+    decision.operator_contact = "lab-ops";
+    return decision;
+}
+
+}  // namespace
+
 TEST(ServerJobTest, SubmissionRequestDefaultsToDryRun) {
     JobSubmissionRequest request;
     EXPECT_TRUE(request.dry_run);
@@ -121,16 +139,9 @@ TEST(ServerJobTest, RejectsRealBackendApprovalWithoutLabDecisionInputs) {
 }
 
 TEST(ServerJobTest, RejectsDryRunAsRealBackendApprovalDecision) {
-    BackendApprovalDecision decision;
+    BackendApprovalDecision decision = make_complete_local_approval();
     decision.backend_type = JobBackendType::DryRun;
-    decision.lab_approved = true;
-    decision.approved_by = "lab-pi";
-    decision.approval_reference = "approval-2026-06-22";
-    decision.workspace_root = "/lab/workspaces/agent";
-    decision.credential_reference = "vault://lab/backend/local";
-    decision.authorization_policy = "lab-members-only";
-    decision.audit_retention_policy = "retain-180-days";
-    decision.operator_contact = "lab-ops";
+    decision.authorized_submitters = {"researcher-a"};
 
     const auto errors = validate_backend_approval_decision(decision);
 
@@ -177,20 +188,57 @@ TEST(ServerJobTest, RejectsPlaceholderApprovalDecisionValues) {
 }
 
 TEST(ServerJobTest, CompleteApprovalRecordDoesNotEnableRuntimeBackend) {
-    BackendApprovalDecision decision;
-    decision.backend_type = JobBackendType::Local;
-    decision.lab_approved = true;
-    decision.approved_by = "lab-pi";
-    decision.approval_reference = "approval-2026-06-22";
-    decision.workspace_root = "/lab/workspaces/agent";
-    decision.credential_reference = "vault://lab/backend/local";
-    decision.authorization_policy = "lab-members-only";
-    decision.audit_retention_policy = "retain-180-days";
-    decision.operator_contact = "lab-ops";
+    BackendApprovalDecision decision = make_complete_local_approval();
+    decision.authorized_submitters = {"researcher-a"};
 
     EXPECT_TRUE(validate_backend_approval_decision(decision).empty());
 
     const auto runtime_errors = validate_backend_enabled(decision.backend_type);
     ASSERT_FALSE(runtime_errors.empty());
     EXPECT_NE(runtime_errors[0].find("only dry_run is enabled"), std::string::npos);
+}
+
+TEST(ServerJobTest, RejectsApprovalDecisionWithoutAuthorizedSubmitters) {
+    const BackendApprovalDecision decision = make_complete_local_approval();
+
+    const auto errors = validate_backend_approval_decision(decision);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "authorized_submitters must include at least one submitter"),
+        errors.end());
+}
+
+TEST(ServerJobTest, RejectsPlaceholderAuthorizedSubmitters) {
+    BackendApprovalDecision decision = make_complete_local_approval();
+    decision.authorized_submitters = {"researcher-a", "pending", "  "};
+
+    const auto errors = validate_backend_approval_decision(decision);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "authorized_submitters must contain only concrete submitter ids"),
+        errors.end());
+}
+
+TEST(ServerJobTest, RejectsUnauthorizedSubmitterForApprovedBackend) {
+    JobSubmissionRequest request;
+    request.user_id = "researcher-b";
+
+    BackendApprovalDecision decision = make_complete_local_approval();
+    decision.authorized_submitters = {"researcher-a"};
+
+    const auto errors = validate_submitter_authorization(request, decision);
+
+    EXPECT_NE(std::find(errors.begin(), errors.end(),
+                  "user_id 'researcher-b' is not authorized by backend approval decision"),
+        errors.end());
+}
+
+TEST(ServerJobTest, AcceptsAuthorizedSubmitterForApprovedBackend) {
+    JobSubmissionRequest request;
+    request.user_id = "researcher-a";
+
+    BackendApprovalDecision decision = make_complete_local_approval();
+    decision.authorized_submitters = {"researcher-a", "researcher-b"};
+
+    EXPECT_TRUE(validate_submitter_authorization(request, decision).empty());
 }
