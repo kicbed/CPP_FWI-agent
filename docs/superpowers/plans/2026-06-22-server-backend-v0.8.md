@@ -464,7 +464,7 @@ git commit -m "feat: validate approved job templates"
 - Modify: `tests/test_server_job.cpp`
 - Modify: `docs/upgrade/upgrade-log.md`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/test_server_job.cpp`:
 
@@ -484,7 +484,7 @@ TEST(ServerJobTest, AcceptsGeneratedWorkspaceName) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 
@@ -498,7 +498,7 @@ Expected:
 error: use of undeclared identifier 'validate_workspace_path'
 ```
 
-- [ ] **Step 3: Implement workspace path validation**
+- [x] **Step 3: Implement workspace path validation**
 
 Add to `server_job.h`:
 
@@ -530,7 +530,7 @@ std::vector<std::string> validate_workspace_path(
 }
 ```
 
-- [ ] **Step 4: Run targeted and full tests**
+- [x] **Step 4: Run targeted and full tests**
 
 Run:
 
@@ -549,7 +549,7 @@ full ctest passes
 git diff --check produces no output
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add research/include/agent_rpc/research/server_job.h \

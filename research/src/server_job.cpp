@@ -83,4 +83,22 @@ std::vector<std::string> validate_approved_template(
     return {"unknown approved template '" + request.template_id + "'"};
 }
 
+std::vector<std::string> validate_workspace_path(
+    const std::string& workspace_root,
+    const std::string& job_directory_name) {
+    std::vector<std::string> errors;
+    if (workspace_root.empty()) {
+        errors.push_back("workspace root is required");
+    }
+    if (job_directory_name.empty()) {
+        errors.push_back("job directory name is required");
+    }
+    if (job_directory_name.find("..") != std::string::npos ||
+        job_directory_name.find('/') != std::string::npos ||
+        job_directory_name.find('\\') != std::string::npos) {
+        errors.push_back("workspace path escapes the configured workspace root");
+    }
+    return errors;
+}
+
 }  // namespace agent_rpc::research

@@ -57,3 +57,17 @@ TEST(ServerJobTest, AcceptsMatchingDryRunTemplate) {
 
     EXPECT_TRUE(validate_approved_template(request, {approved}).empty());
 }
+
+TEST(ServerJobTest, RejectsWorkspaceTraversal) {
+    const auto errors = validate_workspace_path(
+        "/tmp/lab-agent/jobs",
+        "../outside");
+    ASSERT_FALSE(errors.empty());
+    EXPECT_NE(errors[0].find("workspace path escapes"), std::string::npos);
+}
+
+TEST(ServerJobTest, AcceptsGeneratedWorkspaceName) {
+    EXPECT_TRUE(validate_workspace_path(
+        "/tmp/lab-agent/jobs",
+        "job-20260622-0001").empty());
+}

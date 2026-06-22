@@ -1452,3 +1452,48 @@ Commit:
 
 Next task:
 - Continue v0.8 Task 4: add workspace path isolation and traversal rejection.
+
+## 2026-06-22: Guard Server Job Workspaces
+
+Scope:
+- Added workspace path validation for v0.8 server job records.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Future server job workspace names are validated as generated leaf names
+  under a configured workspace root.
+- Path traversal and path separators are rejected before any future job record
+  can claim a workspace.
+- The guard is pure validation; it does not create directories, submit jobs, or
+  touch the filesystem.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, or automatic Code Agent patch
+  application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `validate_workspace_path`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before workspace validation existed.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `ServerJobTest` passed.
+- PASS. Full `ctest` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This server job workspace guard commit.
+
+Next task:
+- Continue v0.8 Task 5: add lifecycle record helpers that mutate only
+  in-memory records and never execute commands.

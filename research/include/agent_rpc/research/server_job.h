@@ -60,5 +60,8 @@ std::vector<std::string> validate_submission_boundary(
 std::vector<std::string> validate_approved_template(
     const JobSubmissionRequest& request,
     const std::vector<ApprovedJobTemplate>& approved_templates);
+std::vector<std::string> validate_workspace_path(
+    const std::string& workspace_root,
+    const std::string& job_directory_name);
 
 }  // namespace agent_rpc::research
