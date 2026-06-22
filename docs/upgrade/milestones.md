@@ -44,6 +44,8 @@ Version status:
   approval decision gate, submitter authorization validation, and audit-event
   metadata plus in-memory audit log validation and a unified preflight readiness
   report. This does not select or enable a real backend.
+- v0.9 Backend Readiness Review started on 2026-06-22 with a non-executing
+  operator-facing renderer for `BackendPreflightReport`.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -303,3 +305,30 @@ Acceptance:
 - Only approved users can submit jobs.
 - Every job has a reproducible spec, logs, artifacts, and audit record.
 - Failure handling is tested before lab users rely on it.
+
+## Milestone 12: Backend Readiness Review
+
+Goal: turn M11 preflight metadata into reviewable non-executing product flows
+before any real backend adapter is connected.
+
+Tasks:
+
+- [x] M12-T1: Render an operator-facing backend readiness report from
+  `BackendPreflightReport`.
+- [ ] M12-T2: Preview a dry-run submission packet for operator review.
+- [ ] M12-T3: Preview audit events and same-job audit logs without writing to a
+  production audit store.
+- [ ] M12-T4: Show workspace and artifact path plans without creating remote
+  directories.
+- [ ] M12-T5: Add v0.9 test report and Chinese learning summary.
+
+Acceptance:
+
+- v0.9 review output is generated from structured metadata, not free-form user
+  shell commands.
+- Reports keep `runtime_enabled` and runtime blockers visible.
+- Runtime still rejects `local`, `ssh`, `slurm`, and `pbs` until M11-T1 has
+  lab approval and operational details.
+- No CUDA/MPI, SSH, Slurm, PBS, local wrapper, remote execution, credential
+  loading, production audit store, arbitrary shell execution, or automatic Code
+  Agent patch application is added.

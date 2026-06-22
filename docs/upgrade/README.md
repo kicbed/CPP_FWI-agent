@@ -106,6 +106,14 @@ Detailed M11 preflight notes:
 - `docs/upgrade/m11-preflight-completion-audit.md`
 - `docs/upgrade/learning-summary-m11-preflight.md`
 
+`v0.9 Backend Readiness Review` started on 2026-06-22:
+
+- Operator-facing rendering for `BackendPreflightReport`.
+- Readiness output shows metadata readiness, runtime enablement state,
+  validation errors, runtime blockers, and safety boundaries.
+- Runtime remains dry-run only; `local`, `ssh`, `slurm`, and `pbs` are still
+  rejected by the shared backend guard.
+
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.
 
@@ -231,11 +239,16 @@ Active plan:
 
 - `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md` (complete)
 
-Next session can start v0.9 only if v0.9 is scoped as a non-executing backend
-readiness and review version. Do not connect real execution by default. Continue
-M11-T1 real backend selection only after the first real backend, credentials,
-workspace root, authorization policy, audit retention, operator ownership, and
-lab approval are known.
+Current version:
+
+- v0.9 Backend Readiness Review, tracked under Milestone 12 in
+  `docs/upgrade/milestones.md`.
+
+Next session should continue v0.9 only as non-executing backend readiness and
+review work. Do not connect real execution by default. Continue M11-T1 real
+backend selection only after the first real backend, credentials, workspace
+root, authorization policy, audit retention, operator ownership, and lab
+approval are known.
 
 When a milestone becomes too large, create a new plan in:
 

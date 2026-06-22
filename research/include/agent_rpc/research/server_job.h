@@ -127,6 +127,8 @@ std::vector<std::string> append_job_audit_event(
     const JobAuditEvent& event);
 BackendPreflightReport evaluate_backend_preflight(
     const BackendPreflightPackage& package);
+std::string render_backend_preflight_report(
+    const BackendPreflightReport& report);
 JobAuditEvent make_job_audit_event(
     const std::string& job_id,
     const JobSubmissionRequest& request,

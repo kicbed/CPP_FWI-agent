@@ -311,8 +311,8 @@ Next target after v0.8:
 
 ## v0.9: Backend Readiness Review
 
-Status: Ready to start after the 2026-06-22 M11 preflight completion audit, if
-the scope remains non-executing.
+Status: Started on 2026-06-22 with operator-facing rendering for
+`BackendPreflightReport`. The scope remains non-executing.
 
 Purpose:
 
@@ -336,6 +336,13 @@ Not included:
 - Credential loading or cluster account handling.
 - Arbitrary shell execution from user text.
 - Automatic Code Agent patch application.
+
+Completed scope:
+
+- Added `render_backend_preflight_report` so the structured M11 preflight result
+  can be displayed as stable operator-facing text with metadata readiness,
+  runtime enablement state, validation errors, runtime blockers, and safety
+  boundaries.
 
 Entry rule:
 

@@ -440,3 +440,28 @@ TEST(ServerJobTest, CompletePreflightPackageDoesNotEnableRuntimeBackend) {
                   "preflight report does not submit jobs"),
         report.safety_boundaries.end());
 }
+
+TEST(ServerJobTest, RendersOperatorFacingBackendReadinessReport) {
+    BackendPreflightReport report;
+    report.metadata_ready = true;
+    report.runtime_enabled = false;
+    report.runtime_blockers = {
+        "backend 'local' is reserved for future server execution; only dry_run is enabled",
+    };
+    report.safety_boundaries = {
+        "preflight report does not submit jobs",
+        "runtime backend guard still controls enablement",
+    };
+
+    const auto rendered = render_backend_preflight_report(report);
+
+    EXPECT_NE(rendered.find("Backend Readiness Report"), std::string::npos);
+    EXPECT_NE(rendered.find("metadata_ready: true"), std::string::npos);
+    EXPECT_NE(rendered.find("runtime_enabled: false"), std::string::npos);
+    EXPECT_NE(rendered.find("Runtime blockers:"), std::string::npos);
+    EXPECT_NE(rendered.find("- backend 'local' is reserved for future server execution; only dry_run is enabled"),
+        std::string::npos);
+    EXPECT_NE(rendered.find("Safety boundaries:"), std::string::npos);
+    EXPECT_NE(rendered.find("- preflight report does not submit jobs"),
+        std::string::npos);
+}

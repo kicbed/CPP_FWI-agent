@@ -59,6 +59,10 @@ Current status:
   submitters, defines metadata-only job audit events and in-memory audit log
   validation, and exposes a unified preflight readiness report, but still does
   not enable real execution.
+- Includes a v0.9 backend readiness review renderer that turns
+  `BackendPreflightReport` into stable operator-facing text with metadata
+  readiness, runtime enablement state, validation errors, runtime blockers, and
+  safety boundaries.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -151,6 +155,14 @@ Current Milestone 11 preflight state:
   aggregates these checks and separates metadata readiness from runtime backend
   enablement.
 
+Current v0.9 state:
+
+- Backend Readiness Review has started with an operator-facing report renderer.
+  The renderer consumes the structured `BackendPreflightReport` produced by M11
+  preflight and displays metadata readiness, runtime enablement, validation
+  errors, runtime blockers, and safety boundaries without submitting jobs or
+  enabling any reserved backend.
+
 ## Technical Highlights
 
 - C++17/C++20 multi-module project with CMake.
@@ -201,6 +213,8 @@ Current Milestone 11 preflight state:
 - Added a unified metadata-only backend preflight report that aggregates
   approval, authorization, dry-run submission boundary, approved template,
   workspace, and audit-log checks while preserving the runtime backend guard.
+- Added an operator-facing backend readiness report renderer so v0.9 can expose
+  M11 preflight status in stable text while keeping runtime blockers visible.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -277,8 +291,10 @@ Use only bullets that match the completed implementation.
 - Added a tested backend preflight readiness report, making it possible to
   explain why a future backend package is metadata-ready while real execution
   remains disabled.
+- Added a tested operator-facing backend readiness report renderer for v0.9
+  review workflows without enabling any real execution path.
 
-Planned after v0.8:
+Planned after the current v0.9 readiness work:
 
 - Controlled real backend integration only after a lab-approved backend,
   credential model, workspace root, authorization policy, audit retention, and
@@ -501,3 +517,15 @@ Add one short entry whenever a meaningful technical change lands.
   and lifecycle events.
 - Added the v0.8 test report and Chinese learning summary for future study and
   interview preparation.
+
+### 2026-06-22: v0.9 Backend Readiness Report Renderer
+
+- Started v0.9 as non-executing readiness/review work by adding
+  `render_backend_preflight_report`.
+- The renderer turns structured preflight results into stable operator-facing
+  text and keeps validation errors, runtime blockers, and safety boundaries
+  visible.
+- Preserved the execution boundary: no real CUDA/MPI execution, SSH, Slurm/PBS,
+  remote execution, local wrapper execution, arbitrary shell execution,
+  credential loading, production audit store, or automatic Code Agent patch
+  application was added.

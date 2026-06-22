@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <sstream>
 
 namespace agent_rpc::research {
 namespace {
@@ -333,6 +334,30 @@ BackendPreflightReport evaluate_backend_preflight(
     report.metadata_ready = report.validation_errors.empty();
     report.runtime_enabled = report.runtime_blockers.empty();
     return report;
+}
+
+std::string render_backend_preflight_report(
+    const BackendPreflightReport& report) {
+    std::ostringstream out;
+    const auto render_list =
+        [&out](const std::string& title, const std::vector<std::string>& values) {
+            out << title << ":\n";
+            if (values.empty()) {
+                out << "- none\n";
+                return;
+            }
+            for (const auto& value : values) {
+                out << "- " << value << "\n";
+            }
+        };
+
+    out << "Backend Readiness Report\n";
+    out << "metadata_ready: " << (report.metadata_ready ? "true" : "false") << "\n";
+    out << "runtime_enabled: " << (report.runtime_enabled ? "true" : "false") << "\n";
+    render_list("Validation errors", report.validation_errors);
+    render_list("Runtime blockers", report.runtime_blockers);
+    render_list("Safety boundaries", report.safety_boundaries);
+    return out.str();
 }
 
 JobAuditEvent make_job_audit_event(

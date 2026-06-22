@@ -2043,3 +2043,52 @@ Next task:
 - Keep real execution disabled. Continue M11 only with metadata,
   authorization, audit persistence design, workspace, and lifecycle
   prerequisites until lab backend approval and operational details are known.
+
+## 2026-06-22: Start v0.9 Backend Readiness Report
+
+Scope:
+- Started v0.9 Backend Readiness Review as non-executing product work.
+- Added an operator-facing renderer for `BackendPreflightReport`.
+- Added Milestone 12 tracking for v0.9 readiness/review tasks.
+
+Files changed:
+- `research/include/agent_rpc/research/server_job.h`
+- `research/src/server_job.cpp`
+- `tests/test_server_job.cpp`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- Added `render_backend_preflight_report` to display metadata readiness,
+  runtime enablement state, validation errors, runtime blockers, and safety
+  boundaries from a structured `BackendPreflightReport`.
+- Runtime backend enablement did not change: `local`, `ssh`, `slurm`, and
+  `pbs` remain rejected by the shared backend guard.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credential loading, production audit
+  store, or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2` before implementation, expected RED failure:
+  missing `render_backend_preflight_report`.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ServerJobTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED build failed before the report renderer API existed.
+- PASS. `ServerJobTest` passed after adding the operator-facing renderer.
+- PASS. Full `cmake --build build -j2` exited 0.
+- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.9 backend readiness report renderer commit.
+
+Next task:
+- Continue v0.9 M12-T2: preview a dry-run submission packet for operator
+  review, without connecting real backend execution.
