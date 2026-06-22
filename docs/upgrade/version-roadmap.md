@@ -255,48 +255,54 @@ Next target after v0.7:
   workspace isolation, approved templates, audit logging, job status, and
   artifact collection.
 
-## v0.8: Server Backend
+## v0.8: Server Backend Safety Foundation
 
-Status: Started on 2026-06-22 with a written safety design and implementation
-plan. No real execution backend is enabled yet.
+Status: Completed on 2026-06-22 with server-job safety models, approved
+template validation, workspace guards, lifecycle helpers, and
+`docs/upgrade/test-report-v0.8.md`. No real execution backend is enabled yet.
 
 Purpose:
 
-- Connect controlled real execution after the planning and safety boundaries are
-  stable.
+- Build the safety foundation required before controlled real execution can be
+  connected.
 
 Must have:
 
-- Backend decision: Slurm, PBS, SSH, or lab wrapper scripts.
-- Authentication and authorization.
-- Workspace isolation.
-- Job submission.
-- Job status.
-- Cancellation.
-- Log collection.
-- Artifact collection.
-- Audit logging.
+- Written safety design.
+- Server-job request and record models.
+- Approved template validation.
+- Workspace isolation and path traversal rejection.
+- Job lifecycle state and in-memory lifecycle history helpers.
+- Tests proving non-`dry_run` backend choices remain rejected.
+- Documentation and learning summary for future backend work.
 
 Example user value:
 
 - "Submit this approved FWI dry-run plan to the lab queue and monitor it."
 
-Current safety-design scope:
+Completed scope:
 
 - Keep `validate_backend_enabled` rejecting all non-`dry_run` backend values.
-- Define server-job submission and lifecycle record models before submission
-  code exists.
+- Define server-job submission and lifecycle record models before real
+  submission code exists.
 - Require approved templates instead of raw user commands.
 - Validate workspace paths so job files cannot escape the configured root.
-- Treat fake backends as test-only helpers that never execute commands.
+- Add lifecycle helpers that mutate only in-memory job records and never
+  execute commands.
 
-Not included in the current v0.8 start:
+Not included in v0.8:
 
 - Real CUDA/MPI execution.
 - SSH, Slurm, PBS, remote server, or local wrapper execution.
 - Credentials or cluster account handling.
 - Arbitrary shell execution from user input.
 - Automatic Code Agent patch application.
+
+Next target after v0.8:
+
+- Start controlled real backend integration only after lab approval, a selected
+  backend, credential handling, workspace root, authorization policy, audit
+  retention, and operator responsibilities are known.
 
 ## v1.0: Lab-Usable Platform
 

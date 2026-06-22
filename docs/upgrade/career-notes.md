@@ -49,6 +49,9 @@ Current status:
 - Includes a v0.8 server-backend safety design that defines the threat model,
   approved-template boundary, workspace isolation, lifecycle records, artifact
   collection, and audit requirements before real execution is enabled.
+- Includes v0.8 C++ server-job safety models and tests for dry-run default
+  requests, approved template validation, workspace traversal rejection, and
+  in-memory lifecycle records.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -119,10 +122,10 @@ Current v0.7 state:
 
 Current v0.8 state:
 
-- Server Backend Safety Design is started for the v0.8 scope: the design
-  separates dry-run previews from future submission APIs, requires approved
-  templates instead of raw user commands, defines server-job request and record
-  shapes, and lists workspace, lifecycle, artifact, and audit validation gates.
+- Server Backend Safety Foundation is complete for the v0.8 scope: the design
+  separates dry-run previews from future submission APIs, and the C++ research
+  library now has server-job request and record models, approved template
+  validation, workspace traversal rejection, and in-memory lifecycle helpers.
   No real execution backend is enabled yet.
 
 ## Technical Highlights
@@ -154,6 +157,10 @@ Current v0.8 state:
   covering command-injection prevention, approved job templates, workspace path
   boundaries, lifecycle states, artifact collection, and audit records before
   any scheduler or remote adapter is connected.
+- Added a tested C++ server-job safety model for future controlled execution,
+  including `JobSubmissionRequest`, `JobRecord`, `ApprovedJobTemplate`,
+  workspace path validation, and lifecycle history helpers while keeping all
+  real backends disabled.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -210,11 +217,16 @@ Use only bullets that match the completed implementation.
   approved templates, workspace isolation, lifecycle records, artifact
   collection, and audit logging before enabling real CUDA/MPI or cluster
   execution.
+- Added v0.8 server-job safety models and tests for dry-run default
+  submissions, approved template validation, workspace path traversal
+  rejection, and in-memory lifecycle event tracking without enabling real
+  execution.
 
-Current v0.8 plan:
+Planned after v0.8:
 
-- Implement server-job safety models, approved-template validation, workspace
-  guards, and lifecycle/audit tests while keeping all real execution disabled.
+- Controlled real backend integration only after a lab-approved backend,
+  credential model, workspace root, authorization policy, audit retention, and
+  operator responsibilities are known.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -422,3 +434,14 @@ Add one short entry whenever a meaningful technical change lands.
 - Kept the product claim explicit: real CUDA/MPI, SSH, Slurm, PBS, remote
   execution, local wrapper execution, arbitrary shell execution, and automatic
   Code Agent patch application are still not enabled.
+
+### 2026-06-22: v0.8 Server Backend Safety Completion
+
+- Added the C++ `server_job` safety model with structured submission requests,
+  job records, lifecycle states, approved templates, workspace guards, and
+  lifecycle history helpers.
+- Added `ServerJobTest` coverage for dry-run defaults, non-`dry_run` rejection,
+  approved-template matching, workspace traversal rejection, rejected records,
+  and lifecycle events.
+- Added the v0.8 test report and Chinese learning summary for future study and
+  interview preparation.

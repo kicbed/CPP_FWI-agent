@@ -67,13 +67,16 @@ Upgrade the project from a rough multi-agent/FWI demo into:
 - `AlgorithmCard` backend validation now uses the shared backend guard.
 - v0.7 test report and Chinese learning summary.
 
-`v0.8 Server Backend Safety Design` is in progress as of 2026-06-22:
+`v0.8 Server Backend Safety Foundation` is complete as of 2026-06-22:
 
 - Written safety design for auth, approved templates, workspace isolation, job
   lifecycle state, artifact collection, and audit logging.
-- New implementation plan for server-job models and validation before any real
-  backend adapter is connected.
-- Runtime remains dry-run only; non-`dry_run` backend values must still be
+- Server-job request and record models for future controlled execution.
+- Approved job template validation.
+- Workspace path traversal rejection.
+- In-memory lifecycle record helpers.
+- v0.8 test report and Chinese learning summary.
+- Runtime remains dry-run only; non-`dry_run` backend values are still
   rejected.
 
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
@@ -199,10 +202,11 @@ Historical starting plan:
 
 Active plan:
 
-- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`
+- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md` (complete)
 
-Next session should continue v0.8 Task 2: add the server job model contract,
-while keeping all execution dry-run only.
+Next session should not connect real execution by default. Start Milestone 11
+only after the first real backend, credentials, workspace root, authorization
+policy, and lab approval are known.
 
 When a milestone becomes too large, create a new plan in:
 

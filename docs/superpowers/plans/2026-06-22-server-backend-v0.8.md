@@ -695,7 +695,7 @@ git commit -m "feat: add server job lifecycle helpers"
 - Modify: `docs/upgrade/career-notes.md`
 - Modify: `docs/upgrade/upgrade-log.md`
 
-- [ ] **Step 1: Confirm v0.8 safety scope is complete**
+- [x] **Step 1: Confirm v0.8 safety scope is complete**
 
 Run:
 
@@ -713,7 +713,7 @@ ctest reports 100% tests passed
 git diff --check produces no output
 ```
 
-- [ ] **Step 2: Write the test report**
+- [x] **Step 2: Write the test report**
 
 The report must include:
 
@@ -726,12 +726,12 @@ The report must include:
   local wrapper execution, arbitrary shell execution, or automatic Code Agent
   patch application was added
 
-- [ ] **Step 3: Mark v0.8 complete only if code and tests exist**
+- [x] **Step 3: Mark v0.8 complete only if code and tests exist**
 
 Update docs only after Task 2 through Task 5 have landed. Do not mark v0.8
 complete after Task 1 alone.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/upgrade/test-report-v0.8.md \

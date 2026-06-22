@@ -1542,3 +1542,51 @@ Commit:
 Next task:
 - Continue v0.8 Task 6: add the v0.8 test report, Chinese learning summary,
   and final milestone documentation.
+
+## 2026-06-22: Complete v0.8 Server Backend Safety Foundation
+
+Scope:
+- Marked v0.8 complete for the server backend safety foundation.
+- Added the v0.8 test report and detailed Chinese learning summary.
+- Updated upgrade guide, milestone board, version roadmap, career notes, and
+  the v0.8 implementation plan.
+
+Files changed:
+- `docs/upgrade/test-report-v0.8.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed in this documentation step.
+- v0.8 is now documented as complete for safety models, approved templates,
+  workspace guards, lifecycle helpers, and tests.
+- Real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credentials, and automatic Code Agent
+  patch application remain disabled.
+
+Tests run:
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. `cmake --build build -j2` exited 0 before the report was written.
+- PASS. Full `ctest` passed 26/26 tests before the report was written.
+- PASS. `git diff --check` produced no output before the report was written.
+- PASS. Final `cmake --build build -j2` exited 0 after the report and docs
+  were written.
+- PASS. Final full `ctest` passed 26/26 tests after the report and docs were
+  written.
+- PASS. Final `git diff --check` produced no output.
+
+Commit:
+- This v0.8 server backend safety completion commit.
+
+Next task:
+- Do not connect real execution by default. Start Milestone 11 only after the
+  lab selects a backend and confirms credentials, workspace root, authorization
+  policy, audit retention, and operator responsibilities.

@@ -37,6 +37,9 @@ Version status:
 - v0.8 Server Backend Safety Design started on 2026-06-22 with
   `docs/upgrade/server-backend-safety-v0.8.md` and
   `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`.
+- v0.8 Server Backend Safety Foundation is complete as of 2026-06-22
+  according to `docs/upgrade/version-roadmap.md` and
+  `docs/upgrade/test-report-v0.8.md`.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -248,11 +251,11 @@ execution adapter is connected.
 Tasks:
 
 - [x] M10-T1: Write the v0.8 server-backend safety design and implementation plan.
-- [ ] M10-T2: Add server job submission and lifecycle record models.
-- [ ] M10-T3: Add approved job template validation.
-- [ ] M10-T4: Add workspace path isolation and traversal rejection.
-- [ ] M10-T5: Add fake backend or lifecycle test helpers that never execute commands.
-- [ ] M10-T6: Add v0.8 test report and Chinese learning summary.
+- [x] M10-T2: Add server job submission and lifecycle record models.
+- [x] M10-T3: Add approved job template validation.
+- [x] M10-T4: Add workspace path isolation and traversal rejection.
+- [x] M10-T5: Add fake backend or lifecycle test helpers that never execute commands.
+- [x] M10-T6: Add v0.8 test report and Chinese learning summary.
 
 Acceptance:
 
