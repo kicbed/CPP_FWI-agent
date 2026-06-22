@@ -29,6 +29,8 @@ Version status:
   `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.5.md`.
 - v0.6 Lab Code Adapter started on 2026-06-22 with
   `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`.
+- v0.6 Lab Code Adapter is complete as of 2026-06-22 according to
+  `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.6.md`.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -197,13 +199,13 @@ signals without submitting jobs.
 Tasks:
 
 - [x] M8-T1: Create the v0.6 Lab Code Adapter implementation plan.
-- [ ] M8-T2: Add config template reader with validation against execution fields.
-- [ ] M8-T3: Add safe config generator with `dry_run: true` preview output.
-- [ ] M8-T4: Add log parser and loss curve parser for supplied text content.
-- [ ] M8-T5: Add common failure recognizers for loss stagnation, NaN/Inf,
+- [x] M8-T2: Add config template reader with validation against execution fields.
+- [x] M8-T3: Add safe config generator with `dry_run: true` preview output.
+- [x] M8-T4: Add log parser and loss curve parser for supplied text content.
+- [x] M8-T5: Add common failure recognizers for loss stagnation, NaN/Inf,
   cycle-skipping hints, missing low-frequency content, and resource limits.
-- [ ] M8-T6: Add planner-facing diagnostic summary grounded in parsed evidence.
-- [ ] M8-T7: Add v0.6 test report and Chinese learning summary.
+- [x] M8-T6: Add planner-facing diagnostic summary grounded in parsed evidence.
+- [x] M8-T7: Add v0.6 test report and Chinese learning summary.
 
 Acceptance:
 

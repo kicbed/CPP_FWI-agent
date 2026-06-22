@@ -1144,3 +1144,72 @@ Commit:
 Next task:
 - Start v0.6 Task 1: add a failing `LabCodeAdapter` config-template reader
   test, then implement the minimal reader that rejects execution fields.
+
+## 2026-06-22: Complete v0.6 Lab Code Adapter
+
+Scope:
+- Added deterministic Lab Code Adapter C++ models and parsing helpers.
+- Added fixture-backed config template, log parsing, loss curve extraction,
+  failure recognition, and Planner-facing summary tests.
+- Added v0.6 test report with detailed Chinese learning and interview-prep
+  summary.
+
+Files changed:
+- `research/include/agent_rpc/research/lab_code_adapter.h`
+- `research/src/lab_code_adapter.cpp`
+- `research/CMakeLists.txt`
+- `resources/lab_code_adapter/config_templates/fwi_marmousi_multiscale.json`
+- `resources/lab_code_adapter/logs/fwi_loss_stagnation.log`
+- `resources/lab_code_adapter/logs/fwi_nan_instability.log`
+- `tests/test_lab_code_adapter.cpp`
+- `tests/CMakeLists.txt`
+- `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/test-report-v0.6.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- The research library can now load lab config templates, reject execution
+  fields, render dry-run config previews, parse supplied log text into loss
+  curves and diagnostic lines, recognize common FWI failure signals, and build
+  Planner-facing diagnostic summaries.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, arbitrary
+  shell execution, or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2` before Task 1 implementation, expected RED failure:
+  missing `agent_rpc/research/lab_code_adapter.h`.
+- `cmake --build build -j2` before Task 2 implementation, expected RED failure:
+  missing `render_config_preview`.
+- `cmake --build build -j2` before Task 3 implementation, expected RED failure:
+  missing `parse_lab_log`.
+- `cmake --build build -j2` before Task 4 implementation, expected RED failure:
+  missing `FailureFinding` and `recognize_failure_modes`.
+- `cmake --build build -j2` before Task 5 implementation, expected RED failure:
+  missing `build_planner_diagnostic_summary`.
+- `./build/tests/test_lab_code_adapter --gtest_filter=LabCodeAdapterTest.RejectsAbsoluteConfigTemplatePaths --gtest_break_on_failure`,
+  expected RED failure: absolute config template paths were not rejected yet.
+- `cmake --build build -j2`
+- `ctest --test-dir build -R LabCodeAdapter --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. The expected RED failures occurred before each new API was implemented.
+- PASS. The path safety RED test failed before absolute-path rejection was
+  added, then passed after implementation.
+- PASS. `cmake --build build -j2` exited 0 after implementation.
+- PASS. `LabCodeAdapterTest` passed 1/1.
+- PASS. Full `ctest` passed 25/25 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.6 Lab Code Adapter completion commit.
+
+Next task:
+- Start JobBackend interface reservation: define the future backend interface,
+  make DryRunBackend implement it, and keep all non-`dry_run` backend choices
+  rejected until the server execution milestone has a safety design.

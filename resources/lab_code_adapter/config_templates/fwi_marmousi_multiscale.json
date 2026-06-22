@@ -1,0 +1,38 @@
+{
+  "id": "fwi-marmousi-multiscale-template",
+  "algorithm_id": "fwi-cuda-mpi",
+  "description": "Dry-run config template for Marmousi multi-scale FWI experiments.",
+  "format": "ini",
+  "placeholders": [
+    {
+      "name": "dataset",
+      "type": "string",
+      "required": true,
+      "description": "Dataset identifier, for example marmousi2_synthetic."
+    },
+    {
+      "name": "start_frequency_hz",
+      "type": "number",
+      "required": true,
+      "description": "Lowest inversion frequency used to reduce cycle skipping risk."
+    },
+    {
+      "name": "max_frequency_hz",
+      "type": "number",
+      "required": true,
+      "description": "Highest frequency included in the current multi-scale band."
+    },
+    {
+      "name": "grid_spacing_m",
+      "type": "number",
+      "required": true,
+      "description": "Finite-difference grid spacing in meters."
+    },
+    {
+      "name": "iteration_count",
+      "type": "integer",
+      "required": true,
+      "description": "Maximum inversion iterations for the dry-run preview."
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+[2026-06-22T10:15:00Z] INFO dataset=marmousi2_synthetic band=8.0-12.0Hz
+ITER 1 FREQ 8.0 LOSS 2.5000 GRADIENT_NORM 1.2e+1
+ITER 2 FREQ 8.0 LOSS NaN GRADIENT_NORM Inf
+ERROR numerical instability: NaN loss detected after source 12
+STATUS failed

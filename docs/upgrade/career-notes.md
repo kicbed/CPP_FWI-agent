@@ -40,6 +40,9 @@ Current status:
 - Includes a v0.5 Lab Agent Workbench UI that exposes sessions, AlgorithmCards,
   experiment history, route trace, tool calls, parameter tables, ExperimentSpec,
   JobSpec, dry-run state, and service status panels in the browser.
+- Includes a v0.6 Lab Code Adapter for local config-template loading, dry-run
+  config previews, supplied log parsing, loss curve extraction, common failure
+  recognition, and Planner-facing diagnostic summaries.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -95,10 +98,10 @@ Current v0.5 state:
 
 Current v0.6 state:
 
-- Lab Code Adapter is in planning as of 2026-06-22. The intended boundary is a
-  deterministic local adapter for config templates, generated config previews,
-  supplied log text, loss curves, and failure recognizers. Adapter runtime code
-  is not implemented yet.
+- Lab Code Adapter is complete for the v0.6 scope: deterministic local parsing
+  covers config templates, dry-run config previews, supplied log text, loss
+  curves, common failure recognizers, and Planner-facing summaries. No real
+  execution backend was added.
 
 ## Technical Highlights
 
@@ -119,6 +122,9 @@ Current v0.6 state:
   experiment records without executing jobs.
 - Static browser workbench that renders planner artifacts into inspectable
   panels and keeps execution state visible as `dry_run: true`.
+- Deterministic lab-code adapter that converts config templates and supplied
+  FWI log text into structured dry-run diagnostics, loss curves, failure
+  findings, and Planner-facing summaries.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -165,12 +171,14 @@ Use only bullets that match the completed implementation.
 - Upgraded the Web UI into a Lab Agent Workbench that renders route traces,
   tool calls, AlgorithmCards, parameter tables, ExperimentSpec, JobSpec,
   dry-run state, experiment history, and service status panels.
+- Added a Lab Code Adapter for reading lab-style config templates, rendering
+  dry-run config previews, parsing supplied logs, extracting loss curves, and
+  recognizing common FWI failure patterns without job submission.
 
-Planned v0.6 work:
+Planned after v0.6:
 
-- Add a Lab Code Adapter for reading lab-style config templates, parsing logs,
-  plotting loss curves, and recognizing common FWI failure patterns without job
-  submission.
+- Reserve and harden the future `JobBackend` interface while keeping non-dry-run
+  backends rejected until server execution has an explicit safety design.
 
 Move planned bullets into completed bullets only after implementation and tests
 are committed.
@@ -335,3 +343,15 @@ Add one short entry whenever a meaningful technical change lands.
 - Kept the career story explicit that v0.6 is planned, not implemented: no real
   CUDA/MPI execution, SSH, Slurm/PBS, remote execution, shell execution, or
   automatic Code Agent patch application was added.
+
+### 2026-06-22: v0.6 Lab Code Adapter Completion
+
+- Added the deterministic `lab_code_adapter` research component for config
+  templates, dry-run config previews, supplied log parsing, loss curve
+  extraction, common failure findings, and Planner-facing diagnostic summaries.
+- Added fixture-backed tests for execution-field rejection, loss parsing,
+  stagnation, NaN/Inf, cycle-skipping risk, resource-limit recognition, and
+  dry-run safety boundary summaries.
+- Preserved the execution boundary: no real CUDA/MPI execution, SSH, Slurm/PBS,
+  remote execution, arbitrary shell execution, or automatic Code Agent patch
+  application was added.

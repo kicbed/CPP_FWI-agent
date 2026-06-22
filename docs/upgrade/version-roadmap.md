@@ -162,9 +162,10 @@ Next target after v0.5:
 
 ## v0.6: Lab Code Adapter
 
-Status: Started on 2026-06-22 with
-`docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`; adapter runtime
-code is not implemented yet.
+Status: Completed on 2026-06-22 with deterministic config-template loading,
+dry-run config previews, supplied log parsing, loss curve extraction, common
+failure recognition, Planner-facing diagnostic summaries, and
+`docs/upgrade/test-report-v0.6.md`.
 
 Purpose:
 
@@ -190,10 +191,21 @@ Example user value:
 
 - "Here is my FWI log and config. Why is the loss not decreasing?"
 
-First implementation task:
+Completed scope:
 
-- Add a tested config template reader that rejects execution fields and keeps
+- Added a tested config template reader that rejects execution fields and keeps
   all outputs as local dry-run previews.
+- Added supplied-text log parsing, loss curve extraction, warning/status
+  extraction, and fixture-backed tests.
+- Added deterministic failure recognizers for loss stagnation, NaN/Inf,
+  cycle-skipping risk, and resource-limit symptoms.
+- Added Planner-facing diagnostic summaries with explicit dry-run safety
+  boundaries.
+
+Next target after v0.6:
+
+- Reserve the future JobBackend interface and keep non-`dry_run` backends
+  rejected until server execution receives an explicit safety design.
 
 ## v0.8: Server Backend
 

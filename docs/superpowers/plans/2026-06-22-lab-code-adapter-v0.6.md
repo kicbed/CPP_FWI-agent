@@ -120,7 +120,7 @@ ctest passes
 - Modify: `docs/upgrade/upgrade-log.md`
 - Modify: `docs/upgrade/career-notes.md`
 
-- [ ] **Step 1: Write failing template-loading test**
+- [x] **Step 1: Write failing template-loading test**
 
 Add a test that loads a JSON template fixture and asserts:
 
@@ -142,13 +142,13 @@ Expected RED:
 missing lab_code_adapter header or symbols
 ```
 
-- [ ] **Step 2: Implement minimal reader and validation**
+- [x] **Step 2: Implement minimal reader and validation**
 
 Add C++ types for `ConfigTemplate` and `ConfigPlaceholder`. Load JSON from a
 known fixture path and reject unknown execution fields such as `submit_command`,
 `ssh_host`, `slurm_partition`, or `pbs_queue`.
 
-- [ ] **Step 3: Validate**
+- [x] **Step 3: Validate**
 
 Run:
 
@@ -168,17 +168,17 @@ git diff --check
 - Modify: `docs/upgrade/upgrade-log.md`
 - Modify: `docs/upgrade/career-notes.md`
 
-- [ ] **Step 1: Write failing generation test**
+- [x] **Step 1: Write failing generation test**
 
 Test that valid parameter values render a config preview with all placeholders
 filled and a `dry_run: true` marker.
 
-- [ ] **Step 2: Implement deterministic rendering**
+- [x] **Step 2: Implement deterministic rendering**
 
 Render config text from structured values only. Do not invoke shell expansion,
 environment-variable expansion, or file writes outside fixture/test paths.
 
-- [ ] **Step 3: Validate**
+- [x] **Step 3: Validate**
 
 Run the targeted Lab Code Adapter test, full CTest, build, and diff check.
 
@@ -192,17 +192,17 @@ Run the targeted Lab Code Adapter test, full CTest, build, and diff check.
 - Modify: `docs/upgrade/upgrade-log.md`
 - Modify: `docs/upgrade/career-notes.md`
 
-- [ ] **Step 1: Write failing log parser test**
+- [x] **Step 1: Write failing log parser test**
 
 Test parsing of iteration number, loss value, frequency band, warning lines,
 and final status from fixture text.
 
-- [ ] **Step 2: Implement parser**
+- [x] **Step 2: Implement parser**
 
 Parse supplied text content as data. The parser must not open arbitrary paths
 from user input and must not execute commands embedded in logs.
 
-- [ ] **Step 3: Validate**
+- [x] **Step 3: Validate**
 
 Run targeted and full validation.
 
@@ -215,7 +215,7 @@ Run targeted and full validation.
 - Modify: `docs/upgrade/upgrade-log.md`
 - Modify: `docs/upgrade/career-notes.md`
 
-- [ ] **Step 1: Write failing recognizer test**
+- [x] **Step 1: Write failing recognizer test**
 
 Cover at least:
 
@@ -224,12 +224,12 @@ Cover at least:
 - cycle-skipping hint from high starting frequency or missing low frequency;
 - resource-limit symptoms from text logs.
 
-- [ ] **Step 2: Implement recognizer**
+- [x] **Step 2: Implement recognizer**
 
 Return structured findings with severity, evidence snippets, and suggested next
 checks. Keep recommendations diagnostic; do not submit jobs.
 
-- [ ] **Step 3: Validate**
+- [x] **Step 3: Validate**
 
 Run targeted and full validation.
 
@@ -244,18 +244,18 @@ Run targeted and full validation.
 - Modify: `docs/upgrade/upgrade-log.md`
 - Modify: `docs/upgrade/career-notes.md`
 
-- [ ] **Step 1: Write failing summary test**
+- [x] **Step 1: Write failing summary test**
 
 Test that parsed config/log/loss findings can be summarized into planner
 context fields: observed symptoms, likely causes, parameter tuning suggestions,
 and explicit dry-run boundary.
 
-- [ ] **Step 2: Implement summary adapter**
+- [x] **Step 2: Implement summary adapter**
 
 Keep the adapter deterministic and local. If PlannerContext is touched, pass
 structured findings rather than raw unbounded logs.
 
-- [ ] **Step 3: Validate**
+- [x] **Step 3: Validate**
 
 Run targeted Lab Code Adapter and PlannerContext tests, then full validation.
 
@@ -269,12 +269,12 @@ Run targeted Lab Code Adapter and PlannerContext tests, then full validation.
 - Modify: `docs/upgrade/career-notes.md`
 - Modify: `docs/upgrade/upgrade-log.md`
 
-- [ ] **Step 1: Write v0.6 test report**
+- [x] **Step 1: Write v0.6 test report**
 
 Document config template loading, config rendering, log parsing, loss curve
 extraction, failure recognition, and safety boundaries.
 
-- [ ] **Step 2: Mark v0.6 complete only after tests pass**
+- [x] **Step 2: Mark v0.6 complete only after tests pass**
 
 Do not mark v0.6 complete until:
 
@@ -286,7 +286,7 @@ git diff --check
 
 all pass and the report records the results.
 
-- [ ] **Step 3: Add Chinese learning summary**
+- [x] **Step 3: Add Chinese learning summary**
 
 Include the detailed sections required by `docs/upgrade/README.md`: problem,
 implementation, key tests/resources, safety boundaries, TDD evidence, interview

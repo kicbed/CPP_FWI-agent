@@ -7,6 +7,7 @@ set(RESEARCH_SOURCES
     src/dry_run_backend.cpp
     src/experiment_spec.cpp
     src/job_spec.cpp
+    src/lab_code_adapter.cpp
     src/planner_answer.cpp
     src/planner_context.cpp
     src/research_knowledge.cpp

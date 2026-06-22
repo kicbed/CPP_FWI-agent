@@ -185,6 +185,18 @@ target_include_directories(test_planner_answer PRIVATE
 )
 add_test(NAME PlannerAnswerTest COMMAND test_planner_answer)
 
+add_executable(test_lab_code_adapter test_lab_code_adapter.cpp)
+target_link_libraries(test_lab_code_adapter
+    agent_rpc_research
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_lab_code_adapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../research/include
+)
+add_test(NAME LabCodeAdapterTest COMMAND test_lab_code_adapter)
+
 add_test(
     NAME WebBrandingTest
     COMMAND ${CMAKE_COMMAND}
