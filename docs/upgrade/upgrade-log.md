@@ -1681,3 +1681,41 @@ Commit:
 Next task:
 - Keep real execution disabled. Continue M11-T1 only after lab backend
   approval and operational prerequisites are known.
+
+## 2026-06-22: Add v0.8 Study Pack
+
+Scope:
+- Added a v0.8 study pack as the main learning entrance for the server backend
+  safety foundation.
+- Linked the study pack from the upgrade guide, v0.8 test report, and v0.8
+  learning summary.
+
+Files changed:
+- `docs/upgrade/study-pack-v0.8.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/learning-summary-v0.8.md`
+- `docs/upgrade/test-report-v0.8.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, local wrapper
+  execution, arbitrary shell execution, credentials, or automatic Code Agent
+  patch application was added.
+
+Tests run:
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This v0.8 study pack commit.
+
+Next task:
+- Study v0.8 from `docs/upgrade/study-pack-v0.8.md`; keep real execution
+  disabled until M11-T1 has lab approval and operational details.
