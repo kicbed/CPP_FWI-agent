@@ -162,6 +162,10 @@ Next target after v0.5:
 
 ## v0.6: Lab Code Adapter
 
+Status: Started on 2026-06-22 with
+`docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`; adapter runtime
+code is not implemented yet.
+
 Purpose:
 
 - Adapt to the shape of the lab's CUDA/MPI FWI code without executing server
@@ -179,10 +183,17 @@ Must have:
 Not included:
 
 - Job submission to real servers.
+- SSH, Slurm, PBS, remote execution, arbitrary shell execution, or automatic
+  Code Agent patch application.
 
 Example user value:
 
 - "Here is my FWI log and config. Why is the loss not decreasing?"
+
+First implementation task:
+
+- Add a tested config template reader that rejects execution fields and keeps
+  all outputs as local dry-run previews.
 
 ## v0.8: Server Backend
 

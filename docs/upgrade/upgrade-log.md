@@ -1106,3 +1106,41 @@ Commit:
 Next task:
 - Start v0.6 Lab Code Adapter for config templates, log parsing, loss curve
   parsing, and failure recognizers without submitting jobs.
+
+## 2026-06-22: Start v0.6 Lab Code Adapter Plan
+
+Scope:
+- Created the v0.6 Lab Code Adapter implementation plan.
+- Added Lab Code Adapter tasks to the milestone board.
+- Marked v0.6 as the active planned target without claiming runtime adapter
+  code exists.
+
+Files changed:
+- `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, remote execution, arbitrary
+  shell execution, or automatic Code Agent patch application was added.
+
+Tests run:
+- `git diff --check`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+
+Result:
+- PASS. `git diff --check` produced no output.
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest` passed 24/24 tests.
+
+Commit:
+- This v0.6 Lab Code Adapter plan commit.
+
+Next task:
+- Start v0.6 Task 1: add a failing `LabCodeAdapter` config-template reader
+  test, then implement the minimal reader that rejects execution fields.

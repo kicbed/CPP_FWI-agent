@@ -93,6 +93,13 @@ Current v0.5 state:
   ExperimentSpec/JobSpec rendering, dry-run boundaries, and local service
   status.
 
+Current v0.6 state:
+
+- Lab Code Adapter is in planning as of 2026-06-22. The intended boundary is a
+  deterministic local adapter for config templates, generated config previews,
+  supplied log text, loss curves, and failure recognizers. Adapter runtime code
+  is not implemented yet.
+
 ## Technical Highlights
 
 - C++17/C++20 multi-module project with CMake.
@@ -159,7 +166,7 @@ Use only bullets that match the completed implementation.
   tool calls, AlgorithmCards, parameter tables, ExperimentSpec, JobSpec,
   dry-run state, experiment history, and service status panels.
 
-Planned after v0.5:
+Planned v0.6 work:
 
 - Add a Lab Code Adapter for reading lab-style config templates, parsing logs,
   plotting loss curves, and recognizing common FWI failure patterns without job
@@ -319,3 +326,12 @@ Add one short entry whenever a meaningful technical change lands.
 - Added a v0.5 test report and Chinese learning summary for product story,
   implementation details, verification evidence, safety boundaries, and
   interview preparation.
+
+### 2026-06-22: v0.6 Lab Code Adapter Plan
+
+- Added a v0.6 implementation plan for config template reading, safe config
+  previews, log parsing, loss curve parsing, and deterministic failure
+  recognition.
+- Kept the career story explicit that v0.6 is planned, not implemented: no real
+  CUDA/MPI execution, SSH, Slurm/PBS, remote execution, shell execution, or
+  automatic Code Agent patch application was added.

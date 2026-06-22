@@ -27,6 +27,8 @@ Version status:
   a generic orchestrator chat page to Lab Agent Workbench.
 - v0.5 Lab Workbench UI is complete as of 2026-06-12 according to
   `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.5.md`.
+- v0.6 Lab Code Adapter started on 2026-06-22 with
+  `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -187,18 +189,42 @@ Acceptance:
 - A demo viewer can see routing, tools, parameter plans, and dry-run job output.
 - UI still works on localhost with existing start scripts.
 
-## Milestone 8: JobBackend Interface Reservation
+## Milestone 8: Lab Code Adapter
+
+Goal: understand lab code configs, logs, loss curves, and common failure
+signals without submitting jobs.
+
+Tasks:
+
+- [x] M8-T1: Create the v0.6 Lab Code Adapter implementation plan.
+- [ ] M8-T2: Add config template reader with validation against execution fields.
+- [ ] M8-T3: Add safe config generator with `dry_run: true` preview output.
+- [ ] M8-T4: Add log parser and loss curve parser for supplied text content.
+- [ ] M8-T5: Add common failure recognizers for loss stagnation, NaN/Inf,
+  cycle-skipping hints, missing low-frequency content, and resource limits.
+- [ ] M8-T6: Add planner-facing diagnostic summary grounded in parsed evidence.
+- [ ] M8-T7: Add v0.6 test report and Chinese learning summary.
+
+Acceptance:
+
+- The adapter can inspect config templates and supplied logs without running
+  CUDA/MPI code.
+- No SSH, Slurm, PBS, remote server, or arbitrary shell execution is added.
+- Tests cover successful parsing, invalid execution fields, loss extraction,
+  and failure recognition.
+
+## Milestone 9: JobBackend Interface Reservation
 
 Goal: reserve the future server execution interface without connecting real
 servers.
 
 Tasks:
 
-- [ ] M8-T1: Define `JobBackend` interface.
-- [ ] M8-T2: Make `DryRunBackend` implement `JobBackend`.
-- [ ] M8-T3: Add backend type enum values: `dry_run`, `local`, `ssh`, `slurm`, `pbs`.
-- [ ] M8-T4: Reject non-`dry_run` backends at runtime with a clear message.
-- [ ] M8-T5: Document how Slurm/PBS can be added later.
+- [ ] M9-T1: Define `JobBackend` interface.
+- [ ] M9-T2: Make `DryRunBackend` implement `JobBackend`.
+- [ ] M9-T3: Add backend type enum values: `dry_run`, `local`, `ssh`, `slurm`, `pbs`.
+- [ ] M9-T4: Reject non-`dry_run` backends at runtime with a clear message.
+- [ ] M9-T5: Document how Slurm/PBS can be added later.
 
 Acceptance:
 
@@ -206,18 +232,18 @@ Acceptance:
 - v0.2 cannot accidentally submit real jobs.
 - Tests pass.
 
-## Milestone 9: Real CUDA/MPI Server Integration
+## Milestone 10: Real CUDA/MPI Server Integration
 
 Goal: connect lab execution after v0.2 is stable.
 
 Tasks:
 
-- [ ] M9-T1: Decide the first real backend: local server script, SSH, Slurm, or PBS.
-- [ ] M9-T2: Add authentication and access boundary design.
-- [ ] M9-T3: Add job workspace isolation.
-- [ ] M9-T4: Add log collection and artifact indexing.
-- [ ] M9-T5: Add loss curve and output model visualization.
-- [ ] M9-T6: Add audit logging for submitted jobs.
+- [ ] M10-T1: Decide the first real backend: local server script, SSH, Slurm, or PBS.
+- [ ] M10-T2: Add authentication and access boundary design.
+- [ ] M10-T3: Add job workspace isolation.
+- [ ] M10-T4: Add log collection and artifact indexing.
+- [ ] M10-T5: Add loss curve and output model visualization.
+- [ ] M10-T6: Add audit logging for submitted jobs.
 
 Acceptance:
 
