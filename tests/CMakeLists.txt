@@ -209,6 +209,18 @@ target_include_directories(test_server_job PRIVATE
 )
 add_test(NAME ServerJobTest COMMAND test_server_job)
 
+add_executable(test_single_server_backend test_single_server_backend.cpp)
+target_link_libraries(test_single_server_backend
+    agent_rpc_research
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_single_server_backend PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../research/include
+)
+add_test(NAME SingleServerBackendTest COMMAND test_single_server_backend)
+
 add_test(
     NAME WebBrandingTest
     COMMAND ${CMAKE_COMMAND}

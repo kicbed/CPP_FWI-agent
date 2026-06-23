@@ -16,6 +16,67 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 完成 v0.10 单服务器账号 metadata 实现
+
+范围：
+- 新增 `SingleServerProfile`、`SingleServerJobTemplate` 和
+  `SingleServerReviewRequest` metadata。
+- 新增 profile/template/review request 校验，拒绝空凭据引用、疑似内联秘密、
+  runtime enabled profile、未知 template、未允许参数和非 dry-run request。
+- 新增 dry-run review packet renderer，输出 profile/template/参数/artifact/资源上限，
+  并明确 execution、credentials、server connection 和 workspace creation 均关闭。
+- 新增 `SingleServerBackendTest` 测试目标。
+- 新增 v0.10 测试报告和中文学习总结，并更新升级指南、里程碑、路线图、career notes
+  和设计文档状态。
+
+改动文件：
+- `research/include/agent_rpc/research/single_server_backend.h`
+- `research/src/single_server_backend.cpp`
+- `tests/test_single_server_backend.cpp`
+- `research/CMakeLists.txt`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/test-report-v0.10.md`
+- `docs/upgrade/learning-summary-v0.10.md`
+- `docs/upgrade/single-server-backend-v0.10.md`
+- `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 新增 C++ metadata validation 和 review packet rendering 能力。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、服务器连接、workspace 创建、生产审计存储或
+  Code Agent 自动应用 patch。
+
+验证命令：
+- `cmake --build build -j2`
+- `ctest --test-dir build -R SingleServerBackendTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+TDD 证据：
+- RED 1：新增测试 target 后构建失败于缺少
+  `agent_rpc/research/single_server_backend.h`。
+- RED 2：template/request 校验测试失败 3 项，因为校验函数尚未实现。
+- RED 3：review packet renderer 测试失败 1 项，因为 renderer 返回空字符串。
+
+结果：
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. `ctest --test-dir build -R SingleServerBackendTest --output-on-failure`
+  通过 1/1 个目标测试，目标内 9 个用例通过。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 27/27 个测试。
+- PASS. `git diff --check` 没有输出。
+
+Commit：
+- 本次 v0.10 单服务器账号 metadata 实现提交。
+
+下一步：
+- 考虑新增单服务器 fake lifecycle，但仍不连接真实服务器、不读取凭据、不创建 workspace、
+  不执行命令。
+
 ## 2026-06-23: 新增单服务器账号接入准备设计和实现计划
 
 范围：

@@ -71,6 +71,9 @@ Current status:
   回滚和实现顺序信息。
 - 新增单服务器账号下一窗口计划，把当前实验室初步阶段收敛为一个服务器账号、
   固定 workspace、固定 approved template、dry-run review packet 和 fake lifecycle。
+- Includes v0.10 single-server account preparation models and tests for
+  `SingleServerProfile`, `SingleServerJobTemplate`, `SingleServerReviewRequest`,
+  validation, and dry-run review packet rendering without connecting to a server.
 - 新增 v0.10 单服务器账号接入准备设计和实现计划，把下一步落到
   `SingleServerProfile`、`SingleServerJobTemplate`、`SingleServerReviewRequest`
   和 dry-run review packet，仍不连接服务器、不读取凭据、不执行命令。
@@ -184,9 +187,9 @@ Current M11 decision package state:
   下一窗口计划。后续不需要一开始实现复杂多租户平台，而是先做
   `SingleServerProfile`、`SingleServerJobTemplate`、dry-run review packet
   和 fake lifecycle。
-- v0.10 设计已经把第一批单服务器准备工作收敛为 metadata-only 模型和
-  review packet renderer。真实服务器连接、凭据加载、workspace 创建和 fake
-  lifecycle 都不在本次文档任务中。
+- v0.10 第一批实现已经把单服务器准备工作收敛为 metadata-only 模型、
+  validation helpers 和 review packet renderer。真实服务器连接、凭据加载、
+  workspace 创建和 fake lifecycle 仍然不在本批实现中。
 
 ## Technical Highlights
 
@@ -248,7 +251,7 @@ Current M11 decision package state:
   或审计持久化开始前必须具备的控制条件。
 - 新增单服务器账号初步接入计划，为下一阶段 profile/template/review packet
   和 fake lifecycle 设计提供中文交接说明。
-- 新增 v0.10 单服务器账号准备设计和实现计划，明确 profile/template/review
+- 新增 v0.10 单服务器账号 metadata 实现与测试，覆盖 profile/template/review
   request/review packet 的数据边界，并把真实执行、凭据读取和服务器连接排除在
   第一批实现之外。
 - Property and integration tests with GoogleTest and RapidCheck.
@@ -591,3 +594,16 @@ Add one short entry whenever a meaningful technical change lands.
 - Preserved the safety boundary: no real CUDA/MPI, SSH, Slurm/PBS, server
   connection, credential loading, workspace creation, arbitrary shell
   execution, or automatic Code Agent patch application.
+
+### 2026-06-23: v0.10 Single Server Metadata Completion
+
+- Added C++ `SingleServerProfile`, `SingleServerJobTemplate`, and
+  `SingleServerReviewRequest` metadata for the first single-server account
+  preparation batch.
+- Added validation that rejects empty credential references, inline
+  secret-looking values, runtime-enabled profiles, unknown templates,
+  unapproved parameters, and non-dry-run review requests.
+- Added a dry-run review packet renderer and `SingleServerBackendTest` coverage
+  while preserving the non-execution boundary: no server connection, credential
+  loading, workspace creation, CUDA/MPI, SSH, Slurm/PBS, or arbitrary shell
+  execution.

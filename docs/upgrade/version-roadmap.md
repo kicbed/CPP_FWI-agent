@@ -372,10 +372,9 @@ v1.0 entry gate:
 
 ## v0.10: Single Server Runner Preparation
 
-Status: Started on 2026-06-23 with
-`docs/upgrade/single-server-backend-v0.10.md` and
-`docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`.
-No runtime implementation is enabled yet.
+Status: Completed on 2026-06-23 for the metadata/profile/template and dry-run
+review packet scope, with `docs/upgrade/test-report-v0.10.md` and
+`docs/upgrade/learning-summary-v0.10.md`. No real server execution is enabled.
 
 Purpose:
 
@@ -406,12 +405,11 @@ Not included:
 - Arbitrary shell execution from user input.
 - Automatic Code Agent patch application.
 
-Next target after the design plan:
+Next target after v0.10:
 
-- Implement the metadata models and review packet renderer with GoogleTest
-  coverage.
-- Only after that, consider a fake lifecycle path that still does not connect
-  to a server.
+- Consider a fake lifecycle path for single-server review records that still
+  does not connect to a server, read credentials, create workspace directories,
+  or execute commands.
 
 ## v1.0: Lab-Usable Platform
 

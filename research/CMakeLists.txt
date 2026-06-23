@@ -13,6 +13,7 @@ set(RESEARCH_SOURCES
     src/planner_context.cpp
     src/research_knowledge.cpp
     src/server_job.cpp
+    src/single_server_backend.cpp
 )
 
 add_library(agent_rpc_research STATIC ${RESEARCH_SOURCES})

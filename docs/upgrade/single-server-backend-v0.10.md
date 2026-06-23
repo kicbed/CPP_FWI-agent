@@ -2,13 +2,13 @@
 
 日期：2026-06-23
 
-状态：设计和实现计划已创建，代码尚未实现。
+状态：metadata/profile/template 和 dry-run review packet 第一批实现已完成。
 
 本文定义 M11-S1 单服务器账号受控运行准备阶段。它服务于当前实验室的现实场景：
 自己或小组先用一个服务器账号跑实验，不一开始建设复杂多用户平台、Slurm/PBS、
 SSH 真实连接或生产审计系统。
 
-本文只设计 metadata、profile、template 和 dry-run review packet。它不执行命令、
+本文只实现 metadata、profile、template 和 dry-run review packet。它不执行命令、
 不读取真实凭据、不连接服务器、不创建 workspace、不提交 CUDA/MPI 作业，也不改变
 运行时后端守卫。
 
@@ -18,7 +18,7 @@ v0.9 已经能把 M11 preflight metadata 渲染成 operator 可以 review 的文
 面向通用真实后端决策：local wrapper、SSH、Slurm、PBS 都只是候选。当前实验室更小：
 先按一个固定服务器账号、固定 workspace、固定 approved template 的路径推进。
 
-v0.10 的目标是把这个最小路径建成可测试的非执行层：
+v0.10 已经把这个最小路径建成可测试的非执行层：
 
 - 用 `SingleServerProfile` 表达一个服务器账号配置的 metadata。
 - 用 `SingleServerJobTemplate` 表达一个 approved template 的 metadata。
@@ -210,23 +210,42 @@ resource_limits:
 safety_boundary: review packet only; no command is submitted or executed
 ```
 
-## 6. 实现顺序
+## 6. 已实现文件
 
-第一批代码任务应该很小：
+代码文件：
 
-1. 新增 `SingleServerProfile`、`SingleServerJobTemplate` 和
+- `research/include/agent_rpc/research/single_server_backend.h`
+- `research/src/single_server_backend.cpp`
+- `tests/test_single_server_backend.cpp`
+
+构建入口：
+
+- `research/CMakeLists.txt`
+- `tests/CMakeLists.txt`
+
+学习和验证文档：
+
+- `docs/upgrade/test-report-v0.10.md`
+- `docs/upgrade/learning-summary-v0.10.md`
+
+## 7. 后续实现顺序
+
+第一批代码任务已经完成：
+
+1. 已新增 `SingleServerProfile`、`SingleServerJobTemplate` 和
    `SingleServerReviewRequest` metadata 类型。
-2. 增加 profile 校验，重点拒绝空 credential reference、疑似内联秘密、空 workspace
+2. 已增加 profile 校验，重点拒绝空 credential reference、疑似内联秘密、空 workspace
    reference、空模板列表和 `runtime_enabled == true`。
-3. 增加 template/request 校验，重点拒绝未知 template、profile 不匹配、版本不匹配、
+3. 已增加 template/request 校验，重点拒绝未知 template、profile 不匹配、版本不匹配、
    未允许参数和 `dry_run == false`。
-4. 增加 dry-run review packet renderer，输出稳定文本并明确所有执行相关状态都是
+4. 已增加 dry-run review packet renderer，输出稳定文本并明确所有执行相关状态都是
    disabled/false。
-5. 增加 v0.10 测试报告和学习总结，再考虑 fake lifecycle。
+5. 已增加 v0.10 测试报告和学习总结。
 
-不要在第一批任务里做真实连接、凭据加载、workspace 创建、日志收集或审计持久化。
+下一步可以考虑 fake lifecycle，但仍不要做真实连接、凭据加载、workspace 创建、
+日志收集或审计持久化。
 
-## 7. 验证要求
+## 8. 验证要求
 
 文档阶段：
 
@@ -243,7 +262,7 @@ safety_boundary: review packet only; no command is submitted or executed
 - `ctest --test-dir build --output-on-failure`
 - `git diff --check`
 
-## 8. 完成标准
+## 9. 完成标准
 
 v0.10 第一批实现只有在满足以下条件时才算完成：
 

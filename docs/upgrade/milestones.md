@@ -54,8 +54,8 @@ Version status:
 - 单服务器账号初步接入交接文档已在 2026-06-23 创建。它把当前实验室场景
   收敛为一个服务器账号、固定 workspace、固定 approved template、dry-run
   review packet 和 fake lifecycle，供下一窗口继续做设计文档和实现计划。
-- M11-S1 单服务器账号接入准备设计和实现计划已在 2026-06-23 创建。当前范围
-  只到 metadata/profile/template 和 dry-run review packet；未实现真实命令执行、
+- M11-S1 单服务器账号接入准备第一批实现已在 2026-06-23 完成。当前范围
+  只到 metadata/profile/template 和 dry-run review packet；没有真实命令执行、
   凭据读取、SSH、Slurm/PBS 或服务器连接。
 
 ## Milestone 0: Baseline And Project Story
@@ -309,16 +309,18 @@ Tasks:
     流程指南，覆盖批准、凭据、workspace、授权、模板、配额、监控、审计和回滚。
   - 2026-06-23 记录：`docs/upgrade/next-session-single-server-plan.md` 是
     下一窗口交接文档，适用于“一个服务器账号、自己先跑”的初步实验室场景。
-- [~] M11-S1: 单服务器账号受控运行准备，作为 M11-T1 未完成前的非执行收敛路径。
+- [x] M11-S1: 单服务器账号受控运行准备，作为 M11-T1 未完成前的非执行收敛路径。
   - [x] 新增设计文档和实现计划：
     `docs/upgrade/single-server-backend-v0.10.md` 和
     `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`。
-  - [ ] 实现 `SingleServerProfile` metadata，拒绝空凭据引用、疑似内联秘密、
+  - [x] 实现 `SingleServerProfile` metadata，拒绝空凭据引用、疑似内联秘密、
     空 workspace 引用、空模板列表和 runtime enabled 状态。
-  - [ ] 实现 `SingleServerJobTemplate` metadata，拒绝未知 template、profile 不匹配、
+  - [x] 实现 `SingleServerJobTemplate` metadata，拒绝未知 template、profile 不匹配、
     版本不匹配和未允许参数。
-  - [ ] 渲染 dry-run review packet，明确不执行命令、不读取凭据、不连接服务器、
+  - [x] 渲染 dry-run review packet，明确不执行命令、不读取凭据、不连接服务器、
     不创建 workspace。
+  - [x] 新增 `docs/upgrade/test-report-v0.10.md` 和
+    `docs/upgrade/learning-summary-v0.10.md`。
 - [ ] M11-T2: Add authentication and access control implementation.
 - [ ] M11-T3: Add job workspace creation and cleanup.
 - [ ] M11-T4: Add job submission, status polling, and cancellation.

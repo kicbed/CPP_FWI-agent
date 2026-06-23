@@ -106,6 +106,9 @@ git commit -m "docs: plan single server backend preparation"
 
 ## Task 2: Metadata Model Contract
 
+Execution note: Task 2 through Task 5 were completed as one tight v0.10
+implementation batch and will be committed together in the final commit.
+
 **Files:**
 - Create: `research/include/agent_rpc/research/single_server_backend.h`
 - Create: `research/src/single_server_backend.cpp`
@@ -114,7 +117,7 @@ git commit -m "docs: plan single server backend preparation"
 - Modify: `tests/CMakeLists.txt`
 - Modify: `docs/upgrade/upgrade-log.md`
 
-- [ ] **Step 1: Write the failing metadata tests and test target**
+- [x] **Step 1: Write the failing metadata tests and test target**
 
 Create `tests/test_single_server_backend.cpp`:
 
@@ -198,7 +201,7 @@ target_include_directories(test_single_server_backend PRIVATE
 add_test(NAME SingleServerBackendTest COMMAND test_single_server_backend)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 
@@ -212,7 +215,7 @@ Expected:
 fatal error: agent_rpc/research/single_server_backend.h: No such file or directory
 ```
 
-- [ ] **Step 3: Add the public metadata header**
+- [x] **Step 3: Add the public metadata header**
 
 Create `research/include/agent_rpc/research/single_server_backend.h`:
 
@@ -274,7 +277,7 @@ std::string render_single_server_review_packet(
 }  // namespace agent_rpc::research
 ```
 
-- [ ] **Step 4: Add the minimal profile validation implementation**
+- [x] **Step 4: Add the minimal profile validation implementation**
 
 Create `research/src/single_server_backend.cpp`:
 
@@ -350,11 +353,11 @@ std::string render_single_server_review_packet(
 }  // namespace agent_rpc::research
 ```
 
-- [ ] **Step 5: Wire the implementation file into CMake**
+- [x] **Step 5: Wire the implementation file into CMake**
 
 Modify `research/CMakeLists.txt` so `single_server_backend.cpp` is compiled into `agent_rpc_research` next to `server_job.cpp`.
 
-- [ ] **Step 6: Run metadata tests**
+- [x] **Step 6: Run metadata tests**
 
 Run:
 
@@ -369,7 +372,7 @@ Expected:
 SingleServerBackendTest passes
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add research/include/agent_rpc/research/single_server_backend.h \
@@ -388,7 +391,7 @@ git commit -m "feat: add single server metadata profiles"
 - Modify: `tests/test_single_server_backend.cpp`
 - Modify: `docs/upgrade/upgrade-log.md`
 
-- [ ] **Step 1: Add failing template/request validation tests**
+- [x] **Step 1: Add failing template/request validation tests**
 
 Append to `tests/test_single_server_backend.cpp`:
 
@@ -480,7 +483,7 @@ TEST(SingleServerBackendTest, RejectsNonDryRunReviewRequest) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -495,7 +498,7 @@ Expected:
 The new template/request tests fail because validation functions still return empty errors.
 ```
 
-- [ ] **Step 3: Implement template/request validation**
+- [x] **Step 3: Implement template/request validation**
 
 Replace the empty validation functions in `research/src/single_server_backend.cpp`:
 
@@ -569,7 +572,7 @@ std::vector<std::string> validate_single_server_review_request(
 }
 ```
 
-- [ ] **Step 4: Run template/request tests**
+- [x] **Step 4: Run template/request tests**
 
 Run:
 
@@ -584,7 +587,7 @@ Expected:
 SingleServerBackendTest passes
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add research/src/single_server_backend.cpp \
@@ -600,7 +603,7 @@ git commit -m "feat: validate single server templates"
 - Modify: `tests/test_single_server_backend.cpp`
 - Modify: `docs/upgrade/upgrade-log.md`
 
-- [ ] **Step 1: Add failing renderer test**
+- [x] **Step 1: Add failing renderer test**
 
 Append to `tests/test_single_server_backend.cpp`:
 
@@ -629,7 +632,7 @@ TEST(SingleServerBackendTest, RendersDryRunReviewPacketWithoutSecretsOrExecution
 }
 ```
 
-- [ ] **Step 2: Run renderer test to verify it fails**
+- [x] **Step 2: Run renderer test to verify it fails**
 
 Run:
 
@@ -644,7 +647,7 @@ Expected:
 The renderer test fails because render_single_server_review_packet returns an empty string.
 ```
 
-- [ ] **Step 3: Implement renderer**
+- [x] **Step 3: Implement renderer**
 
 Replace `render_single_server_review_packet` in `research/src/single_server_backend.cpp`:
 
@@ -685,7 +688,7 @@ std::string render_single_server_review_packet(
 }
 ```
 
-- [ ] **Step 4: Run renderer tests and full tests**
+- [x] **Step 4: Run renderer tests and full tests**
 
 Run:
 
@@ -705,7 +708,7 @@ full ctest reports 100% tests passed
 git diff --check produces no output
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add research/src/single_server_backend.cpp \
@@ -725,7 +728,7 @@ git commit -m "feat: render single server review packets"
 - Modify: `docs/upgrade/career-notes.md`
 - Modify: `docs/upgrade/upgrade-log.md`
 
-- [ ] **Step 1: Write the test report**
+- [x] **Step 1: Write the test report**
 
 Document:
 
@@ -735,7 +738,7 @@ Document:
 - final validation commands
 - explicit safety boundaries
 
-- [ ] **Step 2: Write the Chinese learning summary**
+- [x] **Step 2: Write the Chinese learning summary**
 
 Cover:
 
@@ -745,11 +748,11 @@ Cover:
 - why review packet is not executable
 - interview pitch and likely questions
 
-- [ ] **Step 3: Update upgrade docs**
+- [x] **Step 3: Update upgrade docs**
 
 Mark v0.10 first implementation batch complete only after tests pass. Do not claim server execution capability.
 
-- [ ] **Step 4: Final validation**
+- [x] **Step 4: Final validation**
 
 Run:
 
@@ -767,7 +770,7 @@ cmake build exits 0
 ctest reports 100% tests passed
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/upgrade/test-report-v0.10.md \
