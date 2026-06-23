@@ -57,6 +57,10 @@ Version status:
 - v0.11 实验室内部安全操作策略第一批实现已在 2026-06-23 完成。它新增
   lab_root/lab_user/readonly、safe operation policy、删除 dry-run review packet
   metadata、validation 和 renderer，不实现真实删除。
+- v0.12 Fake Lifecycle 第一批实现已在 2026-06-23 完成。它新增单服务器
+  lifecycle metadata、内存态状态转换和 preview renderer，覆盖 requested、
+  reviewed、approved、rejected、queued、running、succeeded、failed、cancelled，
+  不连接服务器、不执行命令、不创建目录。
 - v1.0 internal preview 分步路线已在 2026-06-23 创建。公开路线图保存在
   `docs/upgrade/v1.0-internal-preview-roadmap.md`；新窗口提示词和详细 agent
   执行计划保存在本地忽略文件中，不提交到 GitHub。
@@ -332,11 +336,11 @@ Tasks:
   - [x] 实现删除 dry-run review request/packet 校验和 renderer。
   - [x] 测试证明 root 角色也不能绕过 dry-run、路径保护和删除确认。
   - [x] 新增 `docs/upgrade/test-report-v0.11.md`。
-- [ ] M11-S3: 单服务器 fake lifecycle，作为 v0.12 目标。
-  - [ ] 实现 requested、reviewed、approved、rejected、queued、running、
+- [x] M11-S3: 单服务器 fake lifecycle，作为 v0.12 目标。
+  - [x] 实现 requested、reviewed、approved、rejected、queued、running、
     succeeded、failed、cancelled 等 metadata 状态。
-  - [ ] 只做内存状态流和 review packet，不连接服务器、不执行命令、不创建目录。
-  - [ ] 新增 v0.12 测试报告和学习总结。
+  - [x] 只做内存状态流和 review packet，不连接服务器、不执行命令、不创建目录。
+  - [x] 新增 v0.12 测试报告和学习总结。
 - [ ] M11-S4: workspace planner，作为 v0.13 目标。
   - [ ] 生成 workspace、artifact、log 和 run directory preview。
   - [ ] 校验路径不能逃逸 lab workspace root。

@@ -78,6 +78,10 @@ Current status:
   `lab_user`, `readonly`, role-based operation allowlists,
   `DeleteReviewRequest`, `DeleteReviewPacket`, and deletion dry-run review
   rendering without real deletion.
+- Includes v0.12 single-server fake lifecycle models and tests for requested,
+  reviewed, approved, rejected, queued, running, succeeded, failed, and
+  cancelled state flow without connecting to a server, executing commands, or
+  creating workspaces.
 - 新增 v0.10 单服务器账号接入准备设计和实现计划，把下一步落到
   `SingleServerProfile`、`SingleServerJobTemplate`、`SingleServerReviewRequest`
   和 dry-run review packet，仍不连接服务器、不读取凭据、不执行命令。
@@ -200,6 +204,9 @@ Current M11 decision package state:
 - v0.11 第一批实现把实验室内部账号模型简化为 `lab_root`、`lab_user`、`readonly`，
   并用 tested policy/validation 证明 root 角色也不能绕过删除 dry-run preview、路径保护、
   symlink 风险和确认边界。
+- v0.12 第一批实现新增单服务器 fake lifecycle 状态机，用内存 metadata 展示
+  requested/reviewed/approved/rejected/queued/running/succeeded/failed/cancelled
+  状态流和 allowed next states，但不连接服务器、不执行命令、不创建目录。
 
 ## Technical Highlights
 
@@ -267,6 +274,9 @@ Current M11 decision package state:
 - 新增 v0.11 `safe_operations` C++ 模块和测试，覆盖内部角色、操作 allowlist、
   删除 dry-run review request/packet、protected path/symlink/confirmation 校验，
   并保持真实删除、trash move 和 shell 执行关闭。
+- 新增 v0.12 `single_server_lifecycle` C++ 模块和测试，覆盖 fake lifecycle
+  状态解析、内存状态转换、终态拒绝、取消路径和 preview renderer，并保持服务器连接、
+  命令执行、workspace 创建关闭。
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -351,6 +361,9 @@ Use only bullets that match the completed implementation.
   operation allowlists, and deletion dry-run review packets while keeping real
   deletion, trash moves, shell execution, credential reads, and server
   connections disabled.
+- Added v0.12 fake lifecycle metadata and tests for single-server review state
+  flow, allowed next states, terminal-state blocking, and non-executing preview
+  rendering.
 - 新增中文 M11 后端决策与流程文档，用于讨论后端批准、凭据、workspace、
   授权、配额、监控、审计、回滚和实现顺序。
 
@@ -657,3 +670,14 @@ Add one short entry whenever a meaningful technical change lands.
 - Moved copy-paste prompts and detailed agent execution plans to local ignored
   files so the GitHub-facing project history stays focused on architecture,
   tests, learning reports, and product decisions.
+
+### 2026-06-23: v0.12 Fake Lifecycle Completion
+
+- Added `single_server_lifecycle` C++ metadata for single-server fake lifecycle
+  states, events, records, transition validation, and preview rendering.
+- Added tests for state parsing, requested-record defaults, success flow,
+  cancellation, rejected terminal blocking, allowed next states, and explicit
+  non-execution flags.
+- Preserved the safety boundary: no server connection, command execution,
+  workspace or directory creation, credential loading, real log collection, or
+  artifact collection.

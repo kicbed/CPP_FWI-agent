@@ -16,6 +16,73 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 完成 v0.12 Fake Lifecycle metadata 实现
+
+范围：
+- 新增 `single_server_lifecycle` C++ 模块，包含 `SingleServerLifecycleState`、
+  `SingleServerLifecycleEvent` 和 `SingleServerLifecycleRecord` metadata。
+- 新增状态名解析、内存态 transition validation、event append helper 和 lifecycle
+  preview renderer。
+- preview 展示当前状态、允许的下一状态、event history、`server_connected: false`、
+  `command_executed: false` 和 `workspace_created: false`。
+- 新增 `SingleServerLifecycleTest`，覆盖 requested/reviewed/approved/rejected/
+  queued/running/succeeded/failed/cancelled 状态解析、成功路径、取消路径、终态拒绝
+  和非执行 preview。
+- 新增 v0.12 测试报告和中文学习总结，并更新升级指南、里程碑、路线图和 career notes。
+
+改动文件：
+- `research/include/agent_rpc/research/single_server_lifecycle.h`
+- `research/src/single_server_lifecycle.cpp`
+- `tests/test_single_server_lifecycle.cpp`
+- `research/CMakeLists.txt`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/test-report-v0.12.md`
+- `docs/upgrade/learning-summary-v0.12.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 新增 C++ metadata、validation helper 和非执行 lifecycle preview rendering。
+- `queued` 和 `running` 只是 fake lifecycle metadata 状态，不表示真实队列或真实进程。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、服务器连接、workspace/目录创建、真实日志采集、
+  artifact 采集、生产审计存储或 Code Agent 自动应用 patch。
+
+验证命令：
+- `cmake --build build -j2`
+- `ctest --test-dir build -R SingleServerLifecycleTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+TDD 证据：
+- RED 1：新增 `SingleServerLifecycleTest` target 后构建失败于缺少
+  `agent_rpc/research/single_server_lifecycle.h`。
+- GREEN 1：新增 lifecycle header/source、状态解析和 requested record 后，构建和
+  聚焦测试通过。
+- RED 2：追加 transition 和 renderer 测试后，构建失败于缺少
+  `append_single_server_lifecycle_event` 和
+  `render_single_server_lifecycle_preview`。
+- GREEN 2：新增 transition validation、event append 和 preview renderer 后，聚焦测试通过。
+- RED 3：追加 `allowed_next_states` preview 断言后，聚焦测试失败于缺少下一状态输出。
+- GREEN 3：renderer 增加 allowed next states 后，聚焦测试通过。
+
+结果：
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. `ctest --test-dir build -R SingleServerLifecycleTest --output-on-failure`
+  通过 1/1 个测试目标。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 29/29 个测试。
+- PASS. `git diff --check` 没有输出。
+
+Commit：
+- 本次 v0.12 Fake Lifecycle metadata 实现提交。
+
+下一步：
+- 开始 v0.13 Workspace Planner，只生成 workspace/artifact/log/run directory preview
+  并做路径安全校验；仍不创建目录、不删除目录、不移动文件、不连接服务器、不执行命令。
+
 ## 2026-06-23: 完成 v0.11 安全操作 metadata 实现
 
 范围：

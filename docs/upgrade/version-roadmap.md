@@ -470,7 +470,9 @@ Next target after v0.11:
 
 ## v0.12: Fake Lifecycle
 
-Status: Planned on 2026-06-23 as part of the v1.0 internal preview roadmap.
+Status: Completed on 2026-06-23 for the metadata-only lifecycle state machine,
+in-memory transition validation, preview renderer, and
+`docs/upgrade/test-report-v0.12.md`. No real server execution is enabled.
 
 Purpose:
 
@@ -487,17 +489,32 @@ Must have:
   safety blockers.
 - Tests proving state changes stay in memory and do not execute commands.
 
+Completed scope:
+
+- Added `single_server_lifecycle` C++ metadata for lifecycle states, events,
+  and records.
+- Added stable parsing/rendering for requested, reviewed, approved, rejected,
+  queued, running, succeeded, failed, cancelled, and unknown states.
+- Added in-memory transition validation for success, rejection, cancellation,
+  and terminal-state blocking.
+- Added preview rendering with current state, allowed next states, event
+  history, and explicit non-execution flags.
+- Added `SingleServerLifecycleTest` coverage.
+
 Not included:
 
 - Real server connection.
 - Workspace creation.
+- Directory creation.
 - CUDA/MPI, SSH, Slurm, PBS, local wrapper, or remote execution.
 - Credential loading.
 - Shell execution.
+- Real log or artifact collection.
 
 Next target after v0.12:
 
-- Add workspace planning so lifecycle records can point at safe preview paths.
+- Start v0.13 Workspace Planner so lifecycle records can point at safe preview
+  paths without creating directories or moving files.
 
 ## v0.13: Workspace Planner
 
