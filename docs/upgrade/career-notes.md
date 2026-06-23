@@ -69,6 +69,10 @@ Current status:
 - Includes an M11 lab backend decision package template that names the approval,
   credential, workspace, authorization, quota/operator, audit, artifact, and
   rollback information required before M11-T1 can select any real backend.
+- Includes a Chinese M11 lab process guide that turns backend approval into a
+  concrete lab workflow: backend choice, credentials, workspace, authorization,
+  approved templates, quotas, monitoring, audit, rollback, and implementation
+  order.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -176,6 +180,10 @@ Current M11 decision package state:
   requires concrete approval, credential policy, workspace root, authorization,
   quota/operator rules, audit retention, artifact policy, operator contact, and
   rollback plan before any backend can be selected.
+- A Chinese lab process guide now explains how to take that template to a lab
+  owner or cluster operator and what questions must be answered before code can
+  move into authentication, workspace lifecycle, scheduler submission,
+  artifact collection, visualization, or audit persistence work.
 
 ## Technical Highlights
 
@@ -236,6 +244,8 @@ Current M11 decision package state:
   selection separate from implementation and lists the controls required before
   authentication, workspace lifecycle, scheduler submission, artifact
   collection, visualization, or audit persistence work can begin.
+- Added a Chinese M11 lab process guide that documents the operational workflow
+  needed before a backend can be selected or implemented.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -318,6 +328,8 @@ Use only bullets that match the completed implementation.
   for submission packets, audit logs, and workspace/artifact plans.
 - Added an M11 backend decision package template that documents the review
   evidence needed before selecting local wrapper, SSH, Slurm, or PBS.
+- Added a Chinese M11 lab process guide for backend approval, credential,
+  workspace, authorization, quota, monitoring, audit, and rollback discussions.
 
 Planned after v0.9:
 

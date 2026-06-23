@@ -125,6 +125,7 @@ Detailed v0.9 notes:
 `M11 lab backend decision package` is available as of 2026-06-23:
 
 - `docs/upgrade/m11-lab-backend-decision-package.md`
+- `docs/upgrade/m11-lab-process-guide.md`
 - This is a review worksheet only. It does not select or enable a real backend.
 - M11-T1 remains incomplete until the lab supplies a concrete backend decision,
   credential policy, workspace root, authorization policy, audit retention,

@@ -9,6 +9,10 @@ complete. It does not select a backend, load credentials, connect SSH, submit
 Slurm or PBS jobs, run local wrappers, create workspaces, or change the runtime
 backend guard.
 
+Process guide:
+
+- `docs/upgrade/m11-lab-process-guide.md`
+
 ## Decision State
 
 Current decision:

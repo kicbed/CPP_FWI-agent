@@ -360,6 +360,8 @@ v1.0 entry gate:
 - The M11 lab backend decision package template exists at
   `docs/upgrade/m11-lab-backend-decision-package.md`, but it is not an approval
   record and does not select or enable a backend.
+- The Chinese lab process guide at `docs/upgrade/m11-lab-process-guide.md`
+  explains what the lab must confirm before M11-T1 can be completed.
 - M11-T2 through M11-T7 must then implement and test authentication/access
   control, workspace lifecycle, submission/status/cancellation, log and
   artifact collection, visualization, and audit logging.

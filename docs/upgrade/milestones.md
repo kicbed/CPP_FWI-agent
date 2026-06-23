@@ -301,6 +301,9 @@ Tasks:
   - 2026-06-23 note: `docs/upgrade/m11-lab-backend-decision-package.md`
     records the required decision package template. This does not complete
     M11-T1 and does not enable runtime execution.
+  - 2026-06-23 note: `docs/upgrade/m11-lab-process-guide.md` records the
+    Chinese lab process guide for approval, credentials, workspace,
+    authorization, templates, quotas, monitoring, audit, and rollback.
 - [ ] M11-T2: Add authentication and access control implementation.
 - [ ] M11-T3: Add job workspace creation and cleanup.
 - [ ] M11-T4: Add job submission, status polling, and cancellation.

@@ -16,6 +16,50 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: Add M11 Lab Process Guide
+
+Scope:
+- Added a Chinese lab-facing process guide for M11 real backend approval.
+- Linked the guide from the M11 decision package, upgrade guide, milestone
+  board, roadmap, and career notes.
+- Documented the next lab workflow: backend choice, approval, credential
+  policy, workspace, authorization, templates, quotas, monitoring, audit, and
+  rollback.
+
+Files changed:
+- `docs/upgrade/m11-lab-process-guide.md`
+- `docs/upgrade/m11-lab-backend-decision-package.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, local wrapper execution, remote
+  execution, arbitrary shell execution, credential loading, production audit
+  store, or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This M11 lab process guide commit.
+
+Next task:
+- Take `docs/upgrade/m11-lab-process-guide.md` and
+  `docs/upgrade/m11-lab-backend-decision-package.md` to the lab owner or
+  cluster operator. Do not implement real backend execution until M11-T1 has a
+  concrete approved decision package.
+
 ## 2026-06-23: Add M11 Backend Decision Package
 
 Scope:
