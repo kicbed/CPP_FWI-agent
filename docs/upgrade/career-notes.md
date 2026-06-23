@@ -66,13 +66,9 @@ Current status:
 - Includes v0.9 non-executing review previews for dry-run submission packets,
   audit logs, workspace paths, and artifact paths without enabling real
   execution.
-- Includes an M11 lab backend decision package template that names the approval,
-  credential, workspace, authorization, quota/operator, audit, artifact, and
-  rollback information required before M11-T1 can select any real backend.
-- Includes a Chinese M11 lab process guide that turns backend approval into a
-  concrete lab workflow: backend choice, credentials, workspace, authorization,
-  approved templates, quotas, monitoring, audit, rollback, and implementation
-  order.
+- 新增中文 M11 实验室后端决策包和流程指南，说明 M11-T1 选择真实后端前
+  必须具备的批准、凭据、workspace、授权、配额/operator、审计、artifact、
+  回滚和实现顺序信息。
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -175,15 +171,10 @@ Current v0.9 state:
 
 Current M11 decision package state:
 
-- A lab backend decision package template exists for M11-T1 review. It compares
-  local wrapper, SSH, Slurm, and PBS candidates as review options only and
-  requires concrete approval, credential policy, workspace root, authorization,
-  quota/operator rules, audit retention, artifact policy, operator contact, and
-  rollback plan before any backend can be selected.
-- A Chinese lab process guide now explains how to take that template to a lab
-  owner or cluster operator and what questions must be answered before code can
-  move into authentication, workspace lifecycle, scheduler submission,
-  artifact collection, visualization, or audit persistence work.
+- M11 决策包和实验室流程指南现在是中文优先的学习与评审文档。它们把
+  local wrapper、SSH、Slurm、PBS 作为仅供评审的候选项对比，并列出选择
+  真实后端前必须确认的批准、凭据、workspace、授权、配额/operator、
+  审计、artifact、operator 联系人、回滚和实现顺序。
 
 ## Technical Highlights
 
@@ -240,12 +231,9 @@ Current M11 decision package state:
 - Added non-executing v0.9 preview renderers for dry-run submission packets,
   audit logs, and workspace/artifact plans so operators can review a future
   backend package before runtime enablement changes.
-- Added an M11 lab backend decision package template that keeps real backend
-  selection separate from implementation and lists the controls required before
-  authentication, workspace lifecycle, scheduler submission, artifact
-  collection, visualization, or audit persistence work can begin.
-- Added a Chinese M11 lab process guide that documents the operational workflow
-  needed before a backend can be selected or implemented.
+- 新增中文优先的 M11 实验室后端决策与流程文档，把真实后端选择和代码实现
+  分开，并列出认证、workspace 生命周期、调度器提交、artifact 收集、可视化
+  或审计持久化开始前必须具备的控制条件。
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -326,10 +314,8 @@ Use only bullets that match the completed implementation.
   review workflows without enabling any real execution path.
 - Completed v0.9 backend readiness review with tested non-executing previews
   for submission packets, audit logs, and workspace/artifact plans.
-- Added an M11 backend decision package template that documents the review
-  evidence needed before selecting local wrapper, SSH, Slurm, or PBS.
-- Added a Chinese M11 lab process guide for backend approval, credential,
-  workspace, authorization, quota, monitoring, audit, and rollback discussions.
+- 新增中文 M11 后端决策与流程文档，用于讨论后端批准、凭据、workspace、
+  授权、配额、监控、审计、回滚和实现顺序。
 
 Planned after v0.9:
 

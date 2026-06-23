@@ -357,11 +357,11 @@ v1.0 entry gate:
 - v1.0 implementation should start only after M11-T1 has a lab decision package
   with selected backend, credential policy, workspace root, authorization
   policy, audit retention, quota/operator rules, and operator contact.
-- The M11 lab backend decision package template exists at
-  `docs/upgrade/m11-lab-backend-decision-package.md`, but it is not an approval
-  record and does not select or enable a backend.
-- The Chinese lab process guide at `docs/upgrade/m11-lab-process-guide.md`
-  explains what the lab must confirm before M11-T1 can be completed.
+- M11 实验室后端决策包模板位于
+  `docs/upgrade/m11-lab-backend-decision-package.md`，但它不是批准记录，
+  也不会选择或启用真实后端。
+- 中文实验室流程指南位于 `docs/upgrade/m11-lab-process-guide.md`，说明
+  M11-T1 完成前实验室必须确认哪些信息。
 - M11-T2 through M11-T7 must then implement and test authentication/access
   control, workspace lifecycle, submission/status/cancellation, log and
   artifact collection, visualization, and audit logging.

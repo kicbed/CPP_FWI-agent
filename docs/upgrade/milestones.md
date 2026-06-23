@@ -47,10 +47,10 @@ Version status:
 - v0.9 Backend Readiness Review is complete as of 2026-06-22 with
   non-executing readiness report rendering, dry-run submission packet preview,
   audit log preview, workspace/artifact path preview, and v0.9 report docs.
-- M11 lab backend decision package template exists as of 2026-06-23. It is a
-  review worksheet only; M11-T1 remains incomplete until the lab supplies a
-  concrete approved backend, credential policy, workspace root, authorization
-  policy, audit retention, quota/operator rules, and operator contact.
+- M11 实验室后端决策包模板已在 2026-06-23 创建。这只是评审材料；
+  M11-T1 仍未完成，必须等实验室提供具体批准后端、凭据策略、
+  workspace root、授权策略、审计保留、配额/operator 规则和 operator
+  联系人后才能继续。
 
 ## Milestone 0: Baseline And Project Story
 
@@ -296,14 +296,11 @@ Tasks:
   helpers for future audit persistence boundaries.
 - [x] M11-T0D: Add a unified metadata-only backend preflight readiness report
   that separates metadata readiness from runtime backend enablement.
-- [ ] M11-T1: Decide the first real backend with lab approval: local wrapper,
-  SSH, Slurm, or PBS.
-  - 2026-06-23 note: `docs/upgrade/m11-lab-backend-decision-package.md`
-    records the required decision package template. This does not complete
-    M11-T1 and does not enable runtime execution.
-  - 2026-06-23 note: `docs/upgrade/m11-lab-process-guide.md` records the
-    Chinese lab process guide for approval, credentials, workspace,
-    authorization, templates, quotas, monitoring, audit, and rollback.
+- [ ] M11-T1: 在实验室批准后决定第一个真实后端：local wrapper、SSH、Slurm 或 PBS。
+  - 2026-06-23 记录：`docs/upgrade/m11-lab-backend-decision-package.md`
+    是必须填写的决策包模板；这不代表 M11-T1 已完成，也不启用运行时执行。
+  - 2026-06-23 记录：`docs/upgrade/m11-lab-process-guide.md` 是中文实验室
+    流程指南，覆盖批准、凭据、workspace、授权、模板、配额、监控、审计和回滚。
 - [ ] M11-T2: Add authentication and access control implementation.
 - [ ] M11-T3: Add job workspace creation and cleanup.
 - [ ] M11-T4: Add job submission, status polling, and cancellation.

@@ -16,17 +16,52 @@ Scope:
 - Next task:
 ```
 
-## 2026-06-23: Add M11 Lab Process Guide
+## 2026-06-23: 中文化 M11 实验室文档
 
-Scope:
-- Added a Chinese lab-facing process guide for M11 real backend approval.
-- Linked the guide from the M11 decision package, upgrade guide, milestone
-  board, roadmap, and career notes.
-- Documented the next lab workflow: backend choice, approval, credential
-  policy, workspace, authorization, templates, quotas, monitoring, audit, and
-  rollback.
+范围：
+- 将 M11 实验室后端决策包从英文改为中文。
+- 润色 M11 实验室流程指南中的英文说明词，保留必要的代码/API/系统专有名词。
+- 将新近新增的 M11 索引说明和升级日志说明改为中文，降低学习和推进实验室流程的阅读成本。
 
-Files changed:
+改动文件：
+- `docs/upgrade/m11-lab-backend-decision-package.md`
+- `docs/upgrade/m11-lab-process-guide.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 没有运行时行为变化。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、生产审计存储或 Code Agent 自动应用 patch。
+
+验证命令：
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+结果：
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 26/26 个测试。
+- PASS. `git diff --check` 没有输出。
+
+Commit：
+- 本次 M11 中文文档提交。
+
+下一步：
+- 使用中文 M11 决策包和流程指南推进实验室确认；M11-T1 未批准前不实现真实后端执行。
+
+## 2026-06-23: 新增 M11 实验室流程指南
+
+范围：
+- 新增面向实验室沟通的中文 M11 真实后端批准流程指南。
+- 从 M11 决策包、升级指南、里程碑、路线图和 career notes 链接该指南。
+- 记录下一步实验室流程：后端选择、批准、凭据策略、workspace、授权、
+  模板、配额、监控、审计和回滚。
+
+改动文件：
 - `docs/upgrade/m11-lab-process-guide.md`
 - `docs/upgrade/m11-lab-backend-decision-package.md`
 - `docs/upgrade/README.md`
@@ -35,39 +70,36 @@ Files changed:
 - `docs/upgrade/career-notes.md`
 - `docs/upgrade/upgrade-log.md`
 
-Behavior changed:
-- No runtime behavior changed.
-- No real CUDA/MPI execution, SSH, Slurm, PBS, local wrapper execution, remote
-  execution, arbitrary shell execution, credential loading, production audit
-  store, or automatic Code Agent patch application was added.
+行为变化：
+- 没有运行时行为变化。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、生产审计存储或 Code Agent 自动应用 patch。
 
-Tests run:
+验证命令：
 - `cmake --build build -j2`
 - `ctest --test-dir build --output-on-failure`
 - `git diff --check`
 
-Result:
-- PASS. `cmake --build build -j2` exited 0.
-- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
-- PASS. `git diff --check` produced no output.
+结果：
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 26/26 个测试。
+- PASS. `git diff --check` 没有输出。
 
-Commit:
-- This M11 lab process guide commit.
+Commit：
+- 本次 M11 实验室流程指南提交。
 
-Next task:
-- Take `docs/upgrade/m11-lab-process-guide.md` and
-  `docs/upgrade/m11-lab-backend-decision-package.md` to the lab owner or
-  cluster operator. Do not implement real backend execution until M11-T1 has a
-  concrete approved decision package.
+下一步：
+- 带着 `docs/upgrade/m11-lab-process-guide.md` 和
+  `docs/upgrade/m11-lab-backend-decision-package.md` 找实验室负责人或集群
+  operator 确认。M11-T1 没有具体批准决策包之前，不实现真实后端执行。
 
-## 2026-06-23: Add M11 Backend Decision Package
+## 2026-06-23: 新增 M11 后端决策包
 
-Scope:
-- Added a non-executing M11 lab backend decision package template.
-- Clarified that M11-T1 remains incomplete until the lab supplies a concrete
-  backend decision and operational controls.
+范围：
+- 新增非执行型 M11 实验室后端决策包模板。
+- 明确 M11-T1 仍未完成，直到实验室提供具体后端决策和运维控制信息。
 
-Files changed:
+改动文件：
 - `docs/upgrade/m11-lab-backend-decision-package.md`
 - `docs/upgrade/README.md`
 - `docs/upgrade/milestones.md`
@@ -75,29 +107,27 @@ Files changed:
 - `docs/upgrade/career-notes.md`
 - `docs/upgrade/upgrade-log.md`
 
-Behavior changed:
-- No runtime behavior changed.
-- No real CUDA/MPI execution, SSH, Slurm, PBS, local wrapper execution, remote
-  execution, arbitrary shell execution, credential loading, production audit
-  store, or automatic Code Agent patch application was added.
+行为变化：
+- 没有运行时行为变化。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、生产审计存储或 Code Agent 自动应用 patch。
 
-Tests run:
+验证命令：
 - `cmake --build build -j2`
 - `ctest --test-dir build --output-on-failure`
 - `git diff --check`
 
-Result:
-- PASS. `cmake --build build -j2` exited 0.
-- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
-- PASS. `git diff --check` produced no output.
+结果：
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 26/26 个测试。
+- PASS. `git diff --check` 没有输出。
 
-Commit:
-- This M11 backend decision package commit.
+Commit：
+- 本次 M11 后端决策包提交。
 
-Next task:
-- Keep real execution disabled. Use the decision package only when the lab is
-  ready to choose a backend and provide credential, workspace, authorization,
-  audit, quota/operator, and contact details.
+下一步：
+- 继续保持真实执行关闭。只有当实验室准备选择后端，并提供凭据、workspace、
+  授权、审计、配额/operator 和联系人信息时，才使用该决策包推进 M11-T1。
 
 ## 2026-06-11: Add Upgrade Operating Plan
 
