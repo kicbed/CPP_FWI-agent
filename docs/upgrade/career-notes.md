@@ -74,9 +74,10 @@ Current status:
 - Includes v0.10 single-server account preparation models and tests for
   `SingleServerProfile`, `SingleServerJobTemplate`, `SingleServerReviewRequest`,
   validation, and dry-run review packet rendering without connecting to a server.
-- 新增 v0.11 实验室内部安全操作策略设计和学习总结，
-  把下一步收敛为 `lab_root`、`lab_user`、`readonly`、safe operation policy
-  和删除 dry-run review packet，仍不实现真实删除。
+- Includes v0.11 safe operation policy models and tests for `lab_root`,
+  `lab_user`, `readonly`, role-based operation allowlists,
+  `DeleteReviewRequest`, `DeleteReviewPacket`, and deletion dry-run review
+  rendering without real deletion.
 - 新增 v0.10 单服务器账号接入准备设计和实现计划，把下一步落到
   `SingleServerProfile`、`SingleServerJobTemplate`、`SingleServerReviewRequest`
   和 dry-run review packet，仍不连接服务器、不读取凭据、不执行命令。
@@ -196,8 +197,9 @@ Current M11 decision package state:
 - v0.10 第一批实现已经把单服务器准备工作收敛为 metadata-only 模型、
   validation helpers 和 review packet renderer。真实服务器连接、凭据加载、
   workspace 创建和 fake lifecycle 仍然不在本批实现中。
-- v0.11 设计把实验室内部账号模型简化为 `lab_root`、`lab_user`、`readonly`，
-  但明确 root 角色也不能绕过删除 dry-run preview、路径保护和确认边界。
+- v0.11 第一批实现把实验室内部账号模型简化为 `lab_root`、`lab_user`、`readonly`，
+  并用 tested policy/validation 证明 root 角色也不能绕过删除 dry-run preview、路径保护、
+  symlink 风险和确认边界。
 
 ## Technical Highlights
 
@@ -262,9 +264,9 @@ Current M11 decision package state:
 - 新增 v0.10 单服务器账号 metadata 实现与测试，覆盖 profile/template/review
   request/review packet 的数据边界，并把真实执行、凭据读取和服务器连接排除在
   第一批实现之外。
-- 新增 v0.11 安全操作策略设计和计划，强调内部实验室工具的防误伤边界：
-  默认读操作安全、受控写入限定 workspace、运行操作必须来自 approved template、
-  删除第一版只做 dry-run review packet。
+- 新增 v0.11 `safe_operations` C++ 模块和测试，覆盖内部角色、操作 allowlist、
+  删除 dry-run review request/packet、protected path/symlink/confirmation 校验，
+  并保持真实删除、trash move 和 shell 执行关闭。
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -345,6 +347,10 @@ Use only bullets that match the completed implementation.
   review workflows without enabling any real execution path.
 - Completed v0.9 backend readiness review with tested non-executing previews
   for submission packets, audit logs, and workspace/artifact plans.
+- Added v0.11 safe operation metadata and tests for internal lab roles,
+  operation allowlists, and deletion dry-run review packets while keeping real
+  deletion, trash moves, shell execution, credential reads, and server
+  connections disabled.
 - 新增中文 M11 后端决策与流程文档，用于讨论后端批准、凭据、workspace、
   授权、配额、监控、审计、回滚和实现顺序。
 
@@ -625,6 +631,19 @@ Add one short entry whenever a meaningful technical change lands.
   operations.
 - Scoped the next implementation to simple roles, operation allowlists, and
   deletion dry-run review packets.
+- Preserved the safety boundary: no real deletion, trash move, filesystem
+  remove, shell execution, credential loading, server connection, or workspace
+  creation.
+
+### 2026-06-23: v0.11 Safe Operations Metadata Completion
+
+- Added `safe_operations` C++ metadata for internal lab roles, safe operation
+  requests, role-based allowlists, delete review requests, and delete review
+  packets.
+- Added validation and `SafeOperationsTest` coverage proving `readonly` cannot
+  request delete preview, `lab_user` can request workspace-scoped dry-run
+  delete preview, and `lab_root` still cannot bypass dry-run, path protection,
+  symlink risk, or confirmation checks.
 - Preserved the safety boundary: no real deletion, trash move, filesystem
   remove, shell execution, credential loading, server connection, or workspace
   creation.

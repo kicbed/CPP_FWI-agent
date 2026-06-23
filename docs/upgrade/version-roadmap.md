@@ -19,7 +19,7 @@ Personal prompts should stay in ignored local files such as
 | v0.8 | Server Backend | Add the safety foundation for controlled execution: approved templates, workspaces, lifecycle records, and audit boundaries |
 | v0.9 | Backend Readiness Review | Turn preflight metadata into non-executing review, packet preview, audit preview, and operator checklist flows |
 | v0.10 | Single Server Runner Preparation | Prepare metadata-only single-server profiles, approved templates, and dry-run review packets before any real server connection |
-| v0.11 | Safe Operations Policy | Plan internal lab roles, safe operation allowlists, and deletion dry-run review packets before any destructive operation exists |
+| v0.11 | Safe Operations Policy | Add internal lab roles, safe operation allowlists, and deletion dry-run review packets before any destructive operation exists |
 | v0.12 | Fake Lifecycle | Simulate single-server job lifecycle states without connecting to a server |
 | v0.13 | Workspace Planner | Preview workspace, log, and artifact paths with path-safety validation |
 | v0.14 | Approved Template Run Packet | Render approved-template run packets from structured parameters without executing commands |
@@ -417,9 +417,9 @@ Next target after v0.10:
 
 ## v0.11: Safe Operations Policy
 
-Status: Started on 2026-06-23 with design and learning summary. No runtime
-implementation is enabled yet. Detailed agent plans and copy-paste prompts are
-kept in local ignored files, not in Git.
+Status: Completed on 2026-06-23 for the metadata, validation, and delete
+dry-run review packet scope, with `docs/upgrade/test-report-v0.11.md`. No real
+deletion or execution path is enabled.
 
 Purpose:
 
@@ -440,6 +440,18 @@ Must have:
   only.
 - Tests proving real deletion remains disabled even for `lab_root`.
 
+Completed scope:
+
+- Added `safe_operations` C++ metadata for `lab_root`, `lab_user`, `readonly`,
+  safe operation types, role-based allowlists, delete review requests, and
+  delete review packets.
+- Added validation that rejects readonly delete preview, real delete execution,
+  non-dry-run delete review requests, path traversal, workspace-root deletion,
+  protected path markers, symlink markers, and missing confirmation phrases.
+- Added delete dry-run review packet rendering with `deletion_executed: false`,
+  `trash_move_executed: false`, and `shell_executed: false`.
+- Added `SafeOperationsTest` coverage for the v0.11 safety boundary.
+
 Not included:
 
 - Real deletion.
@@ -450,10 +462,11 @@ Not included:
 - Credential loading.
 - Workspace creation or cleanup.
 
-Next target after the v0.11 plan:
+Next target after v0.11:
 
-- Implement the safe operation metadata, validation helpers, delete dry-run
-  review packet renderer, and tests.
+- Start v0.12 Fake Lifecycle so the single-server workflow can show
+  non-executing requested/reviewed/approved/rejected/queued/running/succeeded/
+  failed/cancelled states.
 
 ## v0.12: Fake Lifecycle
 

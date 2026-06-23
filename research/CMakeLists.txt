@@ -12,6 +12,7 @@ set(RESEARCH_SOURCES
     src/planner_answer.cpp
     src/planner_context.cpp
     src/research_knowledge.cpp
+    src/safe_operations.cpp
     src/server_job.cpp
     src/single_server_backend.cpp
 )

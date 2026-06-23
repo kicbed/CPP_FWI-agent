@@ -2,7 +2,7 @@
 
 日期：2026-06-23
 
-状态：设计和实现计划已创建，代码尚未实现。
+状态：第一批 metadata、validation、删除 dry-run review packet 和测试已完成。
 
 本文把下一阶段收敛为实验室内部使用场景下的安全操作策略。当前目标不是公网平台，
 也不是复杂多租户系统，而是支持实验室内部账号按既有服务器权限工作，同时在应用层防止
@@ -141,6 +141,16 @@ v0.11 第一批只做“删除 dry-run review packet”，不做真实删除。
 - 缺少确认短语时 review packet 不可执行。
 - renderer 明确 `deletion_executed: false`。
 
+第一批实现结果：
+
+- 新增 `research/include/agent_rpc/research/safe_operations.h` 和
+  `research/src/safe_operations.cpp`。
+- 新增 `tests/test_safe_operations.cpp` 和 `SafeOperationsTest`。
+- `DeleteReviewPacket` 只记录 metadata、validation errors 和非执行标志，不包含
+  删除函数、trash move、shell 调用、凭据读取或服务器连接。
+- `lab_root` 只能通过 review packet 看到更高权限视角，仍不能绕过 dry-run、
+  workspace root 保护、symlink 标记、protected path 标记或确认短语。
+
 ## 6. 实现入口
 
 公开路线：
@@ -158,7 +168,7 @@ v0.11 第一批只做“删除 dry-run review packet”，不做真实删除。
 
 ## 7. 完成标准
 
-v0.11 只有在以下条件满足后才算完成：
+v0.11 第一批只有在以下条件满足后才算完成：
 
 - 有 C++ metadata 和校验测试。
 - 有删除 dry-run review packet renderer。

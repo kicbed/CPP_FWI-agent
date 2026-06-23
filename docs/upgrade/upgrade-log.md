@@ -16,6 +16,71 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 完成 v0.11 安全操作 metadata 实现
+
+范围：
+- 新增 `safe_operations` C++ 模块，包含 `LabAccountRole`、
+  `SafeOperationType`、`SafeOperationRequest`、`SafeOperationPolicy`、
+  `DeleteReviewRequest` 和 `DeleteReviewPacket` metadata。
+- 新增 role/operation allowlist validation。
+- 新增删除 dry-run review request validation、packet builder 和 renderer。
+- 新增 `SafeOperationsTest`，覆盖 readonly/lab_user/lab_root 角色边界、非 dry-run
+  删除拒绝、路径穿越拒绝、workspace root 保护、protected path 标记、symlink 标记、
+  确认短语和非执行 packet flags。
+- 新增 v0.11 测试报告，并更新升级指南、里程碑、路线图、设计文档、学习总结和
+  career notes。
+
+改动文件：
+- `research/include/agent_rpc/research/safe_operations.h`
+- `research/src/safe_operations.cpp`
+- `tests/test_safe_operations.cpp`
+- `research/CMakeLists.txt`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/test-report-v0.11.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/safe-operations-v0.11.md`
+- `docs/upgrade/learning-summary-v0.11-safe-operations.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 新增 C++ metadata、validation helpers 和删除 dry-run review packet rendering。
+- `readonly` 不能请求删除 preview；`lab_user` 可以请求 workspace 下的 delete dry-run
+  preview；`lab_root` 仍不能绕过 dry-run、workspace root 保护、protected path/symlink
+  标记和确认短语。
+- 没有新增真实删除、trash move、filesystem remove、shell 执行、CUDA/MPI、SSH、
+  Slurm/PBS、服务器连接、凭据读取、workspace 创建或 Code Agent 自动应用 patch。
+
+验证命令：
+- `git diff --check`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+
+TDD 证据：
+- RED 1：新增 `SafeOperationsTest` target 后构建失败于缺少
+  `agent_rpc/research/safe_operations.h`。
+- GREEN 1：新增角色/策略 metadata 与 validation 后，构建和 `SafeOperationsTest` 通过。
+- RED 2：追加删除 dry-run review packet 测试后，构建失败于缺少
+  `DeleteReviewRequest`、`validate_delete_review_request`、
+  `render_delete_review_packet` 和 `build_delete_review_packet`。
+- GREEN 2：新增 delete review metadata、validation、packet builder 和 renderer 后，
+  聚焦测试与全量测试通过。
+
+结果：
+- PASS. `git diff --check` 没有输出。
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 28/28 个测试。
+
+Commit：
+- 本次 v0.11 安全操作 metadata 实现提交。
+
+下一步：
+- 开始 v0.12 Fake Lifecycle，只做单服务器 requested/reviewed/approved/rejected/
+  queued/running/succeeded/failed/cancelled metadata 状态和 review 流程，仍不连接服务器、
+  不执行命令、不创建目录。
+
 ## 2026-06-23: 新增 v1.0 internal preview 分步路线并清理提示词跟踪
 
 范围：

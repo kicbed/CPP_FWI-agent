@@ -221,6 +221,18 @@ target_include_directories(test_single_server_backend PRIVATE
 )
 add_test(NAME SingleServerBackendTest COMMAND test_single_server_backend)
 
+add_executable(test_safe_operations test_safe_operations.cpp)
+target_link_libraries(test_safe_operations
+    agent_rpc_research
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_safe_operations PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../research/include
+)
+add_test(NAME SafeOperationsTest COMMAND test_safe_operations)
+
 add_test(
     NAME WebBrandingTest
     COMMAND ${CMAKE_COMMAND}

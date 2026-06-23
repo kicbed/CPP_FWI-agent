@@ -54,9 +54,9 @@ Version status:
 - M11-S1 单服务器账号接入准备第一批实现已在 2026-06-23 完成。当前范围
   只到 metadata/profile/template 和 dry-run review packet；没有真实命令执行、
   凭据读取、SSH、Slurm/PBS 或服务器连接。
-- v0.11 实验室内部安全操作策略设计和实现计划已在 2026-06-23 创建。它把下一步
-  收敛为 lab_root/lab_user/readonly、safe operation policy 和删除 dry-run review
-  packet，不实现真实删除。
+- v0.11 实验室内部安全操作策略第一批实现已在 2026-06-23 完成。它新增
+  lab_root/lab_user/readonly、safe operation policy、删除 dry-run review packet
+  metadata、validation 和 renderer，不实现真实删除。
 - v1.0 internal preview 分步路线已在 2026-06-23 创建。公开路线图保存在
   `docs/upgrade/v1.0-internal-preview-roadmap.md`；新窗口提示词和详细 agent
   执行计划保存在本地忽略文件中，不提交到 GitHub。
@@ -323,14 +323,15 @@ Tasks:
     不创建 workspace。
   - [x] 新增 `docs/upgrade/test-report-v0.10.md` 和
     `docs/upgrade/learning-summary-v0.10.md`。
-- [~] M11-S2: 实验室内部安全操作策略，作为真实运行前的防误伤边界。
+- [x] M11-S2: 实验室内部安全操作策略，作为真实运行前的防误伤边界。
   - [x] 新增设计文档和学习总结：
     `docs/upgrade/safe-operations-v0.11.md`、
     `docs/upgrade/learning-summary-v0.11-safe-operations.md`。
-  - [ ] 实现 `LabAccountRole`、`SafeOperationType`、`SafeOperationRequest`
+  - [x] 实现 `LabAccountRole`、`SafeOperationType`、`SafeOperationRequest`
     和 `SafeOperationPolicy`。
-  - [ ] 实现删除 dry-run review request/packet 校验和 renderer。
-  - [ ] 测试证明 root 角色也不能绕过 dry-run、路径保护和删除确认。
+  - [x] 实现删除 dry-run review request/packet 校验和 renderer。
+  - [x] 测试证明 root 角色也不能绕过 dry-run、路径保护和删除确认。
+  - [x] 新增 `docs/upgrade/test-report-v0.11.md`。
 - [ ] M11-S3: 单服务器 fake lifecycle，作为 v0.12 目标。
   - [ ] 实现 requested、reviewed、approved、rejected、queued、running、
     succeeded、failed、cancelled 等 metadata 状态。

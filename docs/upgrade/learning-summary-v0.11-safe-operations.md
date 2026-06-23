@@ -38,6 +38,12 @@ v0.11 把操作分成四类：
 - `DeleteReviewRequest`：表达一次删除预览请求。
 - `DeleteReviewPacket`：表达删除预览结果。
 
+本次实现已经把这些类型落到 `safe_operations` C++ 模块中。它们仍然是 metadata 和
+validation helper，不包含删除函数、trash move、shell 执行、凭据读取、服务器连接或
+workspace 创建。`SafeOperationPolicy` 让角色和操作 allowlist 分开；`DeleteReviewPacket`
+把 reviewable 状态、validation errors、affected file type 预览和所有非执行标志写入结构化
+metadata。
+
 ## 3. 为什么 root 也要受限制
 
 系统 root 是服务器权限。工具里的 `lab_root` 是应用角色。这两者不能混为一谈。
@@ -113,6 +119,11 @@ v0.11 的关键不是复杂 RBAC，而是操作分级和路径安全。`lab_root
 只是角色输入，真正决定能不能做的是 `SafeOperationPolicy` 和具体操作校验。删除请求必须
 保留 dry-run，检查 workspace root、路径穿越、禁止路径、确认短语和 symlink 风险。renderer
 必须明确 `deletion_executed: false`，保证第一批实现没有任何真实删除副作用。
+
+实现细节可以这样讲：`SafeOperationRequest` 先判断角色是否允许某个操作；删除 preview
+再走 `DeleteReviewRequest` 的专门校验，因为删除风险高于普通读操作。`DeleteReviewPacket`
+统一保存校验结果和非执行标志，renderer 只是把这些 metadata 转成稳定文本。这避免了
+“review 文案看起来安全，但内部数据其实允许执行”的设计漏洞。
 
 常见追问：
 
