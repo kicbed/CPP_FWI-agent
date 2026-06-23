@@ -245,6 +245,18 @@ target_include_directories(test_single_server_lifecycle PRIVATE
 )
 add_test(NAME SingleServerLifecycleTest COMMAND test_single_server_lifecycle)
 
+add_executable(test_workspace_planner test_workspace_planner.cpp)
+target_link_libraries(test_workspace_planner
+    agent_rpc_research
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_workspace_planner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../research/include
+)
+add_test(NAME WorkspacePlannerTest COMMAND test_workspace_planner)
+
 add_test(
     NAME WebBrandingTest
     COMMAND ${CMAKE_COMMAND}

@@ -518,7 +518,10 @@ Next target after v0.12:
 
 ## v0.13: Workspace Planner
 
-Status: Planned on 2026-06-23 as part of the v1.0 internal preview roadmap.
+Status: Completed on 2026-06-23 for the preview-only workspace/log/artifact
+path planning scope, with `docs/upgrade/test-report-v0.13.md` and
+`docs/upgrade/learning-summary-v0.13.md`. No directory creation, deletion, file
+movement, server connection, or remote filesystem access is enabled.
 
 Purpose:
 
@@ -534,12 +537,28 @@ Must have:
   protected locations.
 - Tests proving no filesystem creation, deletion, or movement occurs.
 
+Completed scope:
+
+- Added `workspace_planner` C++ metadata for `WorkspacePlanRequest` and
+  `WorkspacePlan`.
+- Added preview generation for workspace path, run directory path, log path,
+  and artifact paths.
+- Added string-only validation for empty roots, path traversal, absolute
+  component escape attempts, dangerous roots, and protected labels such as
+  `.git`, `.ssh`, `secrets`, `credentials`, `repo`, `code`, `env`, `venv`, and
+  `shared_data`.
+- Added `WorkspacePlannerTest` coverage for preview rendering, non-execution
+  flags, traversal rejection, root protection, absolute escape rejection, and
+  protected label rejection.
+
 Not included:
 
 - Directory creation.
 - Directory deletion.
 - Cleanup jobs.
 - Remote filesystem access.
+- Server connection.
+- File movement.
 
 Next target after v0.13:
 

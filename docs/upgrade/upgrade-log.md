@@ -16,6 +16,73 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 完成 v0.13 Workspace Planner metadata 实现
+
+范围：
+- 新增 `workspace_planner` C++ 模块，包含 `WorkspacePlanRequest` 和
+  `WorkspacePlan` metadata。
+- 新增 workspace path、run directory path、log path 和 artifact path preview。
+- 新增字符串级路径安全校验，拒绝空 workspace root、`..` 路径穿越、绝对路径逃逸、
+  危险 root 和 `.git`、`.ssh`、`secrets`、`credentials`、`repo`、`code`、`env`、
+  `venv`、`shared_data` 等保护标签。
+- 新增 `WorkspacePlannerTest`，覆盖 preview 渲染、非执行 flags、路径穿越、
+  workspace root 保护、绝对逃逸和保护标签。
+- 新增 v0.13 测试报告和中文学习总结，并更新升级指南、里程碑、路线图、v1.0
+  internal preview roadmap 和 career notes。
+
+改动文件：
+- `research/include/agent_rpc/research/workspace_planner.h`
+- `research/src/workspace_planner.cpp`
+- `tests/test_workspace_planner.cpp`
+- `research/CMakeLists.txt`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/test-report-v0.13.md`
+- `docs/upgrade/learning-summary-v0.13.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/v1.0-internal-preview-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 新增 C++ metadata、validation helper 和 preview renderer。
+- `WorkspacePlan` 只表达未来路径计划，不表示目录已存在。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、服务器连接、workspace/目录创建、目录删除、文件移动、
+  真实日志采集、artifact 采集、生产审计存储或 Code Agent 自动应用 patch。
+
+验证命令：
+- `cmake --build build -j2`
+- `ctest --test-dir build -R WorkspacePlannerTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+TDD 证据：
+- RED 1：新增 `WorkspacePlannerTest` target 后构建失败于缺少
+  `agent_rpc/research/workspace_planner.h`。
+- GREEN 1：新增 workspace planner header/source、preview renderer 和基础路径校验后，
+  构建和聚焦测试通过。
+- RED 2：追加保护标签测试后，聚焦测试失败于缺少
+  `run directory name must not use protected labels` 和
+  `artifact subdirectory must not use protected labels`。
+- GREEN 2：复用保护标签校验到相对组件后，聚焦测试通过。
+
+结果：
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. `ctest --test-dir build -R WorkspacePlannerTest --output-on-failure`
+  通过 1/1 个测试目标。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 30/30 个测试。
+- PASS. `git diff --check` 没有输出。
+
+Commit：
+- 本次 v0.13 Workspace Planner metadata 实现提交。
+
+下一步：
+- 开始 v0.14 Approved Template Run Packet，把 approved template、结构化参数、profile、
+  lifecycle 和 workspace plan 合成 non-executing run packet；仍不执行命令、不连接服务器、
+  不读取凭据、不创建目录。
+
 ## 2026-06-23: 完成 v0.12 Fake Lifecycle metadata 实现
 
 范围：

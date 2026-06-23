@@ -82,6 +82,9 @@ Current status:
   reviewed, approved, rejected, queued, running, succeeded, failed, and
   cancelled state flow without connecting to a server, executing commands, or
   creating workspaces.
+- Includes v0.13 workspace planner models and tests for preview-only
+  workspace, run directory, log, and artifact paths with path traversal,
+  absolute escape, dangerous root, and protected-label validation.
 - 新增 v0.10 单服务器账号接入准备设计和实现计划，把下一步落到
   `SingleServerProfile`、`SingleServerJobTemplate`、`SingleServerReviewRequest`
   和 dry-run review packet，仍不连接服务器、不读取凭据、不执行命令。
@@ -207,6 +210,9 @@ Current M11 decision package state:
 - v0.12 第一批实现新增单服务器 fake lifecycle 状态机，用内存 metadata 展示
   requested/reviewed/approved/rejected/queued/running/succeeded/failed/cancelled
   状态流和 allowed next states，但不连接服务器、不执行命令、不创建目录。
+- v0.13 第一批实现新增 workspace planner，用字符串级校验生成 workspace/run/log/
+  artifact preview，拒绝空 root、路径穿越、绝对逃逸、危险 root 和保护标签，同时不创建
+  目录、不删除目录、不移动文件、不连接服务器。
 
 ## Technical Highlights
 
@@ -277,6 +283,9 @@ Current M11 decision package state:
 - 新增 v0.12 `single_server_lifecycle` C++ 模块和测试，覆盖 fake lifecycle
   状态解析、内存状态转换、终态拒绝、取消路径和 preview renderer，并保持服务器连接、
   命令执行、workspace 创建关闭。
+- 新增 v0.13 `workspace_planner` C++ 模块和测试，覆盖 workspace/run/log/artifact
+  preview、路径穿越拒绝、绝对路径逃逸拒绝、危险 root 拒绝和保护标签拒绝，并保持目录
+  创建、删除、文件移动和服务器连接关闭。
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -364,6 +373,10 @@ Use only bullets that match the completed implementation.
 - Added v0.12 fake lifecycle metadata and tests for single-server review state
   flow, allowed next states, terminal-state blocking, and non-executing preview
   rendering.
+- Added v0.13 workspace planner metadata and tests for preview-only
+  workspace/run/log/artifact paths, with path traversal, absolute escape,
+  dangerous root, and protected-label rejection while keeping directory
+  creation, deletion, file movement, and server connections disabled.
 - 新增中文 M11 后端决策与流程文档，用于讨论后端批准、凭据、workspace、
   授权、配额、监控、审计、回滚和实现顺序。
 
@@ -681,3 +694,14 @@ Add one short entry whenever a meaningful technical change lands.
 - Preserved the safety boundary: no server connection, command execution,
   workspace or directory creation, credential loading, real log collection, or
   artifact collection.
+
+### 2026-06-23: v0.13 Workspace Planner Completion
+
+- Added `workspace_planner` C++ metadata for preview-only workspace, run
+  directory, log, and artifact paths.
+- Added path safety validation and `WorkspacePlannerTest` coverage for empty
+  roots, traversal, absolute escape attempts, dangerous roots, protected labels,
+  and explicit non-execution flags.
+- Preserved the safety boundary: no directory creation, deletion, file
+  movement, server connection, remote filesystem access, credential loading, or
+  command execution.

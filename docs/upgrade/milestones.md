@@ -61,6 +61,10 @@ Version status:
   lifecycle metadata、内存态状态转换和 preview renderer，覆盖 requested、
   reviewed、approved、rejected、queued、running、succeeded、failed、cancelled，
   不连接服务器、不执行命令、不创建目录。
+- v0.13 Workspace Planner 第一批实现已在 2026-06-23 完成。它新增 workspace
+  plan metadata、workspace/run/log/artifact preview renderer 和字符串级路径安全
+  校验，拒绝空 root、路径穿越、绝对逃逸、危险 root 和保护标签；不创建目录、
+  不删除目录、不移动文件、不连接服务器。
 - v1.0 internal preview 分步路线已在 2026-06-23 创建。公开路线图保存在
   `docs/upgrade/v1.0-internal-preview-roadmap.md`；新窗口提示词和详细 agent
   执行计划保存在本地忽略文件中，不提交到 GitHub。
@@ -341,10 +345,11 @@ Tasks:
     succeeded、failed、cancelled 等 metadata 状态。
   - [x] 只做内存状态流和 review packet，不连接服务器、不执行命令、不创建目录。
   - [x] 新增 v0.12 测试报告和学习总结。
-- [ ] M11-S4: workspace planner，作为 v0.13 目标。
-  - [ ] 生成 workspace、artifact、log 和 run directory preview。
-  - [ ] 校验路径不能逃逸 lab workspace root。
-  - [ ] 不创建目录、不删除目录、不移动文件。
+- [x] M11-S4: workspace planner，作为 v0.13 目标。
+  - [x] 生成 workspace、artifact、log 和 run directory preview。
+  - [x] 校验路径不能逃逸 lab workspace root。
+  - [x] 不创建目录、不删除目录、不移动文件。
+  - [x] 新增 v0.13 测试报告和学习总结。
 - [ ] M11-S5: approved template run packet，作为 v0.14 目标。
   - [ ] 把 approved template、结构化参数、profile 和 workspace plan 合成
     non-executing run packet。
