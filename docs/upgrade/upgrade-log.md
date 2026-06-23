@@ -16,6 +16,45 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: Add M11 Backend Decision Package
+
+Scope:
+- Added a non-executing M11 lab backend decision package template.
+- Clarified that M11-T1 remains incomplete until the lab supplies a concrete
+  backend decision and operational controls.
+
+Files changed:
+- `docs/upgrade/m11-lab-backend-decision-package.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+Behavior changed:
+- No runtime behavior changed.
+- No real CUDA/MPI execution, SSH, Slurm, PBS, local wrapper execution, remote
+  execution, arbitrary shell execution, credential loading, production audit
+  store, or automatic Code Agent patch application was added.
+
+Tests run:
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+Result:
+- PASS. `cmake --build build -j2` exited 0.
+- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
+- PASS. `git diff --check` produced no output.
+
+Commit:
+- This M11 backend decision package commit.
+
+Next task:
+- Keep real execution disabled. Use the decision package only when the lab is
+  ready to choose a backend and provide credential, workspace, authorization,
+  audit, quota/operator, and contact details.
+
 ## 2026-06-11: Add Upgrade Operating Plan
 
 Scope:

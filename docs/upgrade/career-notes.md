@@ -66,6 +66,9 @@ Current status:
 - Includes v0.9 non-executing review previews for dry-run submission packets,
   audit logs, workspace paths, and artifact paths without enabling real
   execution.
+- Includes an M11 lab backend decision package template that names the approval,
+  credential, workspace, authorization, quota/operator, audit, artifact, and
+  rollback information required before M11-T1 can select any real backend.
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -166,6 +169,14 @@ Current v0.9 state:
   without submitting jobs, persisting audit records, creating directories, or
   enabling any reserved backend.
 
+Current M11 decision package state:
+
+- A lab backend decision package template exists for M11-T1 review. It compares
+  local wrapper, SSH, Slurm, and PBS candidates as review options only and
+  requires concrete approval, credential policy, workspace root, authorization,
+  quota/operator rules, audit retention, artifact policy, operator contact, and
+  rollback plan before any backend can be selected.
+
 ## Technical Highlights
 
 - C++17/C++20 multi-module project with CMake.
@@ -221,6 +232,10 @@ Current v0.9 state:
 - Added non-executing v0.9 preview renderers for dry-run submission packets,
   audit logs, and workspace/artifact plans so operators can review a future
   backend package before runtime enablement changes.
+- Added an M11 lab backend decision package template that keeps real backend
+  selection separate from implementation and lists the controls required before
+  authentication, workspace lifecycle, scheduler submission, artifact
+  collection, visualization, or audit persistence work can begin.
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -301,6 +316,8 @@ Use only bullets that match the completed implementation.
   review workflows without enabling any real execution path.
 - Completed v0.9 backend readiness review with tested non-executing previews
   for submission packets, audit logs, and workspace/artifact plans.
+- Added an M11 backend decision package template that documents the review
+  evidence needed before selecting local wrapper, SSH, Slurm, or PBS.
 
 Planned after v0.9:
 

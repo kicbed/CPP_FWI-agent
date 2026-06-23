@@ -122,6 +122,14 @@ Detailed v0.9 notes:
 - `docs/upgrade/test-report-v0.9.md`
 - `docs/upgrade/learning-summary-v0.9.md`
 
+`M11 lab backend decision package` is available as of 2026-06-23:
+
+- `docs/upgrade/m11-lab-backend-decision-package.md`
+- This is a review worksheet only. It does not select or enable a real backend.
+- M11-T1 remains incomplete until the lab supplies a concrete backend decision,
+  credential policy, workspace root, authorization policy, audit retention,
+  quota/operator rules, and operator contact.
+
 Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
 backend milestone after the product and safety boundaries are stable.
 

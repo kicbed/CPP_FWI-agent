@@ -47,6 +47,10 @@ Version status:
 - v0.9 Backend Readiness Review is complete as of 2026-06-22 with
   non-executing readiness report rendering, dry-run submission packet preview,
   audit log preview, workspace/artifact path preview, and v0.9 report docs.
+- M11 lab backend decision package template exists as of 2026-06-23. It is a
+  review worksheet only; M11-T1 remains incomplete until the lab supplies a
+  concrete approved backend, credential policy, workspace root, authorization
+  policy, audit retention, quota/operator rules, and operator contact.
 
 ## Milestone 0: Baseline And Project Story
 
@@ -294,6 +298,9 @@ Tasks:
   that separates metadata readiness from runtime backend enablement.
 - [ ] M11-T1: Decide the first real backend with lab approval: local wrapper,
   SSH, Slurm, or PBS.
+  - 2026-06-23 note: `docs/upgrade/m11-lab-backend-decision-package.md`
+    records the required decision package template. This does not complete
+    M11-T1 and does not enable runtime execution.
 - [ ] M11-T2: Add authentication and access control implementation.
 - [ ] M11-T3: Add job workspace creation and cleanup.
 - [ ] M11-T4: Add job submission, status polling, and cancellation.

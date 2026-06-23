@@ -357,6 +357,9 @@ v1.0 entry gate:
 - v1.0 implementation should start only after M11-T1 has a lab decision package
   with selected backend, credential policy, workspace root, authorization
   policy, audit retention, quota/operator rules, and operator contact.
+- The M11 lab backend decision package template exists at
+  `docs/upgrade/m11-lab-backend-decision-package.md`, but it is not an approval
+  record and does not select or enable a backend.
 - M11-T2 through M11-T7 must then implement and test authentication/access
   control, workspace lifecycle, submission/status/cancellation, log and
   artifact collection, visualization, and audit logging.
