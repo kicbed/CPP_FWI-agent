@@ -51,6 +51,9 @@ Version status:
   M11-T1 仍未完成，必须等实验室提供具体批准后端、凭据策略、
   workspace root、授权策略、审计保留、配额/operator 规则和 operator
   联系人后才能继续。
+- 单服务器账号初步接入交接文档已在 2026-06-23 创建。它把当前实验室场景
+  收敛为一个服务器账号、固定 workspace、固定 approved template、dry-run
+  review packet 和 fake lifecycle，供下一窗口继续做设计文档和实现计划。
 
 ## Milestone 0: Baseline And Project Story
 
@@ -301,6 +304,8 @@ Tasks:
     是必须填写的决策包模板；这不代表 M11-T1 已完成，也不启用运行时执行。
   - 2026-06-23 记录：`docs/upgrade/m11-lab-process-guide.md` 是中文实验室
     流程指南，覆盖批准、凭据、workspace、授权、模板、配额、监控、审计和回滚。
+  - 2026-06-23 记录：`docs/upgrade/next-session-single-server-plan.md` 是
+    下一窗口交接文档，适用于“一个服务器账号、自己先跑”的初步实验室场景。
 - [ ] M11-T2: Add authentication and access control implementation.
 - [ ] M11-T3: Add job workspace creation and cleanup.
 - [ ] M11-T4: Add job submission, status polling, and cancellation.

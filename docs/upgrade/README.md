@@ -100,24 +100,22 @@ Detailed learning note:
 - Runtime remains dry-run only; `local`, `ssh`, `slurm`, and `pbs` are still
   rejected by the shared backend guard.
 
-Detailed M11 preflight notes:
+M11 预检详细文档：
 
 - `docs/upgrade/test-report-m11-preflight.md`
 - `docs/upgrade/m11-preflight-completion-audit.md`
 - `docs/upgrade/learning-summary-m11-preflight.md`
 
-`v0.9 Backend Readiness Review` is complete as of 2026-06-22:
+`v0.9 后端就绪评审` 已在 2026-06-22 完成：
 
-- Operator-facing rendering for `BackendPreflightReport`.
-- Dry-run submission packet preview for operator review.
-- Metadata-only audit log preview without persistence.
-- Workspace and artifact path preview without directory creation.
-- Readiness output shows metadata readiness, runtime enablement state,
-  validation errors, runtime blockers, and safety boundaries.
-- Runtime remains dry-run only; `local`, `ssh`, `slurm`, and `pbs` are still
-  rejected by the shared backend guard.
+- 面向 operator 渲染 `BackendPreflightReport`。
+- 为 operator 评审生成 dry-run 提交包预览。
+- 生成仅 metadata 的审计日志预览，不做持久化。
+- 生成 workspace 和 artifact 路径预览，不创建目录。
+- 就绪输出展示 metadata 就绪状态、运行时启用状态、验证错误、运行时阻塞原因和安全边界。
+- 运行时仍然只允许 dry-run；`local`、`ssh`、`slurm` 和 `pbs` 仍会被共享后端守卫拒绝。
 
-Detailed v0.9 notes:
+v0.9 详细文档：
 
 - `docs/upgrade/test-report-v0.9.md`
 - `docs/upgrade/learning-summary-v0.9.md`
@@ -126,13 +124,19 @@ Detailed v0.9 notes:
 
 - `docs/upgrade/m11-lab-backend-decision-package.md`
 - `docs/upgrade/m11-lab-process-guide.md`
+- `docs/upgrade/next-session-single-server-plan.md`
 - 这些文档只是评审材料，不选择或启用真实后端。
 - M11-T1 仍未完成；必须等实验室提供具体后端选择、凭据策略、
   workspace root、授权策略、审计保留、配额/operator 规则和 operator
   联系人后才能继续真实后端实现。
 
-Real CUDA/MPI, Slurm, PBS, SSH, or lab server execution is reserved for a later
-backend milestone after the product and safety boundaries are stable.
+如果当前实验室只是一个服务器账号、自己或小组内部先跑实验，请优先阅读
+`docs/upgrade/next-session-single-server-plan.md`。它把下一阶段收敛为
+单服务器账号、固定 workspace、固定 approved template、dry-run review packet
+和 fake lifecycle，不要求一开始做复杂多用户平台。
+
+真实 CUDA/MPI、Slurm、PBS、SSH 或实验室服务器执行仍保留到后续后端里程碑；
+只有产品和最小安全边界稳定后再启用。
 
 ## New Conversation Workflow
 

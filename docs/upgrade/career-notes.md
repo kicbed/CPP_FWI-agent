@@ -69,6 +69,8 @@ Current status:
 - 新增中文 M11 实验室后端决策包和流程指南，说明 M11-T1 选择真实后端前
   必须具备的批准、凭据、workspace、授权、配额/operator、审计、artifact、
   回滚和实现顺序信息。
+- 新增单服务器账号下一窗口计划，把当前实验室初步阶段收敛为一个服务器账号、
+  固定 workspace、固定 approved template、dry-run review packet 和 fake lifecycle。
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -175,6 +177,10 @@ Current M11 decision package state:
   local wrapper、SSH、Slurm、PBS 作为仅供评审的候选项对比，并列出选择
   真实后端前必须确认的批准、凭据、workspace、授权、配额/operator、
   审计、artifact、operator 联系人、回滚和实现顺序。
+- 针对当前实验室只是一个服务器账号、自己或小组内部先跑的现实情况，新增了
+  下一窗口计划。后续不需要一开始实现复杂多租户平台，而是先做
+  `SingleServerProfile`、`SingleServerJobTemplate`、dry-run review packet
+  和 fake lifecycle。
 
 ## Technical Highlights
 
@@ -234,6 +240,8 @@ Current M11 decision package state:
 - 新增中文优先的 M11 实验室后端决策与流程文档，把真实后端选择和代码实现
   分开，并列出认证、workspace 生命周期、调度器提交、artifact 收集、可视化
   或审计持久化开始前必须具备的控制条件。
+- 新增单服务器账号初步接入计划，为下一阶段 profile/template/review packet
+  和 fake lifecycle 设计提供中文交接说明。
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 

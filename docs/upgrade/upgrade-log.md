@@ -16,6 +16,50 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 中文化 M11/v0.9 报告并新增单服务器交接计划
+
+范围：
+- 将 M11 预检测试报告、M11 预检完成审计、v0.9 后端就绪评审测试报告翻译为中文。
+- 新增 `docs/upgrade/next-session-single-server-plan.md`，说明当前框架已经可以学习，
+  并给出 4 周学习计划和下一窗口提示词。
+- 将实验室后端推进思路按当前实际情况收敛为“一个服务器账号、自己或小组内部先跑”的
+  初步阶段：固定 workspace、固定 approved template、dry-run review packet 和 fake lifecycle。
+- 更新升级指南、里程碑、路线图、career notes 和实验室流程指南的相关链接。
+
+改动文件：
+- `docs/upgrade/test-report-m11-preflight.md`
+- `docs/upgrade/m11-preflight-completion-audit.md`
+- `docs/upgrade/test-report-v0.9.md`
+- `docs/upgrade/next-session-single-server-plan.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/m11-lab-process-guide.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 没有运行时行为变化。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、生产审计存储或 Code Agent 自动应用 patch。
+
+验证命令：
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+结果：
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 26/26 个测试。
+- PASS. `git diff --check` 没有输出。
+
+Commit：
+- 本次 M11/v0.9 中文报告和单服务器交接计划提交。
+
+下一步：
+- 新开窗口后按 `docs/upgrade/next-session-single-server-plan.md` 继续，先做单服务器账号
+  profile/template/review packet 的设计文档和实现计划，不连接真实服务器。
+
 ## 2026-06-23: 中文化 M11 实验室文档
 
 范围：

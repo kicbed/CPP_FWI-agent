@@ -362,11 +362,12 @@ v1.0 entry gate:
   也不会选择或启用真实后端。
 - 中文实验室流程指南位于 `docs/upgrade/m11-lab-process-guide.md`，说明
   M11-T1 完成前实验室必须确认哪些信息。
-- M11-T2 through M11-T7 must then implement and test authentication/access
-  control, workspace lifecycle, submission/status/cancellation, log and
-  artifact collection, visualization, and audit logging.
-- Until those controls exist, the project can continue docs-only or
-  non-executing review work, but should not claim v1.0 lab-usable execution.
+- 单服务器账号下一窗口计划位于 `docs/upgrade/next-session-single-server-plan.md`，
+  适用于当前“一个服务器账号、自己或小组内部先跑”的初步阶段。
+- 随后 M11-T2 到 M11-T7 必须实现并测试身份认证/访问控制、workspace 生命周期、
+  提交/状态/取消、日志和 artifact 收集、可视化以及审计日志。
+- 在这些控制存在之前，项目可以继续做纯文档或非执行评审工作，但不能声称已经具备
+  v1.0 实验室可用的真实执行能力。
 
 ## v1.0: Lab-Usable Platform
 

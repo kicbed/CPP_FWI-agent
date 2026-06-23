@@ -1,49 +1,47 @@
-# v0.9 Backend Readiness Review Test Report
+# v0.9 后端就绪评审测试报告
 
-Date: 2026-06-22
+日期：2026-06-22
 
-Status: complete for the v0.9 non-executing readiness/review scope.
+状态：v0.9 非执行就绪/评审范围已完成。
 
-## Scope
+## 范围
 
-v0.9 turns M11 preflight metadata into operator-reviewable text previews without
-connecting any real execution backend.
+v0.9 把 M11 预检 metadata 转换成 operator 可以评审的文本预览，但不连接任何真实执行后端。
 
-Completed capabilities:
+已完成能力：
 
-- Render `BackendPreflightReport` as operator-facing readiness text.
-- Render a dry-run submission packet from `BackendPreflightPackage`.
-- Render a same-job audit log preview without persistence.
-- Render workspace and artifact path plans without creating directories.
+- 将 `BackendPreflightReport` 渲染成面向 operator 的就绪状态文本。
+- 从 `BackendPreflightPackage` 渲染 dry-run 提交包。
+- 渲染同一个 job 的审计日志预览，但不做持久化。
+- 渲染 workspace 和 artifact 路径计划，但不创建目录。
 
-Explicitly not included:
+明确不包含：
 
-- Real CUDA/MPI execution.
-- SSH, Slurm, PBS, local wrapper, or remote server execution.
-- Credential loading or cluster account handling.
-- Production audit store writes.
-- Arbitrary shell execution from user text.
-- Automatic Code Agent patch application.
+- 真实 CUDA/MPI 执行。
+- SSH、Slurm、PBS、本地 wrapper 或远程服务器执行。
+- 凭据读取或集群账号处理。
+- 写入生产审计存储。
+- 从用户文本执行任意 shell 命令。
+- Code Agent 自动应用 patch。
 
-## TDD Evidence
+## TDD 证据
 
-RED checks:
+RED 检查：
 
-- `cmake --build build -j2` failed after adding the readiness report renderer
-  test because `render_backend_preflight_report` did not exist.
-- `cmake --build build -j2` failed after adding the remaining v0.9 preview
-  tests because `render_dry_run_submission_packet`,
-  `render_job_audit_log_preview`, and `render_workspace_artifact_plan` did not
-  exist.
+- 为就绪报告渲染器添加测试后，`cmake --build build -j2` 失败，因为
+  `render_backend_preflight_report` 还不存在。
+- 为剩余 v0.9 预览功能添加测试后，`cmake --build build -j2` 失败，因为
+  `render_dry_run_submission_packet`、`render_job_audit_log_preview` 和
+  `render_workspace_artifact_plan` 还不存在。
 
-GREEN checks:
+GREEN 检查：
 
-- `ctest --test-dir build -R ServerJobTest --output-on-failure` passed after
-  adding the non-executing preview helpers.
+- 增加非执行预览 helper 后，
+  `ctest --test-dir build -R ServerJobTest --output-on-failure` 通过。
 
-## Final Validation
+## 最终验证
 
-Commands:
+命令：
 
 ```bash
 cmake --build build -j2
@@ -52,16 +50,16 @@ ctest --test-dir build --output-on-failure
 git diff --check
 ```
 
-Result:
+结果：
 
-- PASS. `cmake --build build -j2` exited 0.
-- PASS. `ServerJobTest` passed.
-- PASS. Full `ctest --test-dir build --output-on-failure` passed 26/26 tests.
-- PASS. `git diff --check` produced no output.
+- PASS。`cmake --build build -j2` 退出码为 0。
+- PASS。`ServerJobTest` 通过。
+- PASS。全量 `ctest --test-dir build --output-on-failure` 通过 26/26 个测试。
+- PASS。`git diff --check` 没有输出。
 
-## Safety Result
+## 安全结果
 
-v0.9 is a review layer only. The runtime backend guard remains unchanged:
-`local`, `ssh`, `slurm`, and `pbs` are still rejected until a later M11 real
-backend decision and implementation explicitly changes that behavior after lab
-approval and safety controls.
+v0.9 只是评审层。运行时后端守卫没有变化：
+
+- `local`、`ssh`、`slurm` 和 `pbs` 仍然会被拒绝。
+- 只有后续 M11 真实后端决策和实现，在实验室批准与安全控制完成后，才能显式改变该行为。
