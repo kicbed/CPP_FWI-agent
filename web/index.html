@@ -25,6 +25,24 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@14.1.3/marked.min.js"></script>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+        processEscapes: true,
+      },
+      options: {
+        skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+      },
+      startup: {
+        typeset: false,
+      },
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
   <link rel="icon" href="favicon.svg">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -99,6 +117,10 @@
     .markdown-body a { color: #4F46E5; text-decoration: underline; }
     .markdown-body hr { border: none; border-top: 1px solid #E2E8F0; margin: 16px 0; }
     .markdown-body strong { color: #0F172A; }
+    .markdown-body mjx-container { max-width: 100%; overflow-x: auto; overflow-y: hidden; }
+    .markdown-body mjx-container[display="true"] {
+      margin: 12px 0; padding: 4px 0;
+    }
 
     .workbench-card {
       background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px;
@@ -698,15 +720,25 @@
       updateSendBtn();
 
       try {
-        let answer;
+        let response;
         if (state.mode === 'http') {
-          answer = await sendHttp(text);
+          response = await sendHttp(text);
         } else {
-          answer = await sendGrpc(text);
+          response = await sendGrpc(text);
         }
 
         showTyping(false);
-        appendMessage('assistant', answer);
+        let answer = response;
+        let renderedInPlace = false;
+        if (response && typeof response === 'object') {
+          answer = response.answer || '';
+          renderedInPlace = !!response.renderedInPlace;
+        }
+        if (!answer) answer = '无响应内容';
+
+        if (!renderedInPlace) {
+          appendMessage('assistant', answer);
+        }
 
         chatMessages.push({ role: 'assistant', content: answer });
         saveChat(title, chatMessages, state.contextId);
@@ -799,34 +831,19 @@
 
             if (result?.contextId) contextId = result.contextId;
 
-            if (result?.status?.message?.parts) {
-              for (const part of result.status.message.parts) {
-                if (part.kind === 'text' && part.text) {
-                  answer += part.text;
-                  updateStreamMessage(msgEl, answer);
-                }
-              }
-            }
-
-            if (result?.artifacts) {
-              for (const artifact of result.artifacts) {
-                if (artifact.parts) {
-                  for (const part of artifact.parts) {
-                    if (part.kind === 'text' && part.text) {
-                      answer += part.text;
-                      updateStreamMessage(msgEl, answer);
-                    }
-                  }
-                }
-              }
+            const text = extractStreamText(result, answer);
+            if (text) {
+              answer += text;
+              updateStreamMessage(msgEl, answer);
             }
           } catch (e) {}
         }
       }
 
       if (contextId) state.contextId = contextId;
+      if (!answer) answer = '无响应内容';
       finalizeStreamMessage(msgEl, answer);
-      return answer;
+      return { answer, renderedInPlace: true };
     }
 
     async function sendHttpSync(text, id) {
@@ -852,6 +869,47 @@
       if (data.result?.contextId) state.contextId = data.result.contextId;
 
       return extractAnswer(data.result);
+    }
+
+    function extractStreamText(result, currentAnswer = '') {
+      if (!result) return '';
+
+      if (result.type === 'chunk' && result.content) {
+        return result.content;
+      }
+
+      if (result.type === 'stream_end') {
+        if (currentAnswer) return '';
+        let message = result.message;
+        if (typeof message === 'string') {
+          try {
+            message = JSON.parse(message);
+          } catch (e) {
+            return message;
+          }
+        }
+        return extractAnswer(message);
+      }
+
+      if (result.status?.message?.parts?.length > 0) {
+        const textParts = result.status.message.parts
+          .filter(p => p.kind === 'text' && p.text)
+          .map(p => p.text);
+        return textParts.join('\n');
+      }
+
+      if (result.artifacts?.length > 0) {
+        const textParts = [];
+        for (const artifact of result.artifacts) {
+          if (!artifact.parts) continue;
+          for (const part of artifact.parts) {
+            if (part.kind === 'text' && part.text) textParts.push(part.text);
+          }
+        }
+        return textParts.join('\n');
+      }
+
+      return '';
     }
 
     function extractAnswer(result) {
@@ -944,6 +1002,11 @@
 
       msgs.appendChild(el);
       if (role === 'assistant' && !streaming) {
+        const body = el.querySelector('.markdown-body');
+        if (body) {
+          decorateRenderedContent(body);
+          queueMathTypeset(body);
+        }
         updateInspectorFromAnswer(content);
       }
       return el;
@@ -953,6 +1016,8 @@
       const body = el.querySelector('.markdown-body');
       if (body) {
         body.innerHTML = renderMarkdown(content);
+        decorateRenderedContent(body);
+        queueMathTypeset(body);
         scrollToBottom();
       }
     }
@@ -963,6 +1028,8 @@
         body.classList.remove('cursor-blink');
         body.removeAttribute('data-streaming');
         body.innerHTML = renderMarkdown(content);
+        decorateRenderedContent(body);
+        queueMathTypeset(body);
         const wrapper = body.parentElement;
         if (!wrapper.querySelector('.mt-2')) {
           const btn = document.createElement('div');
@@ -1350,7 +1417,7 @@
     }
 
     // ===== Markdown Renderer =====
-    function renderMarkdown(text) {
+    function renderMarkdownFallback(text) {
       if (!text) return '';
       let html = escapeHtml(text);
 
@@ -1382,6 +1449,55 @@
       if (!html.startsWith('<')) html = '<p>' + html + '</p>';
 
       return html;
+    }
+
+    function renderMarkdown(text) {
+      if (!text) return '';
+
+      const source = String(text);
+      const markedLib = window.marked || (typeof marked !== 'undefined' ? marked : null);
+      const purifier = window.DOMPurify || (typeof DOMPurify !== 'undefined' ? DOMPurify : null);
+
+      if (!markedLib || !purifier) {
+        return renderMarkdownFallback(source);
+      }
+
+      if (!window.__markedConfigured && markedLib.setOptions) {
+        markedLib.setOptions({
+          gfm: true,
+          breaks: true,
+        });
+        window.__markedConfigured = true;
+      }
+
+      const rawHtml = markedLib.parse(source);
+      return purifier.sanitize(rawHtml, {
+        USE_PROFILES: { html: true },
+        ADD_ATTR: ['target', 'rel', 'class'],
+      });
+    }
+
+    function decorateRenderedContent(container) {
+      if (!container) return;
+      container.querySelectorAll('a[href]').forEach(link => {
+        link.setAttribute('target', '_blank');
+        link.setAttribute('rel', 'noopener noreferrer');
+      });
+    }
+
+    function queueMathTypeset(container) {
+      if (!container || !window.MathJax || !window.MathJax.typesetPromise) return;
+      if (container._mathTypesetTimer) {
+        clearTimeout(container._mathTypesetTimer);
+      }
+      container._mathTypesetTimer = setTimeout(() => {
+        try {
+          if (window.MathJax.typesetClear) {
+            window.MathJax.typesetClear([container]);
+          }
+          window.MathJax.typesetPromise([container]).catch(() => {});
+        } catch (e) {}
+      }, 0);
     }
 
     function escapeHtml(str) {
