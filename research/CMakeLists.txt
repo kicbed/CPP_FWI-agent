@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 set(RESEARCH_SOURCES
+    src/approved_template_run_packet.cpp
     src/algorithm_card.cpp
     src/algorithm_listing_tool.cpp
     src/algorithm_registry.cpp

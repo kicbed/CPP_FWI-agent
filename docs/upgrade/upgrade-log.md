@@ -16,6 +16,76 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 完成 v0.14 Approved Template Run Packet metadata 实现
+
+范围：
+- 新增 `approved_template_run_packet` C++ 模块，包含
+  `ApprovedTemplateRunPacketRequest` 和 `ApprovedTemplateRunPacket` metadata。
+- 把 `SingleServerProfile`、`SingleServerJobTemplate`、
+  `SingleServerReviewRequest`、`WorkspacePlan` 和 lifecycle id 合成
+  non-executing run packet。
+- 新增批准参数筛选、required parameter 校验、自由 command 拒绝、workspace plan
+  validation error 汇总和 review packet renderer。
+- 新增 `ApprovedTemplateRunPacketTest`，覆盖正常渲染、未批准参数、自由 command、
+  缺失必填参数、template/profile mismatch、workspace plan 错误和显式非执行 flags。
+- 新增 v0.14 测试报告和中文学习总结，并更新升级指南、里程碑、路线图、v1.0
+  internal preview roadmap 和 career notes。
+
+改动文件：
+- `research/include/agent_rpc/research/approved_template_run_packet.h`
+- `research/src/approved_template_run_packet.cpp`
+- `tests/test_approved_template_run_packet.cpp`
+- `research/CMakeLists.txt`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/test-report-v0.14.md`
+- `docs/upgrade/learning-summary-v0.14.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/v1.0-internal-preview-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 新增 C++ metadata、validation helper 和非执行 run packet renderer。
+- renderer 只输出 allowlist 结构化参数；未批准参数和自由 command 不会进入渲染文本。
+- packet 明确展示 `execution: disabled`、`command_executed: false`、
+  `credentials_loaded: false`、`server_connected: false`、
+  `workspace_created: false`、`directories_created: false`、
+  `files_moved: false` 和 `free_form_command_accepted: false`。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、服务器连接、workspace/目录创建、目录删除、文件移动、
+  真实日志采集、artifact 采集、生产审计存储或 Code Agent 自动应用 patch。
+
+验证命令：
+- `cmake --build build -j2`
+- `ctest --test-dir build -R ApprovedTemplateRunPacketTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+TDD 证据：
+- 基线：实现前 `cmake --build build -j2` 退出码为 0，全量
+  `ctest --test-dir build --output-on-failure` 通过 30/30 个测试。
+- RED：新增 `ApprovedTemplateRunPacketTest` target 后，构建失败于缺少
+  `agent_rpc/research/approved_template_run_packet.h`。
+- GREEN：新增 approved template run packet header/source、validation、renderer 和
+  CMake 接入后，构建和聚焦测试通过。
+
+结果：
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. `ctest --test-dir build -R ApprovedTemplateRunPacketTest --output-on-failure`
+  通过 1/1 个测试目标。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 31/31 个测试。
+- PASS. `git diff --check` 没有输出。
+
+Commit：
+- 本次 v0.14 Approved Template Run Packet metadata 实现提交。
+
+下一步：
+- 开始 v0.15 Internal Sanity-Check Runner Gate，先设计固定 allowlisted runner id、
+  timeout、stdout/stderr capture、artifact path 和审计边界；第一批仍以 metadata 和
+  review packet 为主，不接 SSH、Slurm、PBS、CUDA/MPI 或真实服务器。
+
 ## 2026-06-23: 完成 v0.13 Workspace Planner metadata 实现
 
 范围：

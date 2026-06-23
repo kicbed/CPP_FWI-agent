@@ -567,7 +567,11 @@ Next target after v0.13:
 
 ## v0.14: Approved Template Run Packet
 
-Status: Planned on 2026-06-23 as part of the v1.0 internal preview roadmap.
+Status: Completed on 2026-06-23 for the metadata-only run packet rendering
+scope, with `docs/upgrade/test-report-v0.14.md` and
+`docs/upgrade/learning-summary-v0.14.md`. No command execution, credential
+loading, server connection, workspace creation, directory creation, deletion,
+or file movement is enabled.
 
 Purpose:
 
@@ -584,12 +588,32 @@ Must have:
 - Rendering that explicitly says `command_executed: false`.
 - Tests for valid packets and rejection paths.
 
+Completed scope:
+
+- Added `approved_template_run_packet` C++ metadata for
+  `ApprovedTemplateRunPacketRequest` and `ApprovedTemplateRunPacket`.
+- Added validation that reuses single-server profile/template/review request
+  checks, propagates workspace plan validation errors, rejects missing required
+  parameters, and rejects user free-form commands.
+- Added accepted-parameter filtering so only template allowlist parameters are
+  rendered.
+- Added review packet rendering for profile/template/entrypoint, lifecycle id,
+  workspace path, run path, log path, artifact paths, resource limits,
+  validation errors, and explicit execution-disabled flags.
+- Added `ApprovedTemplateRunPacketTest` coverage for valid rendering,
+  unapproved parameters, free-form command rejection, required-parameter
+  rejection, template/profile mismatch, workspace-plan validation errors, and
+  non-rendering of credential references or unsafe command text.
+
 Not included:
 
 - Real command execution.
 - User free-form command strings.
 - Credential loading.
 - Server connection.
+- Workspace creation.
+- Directory creation.
+- File movement.
 
 Next target after v0.14:
 

@@ -257,6 +257,18 @@ target_include_directories(test_workspace_planner PRIVATE
 )
 add_test(NAME WorkspacePlannerTest COMMAND test_workspace_planner)
 
+add_executable(test_approved_template_run_packet test_approved_template_run_packet.cpp)
+target_link_libraries(test_approved_template_run_packet
+    agent_rpc_research
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_approved_template_run_packet PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../research/include
+)
+add_test(NAME ApprovedTemplateRunPacketTest COMMAND test_approved_template_run_packet)
+
 add_test(
     NAME WebBrandingTest
     COMMAND ${CMAKE_COMMAND}

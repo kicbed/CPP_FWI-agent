@@ -85,6 +85,10 @@ Current status:
 - Includes v0.13 workspace planner models and tests for preview-only
   workspace, run directory, log, and artifact paths with path traversal,
   absolute escape, dangerous root, and protected-label validation.
+- Includes v0.14 approved-template run packet models and tests for combining
+  single-server profiles, approved templates, structured parameters, workspace
+  plans, lifecycle ids, resource limits, and explicit non-execution flags while
+  rejecting free-form commands and unapproved parameters.
 - 新增 v0.10 单服务器账号接入准备设计和实现计划，把下一步落到
   `SingleServerProfile`、`SingleServerJobTemplate`、`SingleServerReviewRequest`
   和 dry-run review packet，仍不连接服务器、不读取凭据、不执行命令。
@@ -213,6 +217,10 @@ Current M11 decision package state:
 - v0.13 第一批实现新增 workspace planner，用字符串级校验生成 workspace/run/log/
   artifact preview，拒绝空 root、路径穿越、绝对逃逸、危险 root 和保护标签，同时不创建
   目录、不删除目录、不移动文件、不连接服务器。
+- v0.14 第一批实现新增 approved template run packet，把 profile/template/
+  structured request/workspace plan/lifecycle id 合成 non-executing review
+  packet，拒绝自由 command、未批准参数和缺失必填参数，同时不读取凭据、不连接服务器、
+  不创建 workspace。
 
 ## Technical Highlights
 
@@ -286,6 +294,9 @@ Current M11 decision package state:
 - 新增 v0.13 `workspace_planner` C++ 模块和测试，覆盖 workspace/run/log/artifact
   preview、路径穿越拒绝、绝对路径逃逸拒绝、危险 root 拒绝和保护标签拒绝，并保持目录
   创建、删除、文件移动和服务器连接关闭。
+- 新增 v0.14 `approved_template_run_packet` C++ 模块和测试，覆盖 approved template
+  run packet rendering、批准参数筛选、自由 command 拒绝、必填参数校验、workspace plan
+  error 汇总和显式非执行 flags。
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -377,10 +388,14 @@ Use only bullets that match the completed implementation.
   workspace/run/log/artifact paths, with path traversal, absolute escape,
   dangerous root, and protected-label rejection while keeping directory
   creation, deletion, file movement, and server connections disabled.
+- Added v0.14 approved-template run packet metadata and tests for
+  non-executing future-run review packets, free-form command rejection,
+  unapproved parameter rejection, required-parameter checks, workspace plan
+  validation propagation, and explicit execution-disabled flags.
 - 新增中文 M11 后端决策与流程文档，用于讨论后端批准、凭据、workspace、
   授权、配额、监控、审计、回滚和实现顺序。
 
-Planned after v0.9:
+Future real backend expansion:
 
 - Controlled real backend integration only after a lab-approved backend,
   credential model, workspace root, authorization policy, audit retention, and
@@ -705,3 +720,16 @@ Add one short entry whenever a meaningful technical change lands.
 - Preserved the safety boundary: no directory creation, deletion, file
   movement, server connection, remote filesystem access, credential loading, or
   command execution.
+
+### 2026-06-23: v0.14 Approved Template Run Packet Completion
+
+- Added `approved_template_run_packet` C++ metadata for combining
+  single-server profile, approved template, structured review request,
+  workspace plan, and lifecycle id into a reviewable future-run packet.
+- Added validation and `ApprovedTemplateRunPacketTest` coverage for allowlisted
+  parameters, rejected free-form commands, missing required parameters,
+  template/profile mismatch, workspace-plan errors, and non-rendering of unsafe
+  command text or credential references.
+- Preserved the safety boundary: no command execution, credential loading,
+  server connection, workspace creation, directory creation, deletion, or file
+  movement.
