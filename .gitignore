@@ -24,6 +24,7 @@ examples/ai_orchestrator/pids/
 
 # ==================== 向量缓存 ====================
 resources/embeddings/
+local_knowledge/
 
 # ==================== 环境变量 ====================
 .env
