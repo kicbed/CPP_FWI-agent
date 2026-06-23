@@ -76,6 +76,9 @@ Version status:
 - v1.0 internal preview 分步路线已在 2026-06-23 创建。公开路线图保存在
   `docs/upgrade/v1.0-internal-preview-roadmap.md`；新窗口提示词和详细 agent
   执行计划保存在本地忽略文件中，不提交到 GitHub。
+- v1.0 internal preview 已在 2026-06-23 完成收口。新增完成审计、内部用户手册、
+  operator runbook、演示脚本、总测试报告和中文学习总结；这只标记 review-only
+  internal preview，不启用真实后端执行。
 
 ## Milestone 0: Baseline And Project Story
 
@@ -363,15 +366,15 @@ Tasks:
     non-executing run packet。
   - [x] 拒绝用户自由 command 和未批准参数。
   - [x] 新增 v0.14 测试报告和学习总结。
-- [ ] M11-S6: internal sanity-check runner gate，作为 v0.15 目标。
-  - [ ] 先做固定 allowlisted runner id、timeout、stdout/stderr capture、
+- [x] M11-S6: internal sanity-check runner gate，作为 v0.15 目标。
+  - [x] 先做固定 allowlisted runner id、timeout、stdout/stderr capture、
     artifact path 和审计边界设计。
-  - [ ] 第一批实现仍以 metadata 和 review packet 为主，不接 SSH、Slurm、PBS、
+  - [x] 第一批实现仍以 metadata 和 review packet 为主，不接 SSH、Slurm、PBS、
     CUDA/MPI 或真实服务器。
-- [ ] M11-S7: v1.0 internal preview closeout。
-  - [ ] 汇总 v0.11-v0.15 的安全边界和测试结果。
-  - [ ] 写内部用户手册、operator runbook、演示脚本、测试报告和学习总结。
-  - [ ] 只有前置 gate 都满足，才标记 v1.0 internal preview。
+- [x] M11-S7: v1.0 internal preview closeout。
+  - [x] 汇总 v0.11-v0.15 的安全边界和测试结果。
+  - [x] 写内部用户手册、operator runbook、演示脚本、测试报告和学习总结。
+  - [x] 只有前置 gate 都满足，才标记 v1.0 internal preview。
 - [ ] M11-T2: Add authentication and access control implementation.
 - [ ] M11-T3: Add job workspace creation and cleanup.
 - [ ] M11-T4: Add job submission, status polling, and cancellation.
@@ -418,6 +421,9 @@ The project can enter v1.0 internal preview after the single-server internal
 path is implemented and tested. This is not public release and not a full
 cluster platform.
 
+Status: Entered v1.0 internal preview on 2026-06-23 for the review-only
+single-server workflow.
+
 Required before v1.0 internal preview:
 
 - M11-S2 Safe Operations is implemented and tested.
@@ -429,6 +435,15 @@ Required before v1.0 internal preview:
   exist for internal lab use.
 - The system still rejects user free-form shell commands, real credential
   reading, SSH, Slurm/PBS, remote execution, and dangerous deletion.
+
+Completion evidence:
+
+- `docs/upgrade/v1.0-internal-preview-audit.md`
+- `docs/upgrade/v1.0-internal-user-guide.md`
+- `docs/upgrade/v1.0-internal-operator-runbook.md`
+- `docs/upgrade/demo-script-v1.0-internal-preview.md`
+- `docs/upgrade/test-report-v1.0-internal-preview.md`
+- `docs/upgrade/learning-summary-v1.0-internal-preview.md`
 
 Full real backend expansion still requires:
 

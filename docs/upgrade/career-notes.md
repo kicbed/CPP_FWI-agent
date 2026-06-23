@@ -89,6 +89,14 @@ Current status:
   single-server profiles, approved templates, structured parameters, workspace
   plans, lifecycle ids, resource limits, and explicit non-execution flags while
   rejecting free-form commands and unapproved parameters.
+- Includes v0.15 internal sanity runner gate models and tests for fixed
+  allowlisted runner review packets, timeout metadata, stdout/stderr capture
+  plans, artifact path validation, audit event metadata, and rejection of
+  free-form commands, deletion, credential reads, SSH, Slurm, PBS, and remote
+  access.
+- v1.0 internal preview is complete for the review-only single-server workflow:
+  completion audit, user guide, operator runbook, demo script, consolidated
+  test report, and learning summary are available.
 - 新增 v0.10 单服务器账号接入准备设计和实现计划，把下一步落到
   `SingleServerProfile`、`SingleServerJobTemplate`、`SingleServerReviewRequest`
   和 dry-run review packet，仍不连接服务器、不读取凭据、不执行命令。
@@ -221,6 +229,11 @@ Current M11 decision package state:
   structured request/workspace plan/lifecycle id 合成 non-executing review
   packet，拒绝自由 command、未批准参数和缺失必填参数，同时不读取凭据、不连接服务器、
   不创建 workspace。
+- v0.15 第一批实现新增 internal sanity runner gate，把未来 fixed runner 的最小边界
+  收敛为 allowlisted runner id、timeout、stdout/stderr capture、artifact path 和
+  audit metadata，同时拒绝自由命令、删除、凭据读取、SSH、Slurm、PBS 和 remote access。
+- v1.0 internal preview 收口完成后，用户和 operator 有审计、用户手册、runbook、演示
+  脚本、总测试报告和学习总结。它可以用于内部学习和演示，但仍不是完整真实后端。
 
 ## Technical Highlights
 
@@ -297,6 +310,11 @@ Current M11 decision package state:
 - 新增 v0.14 `approved_template_run_packet` C++ 模块和测试，覆盖 approved template
   run packet rendering、批准参数筛选、自由 command 拒绝、必填参数校验、workspace plan
   error 汇总和显式非执行 flags。
+- 新增 v0.15 `internal_sanity_runner` C++ 模块和测试，覆盖 fixed runner review packet、
+  allowlisted runner id、timeout/capture metadata、artifact path workspace-root 校验、
+  audit event metadata 和危险请求拒绝。
+- 完成 v1.0 internal preview 收口，把 v0.11-v0.15 的 metadata gates 映射到审计、
+  user guide、operator runbook、demo script 和 consolidated test report。
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -392,6 +410,12 @@ Use only bullets that match the completed implementation.
   non-executing future-run review packets, free-form command rejection,
   unapproved parameter rejection, required-parameter checks, workspace plan
   validation propagation, and explicit execution-disabled flags.
+- Added v0.15 internal sanity runner gate metadata and tests for fixed
+  allowlisted runner review packets, timeout/capture planning, artifact path
+  validation, audit event metadata, and rejection of dangerous requests.
+- Completed v1.0 internal preview documentation with a safety audit, internal
+  user guide, operator runbook, demo script, consolidated test report, and
+  learning summary for the review-only single-server workflow.
 - 新增中文 M11 后端决策与流程文档，用于讨论后端批准、凭据、workspace、
   授权、配额、监控、审计、回滚和实现顺序。
 
@@ -746,3 +770,14 @@ Add one short entry whenever a meaningful technical change lands.
 - Preserved the safety boundary: no command execution, credential loading,
   deletion, SSH, Slurm, PBS, remote server access, workspace creation, real
   stdout/stderr capture, or artifact collection.
+
+### 2026-06-23: v1.0 Internal Preview Closeout
+
+- Added the v1.0 internal preview audit, user guide, operator runbook, demo
+  script, consolidated test report, and Chinese learning summary.
+- Marked the review-only single-server internal preview complete only after
+  v0.11-v0.15 safety gates and full CTest evidence were checked.
+- Preserved the safety boundary: no real CUDA/MPI, SSH, Slurm, PBS, remote
+  server connection, arbitrary shell execution, credential loading, workspace
+  creation, deletion, trash move, file movement, real stdout/stderr capture,
+  artifact collection, or automatic Code Agent patch application.

@@ -24,7 +24,7 @@ Personal prompts should stay in ignored local files such as
 | v0.13 | Workspace Planner | Preview workspace, log, and artifact paths with path-safety validation |
 | v0.14 | Approved Template Run Packet | Render approved-template run packets from structured parameters without executing commands |
 | v0.15 | Internal Sanity-Check Runner Gate | Define the fixed-runner gate before any limited execution is enabled |
-| v1.0 | Internal Preview | Let lab members try the single-server workflow with review packets, lifecycle, docs, and safety gates |
+| v1.0 | Internal Preview | Completed review-only single-server internal preview docs, audit, demo, and safety-gate test report |
 
 ## v0.2: Lab Agent MVP
 
@@ -360,8 +360,9 @@ Completed scope:
 
 v1.0 entry gate:
 
-- v1.0 internal preview should start only after the v0.11-v0.15 single-server
-  safety gates are implemented, documented, and tested.
+- v1.0 internal preview was marked complete on 2026-06-23 only after the
+  v0.11-v0.15 single-server safety gates were implemented, documented, and
+  tested.
 - M11 实验室后端决策包模板位于
   `docs/upgrade/m11-lab-backend-decision-package.md`，但它不是批准记录，
   也不会选择或启用真实后端。
@@ -663,14 +664,15 @@ Completed scope:
 
 Next target after v0.15:
 
-- Close out v1.0 internal preview with audit, user guide, operator runbook,
-  demo script, and consolidated test report while keeping real execution behind
-  a later explicit approval and implementation task.
+- v1.0 internal preview closeout is complete as of 2026-06-23. Continue only
+  with study/demo work or later M11 real backend approval tasks; keep real
+  execution behind a later explicit approval and implementation task.
 
 ## v1.0: Lab-Usable Platform
 
-Status: Long-term product name. The current near-term target is
-`v1.0 internal preview`, not a public release.
+Status: `v1.0 internal preview` completed on 2026-06-23 for the review-only
+single-server workflow. This is not a public release and not a full cluster
+platform.
 
 Purpose:
 
@@ -697,6 +699,19 @@ Internal preview scope:
 - Keep real credentials out of the repository.
 - Keep SSH, Slurm, PBS, and general remote execution out of scope until a later
   lab-approved backend expansion.
+
+Completed internal preview closeout:
+
+- Added completion audit in `docs/upgrade/v1.0-internal-preview-audit.md`.
+- Added internal user guide in `docs/upgrade/v1.0-internal-user-guide.md`.
+- Added operator runbook in `docs/upgrade/v1.0-internal-operator-runbook.md`.
+- Added demo script in `docs/upgrade/demo-script-v1.0-internal-preview.md`.
+- Added consolidated test report in
+  `docs/upgrade/test-report-v1.0-internal-preview.md`.
+- Added Chinese learning summary in
+  `docs/upgrade/learning-summary-v1.0-internal-preview.md`.
+- Verified the full suite with `ctest --test-dir build --output-on-failure`
+  passing 32/32 tests before marking the internal preview.
 
 Full backend expansion later adds:
 
@@ -734,6 +749,7 @@ Use this order:
    single-server internal preview path.
 9. If v0.11-v0.15 safety gates are complete and tested, close out v1.0
    internal preview with user docs, operator docs, demo script, and test report.
+   This is complete as of 2026-06-23.
 10. If the lab later approves real backend expansion, continue M11-T1 through
     M11-T7 before enabling SSH, Slurm, PBS, remote execution, or CUDA/MPI jobs.
 

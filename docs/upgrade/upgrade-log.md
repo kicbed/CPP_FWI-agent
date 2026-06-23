@@ -16,6 +16,61 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 完成 v1.0 Internal Preview 收口
+
+范围：
+- 新增 v1.0 internal preview 完成审计，汇总 v0.11-v0.15 的安全边界和测试证据。
+- 新增内部用户手册，说明如何选择 approved template、填写结构化参数、查看 review
+  packet、fake lifecycle、workspace plan、approved-template run packet 和 sanity
+  runner gate。
+- 新增 operator runbook，说明如何审核 approved template metadata、delete dry-run
+  packet、fake lifecycle、workspace plan 和 sanity runner gate，以及何时停止在真实执行前。
+- 新增演示脚本、总测试报告和中文学习总结。
+- 更新升级指南、milestone board、version roadmap、v1.0 internal preview roadmap 和
+  career notes，把 v0.15/M11-S6 补齐，并在前置 gate 全部满足后标记 v1.0 internal
+  preview。
+
+改动文件：
+- `docs/upgrade/v1.0-internal-preview-audit.md`
+- `docs/upgrade/v1.0-internal-user-guide.md`
+- `docs/upgrade/v1.0-internal-operator-runbook.md`
+- `docs/upgrade/demo-script-v1.0-internal-preview.md`
+- `docs/upgrade/test-report-v1.0-internal-preview.md`
+- `docs/upgrade/learning-summary-v1.0-internal-preview.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/v1.0-internal-preview-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 没有运行时行为变化。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、服务器连接、workspace/目录创建、真实删除、trash
+  move、文件移动、真实 stdout/stderr 采集、artifact 采集、生产审计持久化或 Code
+  Agent 自动应用 patch。
+- v1.0 internal preview 只表示 review-only 单服务器内部预览工作流完成，不表示真实
+  后端执行可用。
+
+验证命令：
+- `git diff --check`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+
+结果：
+- PASS. `git diff --check` 没有输出。
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 32/32 个测试。
+
+Commit：
+- 本次 v1.0 internal preview 收口提交。
+
+下一步：
+- 使用 v1.0 internal preview 文档做内部演示和学习；如果要推进真实执行，必须先完成
+  M11-T1 到 M11-T7 的实验室批准、认证授权、workspace 生命周期、提交/状态/取消、
+  日志和 artifact 收集、可视化与生产审计。
+
 ## 2026-06-23: 完成 v0.15 Internal Sanity-Check Runner Gate metadata 实现
 
 范围：
