@@ -19,6 +19,7 @@ Personal prompts should stay in ignored local files such as
 | v0.8 | Server Backend | Add the safety foundation for controlled execution: approved templates, workspaces, lifecycle records, and audit boundaries |
 | v0.9 | Backend Readiness Review | Turn preflight metadata into non-executing review, packet preview, audit preview, and operator checklist flows |
 | v0.10 | Single Server Runner Preparation | Prepare metadata-only single-server profiles, approved templates, and dry-run review packets before any real server connection |
+| v0.11 | Safe Operations Policy | Plan internal lab roles, safe operation allowlists, and deletion dry-run review packets before any destructive operation exists |
 | v1.0 | Lab-Usable Platform | New lab members can learn, plan, run, monitor, and analyze real research experiments safely |
 
 ## v0.2: Lab Agent MVP
@@ -407,9 +408,47 @@ Not included:
 
 Next target after v0.10:
 
-- Consider a fake lifecycle path for single-server review records that still
-  does not connect to a server, read credentials, create workspace directories,
-  or execute commands.
+- Start v0.11 safe operations so internal lab roles and dangerous operation
+  boundaries are defined before fake lifecycle or real backend work.
+
+## v0.11: Safe Operations Policy
+
+Status: Started on 2026-06-23 with design, implementation plan, next-session
+prompt, and learning summary. No runtime implementation is enabled yet.
+
+Purpose:
+
+- Match the internal lab deployment model without building a complex public
+  multi-tenant platform.
+- Keep roles simple: `lab_root`, `lab_user`, and `readonly`.
+- Prevent dangerous tool behavior, especially accidental deletion of code,
+  environments, datasets, credentials, or other users' results.
+
+Must have:
+
+- `LabAccountRole` metadata for simple internal roles.
+- `SafeOperationType` metadata for read, review, approved-template dry-run, and
+  delete-preview operations.
+- `SafeOperationPolicy` validation so role simplicity does not become
+  unrestricted execution.
+- `DeleteReviewRequest` and `DeleteReviewPacket` metadata for deletion preview
+  only.
+- Tests proving real deletion remains disabled even for `lab_root`.
+
+Not included:
+
+- Real deletion.
+- Trash move.
+- Filesystem remove.
+- Shell execution.
+- SSH, Slurm, PBS, local wrapper, or remote server connection.
+- Credential loading.
+- Workspace creation or cleanup.
+
+Next target after the v0.11 plan:
+
+- Implement the safe operation metadata, validation helpers, delete dry-run
+  review packet renderer, and tests.
 
 ## v1.0: Lab-Usable Platform
 

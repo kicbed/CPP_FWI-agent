@@ -57,6 +57,9 @@ Version status:
 - M11-S1 单服务器账号接入准备第一批实现已在 2026-06-23 完成。当前范围
   只到 metadata/profile/template 和 dry-run review packet；没有真实命令执行、
   凭据读取、SSH、Slurm/PBS 或服务器连接。
+- v0.11 实验室内部安全操作策略设计和实现计划已在 2026-06-23 创建。它把下一步
+  收敛为 lab_root/lab_user/readonly、safe operation policy 和删除 dry-run review
+  packet，不实现真实删除。
 
 ## Milestone 0: Baseline And Project Story
 
@@ -321,6 +324,16 @@ Tasks:
     不创建 workspace。
   - [x] 新增 `docs/upgrade/test-report-v0.10.md` 和
     `docs/upgrade/learning-summary-v0.10.md`。
+- [~] M11-S2: 实验室内部安全操作策略，作为真实运行前的防误伤边界。
+  - [x] 新增设计文档、实现计划、新窗口提示词和学习总结：
+    `docs/upgrade/safe-operations-v0.11.md`、
+    `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md`、
+    `docs/upgrade/next-session-safe-operations-v0.11.md`、
+    `docs/upgrade/learning-summary-v0.11-safe-operations.md`。
+  - [ ] 实现 `LabAccountRole`、`SafeOperationType`、`SafeOperationRequest`
+    和 `SafeOperationPolicy`。
+  - [ ] 实现删除 dry-run review request/packet 校验和 renderer。
+  - [ ] 测试证明 root 角色也不能绕过 dry-run、路径保护和删除确认。
 - [ ] M11-T2: Add authentication and access control implementation.
 - [ ] M11-T3: Add job workspace creation and cleanup.
 - [ ] M11-T4: Add job submission, status polling, and cancellation.

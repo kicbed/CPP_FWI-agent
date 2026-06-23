@@ -16,6 +16,53 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 新增 v0.11 安全操作策略计划
+
+范围：
+- 新增 `docs/upgrade/safe-operations-v0.11.md`，定义实验室内部账号场景下的
+  safe operation policy 和删除 dry-run review packet 边界。
+- 新增 `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md`，规划后续
+  `LabAccountRole`、`SafeOperationType`、`SafeOperationRequest`、
+  `SafeOperationPolicy`、`DeleteReviewRequest` 和 `DeleteReviewPacket`。
+- 新增 `docs/upgrade/next-session-safe-operations-v0.11.md`，保存新窗口可直接复制的
+  完整提示词。
+- 新增 `docs/upgrade/learning-summary-v0.11-safe-operations.md`，说明为什么实验室内部
+  工具仍然需要防误删策略。
+- 更新升级指南、里程碑、路线图和 career notes。
+
+改动文件：
+- `docs/upgrade/safe-operations-v0.11.md`
+- `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md`
+- `docs/upgrade/next-session-safe-operations-v0.11.md`
+- `docs/upgrade/learning-summary-v0.11-safe-operations.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 没有运行时行为变化。
+- 没有新增真实删除、trash move、filesystem remove、shell 执行、CUDA/MPI、SSH、
+  Slurm/PBS、服务器连接、凭据读取、workspace 创建或 Code Agent 自动应用 patch。
+
+验证命令：
+- `git diff --check`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+
+结果：
+- PASS. `git diff --check` 没有输出。
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 27/27 个测试。
+
+Commit：
+- 本次 v0.11 安全操作策略计划提交。
+
+下一步：
+- 按 `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md` 实现安全操作
+  metadata、validation 和删除 dry-run review packet，仍不执行真实删除。
+
 ## 2026-06-23: 完成 v0.10 单服务器账号 metadata 实现
 
 范围：

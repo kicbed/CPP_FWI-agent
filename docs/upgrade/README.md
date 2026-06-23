@@ -147,6 +147,17 @@ v0.9 详细文档：
 - 不执行真实命令，不读取真实凭据，不连接服务器，不创建 workspace，也不改变
   运行时后端守卫。
 
+`v0.11 实验室内部安全操作策略` 已在 2026-06-23 创建设计、计划和学习文档：
+
+- `docs/upgrade/safe-operations-v0.11.md`
+- `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md`
+- `docs/upgrade/next-session-safe-operations-v0.11.md`
+- `docs/upgrade/learning-summary-v0.11-safe-operations.md`
+- 范围是 lab_root/lab_user/readonly 角色、safe operation policy 和删除 dry-run
+  review packet。
+- 第一批实现计划仍不做真实删除、不移动 trash、不读取凭据、不连接服务器、不创建
+  workspace、不执行 shell。
+
 真实 CUDA/MPI、Slurm、PBS、SSH 或实验室服务器执行仍保留到后续后端里程碑；
 只有产品和最小安全边界稳定后再启用。
 
@@ -273,12 +284,16 @@ Active plan:
 - `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md` (complete)
 - `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`
   (active for non-executing single-server metadata preparation)
+- `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md`
+  (active for safe operation policy and delete dry-run review packet planning)
 
 Current version state:
 
 - v0.9 Backend Readiness Review is complete.
 - v0.10 Single Server Runner Preparation has completed the metadata/profile/
   template and dry-run review packet implementation batch.
+- v0.11 Safe Operations has design, implementation plan, next-session prompt,
+  and learning documentation, but no runtime implementation yet.
 - v1.0 should not start as implementation until M11 controlled real backend
   integration has a lab-approved backend, credentials policy, workspace root,
   authorization policy, audit retention, quota/operator rules, operator
