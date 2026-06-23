@@ -71,6 +71,9 @@ Current status:
   回滚和实现顺序信息。
 - 新增单服务器账号下一窗口计划，把当前实验室初步阶段收敛为一个服务器账号、
   固定 workspace、固定 approved template、dry-run review packet 和 fake lifecycle。
+- 新增 v0.10 单服务器账号接入准备设计和实现计划，把下一步落到
+  `SingleServerProfile`、`SingleServerJobTemplate`、`SingleServerReviewRequest`
+  和 dry-run review packet，仍不连接服务器、不读取凭据、不执行命令。
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -181,6 +184,9 @@ Current M11 decision package state:
   下一窗口计划。后续不需要一开始实现复杂多租户平台，而是先做
   `SingleServerProfile`、`SingleServerJobTemplate`、dry-run review packet
   和 fake lifecycle。
+- v0.10 设计已经把第一批单服务器准备工作收敛为 metadata-only 模型和
+  review packet renderer。真实服务器连接、凭据加载、workspace 创建和 fake
+  lifecycle 都不在本次文档任务中。
 
 ## Technical Highlights
 
@@ -242,6 +248,9 @@ Current M11 decision package state:
   或审计持久化开始前必须具备的控制条件。
 - 新增单服务器账号初步接入计划，为下一阶段 profile/template/review packet
   和 fake lifecycle 设计提供中文交接说明。
+- 新增 v0.10 单服务器账号准备设计和实现计划，明确 profile/template/review
+  request/review packet 的数据边界，并把真实执行、凭据读取和服务器连接排除在
+  第一批实现之外。
 - Property and integration tests with GoogleTest and RapidCheck.
 - Web UI with HTTP and gRPC bridge modes.
 
@@ -571,3 +580,14 @@ Add one short entry whenever a meaningful technical change lands.
   backend integration has lab approval, auth, workspace lifecycle, submission
   controls, artifact collection, visualization, audit logging, and passing
   tests.
+
+### 2026-06-23: v0.10 Single Server Preparation Design
+
+- Added a Chinese v0.10 design and implementation plan for metadata-only
+  single-server account preparation.
+- Scoped the next implementation to `SingleServerProfile`,
+  `SingleServerJobTemplate`, `SingleServerReviewRequest`, and dry-run review
+  packet rendering.
+- Preserved the safety boundary: no real CUDA/MPI, SSH, Slurm/PBS, server
+  connection, credential loading, workspace creation, arbitrary shell
+  execution, or automatic Code Agent patch application.

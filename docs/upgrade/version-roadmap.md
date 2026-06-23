@@ -18,6 +18,7 @@ Personal prompts should stay in ignored local files such as
 | v0.7 | JobBackend Reservation | Reserve backend interface and reject all non-dry-run execution choices |
 | v0.8 | Server Backend | Add the safety foundation for controlled execution: approved templates, workspaces, lifecycle records, and audit boundaries |
 | v0.9 | Backend Readiness Review | Turn preflight metadata into non-executing review, packet preview, audit preview, and operator checklist flows |
+| v0.10 | Single Server Runner Preparation | Prepare metadata-only single-server profiles, approved templates, and dry-run review packets before any real server connection |
 | v1.0 | Lab-Usable Platform | New lab members can learn, plan, run, monitor, and analyze real research experiments safely |
 
 ## v0.2: Lab Agent MVP
@@ -368,6 +369,49 @@ v1.0 entry gate:
   提交/状态/取消、日志和 artifact 收集、可视化以及审计日志。
 - 在这些控制存在之前，项目可以继续做纯文档或非执行评审工作，但不能声称已经具备
   v1.0 实验室可用的真实执行能力。
+
+## v0.10: Single Server Runner Preparation
+
+Status: Started on 2026-06-23 with
+`docs/upgrade/single-server-backend-v0.10.md` and
+`docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`.
+No runtime implementation is enabled yet.
+
+Purpose:
+
+- Match the current lab reality: one server account used by the researcher or a
+  small group before a full multi-user platform exists.
+- Prepare a small, testable metadata boundary for profile, approved template,
+  structured review request, and dry-run review packet.
+
+Must have:
+
+- `SingleServerProfile` metadata that stores only account, credential, and
+  workspace references, not secrets or real credentials.
+- `SingleServerJobTemplate` metadata for fixed approved entries and allowed
+  structured parameters.
+- Validation that rejects empty credential references, inline secret-looking
+  values, unknown templates, profile/template mismatch, unapproved parameters,
+  and `dry_run == false`.
+- A dry-run review packet renderer that says execution, credential loading,
+  server connection, and workspace creation are disabled.
+
+Not included:
+
+- Real CUDA/MPI execution.
+- SSH, Slurm, PBS, local wrapper, or remote server connection.
+- Credential loading or real server account handling.
+- Workspace creation, deletion, cleanup, or artifact collection.
+- Production audit persistence.
+- Arbitrary shell execution from user input.
+- Automatic Code Agent patch application.
+
+Next target after the design plan:
+
+- Implement the metadata models and review packet renderer with GoogleTest
+  coverage.
+- Only after that, consider a fake lifecycle path that still does not connect
+  to a server.
 
 ## v1.0: Lab-Usable Platform
 

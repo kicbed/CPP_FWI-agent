@@ -135,6 +135,15 @@ v0.9 详细文档：
 单服务器账号、固定 workspace、固定 approved template、dry-run review packet
 和 fake lifecycle，不要求一开始做复杂多用户平台。
 
+`M11-S1 单服务器账号接入准备设计` 已在 2026-06-23 创建：
+
+- `docs/upgrade/single-server-backend-v0.10.md`
+- `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`
+- 范围只到 metadata/profile/template 和 dry-run review packet。
+- 不执行真实命令，不读取真实凭据，不连接服务器，也不改变运行时后端守卫。
+- 下一步是按计划实现 `SingleServerProfile`、`SingleServerJobTemplate`、
+  `SingleServerReviewRequest` 和 review packet renderer。
+
 真实 CUDA/MPI、Slurm、PBS、SSH 或实验室服务器执行仍保留到后续后端里程碑；
 只有产品和最小安全边界稳定后再启用。
 
@@ -259,18 +268,22 @@ Historical starting plan:
 Active plan:
 
 - `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md` (complete)
+- `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`
+  (active for non-executing single-server metadata preparation)
 
 Current version state:
 
 - v0.9 Backend Readiness Review is complete.
+- v0.10 Single Server Runner Preparation has a design and implementation plan,
+  but no runtime implementation yet.
 - v1.0 should not start as implementation until M11 controlled real backend
   integration has a lab-approved backend, credentials policy, workspace root,
   authorization policy, audit retention, quota/operator rules, operator
   contact, and passing tests for auth, workspace lifecycle, submission/status,
   artifact collection, visualization, and audit logging.
 
-Next session should either prepare the M11 lab decision package as docs only or
-continue non-executing review polish. Do not connect real execution by default.
+Next session should continue the v0.10 single-server metadata plan or other
+non-executing review polish. Do not connect real execution by default.
 
 When a milestone becomes too large, create a new plan in:
 

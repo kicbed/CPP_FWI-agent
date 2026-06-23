@@ -16,6 +16,49 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 新增单服务器账号接入准备设计和实现计划
+
+范围：
+- 新增 `docs/upgrade/single-server-backend-v0.10.md`，把当前实验室场景收敛为
+  metadata-only 的单服务器账号准备阶段。
+- 新增 `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`，
+  规划后续 `SingleServerProfile`、`SingleServerJobTemplate`、
+  `SingleServerReviewRequest` 和 dry-run review packet renderer。
+- 更新升级指南、里程碑、版本路线图和 career notes，把 v0.10 标记为已完成
+  设计/计划、尚未实现运行时代码。
+
+改动文件：
+- `docs/upgrade/single-server-backend-v0.10.md`
+- `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 没有运行时行为变化。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、服务器连接、workspace 创建、生产审计存储或
+  Code Agent 自动应用 patch。
+
+验证命令：
+- `git diff --check`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+
+结果：
+- PASS. `git diff --check` 没有输出。
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 26/26 个测试。
+
+Commit：
+- 本次 v0.10 单服务器账号接入准备设计和实现计划提交。
+
+下一步：
+- 按 `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md` 的
+  Task 2 实现 `SingleServerProfile` metadata 和最小校验测试，仍不连接真实服务器。
+
 ## 2026-06-23: 中文化 M11/v0.9 报告并新增单服务器交接计划
 
 范围：
