@@ -269,6 +269,18 @@ target_include_directories(test_approved_template_run_packet PRIVATE
 )
 add_test(NAME ApprovedTemplateRunPacketTest COMMAND test_approved_template_run_packet)
 
+add_executable(test_internal_sanity_runner test_internal_sanity_runner.cpp)
+target_link_libraries(test_internal_sanity_runner
+    agent_rpc_research
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_internal_sanity_runner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../research/include
+)
+add_test(NAME InternalSanityRunnerTest COMMAND test_internal_sanity_runner)
+
 add_test(
     NAME WebBrandingTest
     COMMAND ${CMAKE_COMMAND}

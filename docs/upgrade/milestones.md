@@ -69,6 +69,10 @@ Version status:
   approved template run packet metadata、批准参数筛选、required parameter 校验、
   自由 command 拒绝和 non-executing renderer；不执行命令、不读取凭据、不连接服务器、
   不创建 workspace。
+- v0.15 Internal Sanity-Check Runner Gate 第一批实现已在 2026-06-23 完成。它新增
+  sanity runner definition/request/review packet metadata、固定 allowlisted runner id
+  validation、timeout/capture/artifact/audit review plan 和危险请求拒绝；不执行命令、
+  不读取凭据、不删除文件、不连接服务器、不接 SSH/Slurm/PBS、不创建 workspace。
 - v1.0 internal preview 分步路线已在 2026-06-23 创建。公开路线图保存在
   `docs/upgrade/v1.0-internal-preview-roadmap.md`；新窗口提示词和详细 agent
   执行计划保存在本地忽略文件中，不提交到 GitHub。

@@ -622,7 +622,9 @@ Next target after v0.14:
 
 ## v0.15: Internal Sanity-Check Runner Gate
 
-Status: Planned on 2026-06-23 as part of the v1.0 internal preview roadmap.
+Status: Completed on 2026-06-23 for the metadata-only runner gate and review
+packet scope, with `docs/upgrade/test-report-v0.15.md` and
+`docs/upgrade/learning-summary-v0.15.md`. No real execution is enabled.
 
 Purpose:
 
@@ -647,6 +649,23 @@ Not included in the first v0.15 batch:
 - SSH, Slurm, PBS, or remote execution.
 - General shell execution.
 - Destructive file operations.
+
+Completed scope:
+
+- Added `internal_sanity_runner` C++ metadata for `SanityRunnerDefinition`,
+  `SanityRunnerRequest`, and `SanityRunnerReviewPacket`.
+- Added allowlisted runner id validation and review packet rendering for fixed
+  entrypoint label, timeout, stdout/stderr capture plan, artifact path plan,
+  audit event type, and explicit non-execution flags.
+- Added rejection coverage for unknown runner id, user free-form command,
+  deletion request, credential read request, SSH, Slurm, PBS, remote server
+  access, artifact path escape, traversal, and missing timeout/capture plan.
+
+Next target after v0.15:
+
+- Close out v1.0 internal preview with audit, user guide, operator runbook,
+  demo script, and consolidated test report while keeping real execution behind
+  a later explicit approval and implementation task.
 
 ## v1.0: Lab-Usable Platform
 

@@ -7,6 +7,7 @@ set(RESEARCH_SOURCES
     src/algorithm_registry.cpp
     src/dry_run_backend.cpp
     src/experiment_spec.cpp
+    src/internal_sanity_runner.cpp
     src/job_backend.cpp
     src/job_spec.cpp
     src/lab_code_adapter.cpp

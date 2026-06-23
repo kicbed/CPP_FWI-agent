@@ -16,6 +16,77 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 完成 v0.15 Internal Sanity-Check Runner Gate metadata 实现
+
+范围：
+- 新增 `internal_sanity_runner` C++ 模块，包含 `SanityRunnerDefinition`、
+  `SanityRunnerRequest` 和 `SanityRunnerReviewPacket` metadata。
+- 新增固定 allowlisted runner id validation、timeout/capture metadata validation、
+  workspace-root artifact path preview validation、metadata-only audit event type 和
+  review packet renderer。
+- 新增危险请求拒绝：用户自由 command、删除请求、凭据读取、SSH、Slurm、PBS 和
+  remote server access 都会进入 validation error。
+- 新增 `InternalSanityRunnerTest`，覆盖 allowlisted runner、unknown runner、
+  危险请求拒绝、renderer 不输出自由 command、artifact path 逃逸/traversal 和
+  缺失 timeout/stdout/stderr capture plan。
+- 新增 v0.15 execution gate 设计文档、测试报告和中文学习总结，并更新升级指南、
+  里程碑、路线图、v1.0 internal preview roadmap 和 career notes。
+
+改动文件：
+- `research/include/agent_rpc/research/internal_sanity_runner.h`
+- `research/src/internal_sanity_runner.cpp`
+- `tests/test_internal_sanity_runner.cpp`
+- `research/CMakeLists.txt`
+- `tests/CMakeLists.txt`
+- `docs/upgrade/internal-sanity-runner-execution-gate-v0.15.md`
+- `docs/upgrade/test-report-v0.15.md`
+- `docs/upgrade/learning-summary-v0.15.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/v1.0-internal-preview-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+
+行为变化：
+- 新增 C++ metadata、validation helper 和非执行 sanity runner review packet renderer。
+- runner 只能通过固定 allowlisted runner id 进入 review packet；unknown runner id 被拒绝。
+- packet 明确展示 `execution: disabled`、`command_executed: false`、
+  `free_form_command_accepted: false`、`deletion_executed: false`、
+  `credentials_loaded: false`、`server_connected: false`、`ssh_connected: false`、
+  `slurm_submitted: false`、`pbs_submitted: false` 和 `workspace_created: false`。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、本地 wrapper 执行、远程执行、
+  任意 shell 执行、凭据读取、服务器连接、workspace/目录创建、目录删除、文件移动、
+  真实 stdout/stderr 采集、artifact 采集、生产审计存储或 Code Agent 自动应用 patch。
+
+验证命令：
+- `cmake --build build -j2`
+- `ctest --test-dir build -R InternalSanityRunnerTest --output-on-failure`
+- `ctest --test-dir build --output-on-failure`
+- `git diff --check`
+
+TDD 证据：
+- 基线：实现前 `cmake --build build -j2` 退出码为 0，全量
+  `ctest --test-dir build --output-on-failure` 通过 31/31 个测试。
+- RED：新增 `InternalSanityRunnerTest` target 后，构建失败于缺少
+  `agent_rpc/research/internal_sanity_runner.h`。
+- GREEN：新增 internal sanity runner header/source、validation、renderer 和 CMake 接入后，
+  构建和聚焦测试通过。
+
+结果：
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. `ctest --test-dir build -R InternalSanityRunnerTest --output-on-failure`
+  通过 1/1 个测试目标。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 32/32 个测试。
+- PASS. `git diff --check` 没有输出。
+
+Commit：
+- 本次 v0.15 Internal Sanity-Check Runner Gate metadata 实现提交。
+
+下一步：
+- 开始 v1.0 internal preview closeout，汇总 v0.11-v0.15 的安全边界和测试结果，
+  编写内部用户手册、operator runbook、演示脚本和总测试报告；真实执行仍需后续单独批准。
+
 ## 2026-06-23: 完成 v0.14 Approved Template Run Packet metadata 实现
 
 范围：

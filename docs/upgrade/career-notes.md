@@ -733,3 +733,16 @@ Add one short entry whenever a meaningful technical change lands.
 - Preserved the safety boundary: no command execution, credential loading,
   server connection, workspace creation, directory creation, deletion, or file
   movement.
+
+### 2026-06-23: v0.15 Internal Sanity Runner Gate Completion
+
+- Added `internal_sanity_runner` C++ metadata for fixed allowlisted runner
+  definitions, runner requests, and non-executing review packets.
+- Added `InternalSanityRunnerTest` coverage for allowlisted runner review,
+  unknown runner rejection, free-form command rejection, deletion rejection,
+  credential-read rejection, SSH/Slurm/PBS/remote access rejection, artifact path
+  root checks, traversal checks, and required timeout/stdout/stderr capture
+  metadata.
+- Preserved the safety boundary: no command execution, credential loading,
+  deletion, SSH, Slurm, PBS, remote server access, workspace creation, real
+  stdout/stderr capture, or artifact collection.
