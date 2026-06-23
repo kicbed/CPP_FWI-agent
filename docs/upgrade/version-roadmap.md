@@ -20,7 +20,11 @@ Personal prompts should stay in ignored local files such as
 | v0.9 | Backend Readiness Review | Turn preflight metadata into non-executing review, packet preview, audit preview, and operator checklist flows |
 | v0.10 | Single Server Runner Preparation | Prepare metadata-only single-server profiles, approved templates, and dry-run review packets before any real server connection |
 | v0.11 | Safe Operations Policy | Plan internal lab roles, safe operation allowlists, and deletion dry-run review packets before any destructive operation exists |
-| v1.0 | Lab-Usable Platform | New lab members can learn, plan, run, monitor, and analyze real research experiments safely |
+| v0.12 | Fake Lifecycle | Simulate single-server job lifecycle states without connecting to a server |
+| v0.13 | Workspace Planner | Preview workspace, log, and artifact paths with path-safety validation |
+| v0.14 | Approved Template Run Packet | Render approved-template run packets from structured parameters without executing commands |
+| v0.15 | Internal Sanity-Check Runner Gate | Define the fixed-runner gate before any limited execution is enabled |
+| v1.0 | Internal Preview | Let lab members try the single-server workflow with review packets, lifecycle, docs, and safety gates |
 
 ## v0.2: Lab Agent MVP
 
@@ -356,20 +360,20 @@ Completed scope:
 
 v1.0 entry gate:
 
-- v1.0 implementation should start only after M11-T1 has a lab decision package
-  with selected backend, credential policy, workspace root, authorization
-  policy, audit retention, quota/operator rules, and operator contact.
+- v1.0 internal preview should start only after the v0.11-v0.15 single-server
+  safety gates are implemented, documented, and tested.
 - M11 实验室后端决策包模板位于
   `docs/upgrade/m11-lab-backend-decision-package.md`，但它不是批准记录，
   也不会选择或启用真实后端。
 - 中文实验室流程指南位于 `docs/upgrade/m11-lab-process-guide.md`，说明
   M11-T1 完成前实验室必须确认哪些信息。
-- 单服务器账号下一窗口计划位于 `docs/upgrade/next-session-single-server-plan.md`，
-  适用于当前“一个服务器账号、自己或小组内部先跑”的初步阶段。
+- 单服务器账号路线位于 `docs/upgrade/single-server-backend-v0.10.md` 和
+  `docs/upgrade/v1.0-internal-preview-roadmap.md`，适用于当前“一个服务器账号、
+  自己或小组内部先跑”的初步阶段。
 - 随后 M11-T2 到 M11-T7 必须实现并测试身份认证/访问控制、workspace 生命周期、
   提交/状态/取消、日志和 artifact 收集、可视化以及审计日志。
-- 在这些控制存在之前，项目可以继续做纯文档或非执行评审工作，但不能声称已经具备
-  v1.0 实验室可用的真实执行能力。
+- 在这些控制存在之前，项目可以做内部预览和非执行评审工作，但不能声称已经具备
+  完整真实后端执行能力。
 
 ## v0.10: Single Server Runner Preparation
 
@@ -413,8 +417,9 @@ Next target after v0.10:
 
 ## v0.11: Safe Operations Policy
 
-Status: Started on 2026-06-23 with design, implementation plan, next-session
-prompt, and learning summary. No runtime implementation is enabled yet.
+Status: Started on 2026-06-23 with design and learning summary. No runtime
+implementation is enabled yet. Detailed agent plans and copy-paste prompts are
+kept in local ignored files, not in Git.
 
 Purpose:
 
@@ -450,7 +455,130 @@ Next target after the v0.11 plan:
 - Implement the safe operation metadata, validation helpers, delete dry-run
   review packet renderer, and tests.
 
+## v0.12: Fake Lifecycle
+
+Status: Planned on 2026-06-23 as part of the v1.0 internal preview roadmap.
+
+Purpose:
+
+- Give the single-server account workflow visible job states before any real
+  server connection exists.
+- Let users and operators review lifecycle behavior without submitting jobs.
+
+Must have:
+
+- Lifecycle metadata states for requested, reviewed, approved, rejected,
+  queued, running, succeeded, failed, and cancelled.
+- Validation for allowed state transitions.
+- Review packet rendering that explains current state, next allowed action, and
+  safety blockers.
+- Tests proving state changes stay in memory and do not execute commands.
+
+Not included:
+
+- Real server connection.
+- Workspace creation.
+- CUDA/MPI, SSH, Slurm, PBS, local wrapper, or remote execution.
+- Credential loading.
+- Shell execution.
+
+Next target after v0.12:
+
+- Add workspace planning so lifecycle records can point at safe preview paths.
+
+## v0.13: Workspace Planner
+
+Status: Planned on 2026-06-23 as part of the v1.0 internal preview roadmap.
+
+Purpose:
+
+- Show where a future run would place workspace, logs, and artifacts without
+  creating directories or moving files.
+- Catch path traversal and dangerous root mistakes before any runner exists.
+
+Must have:
+
+- Workspace, run directory, log path, and artifact path preview metadata.
+- Validation that all paths remain under the configured lab workspace root.
+- Rejection for empty roots, path traversal, absolute escape attempts, and
+  protected locations.
+- Tests proving no filesystem creation, deletion, or movement occurs.
+
+Not included:
+
+- Directory creation.
+- Directory deletion.
+- Cleanup jobs.
+- Remote filesystem access.
+
+Next target after v0.13:
+
+- Add approved-template run packet rendering from profile, template,
+  structured parameters, lifecycle, and workspace plan.
+
+## v0.14: Approved Template Run Packet
+
+Status: Planned on 2026-06-23 as part of the v1.0 internal preview roadmap.
+
+Purpose:
+
+- Convert approved templates and structured parameters into a reviewable run
+  packet without executing anything.
+- Keep user intent separate from shell commands.
+
+Must have:
+
+- Run packet metadata for profile id, template id, parameter values, workspace
+  preview, artifact preview, resource limits, and lifecycle id.
+- Validation for required parameters, unknown parameters, template/profile
+  mismatch, and user free-form command rejection.
+- Rendering that explicitly says `command_executed: false`.
+- Tests for valid packets and rejection paths.
+
+Not included:
+
+- Real command execution.
+- User free-form command strings.
+- Credential loading.
+- Server connection.
+
+Next target after v0.14:
+
+- Define the internal sanity-check runner gate before any limited execution is
+  considered.
+
+## v0.15: Internal Sanity-Check Runner Gate
+
+Status: Planned on 2026-06-23 as part of the v1.0 internal preview roadmap.
+
+Purpose:
+
+- Decide the smallest safe shape of future execution before enabling it.
+- Keep the first possible runner fixed, allowlisted, observable, and
+  non-destructive.
+
+Must have:
+
+- Fixed runner id metadata.
+- No user command string.
+- Timeout metadata.
+- stdout/stderr capture plan.
+- Artifact path plan under workspace root.
+- Audit event plan.
+- Tests proving free-form commands, deletion requests, credential reads, SSH,
+  Slurm, PBS, and remote server access remain rejected.
+
+Not included in the first v0.15 batch:
+
+- Real CUDA/MPI.
+- SSH, Slurm, PBS, or remote execution.
+- General shell execution.
+- Destructive file operations.
+
 ## v1.0: Lab-Usable Platform
+
+Status: Long-term product name. The current near-term target is
+`v1.0 internal preview`, not a public release.
 
 Purpose:
 
@@ -460,11 +588,30 @@ Must have:
 
 - Newcomer learning workflow.
 - Experiment planning workflow.
-- Real job submission workflow.
-- Monitoring and result analysis workflow.
+- Internal single-server review workflow.
+- Lifecycle, logs, and artifact preview workflow.
 - Algorithm extension workflow for new lab methods.
 - Reproducible experiment records.
-- Access control and audit logs.
+- Safety gates for roles, workspace paths, approved templates, lifecycle, and
+  audit metadata.
+
+Internal preview scope:
+
+- Use the simple lab account model: `lab_root`, `lab_user`, and `readonly`.
+- Let users choose approved templates and structured parameters.
+- Generate review packets before execution.
+- Show lifecycle and artifact/log preview information.
+- Keep dangerous deletion disabled.
+- Keep real credentials out of the repository.
+- Keep SSH, Slurm, PBS, and general remote execution out of scope until a later
+  lab-approved backend expansion.
+
+Full backend expansion later adds:
+
+- Real job submission workflow.
+- Monitoring and result analysis from collected logs/artifacts.
+- Authentication and access control beyond the simple internal role model.
+- Persistent audit logging.
 
 Product identity:
 
@@ -491,7 +638,12 @@ Use this order:
    hardened, start v0.7.
 7. If v0.7 is complete, start v0.8 with a written safety design and tested
    server-job safety models before enabling controlled execution.
-8. If real execution is stable, harden toward v1.0.
+8. If v0.8 and v0.9 are complete, use v0.10-v0.15 to build the non-executing
+   single-server internal preview path.
+9. If v0.11-v0.15 safety gates are complete and tested, close out v1.0
+   internal preview with user docs, operator docs, demo script, and test report.
+10. If the lab later approves real backend expansion, continue M11-T1 through
+    M11-T7 before enabling SSH, Slurm, PBS, remote execution, or CUDA/MPI jobs.
 
 ## Handoff Rule For New Sessions
 
@@ -502,7 +654,8 @@ At the start of a new upgrade session, read these files:
 - `docs/upgrade/career-notes.md`
 - `docs/upgrade/version-roadmap.md`
 - `docs/upgrade/upgrade-log.md`
-- the active plan in `docs/superpowers/plans/`
+- the active local plan in `docs/superpowers/plans/`, if present in the local
+  ignored workspace
 
 Then continue the first incomplete task for the current version. Validate the
 change, update `upgrade-log.md`, update `career-notes.md` when the change adds

@@ -69,17 +69,20 @@ Current status:
 - 新增中文 M11 实验室后端决策包和流程指南，说明 M11-T1 选择真实后端前
   必须具备的批准、凭据、workspace、授权、配额/operator、审计、artifact、
   回滚和实现顺序信息。
-- 新增单服务器账号下一窗口计划，把当前实验室初步阶段收敛为一个服务器账号、
+- 新增单服务器账号接入学习和设计文档，把当前实验室初步阶段收敛为一个服务器账号、
   固定 workspace、固定 approved template、dry-run review packet 和 fake lifecycle。
 - Includes v0.10 single-server account preparation models and tests for
   `SingleServerProfile`, `SingleServerJobTemplate`, `SingleServerReviewRequest`,
   validation, and dry-run review packet rendering without connecting to a server.
-- 新增 v0.11 实验室内部安全操作策略设计、实现计划、新窗口提示词和学习总结，
+- 新增 v0.11 实验室内部安全操作策略设计和学习总结，
   把下一步收敛为 `lab_root`、`lab_user`、`readonly`、safe operation policy
   和删除 dry-run review packet，仍不实现真实删除。
 - 新增 v0.10 单服务器账号接入准备设计和实现计划，把下一步落到
   `SingleServerProfile`、`SingleServerJobTemplate`、`SingleServerReviewRequest`
   和 dry-run review packet，仍不连接服务器、不读取凭据、不执行命令。
+- 新增 v1.0 internal preview 路线图，把后续工作拆成 safe operations、
+  fake lifecycle、workspace planner、approved template run packet、sanity-check
+  runner gate 和内部预览收口，同时把个人提示词和 agent 执行计划改为本地忽略资料。
 - Includes v0.2 demo and test-report documentation for FWI Q&A, Code Agent
   routing, and dry-run Experiment Planner smoke testing.
 - Real CUDA/MPI or cluster execution is not enabled yet.
@@ -587,7 +590,7 @@ Add one short entry whenever a meaningful technical change lands.
   logs, and workspace/artifact plans.
 - Added v0.9 test report and Chinese learning summary for future study and
   interview preparation.
-- Clarified that v1.0 implementation should wait until M11 controlled real
+- Clarified that full real backend expansion should wait until M11 controlled
   backend integration has lab approval, auth, workspace lifecycle, submission
   controls, artifact collection, visualization, audit logging, and passing
   tests.
@@ -618,10 +621,20 @@ Add one short entry whenever a meaningful technical change lands.
 
 ### 2026-06-23: v0.11 Safe Operations Planning
 
-- Added a Chinese v0.11 design, implementation plan, next-session prompt, and
-  learning summary for internal lab safe operations.
+- Added a Chinese v0.11 design and learning summary for internal lab safe
+  operations.
 - Scoped the next implementation to simple roles, operation allowlists, and
   deletion dry-run review packets.
 - Preserved the safety boundary: no real deletion, trash move, filesystem
   remove, shell execution, credential loading, server connection, or workspace
   creation.
+
+### 2026-06-23: v1.0 Internal Preview Roadmap
+
+- Added a public roadmap for the internal lab preview path from v0.11 to v1.0.
+- Split the remaining work into safe operations, fake lifecycle, workspace
+  planning, approved-template run packets, a fixed sanity-check runner gate, and
+  v1.0 closeout docs.
+- Moved copy-paste prompts and detailed agent execution plans to local ignored
+  files so the GitHub-facing project history stays focused on architecture,
+  tests, learning reports, and product decisions.

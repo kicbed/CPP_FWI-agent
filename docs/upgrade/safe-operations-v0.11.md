@@ -141,15 +141,16 @@ v0.11 第一批只做“删除 dry-run review packet”，不做真实删除。
 - 缺少确认短语时 review packet 不可执行。
 - renderer 明确 `deletion_executed: false`。
 
-## 6. 新窗口实现入口
+## 6. 实现入口
 
-实现计划：
+公开路线：
 
-- `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md`
+- `docs/upgrade/v1.0-internal-preview-roadmap.md`
 
-下一窗口提示词：
+本地实现计划和新窗口复制提示词：
 
-- `docs/upgrade/next-session-safe-operations-v0.11.md`
+- 保存在 `docs/superpowers/plans/*.md` 和 `docs/upgrade/local-*.md`。
+- 这些文件被 git 忽略，不提交到 GitHub。
 
 学习总结：
 

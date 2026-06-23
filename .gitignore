@@ -59,3 +59,5 @@ Thumbs.db
 # ==================== 本地升级提示词 ====================
 docs/upgrade/*prompts*.md
 docs/upgrade/local-*.md
+docs/upgrade/next-session*.md
+docs/superpowers/plans/*.md

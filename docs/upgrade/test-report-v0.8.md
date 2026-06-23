@@ -30,7 +30,8 @@ The project still does not submit, run, cancel, poll, or monitor real jobs.
 - `tests/test_server_job.cpp`
 - `tests/CMakeLists.txt`
 - `docs/upgrade/server-backend-safety-v0.8.md`
-- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`
+- Historical local agent execution plan for v0.8. Local plans are no longer
+  tracked in git.
 - `docs/upgrade/README.md`
 - `docs/upgrade/milestones.md`
 - `docs/upgrade/version-roadmap.md`
@@ -237,9 +238,9 @@ lifecycle event 测试保护未来审计链路。
 前应该先想清楚什么”。它覆盖威胁模型、非目标、API 草图、数据流、模板边界、
 workspace 边界和实现门禁。
 
-`docs/superpowers/plans/2026-06-22-server-backend-v0.8.md` 是执行计划。它展示了
-如何把一个有风险的大功能拆成多个可 TDD 的小任务：先模型、再模板、再工作区、
-再生命周期、最后报告。
+v0.8 的历史本地执行计划展示了如何把一个有风险的大功能拆成多个可 TDD 的小任务：
+先模型、再模板、再工作区、再生命周期、最后报告。此类本地执行计划现在不再纳入
+Git 跟踪。
 
 ### 4. 安全或产品边界
 

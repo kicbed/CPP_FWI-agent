@@ -124,21 +124,20 @@ v0.9 详细文档：
 
 - `docs/upgrade/m11-lab-backend-decision-package.md`
 - `docs/upgrade/m11-lab-process-guide.md`
-- `docs/upgrade/next-session-single-server-plan.md`
 - 这些文档只是评审材料，不选择或启用真实后端。
 - M11-T1 仍未完成；必须等实验室提供具体后端选择、凭据策略、
   workspace root、授权策略、审计保留、配额/operator 规则和 operator
   联系人后才能继续真实后端实现。
 
 如果当前实验室只是一个服务器账号、自己或小组内部先跑实验，请优先阅读
-`docs/upgrade/next-session-single-server-plan.md`。它把下一阶段收敛为
-单服务器账号、固定 workspace、固定 approved template、dry-run review packet
-和 fake lifecycle，不要求一开始做复杂多用户平台。
+`docs/upgrade/single-server-backend-v0.10.md` 和
+`docs/upgrade/v1.0-internal-preview-roadmap.md`。它们把下一阶段收敛为
+单服务器账号、固定 workspace、固定 approved template、dry-run review packet、
+fake lifecycle 和内部预览收口，不要求一开始做复杂多用户平台。
 
 `v0.10 单服务器账号接入准备` 已在 2026-06-23 完成第一批实现：
 
 - `docs/upgrade/single-server-backend-v0.10.md`
-- `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`
 - `docs/upgrade/test-report-v0.10.md`
 - `docs/upgrade/learning-summary-v0.10.md`
 - 新增 `SingleServerProfile`、`SingleServerJobTemplate` 和
@@ -150,13 +149,19 @@ v0.9 详细文档：
 `v0.11 实验室内部安全操作策略` 已在 2026-06-23 创建设计、计划和学习文档：
 
 - `docs/upgrade/safe-operations-v0.11.md`
-- `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md`
-- `docs/upgrade/next-session-safe-operations-v0.11.md`
 - `docs/upgrade/learning-summary-v0.11-safe-operations.md`
 - 范围是 lab_root/lab_user/readonly 角色、safe operation policy 和删除 dry-run
   review packet。
 - 第一批实现计划仍不做真实删除、不移动 trash、不读取凭据、不连接服务器、不创建
   workspace、不执行 shell。
+
+`v1.0 internal preview` 分步路线已在 2026-06-23 创建：
+
+- `docs/upgrade/v1.0-internal-preview-roadmap.md`
+- 路线把 v0.11 到 v1.0 拆成 safe operations、fake lifecycle、workspace
+  planner、approved template run packet、sanity-check runner gate 和 v1.0
+  closeout。
+- 新窗口复制提示词和详细 agent 执行计划保存在本地忽略文件中，不再提交到 GitHub。
 
 真实 CUDA/MPI、Slurm、PBS、SSH 或实验室服务器执行仍保留到后续后端里程碑；
 只有产品和最小安全边界稳定后再启用。
@@ -166,14 +171,16 @@ v0.9 详细文档：
 Every new upgrade conversation should follow this sequence.
 
 1. Keep any copy-paste prompts in a local ignored file, for example
-   `docs/upgrade/local-prompts.md`.
+   `docs/upgrade/local-prompts.md` or
+   `docs/upgrade/local-v1.0-internal-preview-prompts.md`.
 2. Ask the agent to read these files first:
    - `docs/upgrade/README.md`
    - `docs/upgrade/milestones.md`
    - `docs/upgrade/career-notes.md`
    - `docs/upgrade/version-roadmap.md`
    - `docs/upgrade/upgrade-log.md`
-   - the active implementation plan under `docs/superpowers/plans/`
+   - the active local implementation plan under `docs/superpowers/plans/`, if
+     a local ignored plan exists for this workspace
 3. The agent checks `git status --short`.
 4. The agent chooses the next unchecked task from the active plan.
 5. The agent implements only that task or one tightly related batch.
@@ -274,34 +281,29 @@ These rules stay in effect until the real server backend milestone.
 
 ## Active Plans
 
-Historical starting plan:
+Detailed agent execution plans and copy-paste prompts are local workspace
+artifacts. They live under `docs/superpowers/plans/*.md` or
+`docs/upgrade/local-*.md`, and are ignored by git so they do not get uploaded
+to GitHub.
 
-- `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md`
-- `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`
+Tracked planning source of truth:
 
-Active plan:
-
-- `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md` (complete)
-- `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`
-  (active for non-executing single-server metadata preparation)
-- `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md`
-  (active for safe operation policy and delete dry-run review packet planning)
+- `docs/upgrade/v1.0-internal-preview-roadmap.md`
+- `docs/upgrade/safe-operations-v0.11.md`
+- `docs/upgrade/single-server-backend-v0.10.md`
 
 Current version state:
 
 - v0.9 Backend Readiness Review is complete.
 - v0.10 Single Server Runner Preparation has completed the metadata/profile/
   template and dry-run review packet implementation batch.
-- v0.11 Safe Operations has design, implementation plan, next-session prompt,
-  and learning documentation, but no runtime implementation yet.
-- v1.0 should not start as implementation until M11 controlled real backend
-  integration has a lab-approved backend, credentials policy, workspace root,
-  authorization policy, audit retention, quota/operator rules, operator
-  contact, and passing tests for auth, workspace lifecycle, submission/status,
-  artifact collection, visualization, and audit logging.
+- v0.11 Safe Operations has design and learning documentation, but no runtime
+  implementation yet.
+- v1.0 internal preview should start only after the roadmap's v0.11-v0.15
+  safety gates are implemented and tested.
 
-Next session should continue the v0.10 single-server metadata plan or other
-non-executing review polish. Do not connect real execution by default.
+Next session should continue v0.11 Safe Operations. Do not connect real
+execution by default.
 
 When a milestone becomes too large, create a new plan in:
 
@@ -309,7 +311,8 @@ When a milestone becomes too large, create a new plan in:
 docs/superpowers/plans/YYYY-MM-DD-<feature-name>.md
 ```
 
-Each plan should produce working, testable software on its own.
+Each local plan should produce working, testable software on its own. These
+local plans are intentionally ignored by git.
 
 ## Local Prompts
 

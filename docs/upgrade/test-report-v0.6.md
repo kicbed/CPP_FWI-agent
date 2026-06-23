@@ -28,7 +28,8 @@ patches automatically.
 - `docs/upgrade/version-roadmap.md`
 - `docs/upgrade/career-notes.md`
 - `docs/upgrade/upgrade-log.md`
-- `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`
+- Historical local agent execution plan for v0.6. Local plans are no longer
+  tracked in git.
 
 ## Validation
 

@@ -16,6 +16,54 @@ Scope:
 - Next task:
 ```
 
+## 2026-06-23: 新增 v1.0 internal preview 分步路线并清理提示词跟踪
+
+范围：
+- 新增 `docs/upgrade/v1.0-internal-preview-roadmap.md`，把 v0.11 到 v1.0
+  internal preview 拆成 safe operations、fake lifecycle、workspace planner、
+  approved template run packet、internal sanity-check runner gate 和 closeout。
+- 新增本地忽略文件 `docs/upgrade/local-v1.0-internal-preview-prompts.md`，用于
+  保存新窗口复制提示词；该文件不提交到 Git。
+- 更新 `.gitignore`，忽略 `docs/superpowers/plans/*.md`、
+  `docs/upgrade/local-*.md`、`docs/upgrade/*prompts*.md` 和
+  `docs/upgrade/next-session*.md`。
+- 从 Git 跟踪中移除历史 agent 计划和 next-session 提示词文件，但保留本地副本供学习
+  和新窗口复制。
+- 更新升级指南、里程碑、版本路线图和 career notes。
+
+改动文件：
+- `.gitignore`
+- `docs/upgrade/v1.0-internal-preview-roadmap.md`
+- `docs/upgrade/README.md`
+- `docs/upgrade/milestones.md`
+- `docs/upgrade/version-roadmap.md`
+- `docs/upgrade/career-notes.md`
+- `docs/upgrade/upgrade-log.md`
+- 从 Git 跟踪移除 `docs/superpowers/plans/*.md`
+- 从 Git 跟踪移除 `docs/upgrade/next-session*.md`
+
+行为变化：
+- 没有运行时行为变化。
+- 没有新增真实 CUDA/MPI 执行、SSH、Slurm、PBS、远程服务器连接、任意 shell
+  执行、凭据读取、真实删除、trash move、workspace 创建或 Code Agent 自动应用 patch。
+
+验证命令：
+- `git diff --check`
+- `cmake --build build -j2`
+- `ctest --test-dir build --output-on-failure`
+
+结果：
+- PASS. `git diff --check` 没有输出。
+- PASS. `cmake --build build -j2` 退出码为 0。
+- PASS. 全量 `ctest --test-dir build --output-on-failure` 通过 27/27 个测试。
+
+Commit：
+- 本次 v1.0 internal preview 分步路线和提示词跟踪清理提交。
+
+下一步：
+- 新窗口从 v0.11 Safe Operations 实现开始，先做 metadata、validation 和删除
+  dry-run review packet。
+
 ## 2026-06-23: 新增 v0.11 安全操作策略计划
 
 范围：

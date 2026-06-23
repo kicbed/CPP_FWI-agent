@@ -12,7 +12,6 @@ Status markers:
 Version status:
 
 - v0.2 Lab Agent MVP is complete as of 2026-06-11 according to
-  `docs/superpowers/plans/2026-06-11-lab-agent-v0.2.md` and
   `docs/upgrade/version-roadmap.md`.
 - v0.3 Research Knowledge Base started on 2026-06-12 with structured local
   knowledge notes, deterministic file loading, and retrieval tests.
@@ -27,16 +26,14 @@ Version status:
   a generic orchestrator chat page to Lab Agent Workbench.
 - v0.5 Lab Workbench UI is complete as of 2026-06-12 according to
   `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.5.md`.
-- v0.6 Lab Code Adapter started on 2026-06-22 with
-  `docs/superpowers/plans/2026-06-22-lab-code-adapter-v0.6.md`.
+- v0.6 Lab Code Adapter started on 2026-06-22.
 - v0.6 Lab Code Adapter is complete as of 2026-06-22 according to
   `docs/upgrade/version-roadmap.md` and `docs/upgrade/test-report-v0.6.md`.
 - v0.7 JobBackend Interface Reservation is complete as of 2026-06-22
   according to `docs/upgrade/version-roadmap.md` and
   `docs/upgrade/test-report-v0.7.md`.
 - v0.8 Server Backend Safety Design started on 2026-06-22 with
-  `docs/upgrade/server-backend-safety-v0.8.md` and
-  `docs/superpowers/plans/2026-06-22-server-backend-v0.8.md`.
+  `docs/upgrade/server-backend-safety-v0.8.md`.
 - v0.8 Server Backend Safety Foundation is complete as of 2026-06-22
   according to `docs/upgrade/version-roadmap.md` and
   `docs/upgrade/test-report-v0.8.md`.
@@ -60,6 +57,9 @@ Version status:
 - v0.11 实验室内部安全操作策略设计和实现计划已在 2026-06-23 创建。它把下一步
   收敛为 lab_root/lab_user/readonly、safe operation policy 和删除 dry-run review
   packet，不实现真实删除。
+- v1.0 internal preview 分步路线已在 2026-06-23 创建。公开路线图保存在
+  `docs/upgrade/v1.0-internal-preview-roadmap.md`；新窗口提示词和详细 agent
+  执行计划保存在本地忽略文件中，不提交到 GitHub。
 
 ## Milestone 0: Baseline And Project Story
 
@@ -310,12 +310,11 @@ Tasks:
     是必须填写的决策包模板；这不代表 M11-T1 已完成，也不启用运行时执行。
   - 2026-06-23 记录：`docs/upgrade/m11-lab-process-guide.md` 是中文实验室
     流程指南，覆盖批准、凭据、workspace、授权、模板、配额、监控、审计和回滚。
-  - 2026-06-23 记录：`docs/upgrade/next-session-single-server-plan.md` 是
-    下一窗口交接文档，适用于“一个服务器账号、自己先跑”的初步实验室场景。
+  - 2026-06-23 记录：`docs/upgrade/single-server-backend-v0.10.md` 和
+    `docs/upgrade/v1.0-internal-preview-roadmap.md` 适用于“一个服务器账号、
+    自己或小组内部先跑”的初步实验室场景。
 - [x] M11-S1: 单服务器账号受控运行准备，作为 M11-T1 未完成前的非执行收敛路径。
-  - [x] 新增设计文档和实现计划：
-    `docs/upgrade/single-server-backend-v0.10.md` 和
-    `docs/superpowers/plans/2026-06-23-single-server-backend-v0.10.md`。
+  - [x] 新增设计文档：`docs/upgrade/single-server-backend-v0.10.md`。
   - [x] 实现 `SingleServerProfile` metadata，拒绝空凭据引用、疑似内联秘密、
     空 workspace 引用、空模板列表和 runtime enabled 状态。
   - [x] 实现 `SingleServerJobTemplate` metadata，拒绝未知 template、profile 不匹配、
@@ -325,15 +324,35 @@ Tasks:
   - [x] 新增 `docs/upgrade/test-report-v0.10.md` 和
     `docs/upgrade/learning-summary-v0.10.md`。
 - [~] M11-S2: 实验室内部安全操作策略，作为真实运行前的防误伤边界。
-  - [x] 新增设计文档、实现计划、新窗口提示词和学习总结：
+  - [x] 新增设计文档和学习总结：
     `docs/upgrade/safe-operations-v0.11.md`、
-    `docs/superpowers/plans/2026-06-23-safe-operations-v0.11.md`、
-    `docs/upgrade/next-session-safe-operations-v0.11.md`、
     `docs/upgrade/learning-summary-v0.11-safe-operations.md`。
   - [ ] 实现 `LabAccountRole`、`SafeOperationType`、`SafeOperationRequest`
     和 `SafeOperationPolicy`。
   - [ ] 实现删除 dry-run review request/packet 校验和 renderer。
   - [ ] 测试证明 root 角色也不能绕过 dry-run、路径保护和删除确认。
+- [ ] M11-S3: 单服务器 fake lifecycle，作为 v0.12 目标。
+  - [ ] 实现 requested、reviewed、approved、rejected、queued、running、
+    succeeded、failed、cancelled 等 metadata 状态。
+  - [ ] 只做内存状态流和 review packet，不连接服务器、不执行命令、不创建目录。
+  - [ ] 新增 v0.12 测试报告和学习总结。
+- [ ] M11-S4: workspace planner，作为 v0.13 目标。
+  - [ ] 生成 workspace、artifact、log 和 run directory preview。
+  - [ ] 校验路径不能逃逸 lab workspace root。
+  - [ ] 不创建目录、不删除目录、不移动文件。
+- [ ] M11-S5: approved template run packet，作为 v0.14 目标。
+  - [ ] 把 approved template、结构化参数、profile 和 workspace plan 合成
+    non-executing run packet。
+  - [ ] 拒绝用户自由 command 和未批准参数。
+- [ ] M11-S6: internal sanity-check runner gate，作为 v0.15 目标。
+  - [ ] 先做固定 allowlisted runner id、timeout、stdout/stderr capture、
+    artifact path 和审计边界设计。
+  - [ ] 第一批实现仍以 metadata 和 review packet 为主，不接 SSH、Slurm、PBS、
+    CUDA/MPI 或真实服务器。
+- [ ] M11-S7: v1.0 internal preview closeout。
+  - [ ] 汇总 v0.11-v0.15 的安全边界和测试结果。
+  - [ ] 写内部用户手册、operator runbook、演示脚本、测试报告和学习总结。
+  - [ ] 只有前置 gate 都满足，才标记 v1.0 internal preview。
 - [ ] M11-T2: Add authentication and access control implementation.
 - [ ] M11-T3: Add job workspace creation and cleanup.
 - [ ] M11-T4: Add job submission, status polling, and cancellation.
@@ -374,20 +393,32 @@ Acceptance:
   loading, production audit store, arbitrary shell execution, or automatic Code
   Agent patch application is added.
 
-## v1.0 Entry Gate
+## v1.0 Internal Preview Gate
 
-The project can enter v1.0 implementation only after M11 controlled real backend
-integration is approved and completed.
+The project can enter v1.0 internal preview after the single-server internal
+path is implemented and tested. This is not public release and not a full
+cluster platform.
 
-Required before v1.0 implementation starts:
+Required before v1.0 internal preview:
 
-- Lab decision package for M11-T1 names the first backend and includes
+- M11-S2 Safe Operations is implemented and tested.
+- M11-S3 Fake Lifecycle is implemented and tested.
+- M11-S4 Workspace Planner is implemented and tested.
+- M11-S5 Approved Template Run Packet is implemented and tested.
+- M11-S6 Internal Sanity-Check Runner Gate is documented and tested.
+- User guide, operator runbook, demo script, test report, and learning summary
+  exist for internal lab use.
+- The system still rejects user free-form shell commands, real credential
+  reading, SSH, Slurm/PBS, remote execution, and dangerous deletion.
+
+Full real backend expansion still requires:
+
+- Lab decision package for M11-T1 naming the first real backend and including
   credential policy, workspace root, authorization policy, audit retention,
   quota/operator rules, and operator contact.
-- Authentication and access control are implemented and tested.
-- Workspace creation and cleanup are implemented and tested.
-- Job submission, status polling, and cancellation are implemented and tested.
-- Log collection, artifact indexing, loss-curve/output visualization, and audit
-  logging are implemented and tested.
-- The runtime backend guard is intentionally changed only after the above
-  controls exist and pass review.
+- Authentication and access control implementation.
+- Workspace lifecycle implementation.
+- Job submission, status polling, and cancellation implementation.
+- Log collection, artifact indexing, visualization, and audit logging.
+- An intentional runtime backend guard change only after those controls pass
+  review.
