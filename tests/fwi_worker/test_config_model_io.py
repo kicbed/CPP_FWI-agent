@@ -28,6 +28,63 @@ class ConfigAndModelIOTest(unittest.TestCase):
         self.assertEqual(config.n_receivers, 96)
         self.assertAlmostEqual(config.courant_number, 0.7778174593)
 
+    def test_explicit_inversion_iteration_count_is_bounded(self) -> None:
+        for preset in ("fwi_smoke", "fwi_demo"):
+            for iterations in (1, 50, 100):
+                with self.subTest(preset=preset, iterations=iterations):
+                    config = resolve_config(
+                        {
+                            "preset": preset,
+                            "device": "cpu",
+                            "iterations": iterations,
+                        }
+                    )
+                    self.assertEqual(config.iterations, iterations)
+
+            for iterations in (-1, 0, 101):
+                with self.subTest(preset=preset, iterations=iterations):
+                    with self.assertRaises(ValueError):
+                        resolve_config(
+                            {
+                                "preset": preset,
+                                "device": "cpu",
+                                "iterations": iterations,
+                            }
+                        )
+
+    def test_iteration_count_requires_a_strict_integer(self) -> None:
+        for iterations in ("50", 50.0, True, None):
+            with self.subTest(iterations=iterations):
+                with self.assertRaises(ValueError):
+                    resolve_config(
+                        {
+                            "preset": "fwi_demo",
+                            "device": "cpu",
+                            "iterations": iterations,
+                        }
+                    )
+
+    def test_forward_only_presets_require_zero_iterations(self) -> None:
+        for preset in ("marmousi_94_288_demo", "forward"):
+            with self.subTest(preset=preset):
+                self.assertEqual(
+                    resolve_config({"preset": preset, "device": "cpu"}).iterations,
+                    0,
+                )
+                with self.assertRaises(ValueError):
+                    resolve_config(
+                        {"preset": preset, "device": "cpu", "iterations": 1}
+                    )
+
+        # The internal homogeneous preset doubles as the tiny numerical
+        # gradient/update test bed; it is not exposed by the MCP/Web surface.
+        self.assertEqual(
+            resolve_config(
+                {"preset": "homogeneous_smoke", "device": "cpu", "iterations": 1}
+            ).iterations,
+            1,
+        )
+
     def test_unknown_fields_are_rejected(self) -> None:
         with self.assertRaisesRegex(Exception, "extra"):
             resolve_config({"preset": "forward", "shell_command": "rm -rf /"})

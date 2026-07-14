@@ -236,11 +236,13 @@ private:
 
                 std::string response_text;
 
-                // Fixed FWI execution/status/result intents bypass probabilistic
-                // intent routing in both rule and Agent-RAG modes. The planner
-                // explicitly excludes theory questions.
-                if (tool_calling_engine_.has_explicit_fwi_action(user_text)) {
-                    trace_logger_.log_info(ctx, "ROUTING", "deterministic-fwi-tool");
+                // FWI runner actions and runner guidance bypass probabilistic
+                // Agent-RAG in both synchronous and streaming modes. Guidance
+                // includes capability/how-to/negative/theory queries and never
+                // submits a numerical job.
+                if (tool_calling_engine_.has_explicit_fwi_action(user_text) ||
+                    tool_calling_engine_.has_fwi_guidance_request(user_text)) {
+                    trace_logger_.log_info(ctx, "ROUTING", "deterministic-fwi-handler");
                     response_text = handle_fwi_query(user_text, context_id);
                 } else if (orch_config_.routing_mode == RoutingMode::AGENT_RAG) {
                     // Agent-RAG 动态路由
@@ -365,7 +367,8 @@ private:
             write_callback(start_event.dump());
 
             // 识别意图
-            std::string intent = tool_calling_engine_.has_explicit_fwi_action(user_text)
+            std::string intent = (tool_calling_engine_.has_explicit_fwi_action(user_text) ||
+                                  tool_calling_engine_.has_fwi_guidance_request(user_text))
                 ? "fwi"
                 : analyze_intent(user_text);
             trace_logger_.log_system(LogLevel::INFO, "识别意图: " + intent);
@@ -743,18 +746,67 @@ std::string analyze_intent(const std::string& text) {
     /**
      * @brief 处理 FWI（全波形反演）科研问题
      *
-     * 使用专业 FWI 知识增强的 system prompt 进行回答。
-     * 当前阶段：LLM + 专业知识 prompt（不接真实反演模块）。
-     * 后续阶段：可接入 FWITheoryAgent 独立 Agent 或本地知识库。
+     * 显式执行/状态/结果请求走固定白名单 MCP 工具；能力和启动方式
+     * 由本地确定性说明回答；其他理论问题使用专业 FWI prompt。
      */
     std::string handle_fwi_query(const std::string& query, const std::string& context_id) {
         try {
-            // Explicit run/status/result intents are handled by the fixed,
-            // whitelist-only MCP FWI surface. Theory questions return no tool
-            // plan and continue to the explanatory LLM path below.
-            std::string tool_result = tool_calling_engine_.process(query);
-            if (!tool_result.empty()) {
-                return tool_result;
+            const bool is_negative = detail::has_fwi_negative_intent(query);
+            const bool is_capability = detail::is_fwi_capability_query(query);
+            const bool is_howto = detail::is_fwi_howto_query(query);
+            const bool has_invalid_iterations =
+                detail::has_invalid_fwi_iteration_request(query);
+
+            if (is_negative) {
+                return
+                    "已按你的要求：本次不会启动或提交 FWI 任务。\n\n"
+                    "当前可运行范围是固定白名单 `marmousi_94_288` 的实验性 Deepwave "
+                    "二维常密度声学流程（合成观测数据），支持 CUDA 或 CPU。稍后如需验证，"
+                    "可发送：\n"
+                    "`使用 marmousi_94_288 运行两次迭代的二维声学 FWI smoke test。`";
+            }
+
+            if (is_capability || is_howto) {
+                return
+                    "可以，但当前是有明确边界的实验性 FWI MVP：使用 Deepwave 做二维常密度声学 "
+                    "Vp 反演，固定模型为 `marmousi_94_288`，观测数据也是由同一数值后端合成的。"
+                    "它用于验证正演、梯度、优化、任务状态和结果展示链路，不能代表实际数据上的普遍反演效果。\n\n"
+                    "直接在聊天框复制下面任一条即可启动：\n"
+                    "- 正演：`使用 marmousi_94_288 运行一个二维声学正演演示。`\n"
+                    "- 两次迭代 CUDA smoke：`使用 marmousi_94_288 运行两次迭代的二维声学 FWI smoke test。`\n"
+                    "- 两次迭代 CPU smoke：`使用 marmousi_94_288 在 CPU 上运行两次迭代的二维声学 FWI smoke test。`\n"
+                    "- 默认五次迭代 CUDA demo：`使用 marmousi_94_288 运行二维声学 FWI demo。`\n"
+                    "- 显式迭代数（1～100）：`使用 marmousi_94_288 在 CUDA 上运行 50 次迭代的 FWI。`\n\n"
+                    "不写迭代数时，smoke 默认 2 次、demo 默认 5 次；显式迭代数必须是 1～100 的正整数。\n\n"
+                    "提交后可发送 `查看刚才 FWI 任务的状态。`；成功后发送 "
+                    "`显示刚才的反演结果和损失曲线。`\n\n"
+                    "当前不支持通过聊天传入任意模型路径，也不做弹性波、3D、MPI、多 GPU 或真实数据效果承诺。";
+            }
+
+            if (has_invalid_iterations) {
+                return
+                    "本次未提交 FWI 任务：显式迭代数必须是 1～100 的正整数，"
+                    "系统不会静默替换越界值。\n\n"
+                    "可改为发送：\n"
+                    "- `使用 marmousi_94_288 在 CUDA 上运行两次迭代的 FWI smoke test。`\n"
+                    "- `使用 marmousi_94_288 在 CUDA 上运行 50 次迭代的 FWI。`\n\n"
+                    "FWI 作业是异步任务：提交回复只返回 job_id；随后用 `查看刚才 FWI 任务的状态。` "
+                    "查询，成功后再发送 `显示刚才的反演结果和损失曲线。`";
+            }
+
+            // Only an explicit, unnegated execution/status/result request may
+            // call the fixed whitelist MCP surface. A failed MCP call must not
+            // silently fall back to a theoretical LLM answer.
+            if (tool_calling_engine_.has_explicit_fwi_action(query)) {
+                std::string tool_result = tool_calling_engine_.process(query);
+                if (!tool_result.empty()) {
+                    return tool_result;
+                }
+                return
+                    "FWI 工具调用失败，本次没有创建或查询到任务。请确认系统通过 `./start.sh` "
+                    "启动、MCP 已启用且 FWI runner 已构建，然后查看 "
+                    "`examples/ai_orchestrator/logs/orchestrator.log`。"
+                    "这次失败不会自动改成理论回答。";
             }
 
             // Use MemoryManager to get session history

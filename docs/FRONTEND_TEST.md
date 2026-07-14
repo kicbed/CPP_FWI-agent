@@ -73,6 +73,12 @@ b80918e3a609a679f16a47dd30978812d80e4fab1fcbd5ce692d9ca97022a688  ...npy
 ./start.sh
 ```
 
+如果这次要测试页面左侧的 gRPC 模式，请改用：
+
+```bash
+./start.sh --grpc
+```
+
 脚本会依次：
 
 1. 使用仓库外的 FWI Python 环境检查 PyTorch、Deepwave 和模型双哈希；
@@ -98,13 +104,22 @@ curl --fail --silent \
   && printf 'Orchestrator OK\n'
 ```
 
-## 4. 打开 Web 并选择 HTTP 模式
+## 4. 打开 Web 并选择通信模式
 
 浏览器访问：
 
 <http://127.0.0.1:8080>
 
-左侧模式选择器应选 **HTTP**，当前端点显示 `HTTP :5000`。页面会记住上一次模式；如果之前选过 gRPC，必须手动切回 HTTP。本教程不要求启动 gRPC bridge。
+普通 `./start.sh` 启动后请选择 **HTTP**，当前端点显示 `HTTP :5000`。gRPC 按钮会在
+50052 健康检查失败时禁用，避免向不存在的服务发送请求。
+
+如果使用 `./start.sh --grpc`，等待 gRPC 按钮变为可用后可以切换到 **gRPC**。浏览器
+请求先到 50052 Web bridge，再由 bridge 调用 50051 的原生 gRPC 服务；可用下面命令
+先独立检查 bridge：
+
+```bash
+curl --fail --silent http://127.0.0.1:50052/health
+```
 
 ## 5. 依次测试四类中文请求
 
@@ -138,6 +153,15 @@ curl --fail --silent \
 ```
 
 预期新任务的 `total_iterations` 为 2。smoke 的验收目标是 forward/backward、梯度裁剪和模型更新链路均为 finite；它不以高质量反演为目标。
+
+smoke 默认 2 次、demo 默认 5 次，也支持显式指定 1–100 次。可另外输入：
+
+```text
+使用 marmousi_94_288 在 CUDA 上运行 50 次迭代的 FWI，并向我展示结果。
+```
+
+预期先异步返回新 `job_id`，状态中的 `total_iterations` 为 50；计算成功后页面自动加载
+结果。为缩短日常回归时间可以把 50 改为 3。超过 100、负数或小数应被明确拒绝且不创建任务。
 
 ### 5.3 查询刚才任务状态
 
@@ -220,7 +244,7 @@ curl --fail --head \
 | source frequency | `8 Hz` |
 | dt / nt | `0.001 s / 2000` |
 | shots / receivers | `3 / 96` |
-| iterations | forward 为 0；smoke 为 2；demo 为 5 |
+| iterations | forward 为 0；smoke 默认 2；demo 默认 5；显式覆盖时为请求的 1–100 |
 | initial/final loss | 与 `metrics.json` 数值一致 |
 | loss reduction | 与 `(initial-final)/initial` 一致 |
 | model relative L2 | initial → final，与文件一致 |

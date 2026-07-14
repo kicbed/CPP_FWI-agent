@@ -11,6 +11,7 @@ PID_DIR="$INTERNAL_DIR/pids"
 LOG_DIR="$INTERNAL_DIR/logs"
 
 build_mode=auto
+grpc_cli_override=""
 
 usage() {
     cat <<'USAGE'
@@ -21,6 +22,7 @@ usage() {
 选项:
   --rebuild    强制重新运行 CMake 配置和构建
   --no-build   明确跳过构建；缺少二进制会报错
+  --grpc       同时启动本机 gRPC Server（50051）和 Web bridge（50052）
   -h, --help   显示帮助
 
 常用环境变量:
@@ -29,7 +31,7 @@ usage() {
   AGENT_BIND_HOST     Agent 监听地址，默认 127.0.0.1
   AGENT_CORS_ORIGIN   允许的 Web origin，默认 http://127.0.0.1:8080
   ENABLE_MCP          是否启用 MCP，默认 true
-  ENABLE_GRPC         是否启动固定 gRPC/HTTP bridge，默认 false
+  ENABLE_GRPC         是否启动固定 gRPC/HTTP bridge，默认 false；推荐使用 --grpc
 USAGE
 }
 
@@ -37,6 +39,7 @@ while (($#)); do
     case "$1" in
         --rebuild) build_mode=rebuild ;;
         --no-build) build_mode=never ;;
+        --grpc) grpc_cli_override=true ;;
         -h|--help) usage; exit 0 ;;
         *) printf '错误: 未知参数 %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -78,6 +81,9 @@ AGENT_CORS_ORIGIN="${AGENT_CORS_ORIGIN:-http://127.0.0.1:$WEB_PORT}"
 GRPC_BRIDGE_CORS_ORIGIN="${GRPC_BRIDGE_CORS_ORIGIN:-http://127.0.0.1:$WEB_PORT}"
 ENABLE_MCP="${ENABLE_MCP:-true}"
 ENABLE_GRPC="${ENABLE_GRPC:-false}"
+if [[ -n "$grpc_cli_override" ]]; then
+    ENABLE_GRPC="$grpc_cli_override"
+fi
 
 die() {
     printf '错误: %s\n' "$*" >&2
@@ -300,7 +306,9 @@ printf '  Web UI:       http://%s:%s\n' "$WEB_HOST" "$WEB_PORT"
 printf '  Orchestrator: http://127.0.0.1:5000\n'
 if [[ "$ENABLE_GRPC" == true ]]; then
     printf '  gRPC Server:  127.0.0.1:50051\n'
-    printf '  HTTP bridge:  http://127.0.0.1:50052\n'
+    printf '  Web bridge:   http://127.0.0.1:50052 (HTTP → gRPC)\n'
+else
+    printf '  gRPC 模式:    未启动；需要时先停止，再运行 ./start.sh --grpc\n'
 fi
 printf '  运行结果:     %s\n' "$FWI_RUN_ROOT"
 printf '  日志目录:     %s\n' "$LOG_DIR"

@@ -160,10 +160,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # Quiet logging
         pass
 
+class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
+    """Allow a clean stop/start cycle without waiting for TCP TIME_WAIT."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def main():
     # Bind to loopback by default. Failing on a busy port is intentional: the
     # one-click launcher can then roll back instead of reporting the wrong URL.
-    with socketserver.ThreadingTCPServer((HOST, PORT), Handler) as httpd:
+    with ReusableThreadingTCPServer((HOST, PORT), Handler) as httpd:
         display_host = "localhost" if HOST in {"0.0.0.0", "::", "127.0.0.1", "::1"} else HOST
         url = f"http://{display_host}:{PORT}"
         print(f"\033[1;36m┌─────────────────────────────────────────┐\033[0m")

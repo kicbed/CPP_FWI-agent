@@ -10,21 +10,25 @@
 model_id = marmousi_94_288
 ```
 
-`fwi_submit_demo` 只接受三个字符串字段：
+`fwi_submit_demo` 接受三个必填白名单字段和一个可选的有界整数：
 
 ```json
 {
   "model_id": "marmousi_94_288",
   "preset": "forward|fwi_smoke|fwi_demo",
-  "device": "cpu|cuda"
+  "device": "cpu|cuda",
+  "iterations": 50
 }
 ```
+
+`iterations` 可省略；反演允许 1–100，正演必须省略（Worker resolved config 会记录为 0）。
 
 Schema 禁止额外字段，插件也会再次检查字段数量和值。以下输入不会被接受：
 
 - 聊天消息中的任意 MAT、NPY、JSON 或目录路径；
 - Python 可执行文件、模块名、shell 命令或 `extra_args`；
 - 白名单外的 `model_id`；
+- 小数、负数、超过 100 的迭代数，或给正演传入 `iterations`；
 - 通过 `..`、绝对路径或符号链接访问其他文件。
 
 `homogeneous_48_96` 是 Worker 的内部数值 smoke 模型，不是 MCP/Web 可选数据模型。独立 Worker 配置文件是开发和测试接口，也受 `FWIConfig` 的 model/preset 枚举以及模型完整性校验约束，不能把它当作任意文件执行入口。
@@ -167,15 +171,20 @@ loss = sum((predicted - observed)^2) / sum(observed^2)
 
 这是合成逆犯罪链路：观测数据与反演传播都由 Deepwave 生成。它适合验证正演、梯度、优化、任务调度和展示，不代表真实数据反演性能。
 
-### 3.3 三个用户 preset
+### 3.3 三个用户 preset 与迭代覆盖
 
-| Preset | 更新次数 | 记录的模型状态/loss 数 | 成功判据 |
+| Preset | 默认更新次数 | 默认记录的模型状态/loss 数 | 成功判据 |
 |---|---:|---:|---|
 | `forward` | 0 | 1 | 真模型观测和初始模型预测均非零、finite，产物完整 |
 | `fwi_smoke` | 2 | 3（state 0、1、2） | forward/backward、梯度裁剪和两次更新链路 finite，模型确有更新 |
 | `fwi_demo` | 5 | 6（state 0–5） | 先通过独立小模型方向导数检查，再满足 smoke 检查，且 final loss 严格低于 initial loss |
 
 `fwi_smoke` 的目的不是证明反演质量，因此它没有“final loss 必须低于 initial loss”的硬判据。`fwi_demo` 的梯度检查使用独立的 float64 小模型；若相对误差不小于 `5e-3`，不会继续 demo 反演。
+
+MCP/Web 可以用 `iterations=1..100` 覆盖两个反演 preset 的默认更新次数；状态和指标会
+记录实际值。自然语言中的“运行 50 次迭代”会选择 `fwi_demo` 的检查规则并传入 50，
+不会静默回退成默认 5。当前只接受用户明确给出的次数；参数建议、人工审批或授权 Agent
+自行选择迭代预算属于后续交互工作流。
 
 虽然 `FWIConfig` 也声明了 SGD 选项，但当前三个 Marmousi preset 实际均使用 Adam。
 

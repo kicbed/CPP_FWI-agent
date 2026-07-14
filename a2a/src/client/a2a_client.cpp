@@ -3,6 +3,7 @@
 #include <a2a/core/jsonrpc_response.hpp>
 #include <a2a/core/a2a_methods.hpp>
 #include <a2a/core/exception.hpp>
+#include <json.hpp>
 #include <sstream>
 
 namespace a2a {
@@ -90,14 +91,33 @@ A2AResponse A2AClient::send_message(const MessageSendParams& params) {
     
     const std::string& result_json = *response.result_json();
     
-    // Determine if result is Task or Message
-    // Check for "kind" field or "status" field to distinguish
-    if (result_json.find("\"status\":") != std::string::npos) {
+    // Determine the response variant from the top-level object.  Searching
+    // the serialized string for "status" misclassifies a perfectly valid
+    // Message whenever its text contains structured JSON such as an FWI
+    // {"status":"queued"} tool result.
+    nlohmann::json result;
+    try {
+        result = nlohmann::json::parse(result_json);
+    } catch (const nlohmann::json::exception& e) {
+        throw A2AException(
+            std::string("Invalid message/send result JSON: ") + e.what(),
+            ErrorCode::ParseError);
+    }
+    const bool is_task = result.is_object() && result.contains("status") &&
+                         result.at("status").is_object();
+    if (is_task) {
         // It's a Task
         AgentTask task = AgentTask::from_json(result_json);
         return A2AResponse(task);
     } else {
         // It's a Message
+        if (!result.is_object() || !result.contains("role") ||
+            !result.at("role").is_string() || !result.contains("parts") ||
+            !result.at("parts").is_array()) {
+            throw A2AException(
+                "message/send result is neither a valid Task nor Message",
+                ErrorCode::ParseError);
+        }
         AgentMessage message = AgentMessage::from_json(result_json);
         return A2AResponse(message);
     }

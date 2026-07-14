@@ -3,43 +3,84 @@
  * @brief HTTP 桥接服务 - 为 Web 前端提供 HTTP API
  *
  * 在 gRPC Server 同进程中运行一个轻量 HTTP 服务器，
- * 接收浏览器的 JSON 请求，转发到 Orchestrator。
+ * 接收浏览器的 JSON 请求，转换为 AIQueryService gRPC 调用。
  *
  * 架构:
- *   浏览器 ──HTTP──> http_bridge(:50052) ──A2A/HTTP──> Orchestrator(:5000)
+ *   浏览器 ──HTTP──> http_bridge(:50052) ──gRPC──> AIQueryService(:50051)
  */
 
 #include "agent_rpc/server/http_bridge.h"
 #include "agent_rpc/common/logger.h"
+#include "ai_query.grpc.pb.h"
+#include <grpcpp/grpcpp.h>
+#include <nlohmann/json.hpp>
 #include <arpa/inet.h>
-#include <curl/curl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <atomic>
-#include <regex>
+#include <vector>
 
 namespace agent_rpc::server {
 
 class HttpBridge::Impl {
 public:
+    static constexpr std::size_t kMaxHttpRequestBytes = 32 * 1024;
+    static constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
+    static constexpr std::size_t kMaxQuestionBytes = 8 * 1024;
+    static constexpr std::size_t kMaxContextIdBytes = 256;
+    static constexpr std::size_t kMaxWorkers = 32;
+
     std::atomic<bool> running{false};
     int server_fd_ = -1;
     int port_ = 50052;
-    std::string orchestrator_url_ = "http://127.0.0.1:5000";
+    std::string grpc_target_ = "127.0.0.1:50051";
+    std::shared_ptr<grpc::Channel> grpc_channel_;
+    std::unique_ptr<agent_communication::AIQueryService::Stub> grpc_stub_;
     std::string bind_host_ = "127.0.0.1";
     std::string cors_origin_ = "http://127.0.0.1:8080";
     std::thread server_thread_;
+    struct Worker {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::mutex workers_mutex_;
+    std::vector<Worker> workers_;
 
     ~Impl() { stop(); }
 
-    bool start(int port, const std::string& orchestrator_url) {
+    bool start(int port, const std::string& grpc_target) {
         port_ = port;
-        orchestrator_url_ = orchestrator_url;
+        grpc_target_ = grpc_target;
+
+        if (grpc_target_.empty() || grpc_target_.find_first_of("\r\n") != std::string::npos) {
+            LOG_ERROR("HTTP Bridge: invalid gRPC target");
+            return false;
+        }
+
+        grpc_channel_ = grpc::CreateChannel(
+            grpc_target_, grpc::InsecureChannelCredentials());
+        if (!grpc_channel_) {
+            LOG_ERROR("HTTP Bridge: failed to create gRPC channel to " + grpc_target_);
+            return false;
+        }
+        grpc_stub_ = agent_communication::AIQueryService::NewStub(grpc_channel_);
+        if (!grpc_stub_) {
+            LOG_ERROR("HTTP Bridge: failed to create AIQueryService stub");
+            grpc_channel_.reset();
+            return false;
+        }
 
         if (const char* value = std::getenv("HTTP_BRIDGE_BIND_HOST")) {
             if (*value != '\0') bind_host_ = value;
@@ -90,7 +131,8 @@ public:
         running = true;
         server_thread_ = std::thread([this]() { acceptLoop(); });
 
-        LOG_INFO("HTTP Bridge 已启动: " + bind_host_ + ":" + std::to_string(port_));
+        LOG_INFO("HTTP-to-gRPC Bridge 已启动: " + bind_host_ + ":" +
+                 std::to_string(port_) + " -> " + grpc_target_);
         return true;
     }
 
@@ -104,9 +146,18 @@ public:
         if (server_thread_.joinable()) {
             server_thread_.join();
         }
+        reapWorkers(true);
+        grpc_stub_.reset();
+        grpc_channel_.reset();
     }
 
 private:
+    enum class ReadRequestResult {
+        Ok,
+        BadRequest,
+        TooLarge
+    };
+
     void acceptLoop() {
         while (running) {
             struct sockaddr_in client_addr;
@@ -117,21 +168,91 @@ private:
                 break;
             }
 
-            // Handle each connection in a detached thread
-            std::thread([this, client_fd]() {
-                handleConnection(client_fd);
+            reapWorkers(false);
+
+            bool at_capacity = false;
+            {
+                std::lock_guard<std::mutex> lock(workers_mutex_);
+                at_capacity = workers_.size() >= kMaxWorkers;
+                if (!at_capacity) {
+                    auto done = std::make_shared<std::atomic<bool>>(false);
+                    workers_.push_back(Worker{
+                        std::thread([this, client_fd, done]() {
+                            handleConnection(client_fd);
+                            close(client_fd);
+                            done->store(true, std::memory_order_release);
+                        }),
+                        std::move(done)});
+                }
+            }
+
+            if (at_capacity) {
+                const nlohmann::json error = {
+                    {"error", {
+                        {"type", "bridge_busy"},
+                        {"message", "HTTP-to-gRPC bridge is at connection capacity"}
+                    }},
+                    {"status", 503},
+                    {"transport", "grpc"}
+                };
+                sendHttpResponse(client_fd, 503, error.dump(), "application/json");
                 close(client_fd);
-            }).detach();
+            }
+        }
+    }
+
+    void reapWorkers(bool join_all) {
+        std::vector<std::thread> threads_to_join;
+        {
+            std::lock_guard<std::mutex> lock(workers_mutex_);
+            auto worker = workers_.begin();
+            while (worker != workers_.end()) {
+                const bool done = worker->done->load(std::memory_order_acquire);
+                if (join_all || done) {
+                    threads_to_join.push_back(std::move(worker->thread));
+                    worker = workers_.erase(worker);
+                } else {
+                    ++worker;
+                }
+            }
+        }
+        for (auto& thread : threads_to_join) {
+            if (thread.joinable()) thread.join();
         }
     }
 
     void handleConnection(int client_fd) {
-        char buffer[8192];
-        int n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-        if (n <= 0) return;
-        buffer[n] = '\0';
+        // Do not let a client that opens a socket without sending data block
+        // bridge shutdown forever.
+        struct timeval timeout {5, 0};
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-        std::string request(buffer, n);
+        std::string request;
+        const ReadRequestResult read_result = readHttpRequest(client_fd, request);
+        if (read_result == ReadRequestResult::TooLarge) {
+            const nlohmann::json error = {
+                {"error", {
+                    {"type", "request_too_large"},
+                    {"message", "HTTP request exceeds the bridge size limit"}
+                }},
+                {"status", 413},
+                {"transport", "grpc"}
+            };
+            sendHttpResponse(client_fd, 413, error.dump(), "application/json");
+            return;
+        }
+        if (read_result != ReadRequestResult::Ok) {
+            const nlohmann::json error = {
+                {"error", {
+                    {"type", "invalid_http_request"},
+                    {"message", "Malformed or incomplete HTTP request"}
+                }},
+                {"status", 400},
+                {"transport", "grpc"}
+            };
+            sendHttpResponse(client_fd, 400, error.dump(), "application/json");
+            return;
+        }
 
         // Parse HTTP method and path
         std::string method, path, body;
@@ -139,7 +260,8 @@ private:
 
         // CORS preflight
         if (method == "OPTIONS") {
-            sendHttpResponse(client_fd, 200, "{}", "application/json");
+            sendHttpResponse(client_fd, 200, nlohmann::json::object().dump(),
+                             "application/json");
             return;
         }
 
@@ -151,57 +273,244 @@ private:
 
         // Route: GET /health
         if (method == "GET" && (path == "/health" || path == "/")) {
-            sendHttpResponse(client_fd, 200, R"({"status":"ok","service":"grpc-bridge"})", "application/json");
+            const nlohmann::json health = {
+                {"status", "ok"},
+                {"service", "http-to-grpc-bridge"},
+                {"transport", "grpc"},
+                {"grpc_target", grpc_target_}
+            };
+            sendHttpResponse(client_fd, 200, health.dump(), "application/json");
             return;
         }
 
-        sendHttpResponse(client_fd, 404, R"({"error":"not found"})", "application/json");
+        const nlohmann::json error = {
+            {"error", {
+                {"type", "not_found"},
+                {"message", "Route not found"}
+            }},
+            {"status", 404},
+            {"transport", "grpc"}
+        };
+        sendHttpResponse(client_fd, 404, error.dump(), "application/json");
     }
 
     void handleQuery(int client_fd, const std::string& body) {
-        // Parse JSON: {"question": "...", "context_id": "..."}
-        std::string question = extractJsonString(body, "question");
-        std::string context_id = extractJsonString(body, "context_id");
-
-        if (question.empty()) {
-            sendHttpResponse(client_fd, 400, R"({"error":"missing 'question' field"})", "application/json");
+        nlohmann::json payload;
+        try {
+            payload = nlohmann::json::parse(body);
+        } catch (const nlohmann::json::parse_error&) {
+            sendJsonRequestError(client_fd, "invalid_json",
+                                 "Request body must be valid JSON");
             return;
         }
 
-        // Build JSON-RPC request for Orchestrator
+        if (!payload.is_object()) {
+            sendJsonRequestError(client_fd, "invalid_payload",
+                                 "Request body must be a JSON object");
+            return;
+        }
+
+        const auto question_it = payload.find("question");
+        if (question_it == payload.end() || !question_it->is_string()) {
+            sendJsonRequestError(client_fd, "invalid_question",
+                                 "'question' must be a string");
+            return;
+        }
+        const std::string question = question_it->get<std::string>();
+        if (question.empty() || question.size() > kMaxQuestionBytes) {
+            sendJsonRequestError(client_fd, "invalid_question",
+                                 "'question' must contain 1 to 8192 bytes");
+            return;
+        }
+
+        std::string context_id;
+        const auto context_it = payload.find("context_id");
+        if (context_it != payload.end()) {
+            if (!context_it->is_string()) {
+                sendJsonRequestError(client_fd, "invalid_context_id",
+                                     "'context_id' must be a string when provided");
+                return;
+            }
+            context_id = context_it->get<std::string>();
+        }
+        if (context_id.size() > kMaxContextIdBytes) {
+            sendJsonRequestError(client_fd, "invalid_context_id",
+                                 "'context_id' must not exceed 256 bytes");
+            return;
+        }
+
+        if (!grpc_stub_) {
+            sendGrpcError(client_fd, grpc::StatusCode::UNAVAILABLE,
+                          "AIQueryService gRPC client is not available");
+            return;
+        }
+
         std::string req_id = "bridge-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
 
-        std::ostringstream params;
-        params << R"({"message":{"role":"user","contextId":")" << escapeJson(context_id)
-               << R"(","parts":[{"kind":"text","text":")" << escapeJson(question) << R"("}]},"historyLength":5})";
+        agent_communication::AIQueryRequest request;
+        request.set_request_id(req_id);
+        request.set_question(question);
+        request.set_context_id(context_id);
+        request.set_history_length(5);
+        request.set_timeout_seconds(60);
 
-        std::ostringstream jsonrpc;
-        jsonrpc << R"({"jsonrpc":"2.0","id":")" << req_id
-                << R"(","method":"message/send","params":)" << params.str() << "}";
+        grpc::ClientContext grpc_context;
+        grpc_context.set_deadline(
+            std::chrono::system_clock::now() + std::chrono::seconds(60));
 
-        std::string response;
-        if (!postJson(jsonrpc.str(), response)) {
-            sendHttpResponse(client_fd, 500, R"({"error":"failed to call orchestrator"})", "application/json");
+        agent_communication::AIQueryResponse response;
+        const grpc::Status rpc_status = grpc_stub_->Query(
+            &grpc_context, request, &response);
+        if (!rpc_status.ok()) {
+            LOG_ERROR("HTTP Bridge: AIQueryService gRPC call failed: " +
+                      rpc_status.error_message());
+            sendGrpcError(client_fd, rpc_status.error_code(),
+                          rpc_status.error_message().empty()
+                              ? "AIQueryService gRPC call failed"
+                              : rpc_status.error_message());
             return;
         }
 
-        if (response.empty()) {
-            sendHttpResponse(client_fd, 502, R"({"error":"orchestrator returned empty response"})", "application/json");
+        if (response.status().code() != 0) {
+            const std::string message = response.status().message().empty()
+                ? "AIQueryService returned an application error"
+                : response.status().message();
+            LOG_ERROR("HTTP Bridge: AIQueryService application error: " + message);
+            sendApplicationError(client_fd, response.status().code(), message,
+                                 response.status().details(), response.request_id());
             return;
         }
-
-        // Extract answer from JSON-RPC response
-        std::string answer = extractAnswerFromJsonRpc(response);
-        std::string agent_name = extractJsonStringNested(response, "agentName");
 
         // Build simple JSON response for frontend
-        std::ostringstream result;
-        result << R"({"answer":")" << escapeJson(answer)
-               << R"(","agent_name":")" << escapeJson(agent_name)
-               << R"(","context_id":")" << escapeJson(context_id)
-               << R"(","status":0})";
+        const nlohmann::json result = {
+            {"answer", response.answer()},
+            {"agent_name", response.agent_name()},
+            {"context_id", response.context_id().empty()
+                               ? context_id : response.context_id()},
+            {"request_id", response.request_id()},
+            {"status", 0},
+            {"transport", "grpc"}
+        };
 
-        sendHttpResponse(client_fd, 200, result.str(), "application/json");
+        sendHttpResponse(client_fd, 200, result.dump(), "application/json");
+    }
+
+    static std::string trimAscii(std::string value) {
+        const auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
+        value.erase(value.begin(),
+                    std::find_if(value.begin(), value.end(),
+                                 [&](char c) { return !is_space(static_cast<unsigned char>(c)); }));
+        value.erase(std::find_if(value.rbegin(), value.rend(),
+                                 [&](char c) { return !is_space(static_cast<unsigned char>(c)); })
+                        .base(),
+                    value.end());
+        return value;
+    }
+
+    static std::string lowerAscii(std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return value;
+    }
+
+    static bool parseSize(const std::string& text, std::size_t& value) {
+        if (text.empty()) return false;
+        std::size_t parsed = 0;
+        for (const unsigned char c : text) {
+            if (!std::isdigit(c)) return false;
+            const std::size_t digit = static_cast<std::size_t>(c - '0');
+            if (parsed > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+                return false;
+            }
+            parsed = parsed * 10 + digit;
+        }
+        value = parsed;
+        return true;
+    }
+
+    ReadRequestResult readHttpRequest(int client_fd, std::string& request) {
+        std::size_t expected_size = 0;
+        bool headers_parsed = false;
+
+        while (true) {
+            char buffer[4096];
+            const ssize_t bytes = recv(client_fd, buffer, sizeof(buffer), 0);
+            if (bytes < 0) {
+                if (errno == EINTR) continue;
+                return ReadRequestResult::BadRequest;
+            }
+            if (bytes == 0) return ReadRequestResult::BadRequest;
+
+            request.append(buffer, static_cast<std::size_t>(bytes));
+            if (request.size() > kMaxHttpRequestBytes) {
+                return ReadRequestResult::TooLarge;
+            }
+
+            if (!headers_parsed) {
+                std::size_t delimiter_size = 4;
+                std::size_t header_end = request.find("\r\n\r\n");
+                if (header_end == std::string::npos) {
+                    delimiter_size = 2;
+                    header_end = request.find("\n\n");
+                }
+                if (header_end == std::string::npos) {
+                    if (request.size() > kMaxHttpHeaderBytes) {
+                        return ReadRequestResult::TooLarge;
+                    }
+                    continue;
+                }
+                if (header_end > kMaxHttpHeaderBytes) {
+                    return ReadRequestResult::TooLarge;
+                }
+
+                const std::string headers = request.substr(0, header_end);
+                std::size_t content_length = 0;
+                bool has_content_length = false;
+                std::size_t line_start = headers.find('\n');
+                if (line_start != std::string::npos) ++line_start;
+
+                while (line_start != std::string::npos && line_start < headers.size()) {
+                    std::size_t line_end = headers.find('\n', line_start);
+                    if (line_end == std::string::npos) line_end = headers.size();
+                    const std::string line = headers.substr(line_start, line_end - line_start);
+                    const std::size_t colon = line.find(':');
+                    if (colon == std::string::npos) {
+                        return ReadRequestResult::BadRequest;
+                    }
+                    const std::string name = lowerAscii(trimAscii(line.substr(0, colon)));
+                    const std::string value = trimAscii(line.substr(colon + 1));
+                    if (name == "transfer-encoding") {
+                        // Chunked request decoding is intentionally unsupported. Reject it
+                        // instead of ambiguously combining it with Content-Length.
+                        return ReadRequestResult::BadRequest;
+                    }
+                    if (name == "content-length") {
+                        std::size_t parsed_length = 0;
+                        if (!parseSize(value, parsed_length) ||
+                            (has_content_length && parsed_length != content_length)) {
+                            return ReadRequestResult::BadRequest;
+                        }
+                        content_length = parsed_length;
+                        has_content_length = true;
+                    }
+                    line_start = line_end == headers.size()
+                        ? std::string::npos : line_end + 1;
+                }
+
+                const std::size_t body_start = header_end + delimiter_size;
+                if (content_length > kMaxHttpRequestBytes - body_start) {
+                    return ReadRequestResult::TooLarge;
+                }
+                expected_size = body_start + content_length;
+                headers_parsed = true;
+            }
+
+            if (headers_parsed && request.size() >= expected_size) {
+                request.resize(expected_size);
+                return ReadRequestResult::Ok;
+            }
+        }
     }
 
     void parseHttpRequest(const std::string& req, std::string& method, std::string& path, std::string& body) {
@@ -234,9 +543,11 @@ private:
         switch (code) {
             case 200: status_text = "OK"; break;
             case 400: status_text = "Bad Request"; break;
+            case 413: status_text = "Payload Too Large"; break;
             case 404: status_text = "Not Found"; break;
             case 500: status_text = "Internal Server Error"; break;
             case 502: status_text = "Bad Gateway"; break;
+            case 503: status_text = "Service Unavailable"; break;
             default: status_text = "Unknown"; break;
         }
 
@@ -253,175 +564,72 @@ private:
              << body;
 
         std::string resp_str = resp.str();
-        send(client_fd, resp_str.c_str(), resp_str.size(), 0);
-    }
-
-    static size_t curlWriteCallback(char* data, size_t size, size_t count,
-                                    void* user_data) {
-        const size_t bytes = size * count;
-        static_cast<std::string*>(user_data)->append(data, bytes);
-        return bytes;
-    }
-
-    bool postJson(const std::string& body, std::string& response) {
-        static const bool curl_ready = [] {
-            return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
-        }();
-        if (!curl_ready) return false;
-
-        CURL* curl = curl_easy_init();
-        if (!curl) return false;
-
-        curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_URL, orchestrator_url_.c_str());
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curlWriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-
-        const CURLcode result = curl_easy_perform(curl);
-        long status_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-        return result == CURLE_OK && status_code >= 200 && status_code < 300;
-    }
-
-    std::string extractJsonString(const std::string& json, const std::string& key) {
-        std::string pattern = "\"" + key + "\"";
-        auto pos = json.find(pattern);
-        if (pos == std::string::npos) return "";
-
-        auto colon = json.find(':', pos + pattern.size());
-        if (colon == std::string::npos) return "";
-
-        auto start = json.find('"', colon + 1);
-        if (start == std::string::npos) return "";
-        start++;
-
-        auto end = json.find('"', start);
-        if (end == std::string::npos) return "";
-
-        return json.substr(start, end - start);
-    }
-
-    std::string extractJsonStringNested(const std::string& json, const std::string& key) {
-        return extractJsonString(json, key);
-    }
-
-    std::string extractAnswerFromJsonRpc(const std::string& jsonrpc_response) {
-        // Try to extract from result.artifacts[0].parts[0].text
-        auto artifacts_pos = jsonrpc_response.find("\"artifacts\"");
-        if (artifacts_pos != std::string::npos) {
-            auto text_pos = jsonrpc_response.find("\"text\"", artifacts_pos);
-            if (text_pos != std::string::npos) {
-                auto colon = jsonrpc_response.find(':', text_pos);
-                auto start = jsonrpc_response.find('"', colon + 1);
-                if (start != std::string::npos) {
-                    start++;
-                    auto end = findJsonStringEnd(jsonrpc_response, start);
-                    if (end != std::string::npos) {
-                        return unescapeJson(jsonrpc_response.substr(start, end - start));
-                    }
-                }
+        std::size_t sent = 0;
+        while (sent < resp_str.size()) {
+            const ssize_t bytes = send(client_fd, resp_str.data() + sent,
+                                       resp_str.size() - sent, MSG_NOSIGNAL);
+            if (bytes < 0) {
+                if (errno == EINTR) continue;
+                break;
             }
+            if (bytes == 0) break;
+            sent += static_cast<std::size_t>(bytes);
         }
-
-        // Try result.status.message.parts[0].text
-        auto status_pos = jsonrpc_response.find("\"status\"");
-        if (status_pos != std::string::npos) {
-            auto msg_pos = jsonrpc_response.find("\"message\"", status_pos);
-            if (msg_pos != std::string::npos) {
-                auto text_pos = jsonrpc_response.find("\"text\"", msg_pos);
-                if (text_pos != std::string::npos) {
-                    auto colon = jsonrpc_response.find(':', text_pos);
-                    auto start = jsonrpc_response.find('"', colon + 1);
-                    if (start != std::string::npos) {
-                        start++;
-                        auto end = findJsonStringEnd(jsonrpc_response, start);
-                        if (end != std::string::npos) {
-                            return unescapeJson(jsonrpc_response.substr(start, end - start));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Try result.parts[0].text
-        auto parts_pos = jsonrpc_response.find("\"parts\"");
-        if (parts_pos != std::string::npos) {
-            auto text_pos = jsonrpc_response.find("\"text\"", parts_pos);
-            if (text_pos != std::string::npos) {
-                auto colon = jsonrpc_response.find(':', text_pos);
-                auto start = jsonrpc_response.find('"', colon + 1);
-                if (start != std::string::npos) {
-                    start++;
-                    auto end = findJsonStringEnd(jsonrpc_response, start);
-                    if (end != std::string::npos) {
-                        return unescapeJson(jsonrpc_response.substr(start, end - start));
-                    }
-                }
-            }
-        }
-
-        return "无法解析响应";
     }
 
-    size_t findJsonStringEnd(const std::string& str, size_t start) {
-        for (size_t i = start; i < str.size(); i++) {
-            if (str[i] == '\\') { i++; continue; }
-            if (str[i] == '"') return i;
-        }
-        return std::string::npos;
+    void sendGrpcError(int client_fd, grpc::StatusCode code,
+                       const std::string& message) {
+        const nlohmann::json error = {
+            {"error", {
+                {"type", "grpc_transport_error"},
+                {"code", static_cast<int>(code)},
+                {"message", message}
+            }},
+            {"status", 502},
+            {"transport", "grpc"}
+        };
+        sendHttpResponse(client_fd, 502, error.dump(), "application/json");
     }
 
-    std::string escapeJson(const std::string& s) {
-        std::string result;
-        for (char c : s) {
-            switch (c) {
-                case '"':  result += "\\\""; break;
-                case '\\': result += "\\\\"; break;
-                case '\n': result += "\\n"; break;
-                case '\r': result += "\\r"; break;
-                case '\t': result += "\\t"; break;
-                default:   result += c;
-            }
-        }
-        return result;
+    void sendApplicationError(int client_fd, int code,
+                              const std::string& message,
+                              const std::string& details,
+                              const std::string& request_id) {
+        const nlohmann::json error = {
+            {"error", {
+                {"type", "grpc_application_error"},
+                {"code", code},
+                {"message", message},
+                {"details", details}
+            }},
+            {"request_id", request_id},
+            {"status", 502},
+            {"transport", "grpc"}
+        };
+        sendHttpResponse(client_fd, 502, error.dump(), "application/json");
     }
 
-    std::string unescapeJson(const std::string& s) {
-        std::string result;
-        for (size_t i = 0; i < s.size(); i++) {
-            if (s[i] == '\\' && i + 1 < s.size()) {
-                switch (s[i + 1]) {
-                    case '"':  result += '"'; i++; break;
-                    case '\\': result += '\\'; i++; break;
-                    case 'n':  result += '\n'; i++; break;
-                    case 'r':  result += '\r'; i++; break;
-                    case 't':  result += '\t'; i++; break;
-                    default:   result += s[i];
-                }
-            } else {
-                result += s[i];
-            }
-        }
-        return result;
+    void sendJsonRequestError(int client_fd, const std::string& type,
+                              const std::string& message) {
+        const nlohmann::json error = {
+            {"error", {
+                {"type", type},
+                {"message", message}
+            }},
+            {"status", 400},
+            {"transport", "grpc"}
+        };
+        sendHttpResponse(client_fd, 400, error.dump(), "application/json");
     }
+
 };
 
 // Public API
 HttpBridge::HttpBridge() : impl_(std::make_unique<Impl>()) {}
 HttpBridge::~HttpBridge() = default;
 
-bool HttpBridge::start(int port, const std::string& orchestrator_url) {
-    return impl_->start(port, orchestrator_url);
+bool HttpBridge::start(int port, const std::string& grpc_target) {
+    return impl_->start(port, grpc_target);
 }
 
 void HttpBridge::stop() {

@@ -61,7 +61,9 @@ env/
 
 # ==================== 模型缓存 ====================
 .cache/
-models/
+# Only ignore a repository-root model cache.  Unanchored `models/` also hides
+# required C++ protocol sources under a2a/include/a2a/models and a2a/src/models.
+/models/
 
 # ==================== 科研模型与运行产物 ====================
 fwi-runs/

@@ -23,7 +23,10 @@
 #include <sstream>
 #include <initializer_list>
 #include <algorithm>
+#include <cctype>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <regex>
 
 using json = nlohmann::json;
@@ -52,19 +55,134 @@ inline bool contains_any(const std::string& text,
     return false;
 }
 
+inline std::string ascii_lower_copy(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text;
+}
+
 inline std::string extract_fwi_job_id(const std::string& text) {
     static const std::regex pattern(R"(fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12})");
     std::smatch match;
     return std::regex_search(text, match, pattern) ? match.str(0) : std::string();
 }
 
+inline bool mentions_fwi_query(const std::string& query) {
+    return contains_any(
+        query, {"FWI", "fwi", "全波形反演", "声学反演", "Deepwave", "deepwave",
+                "marmousi_94_288", "Marmousi"});
+}
+
+// A negated execution request must never be allowed to fall through to the
+// positive keyword planner. Keep this list deliberately concrete: it is a
+// safety gate for the fixed experimental runner, not a general NLP model.
+inline bool has_fwi_negative_intent(const std::string& query) {
+    const std::string lower_query = ascii_lower_copy(query);
+    return mentions_fwi_query(query) && (contains_any(
+        query, {"不要运行", "不要执行", "不要提交", "不要启动", "不要开始",
+                "别运行", "别执行", "别提交", "别启动", "先别运行", "先别执行",
+                "不用运行", "不用执行", "无需运行", "无需执行", "不运行", "不执行",
+                "不提交", "不启动", "不开始", "勿运行", "勿执行", "仅解释", "只解释",
+                "仅说明", "只说明", "只讲解"}) ||
+        contains_any(lower_query, {"do not run", "don't run", "do not execute",
+                                   "do not submit", "do not start"}));
+}
+
+inline bool is_fwi_capability_query(const std::string& query) {
+    if (!mentions_fwi_query(query)) return false;
+    const bool fixed_phrase = contains_any(
+        query, {"能否", "能不能", "是否能", "是否可以", "可以做", "能做", "支持吗",
+                "是否支持", "支不支持", "会不会", "能运行吗", "可以运行吗", "能执行吗",
+                "可以执行吗", "可以使用吗", "能用吗", "can you", "Can you",
+                "do you support", "Do you support", "is it possible", "Is it possible"});
+    const bool modal_question = contains_any(query, {"吗", "？", "?"}) &&
+                                contains_any(query, {"能", "可以", "支持"});
+    return fixed_phrase || modal_question;
+}
+
+inline bool is_fwi_howto_query(const std::string& query) {
+    return mentions_fwi_query(query) && contains_any(
+        query, {"怎么启动", "如何启动", "怎样启动", "怎么运行", "如何运行", "怎样运行",
+                "怎么执行", "如何执行", "怎样执行", "怎么提交", "如何提交", "怎样提交",
+                "怎么开始", "如何开始", "怎样开始", "怎么使用", "如何使用", "怎样使用",
+                "怎么用", "如何用", "怎样用", "启动方式", "运行方式", "使用方式",
+                "how to run", "How to run", "how to start", "How to start",
+                "how to submit", "How to submit", "how to use", "How to use"});
+}
+
+/**
+ * Extract an iteration count only when it is explicitly attached to an FWI
+ * iteration phrase. This deliberately ignores digits in model IDs, 2D, grid
+ * sizes, frequencies, and job IDs.
+ */
+inline std::optional<int> extract_requested_fwi_iterations(const std::string& query) {
+    static const std::regex chinese_before_pattern(
+        R"(([+-]?[0-9]+(\.[0-9]+)?)\s*(次|轮)(\s*迭代)?)");
+    static const std::regex chinese_after_pattern(
+        R"(迭代\s*([+-]?[0-9]+(\.[0-9]+)?)\s*(次|轮)?)");
+    static const std::regex english_pattern(
+        R"(([+-]?[0-9]+(\.[0-9]+)?)\s*(iterations?|iters?))",
+        std::regex_constants::icase);
+    static const std::regex positive_integer_pattern(R"([0-9]+)");
+    std::smatch match;
+    if (!std::regex_search(query, match, chinese_before_pattern) &&
+        !std::regex_search(query, match, chinese_after_pattern) &&
+        !std::regex_search(query, match, english_pattern)) {
+        return std::nullopt;
+    }
+    const std::string token = match.str(1);
+    if (!std::regex_match(token, positive_integer_pattern)) {
+        return 0;  // Signed and decimal iteration counts are invalid.
+    }
+    try {
+        const unsigned long long value = std::stoull(token);
+        if (value > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+            return 0;  // Present but out of range: always invalid.
+        }
+        return static_cast<int>(value);
+    } catch (const std::exception&) {
+        return 0;  // Present but unparsable: fail closed.
+    }
+}
+
+inline bool has_invalid_fwi_iteration_request(const std::string& query) {
+    if (!mentions_fwi_query(query)) return false;
+    const auto iterations = extract_requested_fwi_iterations(query);
+    return iterations.has_value() && (*iterations < 1 || *iterations > 100);
+}
+
 inline bool is_fwi_theory_query(const std::string& query) {
-    const bool mentions_fwi = contains_any(
-        query, {"FWI", "fwi", "全波形反演", "声学反演"});
     const bool asks_theory = contains_any(
         query, {"什么是", "解释", "理论", "原理", "公式", "为什么", "为何", "区别",
-                "如何", "怎么", "方法", "步骤"});
-    return mentions_fwi && asks_theory;
+                "如何", "怎么", "方法", "步骤", "what is", "What is"});
+    return mentions_fwi_query(query) && asks_theory;
+}
+
+inline bool is_fwi_guidance_query(const std::string& query) {
+    return has_fwi_negative_intent(query) || is_fwi_capability_query(query) ||
+           is_fwi_howto_query(query) || is_fwi_theory_query(query) ||
+           has_invalid_fwi_iteration_request(query);
+}
+
+inline bool contains_run_command_word(const std::string& query) {
+    static const std::vector<std::string> reference_phrases = {
+        "运行状态", "运行进度", "运行结果", "运行情况", "运行了吗", "运行了么",
+        "运行过吗", "运行是否", "运行成功", "运行失败", "运行完成"
+    };
+    std::string::size_type pos = 0;
+    while ((pos = query.find("运行", pos)) != std::string::npos) {
+        const bool is_reference = std::any_of(
+            reference_phrases.begin(), reference_phrases.end(),
+            [&](const std::string& phrase) {
+                return query.compare(pos, phrase.size(), phrase) == 0;
+            });
+        if (!is_reference) {
+            return true;
+        }
+        pos += std::string("运行").size();
+    }
+    return false;
 }
 
 /**
@@ -75,7 +193,7 @@ inline bool is_fwi_theory_query(const std::string& query) {
 inline ToolCallResult plan_fwi_tool_call(const std::string& query,
                                          const std::string& last_job_id = {}) {
     ToolCallResult call{false, "", json::object(), "", ""};
-    if (is_fwi_theory_query(query)) return call;
+    if (is_fwi_guidance_query(query)) return call;
 
     const std::string explicit_job_id = extract_fwi_job_id(query);
     const std::string job_id = explicit_job_id.empty() ? last_job_id : explicit_job_id;
@@ -84,7 +202,51 @@ inline ToolCallResult plan_fwi_tool_call(const std::string& query,
                 "marmousi_94_288"});
     const bool refers_to_previous = contains_any(query, {"刚才", "上一个", "上一项"});
 
-    if (contains_any(query, {"状态", "进度", "status", "progress"}) &&
+    // Submission takes precedence in a combined sentence such as “运行…并展示
+    // 结果”. The result is asynchronous, so this call only submits and returns
+    // the queued job; a later status/result request retrieves artifacts.
+    const std::string lower_query = ascii_lower_copy(query);
+    const bool has_run_action = contains_run_command_word(query) || contains_any(
+        query, {"执行", "提交", "启动", "开始"}) ||
+        contains_any(lower_query, {"run", "execute", "submit", "start"});
+    const bool asks_existing_state = contains_any(
+        query, {"查看", "查询", "状态", "进度", "情况", "了吗", "了么", "是否已经",
+                "结果", "显示", "展示"}) ||
+        contains_any(lower_query, {"status", "progress", "result", "show"});
+    const bool asks_to_run_and_show = has_run_action &&
+        contains_any(query, {"并", "然后", "随后"}) &&
+        contains_any(query, {"结果", "显示", "展示", "损失曲线"});
+    const bool asks_to_run = has_run_action &&
+                             (!asks_existing_state || asks_to_run_and_show);
+    const bool names_model = contains_any(query, {"marmousi_94_288", "Marmousi", "marmousi"});
+    if (asks_to_run && mentions_fwi && names_model) {
+        const auto iterations = extract_requested_fwi_iterations(query);
+        std::string preset = "fwi_demo";
+        if (contains_any(query, {"正演", "forward"})) {
+            preset = "forward";
+        } else {
+            if ((iterations.has_value() && *iterations == 2) ||
+                contains_any(query, {"smoke", "两次迭代", "2次迭代", "2 次迭代"})) {
+                preset = "fwi_smoke";
+            }
+        }
+
+        const std::string device = contains_any(query, {"CPU", "cpu"}) ? "cpu" : "cuda";
+        call.success = true;
+        call.tool_name = "fwi_submit_demo";
+        call.arguments = {
+            {"model_id", "marmousi_94_288"},
+            {"preset", preset},
+            {"device", device}
+        };
+        if (preset != "forward") {
+            call.arguments["iterations"] = iterations.value_or(
+                preset == "fwi_smoke" ? 2 : 5);
+        }
+        return call;
+    }
+
+    if (contains_any(query, {"状态", "进度", "情况", "了吗", "了么", "status", "progress"}) &&
         (mentions_fwi || refers_to_previous || !explicit_job_id.empty())) {
         if (job_id.empty()) return call;
         call.success = true;
@@ -93,7 +255,7 @@ inline ToolCallResult plan_fwi_tool_call(const std::string& query,
         return call;
     }
 
-    if (contains_any(query, {"显示", "结果", "损失曲线", "loss curve", "炮集",
+    if (contains_any(query, {"显示", "展示", "结果", "损失曲线", "loss curve", "炮集",
                              "反演模型"}) &&
         (mentions_fwi || refers_to_previous || !explicit_job_id.empty())) {
         if (job_id.empty()) return call;
@@ -103,27 +265,6 @@ inline ToolCallResult plan_fwi_tool_call(const std::string& query,
         return call;
     }
 
-    const bool asks_to_run = contains_any(
-        query, {"运行", "执行", "提交", "启动", "开始", "run", "demo", "演示",
-                "smoke", "test", "测试"});
-    const bool names_model = contains_any(query, {"marmousi_94_288", "Marmousi", "marmousi"});
-    if (!asks_to_run || !mentions_fwi || !names_model) return call;
-
-    std::string preset = "fwi_demo";
-    if (contains_any(query, {"正演", "forward"})) {
-        preset = "forward";
-    } else if (contains_any(query, {"smoke", "两次迭代", "2次迭代", "2 次迭代"})) {
-        preset = "fwi_smoke";
-    }
-
-    const std::string device = contains_any(query, {"CPU", "cpu"}) ? "cpu" : "cuda";
-    call.success = true;
-    call.tool_name = "fwi_submit_demo";
-    call.arguments = {
-        {"model_id", "marmousi_94_288"},
-        {"preset", preset},
-        {"device", device}
-    };
     return call;
 }
 
@@ -160,6 +301,16 @@ public:
     }
 
     /**
+     * @brief True for FWI capability, usage, negation, and theory questions.
+     *
+     * These queries are routed to the deterministic FWI guidance/explanation
+     * path and must not enter Agent-RAG or the generic tool selector.
+     */
+    bool has_fwi_guidance_request(const std::string& query) const {
+        return detail::is_fwi_guidance_query(query);
+    }
+
+    /**
      * @brief Process a query with tool calling
      * @param query User query
      * @return Tool result as string, or empty if no tool needed
@@ -171,6 +322,11 @@ public:
      * 4. Return result
      */
     std::string process(const std::string& query) {
+        // Never let an FWI capability/how-to/negative/theory question reach
+        // generic Tool-RAG. In particular, semantically similar knowledge
+        // tools must not replace the honest runner guidance or launch a job.
+        if (detail::is_fwi_guidance_query(query)) return "";
+
         if (!mcp_integration_ || !mcp_integration_->isAvailable()) {
             return "";
         }
@@ -192,11 +348,6 @@ public:
             }
             return result.success ? result.result : std::string();
         }
-
-        // A theory query may use FWI vocabulary that is close to the runner's
-        // embedding. Keep it on the explanatory path instead of asking an LLM
-        // tool selector to decide whether to launch a job.
-        if (detail::is_fwi_theory_query(query)) return "";
 
         // Step 1: Retrieve candidate tools
         auto candidates = retrieve_tools(query, 5);

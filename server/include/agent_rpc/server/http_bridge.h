@@ -3,7 +3,7 @@
  * @brief HTTP 桥接服务 - 为 Web 前端提供 HTTP API
  *
  * 在 gRPC Server 同进程中运行，监听 HTTP 端口，
- * 接收浏览器请求并转发到 Orchestrator。
+ * 将浏览器请求转换为 AIQueryService gRPC 调用。
  */
 
 #pragma once
@@ -21,10 +21,10 @@ public:
     /**
      * 启动 HTTP 桥接服务
      * @param port HTTP 监听端口
-     * @param orchestrator_url Orchestrator 地址
+     * @param grpc_target AIQueryService gRPC 目标，例如 127.0.0.1:50051
      * @return 是否启动成功
      */
-    bool start(int port, const std::string& orchestrator_url);
+    bool start(int port, const std::string& grpc_target);
 
     /** 停止服务 */
     void stop();

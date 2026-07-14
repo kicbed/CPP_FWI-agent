@@ -45,6 +45,7 @@ constexpr const char* kModule = "fwi_worker";
 constexpr const char* kDefaultRunRoot = "/root/fwi-runs";
 constexpr const char* kModelId = "marmousi_94_288";
 constexpr std::size_t kMaxJsonBytes = 8U * 1024U * 1024U;
+constexpr std::int64_t kMaxIterations = 100;
 
 #ifndef FWI_PROJECT_ROOT
 #define FWI_PROJECT_ROOT "/root/projects/project/agent-communication-main-v2"
@@ -71,8 +72,8 @@ ReaperState& reaper_state() {
 static PluginTool methods[] = {
     {
         "fwi_submit_demo",
-        "运行固定白名单 Marmousi 二维常密度声学 Deepwave 演示。仅在用户明确要求运行正演、FWI smoke 或 FWI demo 时调用；FWI 理论问题不要调用。提交后立即返回异步 job_id。",
-        R"({"type":"object","additionalProperties":false,"properties":{"model_id":{"type":"string","enum":["marmousi_94_288"],"description":"固定白名单模型"},"preset":{"type":"string","enum":["forward","fwi_smoke","fwi_demo"],"description":"forward=合成正演，fwi_smoke=2次迭代链路检查，fwi_demo=5次迭代演示"},"device":{"type":"string","enum":["cuda","cpu"],"description":"单 CUDA GPU 或 CPU"}},"required":["model_id","preset","device"]})"
+        "运行固定白名单 Marmousi 二维常密度声学 Deepwave 演示。仅在用户明确要求运行正演或 FWI 时调用；iterations 可在 1 到 100 之间显式指定，未指定时 smoke=2、demo=5。FWI 理论问题不要调用。提交后立即返回异步 job_id。",
+        R"({"type":"object","additionalProperties":false,"properties":{"model_id":{"type":"string","enum":["marmousi_94_288"],"description":"固定白名单模型"},"preset":{"type":"string","enum":["forward","fwi_smoke","fwi_demo"],"description":"forward=合成正演；fwi_smoke/fwi_demo 提供不同默认值，均可用 iterations 覆盖"},"device":{"type":"string","enum":["cuda","cpu"],"description":"单 CUDA GPU 或 CPU"},"iterations":{"type":"integer","minimum":1,"maximum":100,"description":"仅用于反演，允许1到100。省略时 smoke=2、demo=5；正演请省略"}},"required":["model_id","preset","device"]})"
     },
     {
         "fwi_get_status",
@@ -456,6 +457,26 @@ void require_exact_keys(const json& args, const std::vector<std::string>& expect
     }
 }
 
+void require_submit_keys(const json& args) {
+    if (!args.is_object()) {
+        throw std::invalid_argument("arguments must be a JSON object");
+    }
+    for (const auto& key : {"model_id", "preset", "device"}) {
+        if (!args.contains(key) || !args.at(key).is_string()) {
+            throw std::invalid_argument(std::string(key) + " must be a string");
+        }
+    }
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        if (it.key() != "model_id" && it.key() != "preset" &&
+            it.key() != "device" && it.key() != "iterations") {
+            throw std::invalid_argument("arguments contain unsupported fields");
+        }
+    }
+    if (args.contains("iterations") && !args.at("iterations").is_number_integer()) {
+        throw std::invalid_argument("iterations must be an integer");
+    }
+}
+
 std::string string_arg(const json& args, const char* key) {
     const std::string value = args.at(key).get<std::string>();
     if (value.empty()) throw std::invalid_argument(std::string(key) + " must not be empty");
@@ -463,7 +484,7 @@ std::string string_arg(const json& args, const char* key) {
 }
 
 json submit_demo(const json& args) {
-    require_exact_keys(args, {"model_id", "preset", "device"});
+    require_submit_keys(args);
     const std::string model_id = string_arg(args, "model_id");
     const std::string preset = string_arg(args, "preset");
     const std::string device = string_arg(args, "device");
@@ -478,14 +499,29 @@ json submit_demo(const json& args) {
         throw std::invalid_argument("device must be cuda or cpu");
     }
 
+    const std::int64_t default_iterations =
+        preset == "fwi_smoke" ? 2 : (preset == "fwi_demo" ? 5 : 0);
+    const std::int64_t requested_iterations =
+        args.contains("iterations")
+            ? args.at("iterations").get<std::int64_t>()
+            : default_iterations;
+    if (preset == "forward" && args.contains("iterations")) {
+        throw std::invalid_argument("forward does not accept iterations");
+    }
+    if (preset != "forward" &&
+        (requested_iterations < 1 || requested_iterations > kMaxIterations)) {
+        throw std::invalid_argument("iterations must be between 1 and 100 for inversion");
+    }
+    const int iterations = static_cast<int>(requested_iterations);
+
     auto [job_id, run_dir] = create_job_dir();
-    const int iterations = preset == "fwi_smoke" ? 2 : (preset == "fwi_demo" ? 5 : 0);
     try {
         const json config = {
             {"job_id", job_id},
             {"model_id", model_id},
             {"preset", preset},
-            {"device", device}
+            {"device", device},
+            {"iterations", iterations}
         };
         atomic_write_json(run_dir / "config.original.json", config);
         atomic_write_json(
@@ -509,6 +545,7 @@ json submit_demo(const json& args) {
         {"type", "fwi_job_submitted"},
         {"job_id", job_id},
         {"status", "queued"},
+        {"iterations", iterations},
         {"status_url", "/fwi-artifacts/" + job_id + "/status.json"}
     };
 }

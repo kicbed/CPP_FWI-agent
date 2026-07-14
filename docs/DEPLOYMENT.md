@@ -128,6 +128,7 @@ export WEB_HOST=127.0.0.1
 export WEB_PORT=8080
 
 ./start.sh                 # 首次运行或源码改变后，自动配置/增量构建
+./start.sh --grpc          # 同时启用 Web 的 gRPC 模式
 ./start.sh --no-build      # 已有最新构建时，仅启动
 ./start.sh --rebuild       # 仅在需要 clean-first 重建时使用
 ```
@@ -137,13 +138,16 @@ export WEB_PORT=8080
 聊天、MCP 或 dotenv 改成其他可执行文件。`FWI_RUN_ROOT` 可以由部署管理员改为其他
 绝对结果目录。
 
-可选 gRPC/HTTP bridge 也通过同一入口启动：
+可选 gRPC Server/Web bridge 也通过同一入口启动：
 
 ```bash
-ENABLE_GRPC=true ./start.sh
+./start.sh --grpc
 ```
 
 默认不开启；开启后额外监听本机 `127.0.0.1:50051/50052`，`./stop.sh` 会一并关闭。
+50052 是浏览器可访问的 HTTP bridge，并会调用 50051 的原生 gRPC
+`AIQueryService`。`--grpc` 是命令行强制开关，不会被 `.env` 中的
+`ENABLE_GRPC=false` 覆盖。
 
 启动器在后台启动 Agent 和 Web，健康检查通过后返回。访问：
 

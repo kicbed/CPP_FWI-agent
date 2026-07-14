@@ -19,14 +19,15 @@
 
 `stop.sh` 可以重复执行；已经停止的服务不会导致脚本失败。
 
-需要保留旧 Web gRPC 模式做本机调试时，也仍从同一个根入口启动：
+需要使用 Web 的 gRPC 模式时，也仍从同一个根入口启动：
 
 ```bash
-ENABLE_GRPC=true ./start.sh
+./start.sh --grpc
 ```
 
-该选项会额外启动仅监听 `127.0.0.1:50051/50052` 的 gRPC Server 和 HTTP bridge，
-不会再自动启动 Embedding 服务、占用者清理命令或前台客户端。
+该选项会额外启动仅监听 `127.0.0.1:50051/50052` 的 gRPC Server 和 Web bridge。
+浏览器仍通过 HTTP 访问 50052，但 bridge 会把请求真正转发到 50051 的
+`AIQueryService`；未加 `--grpc` 时，页面会禁用 gRPC 模式并说明启动方法。
 
 根目录的 `./start.sh` 与 `./stop.sh` 是唯一推荐的日常启停入口。`examples/ai_orchestrator/start_system.sh` 属于内部实现，`deploy/scripts/` 下的旧入口只保留给兼容或高级调试场景，不建议直接调用。
 
@@ -63,6 +64,30 @@ ENABLE_GRPC=true ./start.sh
 ```text
 什么是 FWI？只解释概念，不要运行任务。
 ```
+
+如果只想确认能力或查看启动方法，可以问：
+
+```text
+你可以做 FWI 反演吗？
+怎么启动一个 FWI 反演？
+```
+
+这两类问句只返回受支持范围和可复制命令，不会悄悄提交任务。真正开始两次迭代的
+CUDA smoke 需要使用带模型名和动作的明确命令：
+
+```text
+使用 marmousi_94_288 在 CUDA 上运行两次迭代的二维声学 FWI smoke test。
+```
+
+`fwi_smoke` 默认 2 次，`fwi_demo` 默认 5 次；也可以在自然语言中显式指定
+1–100 次，系统会把该整数原样记录到配置、状态和指标中，例如：
+
+```text
+使用 marmousi_94_288 在 CUDA 上运行 50 次迭代的 FWI，并向我展示结果。
+```
+
+提交是异步的：页面先显示 `job_id` 和进度，成功后自动加载结果；它不会在计算完成前
+伪造图片或指标。超过安全上限、负数、小数，或给正演传入反演迭代参数都会被拒绝。
 
 ## 模型和运行目录
 
@@ -124,9 +149,13 @@ python -m fwi_worker status --run-dir /root/fwi-runs/<job_id>
 
 ```text
 浏览器 Web UI (:8080)
-        │
-        ▼
-C++ Orchestrator (:5000) ── Agent / RAG / 理论问答
+        ├──HTTP 默认───────────────> C++ Orchestrator (:5000)
+        └──可选 Web bridge (:50052) ──gRPC──> AIQueryService (:50051)
+                                                   │ A2A
+                                                   ▼
+                                      C++ Orchestrator (:5000)
+                                                   │
+                                      Agent / RAG / 理论问答
         │
         ▼
 MCP fwi-runner ── 固定参数校验与异步进程启动
@@ -182,6 +211,10 @@ CUDA 运行前建议确认：
 ## 范围与限制
 
 当前只覆盖二维常密度声学、单参数 `Vp`、单频 8 Hz、CPU/单 GPU 和小规模合成验证。尚不支持弹性波、密度或 `Vs` 反演、3D、MPI、多 GPU、SEG-Y 直接读取、远程调度、复杂目标函数和任务取消。
+
+当前参数策略是“用户明确给值就校验后执行，省略时使用记录在 resolved config 中的保守
+默认值”。由 Agent 提议参数后等待人工审批，或由用户授权 Agent 全权选择参数的交互工作流
+尚未实现，作为后续功能保留。
 
 完整的宿主机环境配置、仓库外 Python venv、Docker 隔离、模型放置、启动参数、健康检查、日志、故障排查及卸载步骤见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。模型注册和参数解释见 [docs/MODEL_GUIDE.md](docs/MODEL_GUIDE.md)，浏览器验收步骤见 [docs/FRONTEND_TEST.md](docs/FRONTEND_TEST.md)。
 

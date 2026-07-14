@@ -1,6 +1,7 @@
 #include "PluginAPI.h"
 #include "json.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <cstdint>
@@ -95,6 +96,20 @@ int main() {
     require(names == std::set<std::string>({"fwi_submit_demo", "fwi_get_status", "fwi_get_result"}),
             "unexpected FWI tool names");
 
+    const json submit_schema = json::parse(plugin->GetTool(0)->inputSchema);
+    require(submit_schema.at("properties").contains("iterations"),
+            "submit schema must expose iterations");
+    require(submit_schema.at("properties").at("iterations").at("type") == "integer",
+            "submit schema must require integer iterations");
+    require(submit_schema.at("properties").at("iterations").at("minimum") == 1,
+            "submit schema iteration minimum mismatch");
+    require(submit_schema.at("properties").at("iterations").at("maximum") == 100,
+            "submit schema iteration bound mismatch");
+    require(std::find(submit_schema.at("required").begin(),
+                      submit_schema.at("required").end(), "iterations") ==
+                submit_schema.at("required").end(),
+            "iterations must remain optional so preset defaults still work");
+
     const json invalid_model = call(plugin, "fwi_submit_demo", {
         {"model_id", "../../etc/passwd"}, {"preset", "forward"}, {"device", "cpu"}
     });
@@ -105,6 +120,52 @@ int main() {
         {"extra_args", "--arbitrary-shell-text"}
     });
     require(extra_arg.at("isError") == true, "extra arguments must be rejected");
+
+    const json too_many_iterations = call(plugin, "fwi_submit_demo", {
+        {"model_id", "marmousi_94_288"}, {"preset", "fwi_demo"}, {"device", "cpu"},
+        {"iterations", 101}
+    });
+    require(too_many_iterations.at("isError") == true,
+            "iteration counts above the safety bound must be rejected");
+
+    for (const int invalid_iterations : {-1, 0}) {
+        const json invalid_count = call(plugin, "fwi_submit_demo", {
+            {"model_id", "marmousi_94_288"}, {"preset", "fwi_demo"},
+            {"device", "cpu"}, {"iterations", invalid_iterations}
+        });
+        require(invalid_count.at("isError") == true,
+                "inversion iteration counts below one must be rejected");
+    }
+
+    const json fractional_iterations = call(plugin, "fwi_submit_demo", {
+        {"model_id", "marmousi_94_288"}, {"preset", "fwi_demo"}, {"device", "cpu"},
+        {"iterations", 2.5}
+    });
+    require(fractional_iterations.at("isError") == true,
+            "fractional iteration counts must be rejected");
+
+    for (const json& invalid_type : {json("50"), json(true), json(nullptr)}) {
+        const json invalid_count = call(plugin, "fwi_submit_demo", {
+            {"model_id", "marmousi_94_288"}, {"preset", "fwi_demo"},
+            {"device", "cpu"}, {"iterations", invalid_type}
+        });
+        require(invalid_count.at("isError") == true,
+                "non-integer iteration values must be rejected");
+    }
+
+    const json invalid_forward_iterations = call(plugin, "fwi_submit_demo", {
+        {"model_id", "marmousi_94_288"}, {"preset", "forward"}, {"device", "cpu"},
+        {"iterations", 1}
+    });
+    require(invalid_forward_iterations.at("isError") == true,
+            "forward must reject an iterations argument");
+
+    const json invalid_forward_zero = call(plugin, "fwi_submit_demo", {
+        {"model_id", "marmousi_94_288"}, {"preset", "forward"}, {"device", "cpu"},
+        {"iterations", 0}
+    });
+    require(invalid_forward_zero.at("isError") == true,
+            "forward must require callers to omit iterations");
 
     const json traversal = call(plugin, "fwi_get_status", {{"job_id", "../../root"}});
     require(traversal.at("isError") == true, "path traversal job_id must be rejected");

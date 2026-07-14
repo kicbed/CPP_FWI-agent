@@ -58,9 +58,14 @@ process_matches() {
 
     expected="$(expected_binary "$name")" || return 1
     [[ -n "$expected" && -e "$expected" ]] || return 1
-    actual="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null)" || return 1
+    # When an incremental build atomically replaces a running binary, Linux
+    # reports the original executable as "<canonical path> (deleted)".  It is
+    # still the project process recorded by our private PID file and must
+    # remain stoppable; compare that exact form without weakening the path
+    # allow-list or falling back to process-name matching.
+    actual="$(readlink -- "/proc/$pid/exe" 2>/dev/null)" || return 1
     expected="$(readlink -f -- "$expected" 2>/dev/null)" || return 1
-    [[ "$actual" == "$expected" ]]
+    [[ "$actual" == "$expected" || "$actual" == "$expected (deleted)" ]]
 }
 
 stop_one() {

@@ -203,16 +203,19 @@ int main(int argc, char* argv[]) {
     
     LOG_INFO("RPC Server 已启动: " + config.server_address);
 
-    // 启动 HTTP 桥接服务（为 Web 前端提供 HTTP API）
+    // 启动 HTTP-to-gRPC 桥接服务（为 Web 前端提供 HTTP API）
     HttpBridge http_bridge;
     if (http_bridge_port > 0) {
-        if (http_bridge.start(http_bridge_port, orchestrator_url)) {
+        const std::string grpc_target = "127.0.0.1:" + port;
+        if (http_bridge.start(http_bridge_port, grpc_target)) {
             const char* bridge_host = std::getenv("HTTP_BRIDGE_BIND_HOST");
             const std::string shown_host = bridge_host && *bridge_host ? bridge_host : "127.0.0.1";
-            std::cout << "HTTP 桥接:     " << shown_host << ":" << http_bridge_port << std::endl;
+            std::cout << "HTTP-to-gRPC 桥接: " << shown_host << ":" << http_bridge_port
+                      << " -> " << grpc_target << std::endl;
             std::cout << "  Web UI API:  http://127.0.0.1:" << http_bridge_port << "/api/query" << std::endl;
         } else {
-            std::cerr << "警告: HTTP 桥接启动失败 (端口 " << http_bridge_port << ")" << std::endl;
+            std::cerr << "警告: HTTP-to-gRPC 桥接启动失败 (端口 "
+                      << http_bridge_port << ")" << std::endl;
         }
     }
 

@@ -17,7 +17,7 @@ foreach(required
     "<title>Lab Agent Workbench</title>"
     "Lab Agent Workbench"
     "Seismic Research Workspace"
-    "FWI-first research computing workbench"
+    "Deepwave 二维常密度声学 FWI 实验工作台"
     "Powered by Lab Agent Workbench")
     if(NOT web_index MATCHES "${required}")
         message(FATAL_ERROR "Missing required Web UI branding text: ${required}")
@@ -37,34 +37,55 @@ if(NOT web_server MATCHES "Lab Agent Workbench .*已启动")
 endif()
 
 foreach(required
-    "id=\"algorithmList\""
+    "id=\"fwiQuickActions\""
     "id=\"experimentHistory\""
     "id=\"workbenchInspector\""
-    "Route Trace"
-    "Tool Calls"
-    "AlgorithmCard"
-    "ExperimentSpec"
-    "JobSpec"
-    "Parameter Table"
-    "dry_run: true"
+    "Deepwave 2D Acoustic FWI"
+    "最近 FWI 任务"
+    "当前开放能力"
+    "一键提交"
+    "marmousi_94_288"
+    "运行一个二维声学正演演示"
+    "运行两次迭代的二维声学 FWI smoke test"
+    "运行二维声学 FWI demo"
+    "自定义迭代"
+    "1–100 次"
+    "运行 50 次迭代的 FWI"
+    "Smoke CUDA"
+    "Smoke CPU"
+    "gRPC 桥"
+    "./start.sh --grpc"
+    "grpcAvailable"
+    "setGrpcAvailability"
+    "health.transport === 'grpc'"
+    "已自动切回 HTTP"
+    "processFwiPayloadFromAnswer"
+    "随 Orchestrator 按需调用"
     "statusRegistry"
     "statusMcp"
     "statusEmbedding"
     "statusCodeAgent"
     "statusPlannerAgent"
-    "Planner Agent"
-    "fwi-cuda-mpi"
-    "frequency-extrapolation"
-    "poststack-inversion"
-    "renderAlgorithmList"
-    "selectAlgorithm"
-    "renderExperimentSpec"
-    "renderJobSpec"
-    "extractExperimentSpec"
-    "extractJobSpec"
-    "updateInspectorFromAnswer")
+    "Planner Agent")
     if(NOT web_index MATCHES "${required}")
         message(FATAL_ERROR "Missing required Lab Workbench UI element or helper: ${required}")
+    endif()
+endforeach()
+
+foreach(forbidden
+    "CUDA-MPI FWI"
+    "marmousi2 dry-run"
+    "queued draft"
+    "dry-run research state"
+    "dry_run: true"
+    "id=\"algorithmList\""
+    "Route Trace"
+    "Tool Calls"
+    "AlgorithmCard"
+    "ExperimentSpec"
+    "JobSpec")
+    if(web_index MATCHES "${forbidden}")
+        message(FATAL_ERROR "Web UI still exposes placeholder or unavailable state: ${forbidden}")
     endif()
 endforeach()
 

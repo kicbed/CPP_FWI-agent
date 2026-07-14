@@ -90,6 +90,42 @@ function loadUiFunctions() {
   return { api: sandbox.module.exports, sandbox };
 }
 
+function loadModeFunctions() {
+  const elements = {
+    modeHttp: { className: '' },
+    modeGrpc: {
+      className: '',
+      disabled: true,
+      title: '',
+      attributes: {},
+      setAttribute(name, value) { this.attributes[name] = String(value); },
+    },
+    modeTag: { textContent: '' },
+    currentModeLabel: { textContent: '' },
+  };
+  const storage = new Map();
+  const sandbox = {
+    module: { exports: {} },
+    document: { getElementById(id) { return elements[id] || null; } },
+    localStorage: {
+      setItem(key, value) { storage.set(key, String(value)); },
+      getItem(key) { return storage.get(key) || null; },
+    },
+  };
+  const source = [
+    "const state = { mode: 'http', grpcAvailable: false, contextId: 'old-context' };",
+    "const CONFIG = { http: { label: 'HTTP :5000' }, grpc: { label: 'gRPC :50052' } };",
+    'const toasts = [];',
+    'function showToast(message) { toasts.push(message); }',
+    extractFunction('switchMode'),
+    extractFunction('updateModeControls'),
+    extractFunction('setGrpcAvailability'),
+    'module.exports = { state, toasts, switchMode, setGrpcAvailability };',
+  ].join('\n');
+  vm.runInNewContext(source, sandbox);
+  return { api: sandbox.module.exports, elements, storage };
+}
+
 function testStreamChunkExtraction() {
   const { api } = loadUiFunctions();
 
@@ -256,10 +292,62 @@ function testFwiMissingImageFallback() {
   assert.deepEqual(removedClasses, ['hidden']);
 }
 
+function testHonestFwiControlsAndNoPlaceholderFeatures() {
+  assert.match(html, /id="fwiQuickActions"/);
+  assert.match(html, /Deepwave 2D Acoustic FWI/);
+  assert.match(html, /最近 FWI 任务/);
+  assert.match(html, /marmousi_94_288/);
+  assert.match(html, /运行两次迭代的二维声学 FWI smoke test/);
+  assert.match(html, /运行二维声学 FWI demo/);
+  assert.match(html, /自定义迭代/);
+  assert.match(html, /1–100 次/);
+  assert.match(html, /运行 50 次迭代的 FWI/);
+  assert.doesNotMatch(html, /CUDA-MPI FWI/);
+  assert.doesNotMatch(html, /marmousi2 dry-run/);
+  assert.doesNotMatch(html, /queued draft/);
+  assert.doesNotMatch(html, /dry-run research state/);
+  assert.doesNotMatch(html, /id="algorithmList"/);
+}
+
+function testGrpcModeIsHealthGatedAndFallsBack() {
+  const { api, elements, storage } = loadModeFunctions();
+
+  assert.equal(api.switchMode('grpc'), false);
+  assert.equal(api.state.mode, 'http');
+  assert.equal(storage.get('agent-mode'), 'http');
+  assert.match(api.toasts.at(-1), /\.\/start\.sh --grpc/);
+
+  api.setGrpcAvailability(true);
+  assert.equal(elements.modeGrpc.disabled, false);
+  assert.equal(elements.modeGrpc.attributes['aria-disabled'], 'false');
+  assert.equal(api.switchMode('grpc'), true);
+  assert.equal(api.state.mode, 'grpc');
+  assert.equal(elements.modeTag.textContent, 'gRPC 桥');
+
+  api.setGrpcAvailability(false, 'bridge offline');
+  assert.equal(api.state.mode, 'http');
+  assert.equal(elements.modeGrpc.disabled, true);
+  assert.equal(storage.get('agent-mode'), 'http');
+  assert.equal(api.toasts.at(-1), 'bridge offline');
+
+  assert.match(html, /health\.status === 'ok'/);
+  assert.match(html, /health\.transport === 'grpc'/);
+}
+
+function testChatAndSystemTextAreEscaped() {
+  const historySource = extractFunction('renderHistory');
+  const appendSource = extractFunction('appendMessage');
+  assert.match(historySource, /escapeHtml\(chat\.title \|\| '未命名对话'\)/);
+  assert.match(appendSource, /escapeHtml\(content\)/);
+}
+
 testStreamChunkExtraction();
 testMarkdownRendererUsesLibraryAndSanitizer();
 testMathJaxConfigSkipsCode();
 testFwiSubmittedAndWrappedResultParsing();
 testFwiResultMetricsImagesAndEscaping();
 testFwiMissingImageFallback();
+testHonestFwiControlsAndNoPlaceholderFeatures();
+testGrpcModeIsHealthGatedAndFallsBack();
+testChatAndSystemTextAreEscaped();
 console.log('ui message rendering tests passed');

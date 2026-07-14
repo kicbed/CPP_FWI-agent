@@ -159,6 +159,23 @@ TEST_F(A2AIntegrationTest, ModelInit_MessagePart) {
     EXPECT_EQ(text_part.kind(), a2a::PartKind::Text);
 }
 
+TEST_F(A2AIntegrationTest, MessageJsonPreservesStructuredToolText) {
+    const std::string tool_text =
+        R"({"content":[{"text":"{\"status\":\"queued\",\"iterations\":50}"}],"isError":false})";
+    a2a::AgentMessage source;
+    source.set_message_id("msg-fwi");
+    source.set_context_id("ctx-fwi");
+    source.set_role(a2a::MessageRole::Agent);
+    source.add_text_part(tool_text);
+
+    const auto parsed = a2a::AgentMessage::from_json(source.to_json());
+    ASSERT_EQ(parsed.parts().size(), 1U);
+    const auto* text = dynamic_cast<const a2a::TextPart*>(parsed.parts().front().get());
+    ASSERT_NE(text, nullptr);
+    EXPECT_EQ(text->text(), tool_text);
+    EXPECT_EQ(parsed.context_id().value_or(""), "ctx-fwi");
+}
+
 TEST_F(A2AIntegrationTest, ModelInit_Artifact) {
     a2a::Artifact artifact;
     artifact.set_name("result.txt");
