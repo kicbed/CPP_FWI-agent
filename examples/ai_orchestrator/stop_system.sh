@@ -1,97 +1,118 @@
-#!/bin/bash
-#
-# FWI Agent 系统停止脚本
-#
-# 功能：
-# 1. 停止所有 Agent 服务
-# 2. 停止 Embedding 服务
-# 3. 清理 PID 文件
-#
+#!/usr/bin/env bash
+# Internal, PID-file-only shutdown. Prefer repository-root stop.sh.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+set -Eeuo pipefail
+umask 077
 
-echo "=========================================="
-echo "停止 FWI Agent 系统"
-echo "=========================================="
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
+BIN_DIR="$PROJECT_ROOT/build/examples/ai_orchestrator"
+PID_DIR="$SCRIPT_DIR/pids"
+QUIET=false
 
-# 颜色
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+case "${1:-}" in
+    '') ;;
+    --quiet) QUIET=true ;;
+    -h|--help)
+        printf '用法: %s [--quiet]\n' "$0"
+        exit 0
+        ;;
+    *) printf '错误: 未知参数 %s\n' "$1" >&2; exit 2 ;;
+esac
 
-# 1. 停止 PID 文件中记录的进程
-echo -e "${YELLOW}[1/3] 停止 Agent 服务...${NC}"
-for pid_file in "$SCRIPT_DIR/pids"/*.pid; do
-    if [ -f "$pid_file" ]; then
-        pid=$(cat "$pid_file")
-        name=$(basename "$pid_file" .pid)
-        if kill -0 "$pid" 2>/dev/null; then
-            echo -e "  停止 $name (PID: $pid)"
-            kill "$pid" 2>/dev/null
-            sleep 1
-            # 如果还没停止，强制杀死
-            if kill -0 "$pid" 2>/dev/null; then
-                kill -9 "$pid" 2>/dev/null
-            fi
+log() {
+    [[ "$QUIET" == true ]] || printf '%s\n' "$*"
+}
+
+expected_binary() {
+    case "$1" in
+        registry) printf '%s\n' "$BIN_DIR/ai_registry_server" ;;
+        math_agent) printf '%s\n' "$BIN_DIR/ai_math_agent" ;;
+        fwi_theory_agent) printf '%s\n' "$BIN_DIR/ai_fwi_theory_agent" ;;
+        fwi_teaching_agent) printf '%s\n' "$BIN_DIR/ai_fwi_teaching_agent" ;;
+        general_research_agent) printf '%s\n' "$BIN_DIR/ai_general_research_agent" ;;
+        code_agent) printf '%s\n' "$BIN_DIR/ai_code_agent" ;;
+        experiment_planner_agent) printf '%s\n' "$BIN_DIR/ai_experiment_planner_agent" ;;
+        orchestrator) printf '%s\n' "$BIN_DIR/ai_orchestrator" ;;
+        grpc_server) printf '%s\n' "$PROJECT_ROOT/build/server/rpc_server" ;;
+        redis) command -v redis-server 2>/dev/null || true ;;
+        *) return 1 ;;
+    esac
+}
+
+process_matches() {
+    local name="$1" pid="$2" actual expected
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+
+    if [[ "$name" == watchdog || "$name" == web ]]; then
+        local -a command_line=()
+        mapfile -d '' -t command_line < "/proc/$pid/cmdline" || true
+        ((${#command_line[@]} >= 2)) || return 1
+        if [[ "$name" == watchdog ]]; then
+            [[ "${command_line[1]}" == "$SCRIPT_DIR/watchdog.sh" ]]
+        else
+            [[ "${command_line[1]}" == "$PROJECT_ROOT/web/serve.py" ]]
         fi
-        rm -f "$pid_file"
+        return
     fi
+
+    expected="$(expected_binary "$name")" || return 1
+    [[ -n "$expected" && -e "$expected" ]] || return 1
+    actual="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null)" || return 1
+    expected="$(readlink -f -- "$expected" 2>/dev/null)" || return 1
+    [[ "$actual" == "$expected" ]]
+}
+
+stop_one() {
+    local name="$1" pid_file pid attempt
+    pid_file="$PID_DIR/$name.pid"
+    [[ -e "$pid_file" ]] || return 0
+
+    if [[ -L "$pid_file" || ! -f "$pid_file" ]]; then
+        log "跳过不可信 PID 文件: $pid_file"
+        rm -f -- "$pid_file"
+        return 0
+    fi
+
+    pid="$(tr -d '[:space:]' < "$pid_file")"
+    if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        log "移除无效 PID 文件: $pid_file"
+        rm -f -- "$pid_file"
+        return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f -- "$pid_file"
+        return 0
+    fi
+    if ! process_matches "$name" "$pid"; then
+        log "拒绝停止身份不匹配的 PID $pid（记录名: $name）"
+        rm -f -- "$pid_file"
+        return 0
+    fi
+
+    log "停止 $name (PID $pid)"
+    kill -TERM "$pid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 50; ++attempt)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null && process_matches "$name" "$pid"; then
+        log "$name 未及时退出，发送 KILL"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f -- "$pid_file"
+}
+
+log '停止 FWI Agent 项目进程……'
+
+# Stop the watchdog first so it cannot recreate services during shutdown.
+stop_one watchdog
+stop_one web
+for name in orchestrator experiment_planner_agent code_agent general_research_agent \
+    fwi_teaching_agent fwi_theory_agent math_agent registry grpc_server redis; do
+    stop_one "$name"
 done
 
-# 2. 停止 Embedding 服务
-echo -e "${YELLOW}[2/3] 停止 Embedding 服务...${NC}"
-
-# 检查所有可能的 PID 文件位置
-for pid_file in \
-    "$SCRIPT_DIR/pids/embedding.pid" \
-    "$PROJECT_ROOT/deploy/pids/embedding.pid" \
-    "$PROJECT_ROOT/deploy/logs/embedding.pid"; do
-    if [ -f "$pid_file" ]; then
-        pid=$(cat "$pid_file")
-        if kill -0 "$pid" 2>/dev/null; then
-            echo -e "  停止 Embedding (PID: $pid)"
-            kill "$pid" 2>/dev/null
-            sleep 1
-            if kill -0 "$pid" 2>/dev/null; then
-                kill -9 "$pid" 2>/dev/null
-            fi
-        fi
-        rm -f "$pid_file"
-    fi
-done
-
-# 也通过端口查找并停止
-for port in 6000 50051 50052; do
-    port_pid=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -oP 'pid=\d+' | grep -oP '\d+')
-    if [ -n "$port_pid" ]; then
-        echo -e "  停止服务 (端口 $port, PID: $port_pid)"
-        kill "$port_pid" 2>/dev/null
-        sleep 1
-        if kill -0 "$port_pid" 2>/dev/null; then
-            kill -9 "$port_pid" 2>/dev/null
-        fi
-    fi
-done
-
-# 3. 通过进程名强制停止（兜底）
-echo -e "${YELLOW}[3/3] 清理残留进程...${NC}"
-for pattern in "ai_orchestrator" "ai_math_agent" "ai_registry_server" "ai_fwi_theory" "ai_fwi_teaching" "ai_general_research" "ai_experiment_planner" "embedding_server" "rpc_server"; do
-    pids=$(pgrep -f "$pattern" 2>/dev/null)
-    if [ -n "$pids" ]; then
-        echo -e "  强制停止 $pattern (PIDs: $pids)"
-        echo "$pids" | xargs kill -9 2>/dev/null
-    fi
-done
-
-# 清理 PID 文件
-rm -f "$SCRIPT_DIR/pids"/*.pid
-rm -f "$PROJECT_ROOT/deploy/pids"/*.pid
-
-sleep 1
-
-echo ""
-echo -e "${GREEN}=========================================="
-echo "系统已停止"
-echo -e "==========================================${NC}"
+# Unknown PID files are deliberately left untouched: only the fixed allow-list
+# above is authorised to receive signals.
+log '项目进程已停止。再次执行本脚本也是安全的。'

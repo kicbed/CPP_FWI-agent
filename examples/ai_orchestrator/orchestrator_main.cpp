@@ -14,6 +14,7 @@
 #include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
+#include "api_key_env.hpp"
 
 #include <a2a/models/agent_message.hpp>
 #include <a2a/models/agent_task.hpp>
@@ -913,7 +914,7 @@ std::string analyze_intent(const std::string& text) {
 };
 
 void print_usage(const char* program) {
-    std::cerr << "用法: " << program << " <agent_id> <port> <registry_url> <api_key> [options]" << std::endl;
+    std::cerr << "用法: " << program << " <agent_id> <port> <registry_url> @env [options]" << std::endl;
     std::cerr << "选项:" << std::endl;
     std::cerr << "  --redis-host <host>     Redis 主机 (默认: 127.0.0.1)" << std::endl;
     std::cerr << "  --redis-port <port>     Redis 端口 (默认: 6379)" << std::endl;
@@ -921,7 +922,7 @@ void print_usage(const char* program) {
     std::cerr << "  --mcp-args <args>       MCP Server 启动参数 (逗号分隔)" << std::endl;
     std::cerr << "  --enable-mcp            启用 MCP" << std::endl;
     std::cerr << std::endl;
-    std::cerr << "示例: " << program << " orch-1 5000 http://localhost:8500 sk-xxx --enable-mcp --mcp-server /path/to/mcp_server" << std::endl;
+    std::cerr << "示例: " << program << " orch-1 5000 http://localhost:8500 @env --enable-mcp --mcp-server /path/to/mcp_server" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -933,7 +934,11 @@ int main(int argc, char* argv[]) {
     std::string agent_id = argv[1];
     int port = std::stoi(argv[2]);
     std::string registry_url = argv[3];
-    std::string api_key = argv[4];
+    std::string api_key = agent_rpc::examples::resolve_api_key_argument(argv[4]);
+    if (api_key.empty()) {
+        std::cerr << "错误: 未为所选 LLM_PROVIDER 配置 API Key" << std::endl;
+        return 1;
+    }
 
     // 默认值
     std::string redis_host = "127.0.0.1";

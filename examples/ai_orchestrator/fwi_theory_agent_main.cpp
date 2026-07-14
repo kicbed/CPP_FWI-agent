@@ -2,6 +2,7 @@
 #include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
+#include "api_key_env.hpp"
 #include <a2a/models/agent_message.hpp>
 #include <a2a/models/agent_task.hpp>
 #include <a2a/models/task_status.hpp>
@@ -169,9 +170,11 @@ private:
 };
 
 int main(int argc, char* argv[]) {
-    if (argc < 5) { std::cerr << "用法: " << argv[0] << " <agent_id> <port> <registry_url> <api_key> [--redis-host <host>] [--redis-port <port>]" << std::endl; return 1; }
+    if (argc < 5) { std::cerr << "用法: " << argv[0] << " <agent_id> <port> <registry_url> @env [--redis-host <host>] [--redis-port <port>]" << std::endl; return 1; }
     std::string agent_id = argv[1]; int port = std::stoi(argv[2]);
-    std::string registry_url = argv[3]; std::string api_key = argv[4];
+    std::string registry_url = argv[3];
+    std::string api_key = agent_rpc::examples::resolve_api_key_argument(argv[4]);
+    if (api_key.empty()) { std::cerr << "错误: 未为所选 LLM_PROVIDER 配置 API Key" << std::endl; return 1; }
     std::string redis_host = "127.0.0.1"; int redis_port = 6379;
     for (int i = 5; i < argc; ++i) { std::string arg = argv[i]; if (arg == "--redis-host" && i + 1 < argc) redis_host = argv[++i]; else if (arg == "--redis-port" && i + 1 < argc) redis_port = std::stoi(argv[++i]); }
     std::string listen_address = "http://localhost:" + std::to_string(port);

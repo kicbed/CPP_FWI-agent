@@ -1,5 +1,9 @@
 # v0.14 Approved Template Run Packet 学习总结
 
+> 历史版本说明：本文只描述 2026-06 的 v0.14 通用 run-packet 模块。当前仓库另有
+> 固定白名单 Deepwave CPU/单 GPU FWI 执行路径；通用 JobBackend 仍保持本文所述的
+> 非执行边界。当前能力以 [根 README](../../README.md) 为准。
+
 日期：2026-06-23
 
 ## 解决的问题
@@ -110,7 +114,7 @@ TDD 证据是先看到缺少 header 的编译失败，再实现 header/source/CM
 
 v0.14 仍然不做：
 
-- 不执行真实 CUDA/MPI。
+- v0.14 通用 run-packet 本身不执行 CUDA/MPI；这不描述后来加入的固定 Deepwave FWI 路径。
 - 不执行 shell，不调用 `mpirun`、`srun` 或任何 local wrapper。
 - 不连接 SSH、Slurm、PBS 或远程服务器。
 - 不读取密码、token、私钥、secret manager 或 `.env` 凭据。

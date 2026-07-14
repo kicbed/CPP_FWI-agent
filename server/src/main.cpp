@@ -42,7 +42,7 @@ void printUsage(const char* program) {
     std::cout << std::endl;
     std::cout << "选项:" << std::endl;
     std::cout << "  -p, --port PORT           gRPC 监听端口 (默认: 50051)" << std::endl;
-    std::cout << "  -o, --orchestrator URL    Orchestrator 地址 (默认: http://localhost:5000)" << std::endl;
+    std::cout << "  -o, --orchestrator URL    Orchestrator 地址 (默认: http://127.0.0.1:5000)" << std::endl;
     std::cout << "      --http-port PORT      HTTP 桥接端口 (默认: 50052, 设为 0 禁用)" << std::endl;
     std::cout << "  -r, --registry ADDR       注册中心地址，例如 consul://127.0.0.1:8500" << std::endl;
     std::cout << "      --enable-registry     显式启用服务注册" << std::endl;
@@ -51,9 +51,12 @@ void printUsage(const char* program) {
     std::cout << std::endl;
     std::cout << "环境变量:" << std::endl;
     std::cout << "  RPC_SERVER_PORT           gRPC 监听端口" << std::endl;
+    std::cout << "  GRPC_BIND_HOST            gRPC 监听地址 (默认: 127.0.0.1)" << std::endl;
     std::cout << "  ORCHESTRATOR_URL          Orchestrator 地址" << std::endl;
     std::cout << "  RPC_REGISTRY_ADDRESS      注册中心地址" << std::endl;
     std::cout << "  HTTP_BRIDGE_PORT          HTTP 桥接端口" << std::endl;
+    std::cout << "  HTTP_BRIDGE_BIND_HOST     HTTP 桥接监听地址 (默认: 127.0.0.1)" << std::endl;
+    std::cout << "  GRPC_BRIDGE_CORS_ORIGIN   精确允许的 Web origin" << std::endl;
     std::cout << std::endl;
     std::cout << "示例:" << std::endl;
     std::cout << "  " << program << std::endl;
@@ -71,8 +74,9 @@ void printUsage(const char* program) {
 int main(int argc, char* argv[]) {
     // 默认配置
     std::string port = "50051";
-    std::string orchestrator_url = "http://localhost:5000";
+    std::string orchestrator_url = "http://127.0.0.1:5000";
     std::string registry_address = "localhost:8500";
+    std::string grpc_bind_host = "127.0.0.1";
     int http_bridge_port = 50052;
     bool enable_registry = false;
     int timeout_seconds = 60;
@@ -83,6 +87,9 @@ int main(int argc, char* argv[]) {
     }
     if (const char* env_url = std::getenv("ORCHESTRATOR_URL")) {
         orchestrator_url = env_url;
+    }
+    if (const char* env_host = std::getenv("GRPC_BIND_HOST")) {
+        if (*env_host != '\0') grpc_bind_host = env_host;
     }
     if (const char* env_registry = std::getenv("RPC_REGISTRY_ADDRESS")) {
         registry_address = env_registry;
@@ -119,6 +126,11 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    if (grpc_bind_host != "127.0.0.1" && grpc_bind_host != "0.0.0.0") {
+        std::cerr << "错误: GRPC_BIND_HOST 只允许 127.0.0.1 或 0.0.0.0" << std::endl;
+        return 1;
+    }
+
     // 设置信号处理
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
@@ -131,7 +143,7 @@ int main(int argc, char* argv[]) {
     
     // 配置 RPC Server
     RpcConfig config;
-    config.server_address = "0.0.0.0:" + port;
+    config.server_address = grpc_bind_host + ":" + port;
     config.max_message_size = 64 * 1024 * 1024;  // 64MB
     config.max_receive_message_size = 64 * 1024 * 1024;
     config.timeout_seconds = timeout_seconds;
@@ -195,8 +207,10 @@ int main(int argc, char* argv[]) {
     HttpBridge http_bridge;
     if (http_bridge_port > 0) {
         if (http_bridge.start(http_bridge_port, orchestrator_url)) {
-            std::cout << "HTTP 桥接:     0.0.0.0:" << http_bridge_port << std::endl;
-            std::cout << "  Web UI API:  http://localhost:" << http_bridge_port << "/api/query" << std::endl;
+            const char* bridge_host = std::getenv("HTTP_BRIDGE_BIND_HOST");
+            const std::string shown_host = bridge_host && *bridge_host ? bridge_host : "127.0.0.1";
+            std::cout << "HTTP 桥接:     " << shown_host << ":" << http_bridge_port << std::endl;
+            std::cout << "  Web UI API:  http://127.0.0.1:" << http_bridge_port << "/api/query" << std::endl;
         } else {
             std::cerr << "警告: HTTP 桥接启动失败 (端口 " << http_bridge_port << ")" << std::endl;
         }

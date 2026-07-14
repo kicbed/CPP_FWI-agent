@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <thread>
 #include <chrono>
+#include <cstdlib>
 #include <curl/curl.h>
 #include <json/json.h>
 
@@ -241,33 +242,45 @@ private:
 };
 
 void printUsage(const char* program) {
-    std::cout << "用法: " << program << " <API_KEY> [PORT] [MODEL]" << std::endl;
+    std::cout << "用法: " << program << " [PORT] [MODEL]" << std::endl;
     std::cout << std::endl;
     std::cout << "参数:" << std::endl;
-    std::cout << "  API_KEY  - Qwen API Key (必需)" << std::endl;
+    std::cout << "  QWEN_API_KEY 从环境变量读取，不接受命令行密钥" << std::endl;
     std::cout << "  PORT     - 监听端口 (默认: 50051)" << std::endl;
     std::cout << "  MODEL    - AI 模型名称 (默认: qwen-plus)" << std::endl;
     std::cout << std::endl;
     std::cout << "示例:" << std::endl;
-    std::cout << "  " << program << " sk-xxx" << std::endl;
-    std::cout << "  " << program << " sk-xxx 50051 qwen-turbo" << std::endl;
+    std::cout << "  " << program << std::endl;
+    std::cout << "  " << program << " 50051 qwen-turbo" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
+    if (argc > 1 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
         printUsage(argv[0]);
+        return 0;
+    }
+
+    const char* api_key_value = std::getenv("QWEN_API_KEY");
+    if (api_key_value == nullptr || *api_key_value == '\0') {
+        std::cerr << "错误: 请通过环境变量 QWEN_API_KEY 配置密钥" << std::endl;
         return 1;
     }
-    
-    std::string api_key = argv[1];
-    std::string port = argc > 2 ? argv[2] : "50051";
-    std::string model = argc > 3 ? argv[3] : "qwen-plus";
+    std::string api_key = api_key_value;
+    std::string port = argc > 1 ? argv[1] : "50051";
+    std::string model = argc > 2 ? argv[2] : "qwen-plus";
+
+    const char* bind_value = std::getenv("GRPC_BIND_HOST");
+    const std::string bind_host = bind_value && *bind_value ? bind_value : "127.0.0.1";
+    if (bind_host != "127.0.0.1" && bind_host != "0.0.0.0") {
+        std::cerr << "错误: GRPC_BIND_HOST 只允许 127.0.0.1 或 0.0.0.0" << std::endl;
+        return 1;
+    }
     
     // 设置信号处理
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
     
-    std::string server_address = "0.0.0.0:" + port;
+    std::string server_address = bind_host + ":" + port;
     
     // 创建服务实现
     DirectAIQueryServiceImpl service(api_key, model);

@@ -1,177 +1,212 @@
-#!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN_DIR="$PROJECT_ROOT/build/examples/ai_orchestrator"
+#!/usr/bin/env bash
+# Internal launcher for the C++ Agent processes. Prefer repository-root start.sh.
 
-# 自动加载 .env 文件（如果存在）
-if [ -f "$PROJECT_ROOT/.env" ]; then
-    echo "加载配置: $PROJECT_ROOT/.env"
+set -Eeuo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
+BIN_DIR="$PROJECT_ROOT/build/examples/ai_orchestrator"
+LOG_DIR="$SCRIPT_DIR/logs"
+PID_DIR="$SCRIPT_DIR/pids"
+
+REGISTRY_PORT="${REGISTRY_PORT:-8500}"
+ORCHESTRATOR_PORT="${ORCHESTRATOR_PORT:-5000}"
+MATH_AGENT_PORT="${MATH_AGENT_PORT:-5001}"
+FWI_THEORY_PORT="${FWI_THEORY_PORT:-5002}"
+FWI_TEACHING_PORT="${FWI_TEACHING_PORT:-5003}"
+GENERAL_RESEARCH_PORT="${GENERAL_RESEARCH_PORT:-5004}"
+CODE_AGENT_PORT="${CODE_AGENT_PORT:-5010}"
+EXPERIMENT_PLANNER_AGENT_PORT="${EXPERIMENT_PLANNER_AGENT_PORT:-5011}"
+REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
+REDIS_PORT="${REDIS_PORT:-6379}"
+
+MCP_SERVER="${MCP_SERVER:-$PROJECT_ROOT/mcp_server_integrated/build/mcp_server}"
+MCP_PLUGINS="${MCP_PLUGINS:-$PROJECT_ROOT/mcp_server_integrated/build/plugins}"
+ENABLE_MCP="${ENABLE_MCP:-false}"
+
+die() {
+    printf '错误: %s\n' "$*" >&2
+    return 1
+}
+
+if [[ "${FWI_ENV_LOADED:-false}" != true && -e "$PROJECT_ROOT/.env" ]]; then
+    [[ -f "$PROJECT_ROOT/.env" && ! -L "$PROJECT_ROOT/.env" ]] || die ".env 必须是普通文件，不能是符号链接"
+    env_mode="$(stat -c '%a' "$PROJECT_ROOT/.env")"
+    if (( (8#$env_mode & 077) != 0 )); then
+        chmod 600 "$PROJECT_ROOT/.env"
+    fi
+    printf '加载本地配置: %s（不会输出配置内容）\n' "$PROJECT_ROOT/.env"
     set -a
+    # .env is trusted local shell input and is excluded from Git.
+    # shellcheck disable=SC1091
     source "$PROJECT_ROOT/.env"
     set +a
 fi
 
-if [ ! -f "$BIN_DIR/ai_orchestrator" ]; then
-    echo "错误: 找不到可执行文件，请先编译项目"
-    exit 1
-fi
-
-REGISTRY_PORT=8500
-ORCHESTRATOR_PORT=5000
-MATH_AGENT_PORT=5001
-FWI_THEORY_PORT=5002
-FWI_TEACHING_PORT=5003
-GENERAL_RESEARCH_PORT=5004
-CODE_AGENT_PORT=5010
-EXPERIMENT_PLANNER_AGENT_PORT=5011
-REDIS_HOST="127.0.0.1"
-REDIS_PORT=6379
-
-MCP_SERVER="$PROJECT_ROOT/mcp_server_integrated/build/mcp_server"
-MCP_PLUGINS="$PROJECT_ROOT/mcp_server_integrated/build/plugins"
-ENABLE_MCP="${ENABLE_MCP:-false}"
-EMBEDDING_URL="${LOCAL_EMBEDDING_URL:-http://localhost:6000}"
-EMBEDDING_MODEL="${LOCAL_EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}"
-
-# 自动检测 LLM 提供商和 API Key
 LLM_PROVIDER="${LLM_PROVIDER:-qwen}"
-API_KEY=""
+export LLM_PROVIDER
 
-case "$LLM_PROVIDER" in
-    deepseek)
-        API_KEY="${DEEPSEEK_API_KEY:-}"
-        ;;
-    qwen)
-        API_KEY="${QWEN_API_KEY:-}"
-        ;;
-    openai)
-        API_KEY="${OPENAI_API_KEY:-}"
-        ;;
-    local)
-        API_KEY="not-needed"
-        ;;
-    *)
-        # 兼容旧配置：检查 QWEN_API_KEY
-        API_KEY="${QWEN_API_KEY:-${DEEPSEEK_API_KEY:-${OPENAI_API_KEY:-}}}"
-        ;;
-esac
+api_key_is_configured() {
+    case "$LLM_PROVIDER" in
+        local) return 0 ;;
+        deepseek) [[ -n "${DEEPSEEK_API_KEY:-}" ]] ;;
+        qwen) [[ -n "${QWEN_API_KEY:-}" ]] ;;
+        openai) [[ -n "${OPENAI_API_KEY:-}" ]] ;;
+        *) [[ -n "${QWEN_API_KEY:-${DEEPSEEK_API_KEY:-${OPENAI_API_KEY:-}}}" ]] ;;
+    esac
+}
 
-if [ -z "$API_KEY" ]; then
-    echo "错误: 请设置 API Key"
-    echo ""
-    echo "方法 1: 使用 .env 文件（推荐）"
-    echo "  cp .env.example .env"
-    echo "  nano .env  # 填入你的密钥"
-    echo "  source .env"
-    echo ""
-    echo "方法 2: 直接设置环境变量"
-    echo "  export LLM_PROVIDER=deepseek"
-    echo "  export DEEPSEEK_API_KEY=sk-你的密钥"
-    echo ""
-    echo "方法 3: 使用通义千问"
-    echo "  export QWEN_API_KEY=sk-你的密钥"
-    echo ""
-    exit 1
-fi
+api_key_is_configured || die "未为 LLM_PROVIDER=$LLM_PROVIDER 配置 API Key；请复制 .env.example 为 .env 后填写。"
+printf '使用 LLM provider: %s（密钥仅通过继承环境传递）\n' "$LLM_PROVIDER"
 
-echo "使用 LLM: $LLM_PROVIDER"
-
-mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/pids"
-
-# 清理旧进程，确保端口可用
-# 注意：进程名在 Linux 上被截断为 15 字符，所以用 -f 匹配完整命令行
-# 但 -f 会匹配脚本自身路径（包含 ai_orchestrator），必须精确匹配二进制路径
-echo "清理旧进程..."
-for port in $REGISTRY_PORT $ORCHESTRATOR_PORT $MATH_AGENT_PORT $FWI_THEORY_PORT $FWI_TEACHING_PORT $GENERAL_RESEARCH_PORT $CODE_AGENT_PORT $EXPERIMENT_PLANNER_AGENT_PORT; do
-    # 找出占用端口的进程 PID 并 kill
-    fuser -k "$port/tcp" 2>/dev/null || true
+required_binaries=(
+    ai_registry_server ai_math_agent ai_fwi_theory_agent
+    ai_fwi_teaching_agent ai_general_research_agent ai_code_agent
+    ai_experiment_planner_agent ai_orchestrator
+)
+for binary in "${required_binaries[@]}"; do
+    [[ -x "$BIN_DIR/$binary" ]] || die "缺少可执行文件 $BIN_DIR/$binary，请先运行根目录 ./start.sh 构建。"
 done
-sleep 2
-
-echo "=========================================="
-echo "AI Agent 系统启动"
-echo "=========================================="
-
-echo "[1/8] 启动 Registry Server..."
-nohup "$BIN_DIR/ai_registry_server" $REGISTRY_PORT > "$SCRIPT_DIR/logs/registry.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/pids/registry.pid"
-sleep 1
-echo "Registry Server 启动完成 (端口: $REGISTRY_PORT)"
-
-MCP_ARGS=""
-if [ "$ENABLE_MCP" == "true" ] && [ -f "$MCP_SERVER" ]; then
-    MCP_ARGS="--enable-mcp --mcp-server $MCP_SERVER --mcp-args -p,$MCP_PLUGINS"
-    echo "MCP 已启用: $MCP_SERVER"
+if [[ "$ENABLE_MCP" == true ]]; then
+    [[ -x "$MCP_SERVER" ]] || die "ENABLE_MCP=true，但 MCP Server 不存在或不可执行: $MCP_SERVER"
+    [[ -d "$MCP_PLUGINS" ]] || die "MCP 插件目录不存在: $MCP_PLUGINS"
+elif [[ "$ENABLE_MCP" != false ]]; then
+    die "ENABLE_MCP 只能是 true 或 false"
 fi
 
-echo "[2/8] 启动 Math Agent..."
-nohup "$BIN_DIR/ai_math_agent" math-1 $MATH_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT $MCP_ARGS > "$SCRIPT_DIR/logs/math_agent.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/pids/math_agent.pid"
-sleep 1
-echo "Math Agent 启动完成 (端口: $MATH_AGENT_PORT)"
+mkdir -p -- "$LOG_DIR" "$PID_DIR"
+chmod 700 "$LOG_DIR" "$PID_DIR"
 
-echo "[3/8] 启动 FWI Theory Agent..."
-nohup "$BIN_DIR/ai_fwi_theory_agent" fwi-theory-1 $FWI_THEORY_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT > "$SCRIPT_DIR/logs/fwi_theory_agent.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/pids/fwi_theory_agent.pid"
-sleep 1
-echo "FWI Theory Agent 启动完成 (端口: $FWI_THEORY_PORT)"
+port_in_use() {
+    ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .
+}
 
-echo "[4/8] 启动 FWI Teaching Agent..."
-nohup "$BIN_DIR/ai_fwi_teaching_agent" fwi-teaching-1 $FWI_TEACHING_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT > "$SCRIPT_DIR/logs/fwi_teaching_agent.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/pids/fwi_teaching_agent.pid"
-sleep 1
-echo "FWI Teaching Agent 启动完成 (端口: $FWI_TEACHING_PORT)"
+write_pid() {
+    local name="$1" pid="$2" tmp
+    tmp="$PID_DIR/.${name}.pid.$$"
+    printf '%s\n' "$pid" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f -- "$tmp" "$PID_DIR/$name.pid"
+}
 
-echo "[5/8] 启动 General Research Agent..."
-nohup "$BIN_DIR/ai_general_research_agent" general-research-1 $GENERAL_RESEARCH_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT > "$SCRIPT_DIR/logs/general_research_agent.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/pids/general_research_agent.pid"
-sleep 1
-echo "General Research Agent 启动完成 (端口: $GENERAL_RESEARCH_PORT)"
+wait_for_port() {
+    local name="$1" port="$2" pid="$3" attempt
+    for ((attempt = 0; attempt < 100; ++attempt)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            die "$name 启动失败；请查看 $LOG_DIR/$name.log"
+        fi
+        if port_in_use "$port"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    die "$name 未在期限内监听端口 $port；请查看 $LOG_DIR/$name.log"
+}
 
-echo "[6/8] 启动 Code Agent..."
-nohup "$BIN_DIR/ai_code_agent" code-agent-1 $CODE_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT --project-root "$PROJECT_ROOT" > "$SCRIPT_DIR/logs/code_agent.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/pids/code_agent.pid"
-sleep 1
-echo "Code Agent 启动完成 (端口: $CODE_AGENT_PORT)"
+launch_service() {
+    local name="$1" port="$2"
+    shift 2
+    nohup "$@" > "$LOG_DIR/$name.log" 2>&1 &
+    local pid=$!
+    write_pid "$name" "$pid"
+    wait_for_port "$name" "$port" "$pid"
+}
 
-echo "[7/8] 启动 Experiment Planner Agent..."
-nohup "$BIN_DIR/ai_experiment_planner_agent" experiment-planner-1 $EXPERIMENT_PLANNER_AGENT_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT --algorithm-dir "$PROJECT_ROOT/resources/algorithms" > "$SCRIPT_DIR/logs/experiment_planner_agent.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/pids/experiment_planner_agent.pid"
-sleep 1
-echo "Experiment Planner Agent 启动完成 (端口: $EXPERIMENT_PLANNER_AGENT_PORT)"
+# Refuse to overwrite a live PID file or take over a port. The stop scripts
+# validate process identity before sending signals, so an unrelated process is
+# never killed to make room.
+for pid_file in "$PID_DIR"/*.pid; do
+    [[ -e "$pid_file" ]] || continue
+    if [[ -L "$pid_file" || ! -f "$pid_file" ]]; then
+        die "不可信 PID 文件: $pid_file"
+    fi
+    pid="$(tr -d '[:space:]' < "$pid_file")"
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null; then
+        die "检测到仍在运行的项目 PID $pid；请先执行 $PROJECT_ROOT/stop.sh"
+    fi
+    rm -f -- "$pid_file"
+done
 
-echo "[8/8] 启动 Orchestrator..."
-nohup "$BIN_DIR/ai_orchestrator" orch-1 $ORCHESTRATOR_PORT http://localhost:$REGISTRY_PORT $API_KEY --redis-host $REDIS_HOST --redis-port $REDIS_PORT $MCP_ARGS > "$SCRIPT_DIR/logs/orchestrator.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/pids/orchestrator.pid"
-sleep 1
-echo "Orchestrator 启动完成 (端口: $ORCHESTRATOR_PORT)"
+service_ports=(
+    "$REGISTRY_PORT" "$ORCHESTRATOR_PORT" "$MATH_AGENT_PORT"
+    "$FWI_THEORY_PORT" "$FWI_TEACHING_PORT" "$GENERAL_RESEARCH_PORT"
+    "$CODE_AGENT_PORT" "$EXPERIMENT_PLANNER_AGENT_PORT"
+)
+for port in "${service_ports[@]}"; do
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || die "非法端口: $port"
+    port_in_use "$port" && die "端口 $port 已被占用；不会自动终止占用者。"
+done
 
-echo ""
-echo "=========================================="
-echo "系统启动完成!"
-echo "=========================================="
-echo ""
-echo "服务地址:"
-echo "  Registry:              http://localhost:$REGISTRY_PORT"
-echo "  Orchestrator:          http://localhost:$ORCHESTRATOR_PORT"
-echo "  Math Agent:            http://localhost:$MATH_AGENT_PORT"
-echo "  FWI Theory Agent:      http://localhost:$FWI_THEORY_PORT"
-echo "  FWI Teaching Agent:    http://localhost:$FWI_TEACHING_PORT"
-echo "  General Research Agent: http://localhost:$GENERAL_RESEARCH_PORT"
-echo "  Code Agent:            http://localhost:$CODE_AGENT_PORT"
-echo "  Experiment Planner:    http://localhost:$EXPERIMENT_PLANNER_AGENT_PORT"
-echo ""
-echo "停止系统: $SCRIPT_DIR/stop_system.sh"
+startup_complete=false
+rollback() {
+    local rc="${1:-1}"
+    trap - ERR INT TERM
+    if [[ "$startup_complete" != true ]]; then
+        printf '启动未完成，正在回滚本次项目进程……\n' >&2
+        "$SCRIPT_DIR/stop_system.sh" --quiet || true
+    fi
+    exit "$rc"
+}
+trap 'rollback "$?"' ERR
+trap 'rollback 130' INT
+trap 'rollback 143' TERM
 
-# 启动看门狗（自动重启崩溃的 orchestrator 和 gRPC server）
-nohup "$SCRIPT_DIR/watchdog.sh" \
-    "$ORCHESTRATOR_PORT" \
-    "$REGISTRY_PORT" \
-    "$API_KEY" \
-    "$REDIS_HOST" \
-    "$REDIS_PORT" \
-    "$MCP_ARGS" \
-    "$BIN_DIR" \
-    "$PROJECT_ROOT" \
-    > "$SCRIPT_DIR/logs/watchdog.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/pids/watchdog.pid"
+if command -v redis-cli >/dev/null 2>&1 && redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" ping 2>/dev/null | grep -qx PONG; then
+    printf '使用现有 Redis: %s:%s\n' "$REDIS_HOST" "$REDIS_PORT"
+else
+    [[ "$REDIS_HOST" == 127.0.0.1 || "$REDIS_HOST" == localhost ]] || die "无法连接远程 Redis $REDIS_HOST:$REDIS_PORT"
+    command -v redis-server >/dev/null 2>&1 || die "Redis 未运行且找不到 redis-server"
+    command -v redis-cli >/dev/null 2>&1 || die "找不到 redis-cli，无法进行 Redis 健康检查"
+    port_in_use "$REDIS_PORT" && die "Redis 端口 $REDIS_PORT 已被非预期服务占用"
+    nohup redis-server --bind 127.0.0.1 --port "$REDIS_PORT" --daemonize no --save '' --appendonly no \
+        > "$LOG_DIR/redis.log" 2>&1 &
+    redis_pid=$!
+    write_pid redis "$redis_pid"
+    for _ in {1..50}; do
+        kill -0 "$redis_pid" 2>/dev/null || die "Redis 启动失败；请查看 $LOG_DIR/redis.log"
+        redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" ping 2>/dev/null | grep -qx PONG && break
+        sleep 0.1
+    done
+    redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" ping 2>/dev/null | grep -qx PONG || die "Redis 健康检查超时"
+fi
+
+registry_url="http://127.0.0.1:$REGISTRY_PORT"
+key_sentinel='@env'
+mcp_args=()
+if [[ "$ENABLE_MCP" == true ]]; then
+    mcp_args=(--enable-mcp --mcp-server "$MCP_SERVER" --mcp-args "-p,$MCP_PLUGINS")
+fi
+
+printf '启动 Registry 和 Agent 服务……\n'
+launch_service registry "$REGISTRY_PORT" "$BIN_DIR/ai_registry_server" "$REGISTRY_PORT"
+launch_service math_agent "$MATH_AGENT_PORT" \
+    "$BIN_DIR/ai_math_agent" math-1 "$MATH_AGENT_PORT" "$registry_url" "$key_sentinel" \
+    --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT" "${mcp_args[@]}"
+launch_service fwi_theory_agent "$FWI_THEORY_PORT" \
+    "$BIN_DIR/ai_fwi_theory_agent" fwi-theory-1 "$FWI_THEORY_PORT" "$registry_url" "$key_sentinel" \
+    --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT"
+launch_service fwi_teaching_agent "$FWI_TEACHING_PORT" \
+    "$BIN_DIR/ai_fwi_teaching_agent" fwi-teaching-1 "$FWI_TEACHING_PORT" "$registry_url" "$key_sentinel" \
+    --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT"
+launch_service general_research_agent "$GENERAL_RESEARCH_PORT" \
+    "$BIN_DIR/ai_general_research_agent" general-research-1 "$GENERAL_RESEARCH_PORT" "$registry_url" "$key_sentinel" \
+    --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT"
+launch_service code_agent "$CODE_AGENT_PORT" \
+    "$BIN_DIR/ai_code_agent" code-agent-1 "$CODE_AGENT_PORT" "$registry_url" "$key_sentinel" \
+    --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT" --project-root "$PROJECT_ROOT"
+launch_service experiment_planner_agent "$EXPERIMENT_PLANNER_AGENT_PORT" \
+    "$BIN_DIR/ai_experiment_planner_agent" experiment-planner-1 "$EXPERIMENT_PLANNER_AGENT_PORT" "$registry_url" "$key_sentinel" \
+    --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT" --algorithm-dir "$PROJECT_ROOT/resources/algorithms"
+launch_service orchestrator "$ORCHESTRATOR_PORT" \
+    "$BIN_DIR/ai_orchestrator" orch-1 "$ORCHESTRATOR_PORT" "$registry_url" "$key_sentinel" \
+    --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT" "${mcp_args[@]}"
+
+export ORCHESTRATOR_PORT REGISTRY_PORT REDIS_HOST REDIS_PORT BIN_DIR PROJECT_ROOT
+export ENABLE_MCP MCP_SERVER MCP_PLUGINS
+nohup "$SCRIPT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 &
+write_pid watchdog "$!"
+
+startup_complete=true
+trap - ERR INT TERM
+printf 'Agent 系统已启动：Orchestrator http://127.0.0.1:%s\n' "$ORCHESTRATOR_PORT"

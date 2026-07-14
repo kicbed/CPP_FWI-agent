@@ -1,0 +1,5 @@
+{
+  "preset": "forward",
+  "model_id": "marmousi_94_288",
+  "device": "cpu"
+}

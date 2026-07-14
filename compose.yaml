@@ -1,0 +1,139 @@
+name: fwi-agent
+
+x-fwi-command: &fwi-command
+  - /bin/bash
+  - -euc
+  - |
+      cleanup() {
+        exit_code=$$?
+        trap - EXIT INT TERM
+        /opt/fwi-agent/stop.sh --quiet || true
+        exit "$${exit_code}"
+      }
+      trap 'exit 143' INT TERM
+      trap cleanup EXIT
+
+      # Keep MCP's relative log path on writable tmpfs. The repository root
+      # launcher remains the only authority that starts individual services.
+      mkdir -p /tmp/fwi-agent/logs
+      cd /tmp/fwi-agent
+      /opt/fwi-agent/start.sh --no-build
+
+      pid_dir=/opt/fwi-agent/examples/ai_orchestrator/pids
+      tracked=(
+        redis registry math_agent fwi_theory_agent fwi_teaching_agent
+        general_research_agent code_agent experiment_planner_agent
+        orchestrator watchdog web
+      )
+      while true; do
+        for name in "$${tracked[@]}"; do
+          pid_file="$${pid_dir}/$${name}.pid"
+          test -f "$${pid_file}" || {
+            echo "Managed PID file disappeared: $${name}" >&2
+            exit 1
+          }
+          pid=$$(tr -d '[:space:]' < "$${pid_file}")
+          [[ "$${pid}" =~ ^[1-9][0-9]*$$ ]] && kill -0 "$${pid}" 2>/dev/null || {
+            echo "Managed service exited: $${name}" >&2
+            exit 1
+          }
+        done
+        sleep 2
+      done
+
+x-fwi-common: &fwi-common
+  init: true
+  restart: unless-stopped
+  command: *fwi-command
+  env_file:
+    - ${FWI_ENV_FILE:-.env}
+  environment:
+    ENABLE_MCP: "true"
+    ENABLE_GRPC: "false"
+    ENABLE_RAG: ${ENABLE_RAG:-false}
+    FWI_RUN_ROOT: /root/fwi-runs
+    LOCAL_EMBEDDING_URL: ${LOCAL_EMBEDDING_URL:-http://127.0.0.1:6000}
+    MCP_PLUGINS: /opt/fwi-agent/mcp_server_integrated/build/plugins
+    MCP_SERVER: /opt/fwi-agent/mcp_server_integrated/build/mcp_server
+    REDIS_HOST: 127.0.0.1
+    REDIS_PORT: "6379"
+    REGISTRY_PORT: "8500"
+    ORCHESTRATOR_PORT: "5000"
+    MATH_AGENT_PORT: "5001"
+    FWI_THEORY_PORT: "5002"
+    FWI_TEACHING_PORT: "5003"
+    GENERAL_RESEARCH_PORT: "5004"
+    CODE_AGENT_PORT: "5010"
+    EXPERIMENT_PLANNER_AGENT_PORT: "5011"
+    ROUTING_MODE: ${ROUTING_MODE:-fixed}
+    TOOL_CALLING_MODE: ${TOOL_CALLING_MODE:-rule}
+    AGENT_BIND_HOST: 0.0.0.0
+    AGENT_CORS_ORIGIN: http://127.0.0.1:${FWI_WEB_PORT:-8080}
+    WEB_HOST: 0.0.0.0
+    WEB_PORT: "8080"
+  ports:
+    - "127.0.0.1:5000:5000"
+    - "127.0.0.1:${FWI_WEB_PORT:-8080}:8080"
+  volumes:
+    - type: bind
+      source: ${FWI_MODEL_DIR:-/root/fwi-data/models}
+      target: /root/fwi-data/models
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${FWI_RUN_DIR:-/root/fwi-runs}
+      target: /root/fwi-runs
+      bind:
+        create_host_path: false
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=1g
+    - /opt/fwi-agent/examples/ai_orchestrator/logs:rw,nosuid,nodev,size=128m,mode=0700
+    - /opt/fwi-agent/examples/ai_orchestrator/pids:rw,nosuid,nodev,size=1m,mode=0700
+  shm_size: 1g
+  stop_grace_period: 90s
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/"]
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 20s
+
+services:
+  # Default service: CPU-only PyTorch wheel and no host GPU reservation.
+  fwi-agent:
+    <<: *fwi-common
+    image: ${FWI_CPU_IMAGE:-fwi-agent:cpu}
+    build:
+      context: .
+      target: runtime
+      args:
+        BUILD_JOBS: ${BUILD_JOBS:-2}
+        TORCH_VERSION: ${TORCH_VERSION:-2.12.0}
+        TORCH_INDEX_URL: ${PYTORCH_CPU_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+
+  # Start this service explicitly with --profile gpu; do not run it together
+  # with fwi-agent because both intentionally own the same localhost ports.
+  fwi-agent-gpu:
+    <<: *fwi-common
+    profiles: [gpu]
+    image: ${FWI_GPU_IMAGE:-fwi-agent:gpu}
+    build:
+      context: .
+      target: runtime
+      args:
+        BUILD_JOBS: ${BUILD_JOBS:-2}
+        TORCH_VERSION: ${TORCH_VERSION:-2.12.0}
+        TORCH_INDEX_URL: ${PYTORCH_GPU_INDEX_URL:-https://download.pytorch.org/whl/cu130}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

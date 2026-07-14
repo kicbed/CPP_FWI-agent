@@ -42,7 +42,7 @@ namespace {
 
 constexpr const char* kPython = "/root/.venvs/cpp-fwi-agent/bin/python";
 constexpr const char* kModule = "fwi_worker";
-constexpr const char* kRunRoot = "/root/fwi-runs";
+constexpr const char* kDefaultRunRoot = "/root/fwi-runs";
 constexpr const char* kModelId = "marmousi_94_288";
 constexpr std::size_t kMaxJsonBytes = 8U * 1024U * 1024U;
 
@@ -121,13 +121,43 @@ bool is_within(const fs::path& child, const fs::path& parent) {
     return true;
 }
 
-fs::path canonical_run_root() {
+fs::path configured_python() {
+    // This executable path is a deployment invariant, not MCP/user input.
+    // Keep the venv path itself (rather than resolving its Python symlink), so
+    // Python retains the virtual environment's sys.prefix and site-packages.
+    const fs::path python(kPython);
     std::error_code ec;
-    fs::create_directories(kRunRoot, ec);
+    const auto status = fs::status(python, ec);
+    if (ec || !fs::is_regular_file(status) || ::access(python.c_str(), X_OK) != 0) {
+        throw std::runtime_error("configured FWI worker Python is not executable");
+    }
+    return python;
+}
+
+fs::path configured_project_root() {
+    // The module root is compiled into the plugin and cannot be selected by a
+    // tool call or runtime dotenv value.
+    fs::path root(FWI_PROJECT_ROOT);
+    std::error_code ec;
+    root = fs::canonical(root, ec);
+    if (ec || !fs::is_directory(root)) {
+        throw std::runtime_error("configured FWI project root is unavailable");
+    }
+    return root;
+}
+
+fs::path canonical_run_root() {
+    const char* value = std::getenv("FWI_RUN_ROOT");
+    fs::path configured = value && *value ? fs::path(value) : fs::path(kDefaultRunRoot);
+    if (!configured.is_absolute()) {
+        throw std::runtime_error("FWI_RUN_ROOT must be an absolute path");
+    }
+    std::error_code ec;
+    fs::create_directories(configured, ec);
     if (ec) {
         throw std::runtime_error("cannot create FWI run root");
     }
-    const fs::path root = fs::canonical(kRunRoot, ec);
+    const fs::path root = fs::canonical(configured, ec);
     if (ec || !fs::is_directory(root)) {
         throw std::runtime_error("FWI run root is unavailable");
     }
@@ -252,15 +282,18 @@ void mark_unexpected_exit(const fs::path& run_dir, int wait_status) {
     }
 }
 
-std::vector<std::string> child_environment() {
+std::vector<std::string> child_environment(const fs::path& python,
+                                           const fs::path& run_root,
+                                           const fs::path& project_root) {
     // start_system.sh imports .env into the MCP server. Do not propagate that
     // process environment wholesale to numerical jobs: in particular, API
     // keys, tokens, and secrets have no purpose in the worker.
     std::vector<std::string> result = {
-        std::string("PYTHONPATH=") + FWI_PROJECT_ROOT,
-        std::string("FWI_RUN_ROOT=") + kRunRoot,
+        std::string("PYTHONPATH=") + project_root.string(),
+        std::string("FWI_RUN_ROOT=") + run_root.string(),
         "PYTHONUNBUFFERED=1",
-        "PATH=/root/.venvs/cpp-fwi-agent/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        std::string("PATH=") + python.parent_path().string() +
+            ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME=/root",
         "LANG=C.UTF-8"
     };
@@ -287,6 +320,9 @@ std::vector<std::string> child_environment() {
 pid_t spawn_worker(const std::string& command,
                    const fs::path& config_path,
                    const fs::path& run_dir) {
+    const fs::path python = configured_python();
+    const fs::path run_root = canonical_run_root();
+    const fs::path project_root = configured_project_root();
     const fs::path log_path = run_dir / "run.log";
     posix_spawn_file_actions_t actions;
     int rc = posix_spawn_file_actions_init(&actions);
@@ -311,7 +347,7 @@ pid_t spawn_worker(const std::string& command,
     }
 
     std::vector<std::string> argv_storage = {
-        kPython,
+        python.string(),
         "-m",
         kModule,
         command,
@@ -325,14 +361,14 @@ pid_t spawn_worker(const std::string& command,
     for (auto& item : argv_storage) argv.push_back(item.data());
     argv.push_back(nullptr);
 
-    std::vector<std::string> env_storage = child_environment();
+    std::vector<std::string> env_storage = child_environment(python, run_root, project_root);
     std::vector<char*> envp;
     envp.reserve(env_storage.size() + 1);
     for (auto& item : env_storage) envp.push_back(item.data());
     envp.push_back(nullptr);
 
     pid_t pid = -1;
-    rc = posix_spawn(&pid, kPython, &actions, nullptr, argv.data(), envp.data());
+    rc = posix_spawn(&pid, python.c_str(), &actions, nullptr, argv.data(), envp.data());
     destroy_actions();
     if (rc != 0) {
         throw std::runtime_error("cannot start fixed FWI worker: " + std::string(std::strerror(rc)));

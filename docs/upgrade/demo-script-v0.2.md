@@ -1,5 +1,11 @@
 # v0.2 Demo Script
 
+> Historical v0.2 demo only. Its non-execution statements and direct internal
+> startup commands describe the 2026-06 version, not the current Deepwave FWI
+> implementation. For current one-command startup and a real CPU/single-GPU
+> FWI browser test, use [README](../../README.md) and
+> [FRONTEND_TEST.md](../FRONTEND_TEST.md).
+
 This script demonstrates the v0.2 Lab Agent MVP on local `localhost` services.
 It does not execute real CUDA/MPI jobs, connect SSH, Slurm, PBS, or remote
 servers, or apply code patches automatically.

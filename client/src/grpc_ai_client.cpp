@@ -9,6 +9,7 @@
 
 #include "agent_rpc/client/ai_query_client.h"
 #include "agent_rpc/common/logger.h"
+#include "agent_rpc/common/redis_cli.h"
 
 #include <nlohmann/json.hpp>
 #include <iostream>
@@ -44,18 +45,13 @@ struct Conv {
     int count = 0;
 };
 
-std::string redis(const std::string& cmd) {
-    FILE* p = popen(("redis-cli " + cmd + " 2>/dev/null").c_str(), "r");
-    if (!p) return "";
-    std::string r; char b[8192];
-    while (fgets(b, sizeof(b), p)) r += b;
-    pclose(p);
-    return r;
+std::string redis(const std::vector<std::string>& arguments) {
+    return agent_rpc::common::run_redis_cli(arguments);
 }
 
 std::vector<Conv> load_convos() {
     std::vector<Conv> out;
-    std::string ids = redis("keys 'a2a:session:*'");
+    std::string ids = redis({"keys", "a2a:session:*"});
     std::istringstream iss(ids);
     std::string line;
     while (std::getline(iss, line)) {
@@ -63,8 +59,8 @@ std::vector<Conv> load_convos() {
         if (line.empty() || line.find("a2a:session:") != 0) continue;
         Conv c;
         c.id = line.substr(12);
-        c.count = std::atoi(redis("llen 'a2a:session:" + c.id + "'").c_str());
-        std::string title_raw = redis("lindex 'a2a:session:" + c.id + "' 0");
+        c.count = std::atoi(redis({"llen", "a2a:session:" + c.id}).c_str());
+        std::string title_raw = redis({"lindex", "a2a:session:" + c.id, "0"});
         try {
             auto j = json::parse(title_raw);
             if (j.contains("parts") && !j["parts"].empty())
@@ -73,7 +69,7 @@ std::vector<Conv> load_convos() {
         if (c.title.empty()) c.title = c.id;
         std::replace(c.title.begin(), c.title.end(), '\n', ' ');
         if (c.title.length() > 30) c.title = c.title.substr(0, 30) + "...";
-        std::string last = redis("lindex 'a2a:session:" + c.id + "' -1");
+        std::string last = redis({"lindex", "a2a:session:" + c.id, "-1"});
         try {
             auto j = json::parse(last);
             if (j.contains("parts") && !j["parts"].empty()) {
@@ -88,7 +84,7 @@ std::vector<Conv> load_convos() {
 }
 
 void show_history(const std::string& ctx_id) {
-    std::string all = redis("lrange 'a2a:session:" + ctx_id + "' 0 -1");
+    std::string all = redis({"lrange", "a2a:session:" + ctx_id, "0", "-1"});
     std::istringstream iss(all);
     std::string line;
     while (std::getline(iss, line)) {
@@ -228,7 +224,8 @@ int main(int argc, char* argv[]) {
                     if (num >= 1 && num <= static_cast<int>(convs.size())) {
                         std::string to_del = convs[num-1].id;
                         std::string to_del_name = convs[num-1].title;
-                        redis("del 'a2a:session:" + to_del + "' 'a2a:history:" + to_del + "' 'a2a:task:" + to_del + "'");
+                        redis({"del", "a2a:session:" + to_del,
+                               "a2a:history:" + to_del, "a2a:task:" + to_del});
                         convs = load_convos();
                         std::cout << C::G << "  ✓ 已删除: " << to_del_name << C::R << "\n\n";
                     }

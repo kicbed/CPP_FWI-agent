@@ -23,6 +23,8 @@ class ArtifactRouteTest(unittest.TestCase):
     def setUpClass(cls):
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.previous_root = os.environ.get("FWI_RUN_ROOT")
+        cls.previous_allow_origin = serve.ALLOW_ORIGIN
+        serve.ALLOW_ORIGIN = ""
         cls.run_root = Path(cls.temp_dir.name) / "runs"
         cls.job_id = "fwi-test-20260714"
         cls.job_dir = cls.run_root / cls.job_id
@@ -65,6 +67,7 @@ class ArtifactRouteTest(unittest.TestCase):
             os.environ.pop("FWI_RUN_ROOT", None)
         else:
             os.environ["FWI_RUN_ROOT"] = cls.previous_root
+        serve.ALLOW_ORIGIN = cls.previous_allow_origin
         cls.temp_dir.cleanup()
 
     def request(self, path, method="GET"):
@@ -142,6 +145,24 @@ class ArtifactRouteTest(unittest.TestCase):
 
         status, _, _ = self.request("/fwi-artifacts")
         self.assertEqual(status, 404)
+
+    def test_cross_origin_access_is_opt_in(self):
+        path = f"/fwi-artifacts/{self.job_id}/status.json"
+        status, headers, _ = self.request(path)
+        self.assertEqual(status, 200)
+        self.assertNotIn("access-control-allow-origin", headers)
+
+        serve.ALLOW_ORIGIN = "http://127.0.0.1:9090"
+        try:
+            status, headers, _ = self.request(path)
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                headers.get("access-control-allow-origin"),
+                "http://127.0.0.1:9090",
+            )
+            self.assertEqual(headers.get("vary"), "Origin")
+        finally:
+            serve.ALLOW_ORIGIN = ""
 
 
 if __name__ == "__main__":

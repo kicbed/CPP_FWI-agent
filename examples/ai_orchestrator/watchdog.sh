@@ -1,57 +1,72 @@
-#!/bin/bash
-#
-# 看门狗脚本 - 监控并自动重启关键服务
-# 由 start_system.sh 启动，不应手动运行
-#
+#!/usr/bin/env bash
+# Internal watchdog. Configuration and credentials are inherited via the
+# environment; secrets are never accepted as positional arguments.
 
-ORCH_PORT="${1:-5000}"
-REGISTRY_PORT="${2:-8500}"
-API_KEY="${3:-}"
-REDIS_HOST="${4:-127.0.0.1}"
-REDIS_PORT="${5:-6379}"
-MCP_ARGS="${6:-}"
-BIN_DIR="${7:-/root/projects/project/agent-communication-main-v2/build/examples/ai_orchestrator}"
-PROJECT_ROOT="${8:-/root/projects/project/agent-communication-main-v2}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+set -Eeuo pipefail
+umask 077
 
-WATCH_LOG="$SCRIPT_DIR/logs/watchdog.log"
-ORCH_LOG="$SCRIPT_DIR/logs/orchestrator.log"
-GRPC_LOG="$PROJECT_ROOT/deploy/logs/grpc_server.log"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$SCRIPT_DIR/../.." && pwd -P)}"
+BIN_DIR="${BIN_DIR:-$PROJECT_ROOT/build/examples/ai_orchestrator}"
 PID_DIR="$SCRIPT_DIR/pids"
+ORCH_LOG="$SCRIPT_DIR/logs/orchestrator.log"
 
-mkdir -p "$PID_DIR" "$(dirname "$GRPC_LOG")"
+ORCHESTRATOR_PORT="${ORCHESTRATOR_PORT:-5000}"
+REGISTRY_PORT="${REGISTRY_PORT:-8500}"
+REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
+REDIS_PORT="${REDIS_PORT:-6379}"
+ENABLE_MCP="${ENABLE_MCP:-false}"
+MCP_SERVER="${MCP_SERVER:-$PROJECT_ROOT/mcp_server_integrated/build/mcp_server}"
+MCP_PLUGINS="${MCP_PLUGINS:-$PROJECT_ROOT/mcp_server_integrated/build/plugins}"
+
+mkdir -p -- "$PID_DIR"
 
 log() {
-    echo "[$(date '+%H:%M:%S')] $1" >> "$WATCH_LOG"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+port_in_use() {
+    ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .
+}
+
+write_pid() {
+    local name="$1" pid="$2" tmp
+    tmp="$PID_DIR/.${name}.pid.$$"
+    printf '%s\n' "$pid" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f -- "$tmp" "$PID_DIR/$name.pid"
+}
+
+tracked_process_is_running() {
+    local name="$1" expected="$2" pid_file pid actual
+    pid_file="$PID_DIR/$name.pid"
+    [[ -f "$pid_file" && ! -L "$pid_file" ]] || return 1
+    pid="$(tr -d '[:space:]' < "$pid_file")"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    actual="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null)" || return 1
+    expected="$(readlink -f -- "$expected" 2>/dev/null)" || return 1
+    [[ "$actual" == "$expected" ]]
 }
 
 restart_orchestrator() {
-    log "Orchestrator (port $ORCH_PORT) 崩溃，自动重启..."
-    nohup "$BIN_DIR/ai_orchestrator" orch-1 "$ORCH_PORT" "http://localhost:$REGISTRY_PORT" "$API_KEY" \
-        --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT" $MCP_ARGS \
+    if port_in_use "$ORCHESTRATOR_PORT"; then
+        log "端口 $ORCHESTRATOR_PORT 已由未跟踪进程占用，拒绝重启 Orchestrator"
+        return
+    fi
+    local -a mcp_args=()
+    if [[ "$ENABLE_MCP" == true ]]; then
+        mcp_args=(--enable-mcp --mcp-server "$MCP_SERVER" --mcp-args "-p,$MCP_PLUGINS")
+    fi
+    log "Orchestrator 已退出，使用 @env 凭据哨兵重启"
+    nohup "$BIN_DIR/ai_orchestrator" orch-1 "$ORCHESTRATOR_PORT" \
+        "http://127.0.0.1:$REGISTRY_PORT" '@env' \
+        --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT" "${mcp_args[@]}" \
         >> "$ORCH_LOG" 2>&1 &
-    echo $! >> "$PID_DIR/orchestrator.pid"
-}
-
-restart_grpc_server() {
-    log "gRPC Server (port 50051) 崩溃，自动重启..."
-    nohup "$PROJECT_ROOT/build/server/rpc_server" \
-        >> "$GRPC_LOG" 2>&1 &
-    echo $! >> "$PID_DIR/grpc_server.pid"
+    write_pid orchestrator "$!"
 }
 
 while true; do
     sleep 2
-
-    # 监控 Orchestrator
-    if ! ss -tlnp 2>/dev/null | grep -q ":$ORCH_PORT "; then
-        restart_orchestrator
-    fi
-
-    # 监控 gRPC Server
-    if [ -f "$PROJECT_ROOT/build/server/rpc_server" ]; then
-        if ! ss -tlnp 2>/dev/null | grep -q ":50051 "; then
-            restart_grpc_server
-        fi
-    fi
+    tracked_process_is_running orchestrator "$BIN_DIR/ai_orchestrator" || restart_orchestrator
 done

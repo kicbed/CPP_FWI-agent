@@ -11,9 +11,12 @@
 
 #include "agent_rpc/server/http_bridge.h"
 #include "agent_rpc/common/logger.h"
+#include <arpa/inet.h>
+#include <curl/curl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <thread>
@@ -27,7 +30,9 @@ public:
     std::atomic<bool> running{false};
     int server_fd_ = -1;
     int port_ = 50052;
-    std::string orchestrator_url_ = "http://localhost:5000";
+    std::string orchestrator_url_ = "http://127.0.0.1:5000";
+    std::string bind_host_ = "127.0.0.1";
+    std::string cors_origin_ = "http://127.0.0.1:8080";
     std::thread server_thread_;
 
     ~Impl() { stop(); }
@@ -35,6 +40,19 @@ public:
     bool start(int port, const std::string& orchestrator_url) {
         port_ = port;
         orchestrator_url_ = orchestrator_url;
+
+        if (const char* value = std::getenv("HTTP_BRIDGE_BIND_HOST")) {
+            if (*value != '\0') bind_host_ = value;
+        }
+        if (const char* value = std::getenv("GRPC_BRIDGE_CORS_ORIGIN")) {
+            if (*value != '\0') cors_origin_ = value;
+        }
+        if ((bind_host_ != "127.0.0.1" && bind_host_ != "0.0.0.0") ||
+            cors_origin_ == "*" ||
+            cors_origin_.find_first_of("\r\n") != std::string::npos) {
+            LOG_ERROR("HTTP Bridge: invalid bind host or CORS origin");
+            return false;
+        }
 
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd_ < 0) {
@@ -47,7 +65,12 @@ public:
 
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
+        if (inet_pton(AF_INET, bind_host_.c_str(), &addr.sin_addr) != 1) {
+            LOG_ERROR("HTTP Bridge: invalid IPv4 bind address");
+            close(server_fd_);
+            server_fd_ = -1;
+            return false;
+        }
         addr.sin_port = htons(port_);
 
         if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -67,7 +90,7 @@ public:
         running = true;
         server_thread_ = std::thread([this]() { acceptLoop(); });
 
-        LOG_INFO("HTTP Bridge 已启动: 0.0.0.0:" + std::to_string(port_));
+        LOG_INFO("HTTP Bridge 已启动: " + bind_host_ + ":" + std::to_string(port_));
         return true;
     }
 
@@ -156,24 +179,11 @@ private:
         jsonrpc << R"({"jsonrpc":"2.0","id":")" << req_id
                 << R"(","method":"message/send","params":)" << params.str() << "}";
 
-        // Use system curl for simplicity (avoids linking libcurl here)
-        std::string curl_cmd = "curl -s -X POST " + orchestrator_url_
-            + " -H 'Content-Type: application/json'"
-            + " -d '" + jsonrpc.str() + "'"
-            + " --max-time 120";
-
-        FILE* pipe = popen(curl_cmd.c_str(), "r");
-        if (!pipe) {
+        std::string response;
+        if (!postJson(jsonrpc.str(), response)) {
             sendHttpResponse(client_fd, 500, R"({"error":"failed to call orchestrator"})", "application/json");
             return;
         }
-
-        std::string response;
-        char buf[4096];
-        while (fgets(buf, sizeof(buf), pipe)) {
-            response += buf;
-        }
-        pclose(pipe);
 
         if (response.empty()) {
             sendHttpResponse(client_fd, 502, R"({"error":"orchestrator returned empty response"})", "application/json");
@@ -234,7 +244,8 @@ private:
         resp << "HTTP/1.1 " << code << " " << status_text << "\r\n"
              << "Content-Type: " << content_type << "\r\n"
              << "Content-Length: " << body.size() << "\r\n"
-             << "Access-Control-Allow-Origin: *\r\n"
+             << "Access-Control-Allow-Origin: " << cors_origin_ << "\r\n"
+             << "Vary: Origin\r\n"
              << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
              << "Access-Control-Allow-Headers: Content-Type\r\n"
              << "Connection: close\r\n"
@@ -243,6 +254,43 @@ private:
 
         std::string resp_str = resp.str();
         send(client_fd, resp_str.c_str(), resp_str.size(), 0);
+    }
+
+    static size_t curlWriteCallback(char* data, size_t size, size_t count,
+                                    void* user_data) {
+        const size_t bytes = size * count;
+        static_cast<std::string*>(user_data)->append(data, bytes);
+        return bytes;
+    }
+
+    bool postJson(const std::string& body, std::string& response) {
+        static const bool curl_ready = [] {
+            return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+        }();
+        if (!curl_ready) return false;
+
+        CURL* curl = curl_easy_init();
+        if (!curl) return false;
+
+        curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_URL, orchestrator_url_.c_str());
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curlWriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+        const CURLcode result = curl_easy_perform(curl);
+        long status_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return result == CURLE_OK && status_code >= 200 && status_code < 300;
     }
 
     std::string extractJsonString(const std::string& json, const std::string& key) {

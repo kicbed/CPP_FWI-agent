@@ -465,8 +465,8 @@
     };
 
     const CONFIG = {
-      http: { url: 'http://localhost:5000', label: 'HTTP :5000' },
-      grpc: { url: 'http://localhost:50052', label: 'gRPC :50052' },
+      http: { url: 'http://127.0.0.1:5000', label: 'HTTP :5000' },
+      grpc: { url: 'http://127.0.0.1:50052', label: 'gRPC :50052' },
     };
 
     const ALGORITHM_CARDS = [
@@ -1707,7 +1707,7 @@
     async function checkStatus() {
       // Check Orchestrator (port 5000) - lightweight GET /health
       try {
-        const resp = await fetch('http://localhost:5000/health', {
+        const resp = await fetch('http://127.0.0.1:5000/health', {
           signal: AbortSignal.timeout(3000),
         });
         if (resp.ok) {
@@ -1718,7 +1718,7 @@
       } catch (e) {
         // Fallback: try agent-card endpoint (GET, no CORS issue)
         try {
-          const resp2 = await fetch('http://localhost:5000/.well-known/agent-card.json', {
+          const resp2 = await fetch('http://127.0.0.1:5000/.well-known/agent-card.json', {
             signal: AbortSignal.timeout(3000),
           });
           setStatus('Orchestrator', resp2.ok);
@@ -1729,7 +1729,7 @@
 
       // Check gRPC HTTP Bridge (port 50052)
       try {
-        const resp = await fetch('http://localhost:50052/health', {
+        const resp = await fetch('http://127.0.0.1:50052/health', {
           signal: AbortSignal.timeout(3000),
         });
         setStatus('Grpc', resp.ok);

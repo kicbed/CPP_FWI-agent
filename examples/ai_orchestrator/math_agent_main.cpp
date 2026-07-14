@@ -2,6 +2,7 @@
 #include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
+#include "api_key_env.hpp"
 #include <a2a/models/agent_message.hpp>
 #include <a2a/models/agent_task.hpp>
 #include <a2a/models/task_status.hpp>
@@ -187,13 +188,15 @@ private:
 };
 
 void print_usage(const char* program) {
-    std::cerr << "用法: " << program << " <agent_id> <port> <registry_url> <api_key> [--redis-host <host>] [--redis-port <port>] [--enable-mcp] [--mcp-server <path>]" << std::endl;
+    std::cerr << "用法: " << program << " <agent_id> <port> <registry_url> @env [--redis-host <host>] [--redis-port <port>] [--enable-mcp] [--mcp-server <path>]" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
     if (argc < 5) { print_usage(argv[0]); return 1; }
     std::string agent_id = argv[1]; int port = std::stoi(argv[2]);
-    std::string registry_url = argv[3]; std::string api_key = argv[4];
+    std::string registry_url = argv[3];
+    std::string api_key = agent_rpc::examples::resolve_api_key_argument(argv[4]);
+    if (api_key.empty()) { std::cerr << "错误: 未为所选 LLM_PROVIDER 配置 API Key" << std::endl; return 1; }
     std::string redis_host = "127.0.0.1"; int redis_port = 6379;
     MCPAgentConfig mcp_config = parseMCPConfigFromArgs(argc, argv);
     if (!mcp_config.enable_mcp) { MCPAgentConfig env_config = parseMCPConfigFromEnv(); if (env_config.enable_mcp) mcp_config = env_config; }

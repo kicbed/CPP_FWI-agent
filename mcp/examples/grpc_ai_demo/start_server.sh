@@ -16,9 +16,8 @@ if [ ! -f "$BIN_DIR/grpc_server" ]; then
     exit 1
 fi
 
-# 获取 API Key
-API_KEY="${QWEN_API_KEY:-}"
-if [ -z "$API_KEY" ]; then
+# API Key stays in the inherited environment and never enters argv.
+if [ -z "${QWEN_API_KEY:-}" ]; then
     echo "错误: 请设置 QWEN_API_KEY 环境变量"
     echo "  export QWEN_API_KEY=sk-xxx"
     exit 1
@@ -36,4 +35,4 @@ echo "模型: $MODEL"
 echo ""
 
 # 启动服务器
-exec "$BIN_DIR/grpc_server" "$API_KEY" "$PORT" "$MODEL"
+exec "$BIN_DIR/grpc_server" "$PORT" "$MODEL"

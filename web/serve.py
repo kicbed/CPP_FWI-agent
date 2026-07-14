@@ -17,6 +17,8 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8080
+HOST = os.environ.get("WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
+ALLOW_ORIGIN = os.environ.get("WEB_ALLOW_ORIGIN", "").strip()
 WEB_DIR = Path(__file__).parent.resolve()
 DEFAULT_FWI_RUN_ROOT = Path("/root/fwi-runs")
 FWI_ARTIFACT_PREFIX = "/fwi-artifacts/"
@@ -46,10 +48,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
     def end_headers(self):
-        # CORS headers for API calls
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        # Same-origin is sufficient for the Web UI and FWI artifacts. An
+        # explicit origin can be enabled for a trusted development client.
+        if ALLOW_ORIGIN:
+            self.send_header("Access-Control-Allow-Origin", ALLOW_ORIGIN)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header('Cache-Control', 'no-cache')
         super().end_headers()
 
@@ -155,22 +160,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # Quiet logging
         pass
 
-def find_free_port(start=8080, max_tries=20):
-    import socket
-    for p in range(start, start + max_tries):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(('', p))
-                return p
-            except OSError:
-                continue
-    return start
-
 def main():
-    port = find_free_port(PORT)
-
-    with socketserver.ThreadingTCPServer(("", port), Handler) as httpd:
-        url = f"http://localhost:{port}"
+    # Bind to loopback by default. Failing on a busy port is intentional: the
+    # one-click launcher can then roll back instead of reporting the wrong URL.
+    with socketserver.ThreadingTCPServer((HOST, PORT), Handler) as httpd:
+        display_host = "localhost" if HOST in {"0.0.0.0", "::", "127.0.0.1", "::1"} else HOST
+        url = f"http://{display_host}:{PORT}"
         print(f"\033[1;36m┌─────────────────────────────────────────┐\033[0m")
         print(f"\033[1;36m│\033[0m  🌐 Lab Agent Workbench 已启动          \033[1;36m│\033[0m")
         print(f"\033[1;36m│\033[0m  📍 {url:<33} \033[1;36m│\033[0m")
@@ -179,7 +174,7 @@ def main():
 
         try:
             webbrowser.open(url)
-        except:
+        except Exception:
             pass
 
         try:

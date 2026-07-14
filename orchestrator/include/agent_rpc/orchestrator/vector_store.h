@@ -17,7 +17,9 @@
 #include <vector>
 #include <map>
 #include <fstream>
+#include <filesystem>
 #include <mutex>
+#include <system_error>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -81,8 +83,9 @@ public:
         }
 
         // Create directory if not exists
-        std::string dir = store_dir_;
-        create_directory(dir);
+        std::error_code directory_error;
+        std::filesystem::create_directories(store_dir_, directory_error);
+        if (directory_error) return false;
 
         std::string path = store_dir_ + "/" + name + ".json";
         std::ofstream file(path);
@@ -192,12 +195,6 @@ public:
     }
 
 private:
-    void create_directory(const std::string& path) {
-        // Simple directory creation (Linux)
-        std::string cmd = "mkdir -p " + path;
-        system(cmd.c_str());
-    }
-
     std::string store_dir_;
     std::map<std::string, std::map<std::string, std::vector<float>>> stores_;
     std::mutex mutex_;

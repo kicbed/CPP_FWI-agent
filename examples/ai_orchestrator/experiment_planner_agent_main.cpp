@@ -2,6 +2,7 @@
 #include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
+#include "api_key_env.hpp"
 
 #include <agent_rpc/research/algorithm_registry.h>
 #include <agent_rpc/research/planner_answer.h>
@@ -240,7 +241,7 @@ private:
 int main(int argc, char* argv[]) {
     if (argc < 5) {
         std::cerr << "用法: " << argv[0]
-                  << " <agent_id> <port> <registry_url> <api_key>"
+                  << " <agent_id> <port> <registry_url> @env"
                   << " [--redis-host <host>] [--redis-port <port>]"
                   << " [--algorithm-dir <path>] [--knowledge-dir <path>]"
                   << std::endl;
@@ -250,7 +251,11 @@ int main(int argc, char* argv[]) {
     std::string agent_id = argv[1];
     int port = std::stoi(argv[2]);
     std::string registry_url = argv[3];
-    std::string api_key = argv[4];
+    std::string api_key = agent_rpc::examples::resolve_api_key_argument(argv[4]);
+    if (api_key.empty()) {
+        std::cerr << "错误: 未为所选 LLM_PROVIDER 配置 API Key" << std::endl;
+        return 1;
+    }
     std::string redis_host = "127.0.0.1";
     int redis_port = 6379;
     std::string algorithm_dir =

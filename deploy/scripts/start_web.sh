@@ -1,31 +1,12 @@
-#!/bin/bash
-# 启动 Web UI 前端服务器
-# 用法: ./deploy/scripts/start_web.sh [端口]
-# 默认端口: 8080
+#!/usr/bin/env bash
+# Compatibility wrapper for the former Web-only launcher.
+set -Eeuo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-PORT="${1:-8080}"
-
-echo ""
-echo -e "\033[1;36m┌─────────────────────────────────────────────┐\033[0m"
-echo -e "\033[1;36m│\033[0m  🌐 启动 Web UI 前端                        \033[1;36m│\033[0m"
-echo -e "\033[1;36m└─────────────────────────────────────────────┘\033[0m"
-echo ""
-
-# 检查前端文件是否存在
-if [ ! -f "$PROJECT_ROOT/web/index.html" ]; then
-    echo -e "\033[1;31m错误: 找不到 web/index.html\033[0m"
-    exit 1
+if (($# > 0)) && [[ "$1" =~ ^[0-9]+$ ]]; then
+    export WEB_PORT="$1"
+    shift
 fi
-
-echo -e "\033[1;33m提示:\033[0m"
-echo "  - HTTP 模式需要 Orchestrator 运行在 :5000"
-echo "  - gRPC 模式需要 gRPC Server 运行在 :50051 (含 HTTP 桥接 :50052)"
-echo ""
-
-# 启动 Python HTTP 服务器
-cd "$PROJECT_ROOT"
-python3 web/serve.py "$PORT"
+printf '提示: start_web.sh 已弃用；根 start.sh 现在会启动完整 Agent + Web 栈。\n' >&2
+exec "$PROJECT_ROOT/start.sh" "$@"

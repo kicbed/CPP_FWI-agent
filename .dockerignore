@@ -1,0 +1,61 @@
+# Version control and local editor state
+.git
+.github
+.claude
+.vscode
+.idea
+
+# Secrets are runtime-only. Keep every common dotenv variant out of all layers.
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+*.pem
+*.key
+
+# Host build outputs and package caches
+build
+build-*
+cmake-build-*
+**/build
+**/build-*
+**/CMakeFiles
+**/CMakeCache.txt
+**/Testing
+node_modules
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.cache
+.venv
+venv
+
+# Models and run artifacts must be bind-mounted at runtime.
+/fwi-data
+/fwi-runs
+/models
+/runs
+**/*.mat
+**/*.npy
+**/*.npz
+**/*.pt
+**/*.pth
+**/*.sgy
+**/*.segy
+
+# Runtime logs/PIDs and other generated artifacts
+**/logs
+**/pids
+*.log
+coverage*
+htmlcov
+/resources/embeddings
+
+# Repository metadata not needed to build or run the image
+.gitignore
+Dockerfile*
+compose*.yaml
+compose*.yml

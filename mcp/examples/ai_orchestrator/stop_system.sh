@@ -1,22 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Deprecated compatibility entry for the canonical PID-safe shutdown.
 
-# AI Agent 系统停止脚本
+set -Eeuo pipefail
 
-# 获取脚本所在目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../../.." && pwd -P)"
 
-echo "停止 AI Agent 系统..."
-
-# 停止所有服务
-for pid_file in "$SCRIPT_DIR/pids"/*.pid; do
-    if [ -f "$pid_file" ]; then
-        pid=$(cat "$pid_file")
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "停止进程 $pid ($(basename $pid_file .pid))"
-            kill "$pid"
-        fi
-        rm -f "$pid_file"
-    fi
-done
-
-echo "系统已停止"
+printf '提示: mcp/examples/ai_orchestrator/stop_system.sh 已弃用，请改用 %s/stop.sh\n' \
+    "$PROJECT_ROOT" >&2
+exec "$PROJECT_ROOT/stop.sh" "$@"

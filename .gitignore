@@ -1,9 +1,26 @@
 # ==================== 构建产物 ====================
 build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+Testing/
+_deps/
+.ninja_*/
+*.ninja
 *.o
+*.obj
 *.so
+*.so.*
 *.a
 *.dylib
+*.dll
+*.lib
+*.exe
+*.pdb
+a.out
 
 # ==================== IDE ====================
 .vscode/
@@ -21,6 +38,7 @@ mcp_server_integrated/build/logs/
 # ==================== PID 文件 ====================
 deploy/pids/
 examples/ai_orchestrator/pids/
+.runtime/
 
 # ==================== 向量缓存 ====================
 resources/embeddings/
@@ -37,10 +55,26 @@ __pycache__/
 *.pyo
 *.egg-info/
 .eggs/
+.venv/
+venv/
+env/
 
 # ==================== 模型缓存 ====================
 .cache/
 models/
+
+# ==================== 科研模型与运行产物 ====================
+fwi-runs/
+runs/
+artifacts/
+*.mat
+*.npy
+*.npz
+*.sgy
+*.segy
+*.pt
+*.pth
+*.ckpt
 
 # ==================== 临时文件 ====================
 *.tmp

@@ -7,9 +7,12 @@
 #include <iostream>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 
 /**
  * @brief 简单的 HTTP 服务器
@@ -22,7 +25,19 @@ public:
     // 流式处理器: 接收请求体和写入回调函数
     using StreamHandler = std::function<void(const std::string&, std::function<bool(const std::string&)>)>;
     
-    explicit HttpServer(int port) : port_(port), running_(false) {}
+    explicit HttpServer(int port)
+        : port_(port),
+          running_(false),
+          bind_address_(environment_or("AGENT_BIND_HOST", "127.0.0.1")),
+          cors_origin_(environment_or("AGENT_CORS_ORIGIN", "http://127.0.0.1:8080")) {
+        if (bind_address_ != "127.0.0.1" && bind_address_ != "0.0.0.0") {
+            throw std::invalid_argument(
+                "AGENT_BIND_HOST must be 127.0.0.1 or 0.0.0.0");
+        }
+        if (cors_origin_.find_first_of("\r\n") != std::string::npos) {
+            throw std::invalid_argument("AGENT_CORS_ORIGIN contains invalid characters");
+        }
+    }
     
     ~HttpServer() {
         stop();
@@ -57,7 +72,10 @@ public:
         // 绑定地址
         struct sockaddr_in address;
         address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY;
+        if (inet_pton(AF_INET, bind_address_.c_str(), &address.sin_addr) != 1) {
+            close(server_fd);
+            throw std::runtime_error("Invalid HTTP bind address");
+        }
         address.sin_port = htons(port_);
         
         if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
@@ -71,7 +89,7 @@ public:
             throw std::runtime_error("Failed to listen on port " + std::to_string(port_));
         }
         
-        std::cout << "HTTP Server listening on port " << port_ << std::endl;
+        std::cout << "HTTP Server listening on " << bind_address_ << ':' << port_ << std::endl;
         
         // 接受连接
         while (running_) {
@@ -124,7 +142,7 @@ private:
         if (method == "OPTIONS") {
             std::ostringstream response;
             response << "HTTP/1.1 204 No Content\r\n";
-            response << "Access-Control-Allow-Origin: *\r\n";
+            append_cors_headers(response);
             response << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
             response << "Access-Control-Allow-Headers: Content-Type, Accept\r\n";
             response << "Access-Control-Max-Age: 86400\r\n";
@@ -143,7 +161,7 @@ private:
             response << "HTTP/1.1 200 OK\r\n";
             response << "Content-Type: application/json\r\n";
             response << "Content-Length: " << health_body.length() << "\r\n";
-            response << "Access-Control-Allow-Origin: *\r\n";
+            append_cors_headers(response);
             response << "\r\n";
             response << health_body;
             std::string response_str = response.str();
@@ -188,7 +206,7 @@ private:
         response << "HTTP/1.1 " << status_code << " OK\r\n";
         response << "Content-Type: application/json\r\n";
         response << "Content-Length: " << response_body.length() << "\r\n";
-        response << "Access-Control-Allow-Origin: *\r\n";
+        append_cors_headers(response);
         response << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
         response << "Access-Control-Allow-Headers: Content-Type, Accept\r\n";
         response << "\r\n";
@@ -210,7 +228,7 @@ private:
         header << "Content-Type: text/event-stream\r\n";
         header << "Cache-Control: no-cache\r\n";
         header << "Connection: keep-alive\r\n";
-        header << "Access-Control-Allow-Origin: *\r\n";
+        append_cors_headers(header);
         header << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
         header << "Access-Control-Allow-Headers: Content-Type, Accept\r\n";
         header << "\r\n";
@@ -238,8 +256,22 @@ private:
         close(client_fd);
     }
 
+    static std::string environment_or(const char* name, const char* fallback) {
+        const char* value = std::getenv(name);
+        return value != nullptr && *value != '\0' ? value : fallback;
+    }
+
+    void append_cors_headers(std::ostringstream& response) const {
+        if (!cors_origin_.empty()) {
+            response << "Access-Control-Allow-Origin: " << cors_origin_ << "\r\n";
+            response << "Vary: Origin\r\n";
+        }
+    }
+
     int port_;
     bool running_;
+    std::string bind_address_;
+    std::string cors_origin_;
     std::map<std::string, RequestHandler> handlers_;
     std::map<std::string, StreamHandler> stream_handlers_;
 };
