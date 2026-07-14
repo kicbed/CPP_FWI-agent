@@ -44,14 +44,16 @@ process_matches() {
     local name="$1" pid="$2" actual expected
     [[ -r "/proc/$pid/cmdline" ]] || return 1
 
-    if [[ "$name" == watchdog || "$name" == web ]]; then
+    if [[ "$name" == watchdog || "$name" == web || "$name" == embedding ]]; then
         local -a command_line=()
         mapfile -d '' -t command_line < "/proc/$pid/cmdline" || true
         ((${#command_line[@]} >= 2)) || return 1
         if [[ "$name" == watchdog ]]; then
             [[ "${command_line[1]}" == "$SCRIPT_DIR/watchdog.sh" ]]
-        else
+        elif [[ "$name" == web ]]; then
             [[ "${command_line[1]}" == "$PROJECT_ROOT/web/serve.py" ]]
+        else
+            [[ "${command_line[1]}" == "$PROJECT_ROOT/deploy/scripts/embedding_server.py" ]]
         fi
         return
     fi
@@ -114,7 +116,7 @@ log '停止 FWI Agent 项目进程……'
 stop_one watchdog
 stop_one web
 for name in orchestrator experiment_planner_agent code_agent general_research_agent \
-    fwi_teaching_agent fwi_theory_agent math_agent registry grpc_server redis; do
+    fwi_teaching_agent fwi_theory_agent math_agent registry grpc_server embedding redis; do
     stop_one "$name"
 done
 

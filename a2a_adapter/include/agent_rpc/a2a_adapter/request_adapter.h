@@ -9,6 +9,7 @@
 
 #include <string>
 #include <memory>
+#include <atomic>
 #include <a2a/models/message_send_params.hpp>
 #include <a2a/models/agent_message.hpp>
 #include <a2a/core/types.hpp>
@@ -68,8 +69,8 @@ public:
     std::string generateContextId();
 
 private:
-    uint64_t message_counter_ = 0;
-    uint64_t context_counter_ = 0;
+    std::atomic<uint64_t> message_counter_{0};
+    std::atomic<uint64_t> context_counter_{0};
 };
 
 } // namespace a2a_adapter

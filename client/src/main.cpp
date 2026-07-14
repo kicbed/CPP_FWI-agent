@@ -19,9 +19,19 @@
 #include <cstdlib>
 #include <cctype>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 
 using namespace agent_rpc::client;
 using namespace agent_rpc::common;
+
+std::string generateContextId() {
+    static std::atomic<std::uint64_t> sequence{0};
+    const auto now = std::chrono::system_clock::now().time_since_epoch().count();
+    return "ctx-cli-" + std::to_string(now) + "-" +
+           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed) + 1);
+}
 
 // 全局变量用于优雅关闭
 std::atomic<bool> g_running{true};
@@ -98,7 +108,7 @@ int main(int argc, char* argv[]) {
     std::string server_address = "localhost:50051";
     std::string registry_address;
     std::string service_name = "rpc_server";
-    std::string context_id = "default";
+    std::string context_id = generateContextId();
     bool stream_mode = false;
     int timeout_seconds = 60;
     

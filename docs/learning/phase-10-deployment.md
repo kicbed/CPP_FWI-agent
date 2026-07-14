@@ -1,5 +1,10 @@
 # Phase 10: 部署配置 — 学习文档
 
+> **历史学习资料，不可作为当前部署命令执行。** 本文记录早期 `deploy/scripts` 方案，
+> 其中的 Token 认证只是当时的设计草案，当前 Web 服务并未实现登录鉴权。当前版本必须
+> 使用根目录 `./start.sh` / `./stop.sh`，并遵循 `docs/DEPLOYMENT.md`；不要把服务暴露到
+> 公网，也不要在终端输出任何 API Key。
+
 ## 一、目标
 
 创建部署脚本、配置文件、日志管理，让课题组成员可以方便地部署和使用 FWI Agent 平台。
@@ -139,10 +144,12 @@ grep "ERROR" deploy/logs/*.log
 ### 6.1 Token 认证
 
 ```bash
-export AGENT_API_TOKEN=your-secret-token
+read -rsp "AGENT_API_TOKEN: " AGENT_API_TOKEN
+printf '\n'
+export AGENT_API_TOKEN
 
 curl -X POST http://localhost:5000/ \
-  -H "Authorization: Bearer your-secret-token" \
+  -H "Authorization: Bearer ${AGENT_API_TOKEN}" \
   -d '{...}'
 ```
 
@@ -165,7 +172,7 @@ curl -X POST http://localhost:5000/ \
 |------|----------|
 | 找不到可执行文件 | 先编译：`cd build && cmake .. && make -j` |
 | Redis 连接失败 | 启动 Redis：`redis-server --daemonize yes` |
-| API Key 无效 | 检查环境变量：`echo $QWEN_API_KEY` |
+| API Key 无效 | 只检查是否配置：`test -n "${QWEN_API_KEY:-}" && echo configured || echo missing`，不要输出值 |
 | Agent 不可用 | 检查日志：`tail -f deploy/logs/*.log` |
 
 ### 7.2 日志位置

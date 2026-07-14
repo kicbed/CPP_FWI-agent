@@ -52,7 +52,9 @@ public:
      * @brief Construct with Redis connection parameters
      */
     explicit MemoryManager(const std::string& redis_host = "127.0.0.1",
-                          int redis_port = 6379);
+                          int redis_port = 6379,
+                          std::size_t session_max_messages = 200,
+                          std::size_t session_ttl_seconds = 30 * 24 * 60 * 60);
 
     ~MemoryManager();
 
@@ -73,6 +75,17 @@ public:
                              const a2a::AgentMessage& message);
 
     /**
+     * @brief Atomically append one complete user/assistant conversation turn.
+     *
+     * Unlike the legacy single-message helper, this operation fails loudly so
+     * the caller never reports a response as durably recorded when Redis did
+     * not accept the complete turn.
+     */
+    void save_session_turn(const std::string& context_id,
+                           const a2a::AgentMessage& user_message,
+                           const a2a::AgentMessage& assistant_message);
+
+    /**
      * @brief Get session conversation history
      * @param context_id Session/conversation ID
      * @param limit Maximum number of messages (0 = all)
@@ -80,6 +93,9 @@ public:
      */
     std::vector<a2a::AgentMessage> get_session_history(const std::string& context_id,
                                                        int limit = 0);
+
+    /** Delete the canonical user-visible session history. */
+    bool delete_session(const std::string& context_id);
 
     // ========================================================================
     // Agent Memory (agent internal processing)
@@ -186,12 +202,15 @@ private:
 
     // Redis operations
     redisReply* execute_command(const char* format, ...);
+    redisReply* execute_command_argv(const std::vector<std::string>& arguments);
     void ensure_connection();
 
     // Connection
     redisContext* context_;
     std::string host_;
     int port_;
+    std::size_t session_max_messages_;
+    std::size_t session_ttl_seconds_;
     std::mutex mutex_;
 };
 

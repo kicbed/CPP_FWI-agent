@@ -1,11 +1,9 @@
-#include "redis_task_store.hpp"
 #include "llm_client.hpp"
 #include "http_server.hpp"
 #include "registry_client.hpp"
 #include "api_key_env.hpp"
+#include "specialist_context.h"
 #include <a2a/models/agent_message.hpp>
-#include <a2a/models/agent_task.hpp>
-#include <a2a/models/task_status.hpp>
 #include <a2a/models/message_part.hpp>
 #include <a2a/core/jsonrpc_request.hpp>
 #include <a2a/core/jsonrpc_response.hpp>
@@ -21,9 +19,12 @@ using json = nlohmann::json;
 class FWITeachingAgent {
 public:
     FWITeachingAgent(const std::string& agent_id, const std::string& listen_address, const std::string& registry_url,
-                     const std::string& api_key, const std::string& redis_host, int redis_port)
-        : agent_id_(agent_id), listen_address_(listen_address), task_store_(std::make_shared<RedisTaskStore>(redis_host, redis_port)),
-          llm_client_(api_key, LLMProvider::DEEPSEEK), registry_client_(registry_url) {
+                     const std::string& api_key,
+                     const agent_rpc::examples::LLMRuntimeConfig& llm_config)
+        : agent_id_(agent_id), listen_address_(listen_address),
+          llm_client_(api_key, llm_config.provider, llm_config.model,
+                      llm_config.api_url),
+          registry_client_(registry_url) {
         std::cout << "[FWITeachingAgent] 初始化完成" << std::endl;
     }
 
@@ -58,29 +59,21 @@ private:
             if (request.method() == "message/send") {
                 auto params_json = request_json["params"];
                 auto message = AgentMessage::from_json(params_json["message"].dump());
-                std::string user_text;
-                if (!message.parts().empty()) { auto tp = dynamic_cast<TextPart*>(message.parts()[0].get()); if (tp) user_text = tp->text(); }
+                const std::string user_text = specialist_context::user_text(message);
+                const std::string history_json =
+                    specialist_context::conversation_history_json(message);
                 std::string context_id = message.context_id().value_or("default");
-                save_message(context_id, message);
-                std::string response_text = teach_fwi(user_text, context_id);
+                std::string response_text = teach_fwi(user_text, history_json);
                 auto response_msg = AgentMessage::create().with_role(MessageRole::Agent).with_context_id(context_id);
                 response_msg.add_text_part(response_text);
-                save_message(context_id, response_msg);
                 return JsonRpcResponse::create_success(request.id(), response_msg.to_json()).to_json();
             }
             return JsonRpcResponse::create_error(request.id(), ErrorCode::MethodNotFound, "Method not found").to_json();
         } catch (const std::exception& e) { return JsonRpcResponse::create_error("1", ErrorCode::InternalError, e.what()).to_json(); }
     }
 
-    std::string teach_fwi(const std::string& query, const std::string& context_id) {
-        auto history = task_store_->get_history(context_id, 20);
-        std::string history_text;
-        for (const auto& msg : history) {
-            std::string role_str = to_string(msg.role());
-            std::string text;
-            if (!msg.parts().empty()) { auto tp = dynamic_cast<TextPart*>(msg.parts()[0].get()); if (tp) text = tp->text(); }
-            history_text += role_str + ": " + text + "\n";
-        }
+    std::string teach_fwi(const std::string& query,
+                          const std::string& history_json) {
         std::string system_prompt =
             "你是一位 FWI 领域的资深教师。\n\n"
             "## 教学风格\n"
@@ -88,17 +81,9 @@ private:
             "2. **直觉/类比**: 用生活中的例子帮助理解\n"
             "3. **数学**: 给出核心公式（LaTeX 格式）\n"
             "4. **代码思路**: 给出伪代码\n"
-            "5. **汇报表达**: 如何在论文/汇报中描述\n\n"
-            "历史对话：\n" + history_text;
-        return llm_client_.chat(system_prompt, query);
-    }
-
-    void save_message(const std::string& context_id, const AgentMessage& message) {
-        if (!task_store_->task_exists(context_id)) {
-            auto task = AgentTask::create().with_id(context_id).with_context_id(context_id).with_status(TaskState::Running);
-            task_store_->set_task(task);
-        }
-        task_store_->add_history_message(context_id, message);
+            "5. **汇报表达**: 如何在论文/汇报中描述\n";
+        return llm_client_.chat_with_history(system_prompt, history_json,
+                                             query);
     }
 
     std::string get_agent_card() {
@@ -110,7 +95,6 @@ private:
     }
 
     std::string agent_id_, listen_address_;
-    std::shared_ptr<RedisTaskStore> task_store_;
     LLMClient llm_client_;
     RegistryClient registry_client_;
 };
@@ -119,12 +103,20 @@ int main(int argc, char* argv[]) {
     if (argc < 5) { std::cerr << "用法: " << argv[0] << " <agent_id> <port> <registry_url> @env" << std::endl; return 1; }
     std::string agent_id = argv[1]; int port = std::stoi(argv[2]);
     std::string registry_url = argv[3];
-    std::string api_key = agent_rpc::examples::resolve_api_key_argument(argv[4]);
+    agent_rpc::examples::LLMRuntimeConfig llm_config{};
+    try {
+        llm_config = agent_rpc::examples::load_llm_runtime_config_from_env();
+    } catch (const std::exception& e) {
+        std::cerr << "错误: " << e.what() << std::endl;
+        return 1;
+    }
+    std::string api_key =
+        agent_rpc::examples::resolve_api_key_argument(argv[4], llm_config);
     if (api_key.empty()) { std::cerr << "错误: 未为所选 LLM_PROVIDER 配置 API Key" << std::endl; return 1; }
-    std::string redis_host = "127.0.0.1"; int redis_port = 6379;
-    for (int i = 5; i < argc; ++i) { std::string arg = argv[i]; if (arg == "--redis-host" && i + 1 < argc) redis_host = argv[++i]; else if (arg == "--redis-port" && i + 1 < argc) redis_port = std::stoi(argv[++i]); }
+    for (int i = 5; i < argc; ++i) { std::string arg = argv[i]; if (arg == "--redis-host" && i + 1 < argc) ++i; else if (arg == "--redis-port" && i + 1 < argc) ++i; }
     std::string listen_address = "http://localhost:" + std::to_string(port);
-    try { FWITeachingAgent agent(agent_id, listen_address, registry_url, api_key, redis_host, redis_port); agent.start(port); }
+    try { FWITeachingAgent agent(agent_id, listen_address, registry_url,
+                                 api_key, llm_config); agent.start(port); }
     catch (const std::exception& e) { std::cerr << "错误: " << e.what() << std::endl; return 1; }
     return 0;
 }

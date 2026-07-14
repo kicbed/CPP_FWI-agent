@@ -15,6 +15,7 @@
 #include <fstream>
 #include <chrono>
 #include <iomanip>
+#include <algorithm>
 
 namespace agent_rpc {
 namespace orchestrator {
@@ -68,7 +69,10 @@ public:
      * @brief Log a request received event
      */
     void log_request(const RequestContext& ctx, const std::string& message) {
-        log(LogLevel::INFO, ctx, "REQ", message);
+        // User content may contain credentials or unpublished research data.
+        // Request logs retain only size and trace identifiers by default.
+        log(LogLevel::INFO, ctx, "REQ",
+            "received user_text_bytes=" + std::to_string(message.size()));
     }
 
     /**
@@ -141,7 +145,7 @@ private:
             << "[req:" << request_id << "]"
             << "[ctx:" << context_id << "]"
             << "[" << tag << "] "
-            << message;
+            << sanitize_log_text(message);
         return oss.str();
     }
 
@@ -172,6 +176,23 @@ private:
             case LogLevel::ERROR: return "ERROR";
             default:              return "?????";
         }
+    }
+
+    static std::string sanitize_log_text(const std::string& value) {
+        std::string sanitized;
+        sanitized.reserve(std::min<std::size_t>(value.size(), 1024));
+        for (const unsigned char c : value) {
+            if (sanitized.size() >= 1024) {
+                sanitized += "...[truncated]";
+                break;
+            }
+            if (c == '\n') sanitized += "\\n";
+            else if (c == '\r') sanitized += "\\r";
+            else if (c == '\t') sanitized += "\\t";
+            else if (c < 0x20 || c == 0x7f) sanitized += '?';
+            else sanitized += static_cast<char>(c);
+        }
+        return sanitized;
     }
 
     std::string agent_id_;

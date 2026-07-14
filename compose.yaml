@@ -25,6 +25,7 @@ x-fwi-command: &fwi-command
         general_research_agent code_agent experiment_planner_agent
         orchestrator watchdog web
       )
+      test ! -f "$${pid_dir}/embedding.pid" || tracked+=(embedding)
       while true; do
         for name in "$${tracked[@]}"; do
           pid_file="$${pid_dir}/$${name}.pid"
@@ -51,12 +52,19 @@ x-fwi-common: &fwi-common
     ENABLE_MCP: "true"
     ENABLE_GRPC: "false"
     ENABLE_RAG: ${ENABLE_RAG:-false}
+    # The image does not bundle a 0.6B model. Keep local Embedding opt-in and
+    # mount/provision its cache explicitly when enabling it in a container.
+    ENABLE_LOCAL_EMBEDDING: ${ENABLE_LOCAL_EMBEDDING:-false}
+    EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
     FWI_RUN_ROOT: /root/fwi-runs
     LOCAL_EMBEDDING_URL: ${LOCAL_EMBEDDING_URL:-http://127.0.0.1:6000}
+    LOCAL_EMBEDDING_MODEL: ${LOCAL_EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
+    LOCAL_EMBEDDING_DEVICE: ${LOCAL_EMBEDDING_DEVICE:-cpu}
     MCP_PLUGINS: /opt/fwi-agent/mcp_server_integrated/build/plugins
     MCP_SERVER: /opt/fwi-agent/mcp_server_integrated/build/mcp_server
     REDIS_HOST: 127.0.0.1
     REDIS_PORT: "6379"
+    REDIS_DATA_DIR: /var/lib/fwi-agent/redis
     REGISTRY_PORT: "8500"
     ORCHESTRATOR_PORT: "5000"
     MATH_AGENT_PORT: "5001"
@@ -75,6 +83,9 @@ x-fwi-common: &fwi-common
     - "127.0.0.1:5000:5000"
     - "127.0.0.1:${FWI_WEB_PORT:-8080}:8080"
   volumes:
+    - type: volume
+      source: conversation-state
+      target: /var/lib/fwi-agent/redis
     - type: bind
       source: ${FWI_MODEL_DIR:-/root/fwi-data/models}
       target: /root/fwi-data/models
@@ -137,3 +148,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+volumes:
+  conversation-state:

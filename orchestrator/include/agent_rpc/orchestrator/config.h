@@ -11,6 +11,9 @@
 #include <string>
 #include <vector>
 #include <stdexcept>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 
 // LLM Provider 类型 - 使用 forward declaration 避免重复定义
 #ifndef LLM_PROVIDER_DEFINED
@@ -120,6 +123,16 @@ struct OrchestratorConfig {
     std::string llm_model;
     std::string llm_api_url;
 
+    // Conversation context. These are hard server-side ceilings; a client may
+    // request a smaller historyLength but cannot enlarge the prompt window.
+    // The legacy *_chars names are byte ceilings after JSON serialization,
+    // not Unicode code-point or tokenizer-token counts.
+    std::size_t context_max_messages = 10;
+    std::size_t context_max_chars = 12000;
+    std::size_t context_max_message_chars = 4000;
+    std::size_t conversation_max_stored_messages = 200;
+    std::size_t conversation_ttl_seconds = 30 * 24 * 60 * 60;
+
     // Logging
     std::string log_file;
     std::string log_level = "INFO";
@@ -129,6 +142,22 @@ struct OrchestratorConfig {
      */
     static OrchestratorConfig from_env() {
         OrchestratorConfig config;
+
+        const auto bounded_size_from_env = [](const char* name,
+                                              std::size_t fallback,
+                                              std::size_t minimum,
+                                              std::size_t maximum) {
+            const char* value = std::getenv(name);
+            if (value == nullptr || *value == '\0') return fallback;
+            errno = 0;
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(value, &end, 10);
+            if (errno != 0 || end == value || *end != '\0' ||
+                parsed < minimum || parsed > maximum) {
+                return fallback;
+            }
+            return static_cast<std::size_t>(parsed);
+        };
 
         // Routing
         const char* routing_mode = std::getenv("ROUTING_MODE");
@@ -208,6 +237,20 @@ struct OrchestratorConfig {
         if (llm_api_url) {
             config.llm_api_url = llm_api_url;
         }
+
+        config.context_max_messages = bounded_size_from_env(
+            "CONTEXT_MAX_MESSAGES", config.context_max_messages, 1, 50);
+        config.context_max_chars = bounded_size_from_env(
+            "CONTEXT_MAX_CHARS", config.context_max_chars, 1024, 100000);
+        config.context_max_message_chars = bounded_size_from_env(
+            "CONTEXT_MAX_MESSAGE_CHARS", config.context_max_message_chars,
+            256, config.context_max_chars);
+        config.conversation_max_stored_messages = bounded_size_from_env(
+            "CONVERSATION_MAX_STORED_MESSAGES",
+            config.conversation_max_stored_messages, 20, 5000);
+        config.conversation_ttl_seconds = bounded_size_from_env(
+            "CONVERSATION_TTL_SECONDS", config.conversation_ttl_seconds,
+            60, 365ULL * 24ULL * 60ULL * 60ULL);
 
         return config;
     }

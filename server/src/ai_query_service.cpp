@@ -14,6 +14,44 @@
 #include <sstream>
 #include <iomanip>
 #include <uuid/uuid.h>
+#include <algorithm>
+#include <cctype>
+
+namespace {
+
+bool valid_context_id(const std::string& value) {
+    if (value.empty()) return true;
+    if (value.size() > 128 ||
+        !std::isalnum(static_cast<unsigned char>(value.front()))) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '-' || c == '_';
+    });
+}
+
+bool valid_request_id(const std::string& value) {
+    if (value.empty()) return true;
+    if (value.size() > 128 ||
+        !std::isalnum(static_cast<unsigned char>(value.front()))) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '-' || c == '_';
+    });
+}
+
+bool valid_question(const std::string& value) {
+    if (value.empty() || value.size() > 8192 ||
+        value.find('\0') != std::string::npos) {
+        return false;
+    }
+    return !std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    });
+}
+
+}  // namespace
 
 namespace agent_rpc {
 namespace server {
@@ -81,6 +119,15 @@ grpc::Status AIQueryServiceImpl::Query(
     if (!request || !response) {
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                            "Invalid request or response");
+    }
+
+    if (!valid_request_id(request->request_id()) ||
+        !valid_question(request->question()) ||
+        !valid_context_id(request->context_id()) ||
+        request->history_length() < 0 || request->history_length() > 1000) {
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT,
+            "request_id, question, context_id, or history_length is invalid");
     }
     
     auto start_time = std::chrono::steady_clock::now();
@@ -151,6 +198,16 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     if (!request || !writer) {
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                            "Invalid request or writer");
+    }
+
+
+    if (!valid_request_id(request->request_id()) ||
+        !valid_question(request->question()) ||
+        !valid_context_id(request->context_id()) ||
+        request->history_length() < 0 || request->history_length() > 1000) {
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT,
+            "request_id, question, context_id, or history_length is invalid");
     }
     
     auto start_time = std::chrono::steady_clock::now();

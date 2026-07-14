@@ -16,6 +16,10 @@
 
 # Host build outputs and package caches
 build
+redis-data
+appendonlydir
+*.aof
+dump.rdb
 build-*
 cmake-build-*
 **/build

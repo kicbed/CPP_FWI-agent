@@ -46,9 +46,10 @@ constexpr const char* kDefaultRunRoot = "/root/fwi-runs";
 constexpr const char* kModelId = "marmousi_94_288";
 constexpr std::size_t kMaxJsonBytes = 8U * 1024U * 1024U;
 constexpr std::int64_t kMaxIterations = 100;
+constexpr std::size_t kMaxActiveJobs = 2;
 
 #ifndef FWI_PROJECT_ROOT
-#define FWI_PROJECT_ROOT "/root/projects/project/agent-communication-main-v2"
+#error "FWI_PROJECT_ROOT must be defined by the fwi-runner CMake target"
 #endif
 
 const std::regex kJobIdPattern(
@@ -69,10 +70,29 @@ ReaperState& reaper_state() {
     return *state;
 }
 
+void reserve_worker_slot() {
+    auto& state = reaper_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.active >= kMaxActiveJobs) {
+        throw std::runtime_error(
+            "FWI runner is at its two-job concurrency limit");
+    }
+    ++state.active;
+}
+
+void release_worker_slot() {
+    auto& state = reaper_state();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.active > 0) --state.active;
+    }
+    state.cv.notify_all();
+}
+
 static PluginTool methods[] = {
     {
         "fwi_submit_demo",
-        "运行固定白名单 Marmousi 二维常密度声学 Deepwave 演示。仅在用户明确要求运行正演或 FWI 时调用；iterations 可在 1 到 100 之间显式指定，未指定时 smoke=2、demo=5。FWI 理论问题不要调用。提交后立即返回异步 job_id。",
+        "运行固定白名单 Marmousi 二维常密度声学 Deepwave 演示。仅在用户明确要求运行正演或 FWI 时调用；iterations 可在 1 到 100 之间显式指定，未指定时 smoke=2、demo=5。FWI 理论问题不要调用。提交后立即返回异步 job_id；单个 runner 最多同时运行 2 个作业。",
         R"({"type":"object","additionalProperties":false,"properties":{"model_id":{"type":"string","enum":["marmousi_94_288"],"description":"固定白名单模型"},"preset":{"type":"string","enum":["forward","fwi_smoke","fwi_demo"],"description":"forward=合成正演；fwi_smoke/fwi_demo 提供不同默认值，均可用 iterations 覆盖"},"device":{"type":"string","enum":["cuda","cpu"],"description":"单 CUDA GPU 或 CPU"},"iterations":{"type":"integer","minimum":1,"maximum":100,"description":"仅用于反演，允许1到100。省略时 smoke=2、demo=5；正演请省略"}},"required":["model_id","preset","device"]})"
     },
     {
@@ -154,12 +174,48 @@ fs::path canonical_run_root() {
         throw std::runtime_error("FWI_RUN_ROOT must be an absolute path");
     }
     std::error_code ec;
+    const auto initial_status = fs::symlink_status(configured, ec);
+    if (!ec && fs::is_symlink(initial_status)) {
+        throw std::runtime_error("FWI_RUN_ROOT cannot be a symlink");
+    }
+    ec.clear();
+    const fs::path candidate = fs::weakly_canonical(configured, ec);
+    if (ec || candidate.empty() || candidate == candidate.root_path() ||
+        candidate.parent_path() == candidate.root_path()) {
+        throw std::runtime_error("FWI_RUN_ROOT must be a dedicated directory");
+    }
+
+    static const std::vector<fs::path> sensitive_roots = {
+        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64",
+        "/boot", "/proc", "/sys", "/dev", "/run",
+    };
+    for (const auto& sensitive : sensitive_roots) {
+        if (is_within(candidate, sensitive)) {
+            throw std::runtime_error("FWI_RUN_ROOT overlaps a sensitive system path");
+        }
+    }
+    if (candidate == fs::path("/var")) {
+        throw std::runtime_error("FWI_RUN_ROOT cannot be /var");
+    }
+
+    const fs::path project_root = configured_project_root();
+    if (is_within(candidate, project_root) || is_within(project_root, candidate)) {
+        throw std::runtime_error("FWI_RUN_ROOT cannot overlap the project root");
+    }
+    if (const char* home_value = std::getenv("HOME")) {
+        fs::path home = fs::weakly_canonical(fs::path(home_value), ec);
+        if (!ec && (candidate == home || is_within(home, candidate))) {
+            throw std::runtime_error("FWI_RUN_ROOT cannot contain the home directory");
+        }
+        ec.clear();
+    }
+
     fs::create_directories(configured, ec);
     if (ec) {
         throw std::runtime_error("cannot create FWI run root");
     }
     const fs::path root = fs::canonical(configured, ec);
-    if (ec || !fs::is_directory(root)) {
+    if (ec || !fs::is_directory(root) || root != candidate) {
         throw std::runtime_error("FWI run root is unavailable");
     }
     return root;
@@ -375,11 +431,6 @@ pid_t spawn_worker(const std::string& command,
         throw std::runtime_error("cannot start fixed FWI worker: " + std::string(std::strerror(rc)));
     }
 
-    ReaperState& state = reaper_state();
-    {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        ++state.active;
-    }
     try {
         std::thread([pid, run_dir]() {
             int wait_status = 0;
@@ -388,19 +439,9 @@ pid_t spawn_worker(const std::string& command,
                 waited_pid = ::waitpid(pid, &wait_status, 0);
             } while (waited_pid < 0 && errno == EINTR);
             if (waited_pid == pid) mark_unexpected_exit(run_dir, wait_status);
-            {
-                ReaperState& state = reaper_state();
-                std::lock_guard<std::mutex> lock(state.mutex);
-                --state.active;
-            }
-            reaper_state().cv.notify_all();
+            release_worker_slot();
         }).detach();
     } catch (...) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            --state.active;
-        }
-        state.cv.notify_all();
         ::kill(pid, SIGTERM);
         int wait_status = 0;
         while (::waitpid(pid, &wait_status, 0) < 0 && errno == EINTR) {
@@ -514,8 +555,14 @@ json submit_demo(const json& args) {
     }
     const int iterations = static_cast<int>(requested_iterations);
 
-    auto [job_id, run_dir] = create_job_dir();
+    reserve_worker_slot();
+    bool slot_owned_by_submitter = true;
+    std::string job_id;
+    fs::path run_dir;
     try {
+        auto created = create_job_dir();
+        job_id = std::move(created.first);
+        run_dir = std::move(created.second);
         const json config = {
             {"job_id", job_id},
             {"model_id", model_id},
@@ -530,13 +577,18 @@ json submit_demo(const json& args) {
 
         const std::string command = preset == "forward" ? "forward" : "invert";
         spawn_worker(command, run_dir / "config.original.json", run_dir);
+        // The detached reaper now owns and releases this slot.
+        slot_owned_by_submitter = false;
     } catch (...) {
-        try {
-            atomic_write_json(
-                run_dir / "status.json",
-                status_payload(job_id, "failed", "submit", 0, iterations,
-                               "FWI worker could not be started"));
-        } catch (...) {
+        if (slot_owned_by_submitter) release_worker_slot();
+        if (!run_dir.empty()) {
+            try {
+                atomic_write_json(
+                    run_dir / "status.json",
+                    status_payload(job_id, "failed", "submit", 0, iterations,
+                                   "FWI worker could not be started"));
+            } catch (...) {
+            }
         }
         throw;
     }

@@ -19,7 +19,7 @@ fi
 # API Key stays in the inherited environment and never enters argv.
 if [ -z "${QWEN_API_KEY:-}" ]; then
     echo "错误: 请设置 QWEN_API_KEY 环境变量"
-    echo "  export QWEN_API_KEY=sk-xxx"
+    echo "请通过权限受限的本地配置加载，勿把真实 Key 写入命令行、日志或仓库。"
     exit 1
 fi
 

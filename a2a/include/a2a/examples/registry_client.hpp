@@ -8,13 +8,27 @@
 #include <stdexcept>
 #include <thread>
 #include <atomic>
+#include <algorithm>
+#include <cctype>
 
 using json = nlohmann::json;
 
+struct RegistryResponseBuffer {
+    static constexpr std::size_t kMaxBytes = 1024U * 1024U;
+    std::string body;
+    bool too_large = false;
+};
+
 // CURL 回调函数
-static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
-    userp->append((char*)contents, size * nmemb);
-    return size * nmemb;
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb,
+                            RegistryResponseBuffer* output) {
+    const std::size_t bytes = size * nmemb;
+    if (bytes > RegistryResponseBuffer::kMaxBytes - output->body.size()) {
+        output->too_large = true;
+        return 0;
+    }
+    output->body.append(static_cast<const char*>(contents), bytes);
+    return bytes;
 }
 
 /**
@@ -24,7 +38,12 @@ class RegistryClient {
 public:
     explicit RegistryClient(const std::string& registry_url = "http://localhost:8500")
         : registry_url_(registry_url)
-        , heartbeat_running_(false) {}
+        , heartbeat_running_(false) {
+        if (!is_loopback_http_url(registry_url_)) {
+            throw std::invalid_argument(
+                "Registry URL must be loopback HTTP with an explicit port");
+        }
+    }
     
     ~RegistryClient() {
         stop_heartbeat();
@@ -106,6 +125,29 @@ public:
     }
 
 private:
+    static bool is_loopback_http_url(const std::string& url) {
+        std::string remainder;
+        if (url.rfind("http://127.0.0.1:", 0) == 0) {
+            remainder = url.substr(std::string("http://127.0.0.1:").size());
+        } else if (url.rfind("http://localhost:", 0) == 0) {
+            remainder = url.substr(std::string("http://localhost:").size());
+        } else {
+            return false;
+        }
+        if (remainder.empty() || !std::all_of(
+                remainder.begin(), remainder.end(), [](unsigned char value) {
+                    return std::isdigit(value) != 0;
+                })) {
+            return false;
+        }
+        try {
+            const unsigned long port = std::stoul(remainder);
+            return port > 0 && port <= 65535;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
     // 发送 POST 请求
     json post(const std::string& path, const std::string& body) {
         CURL* curl = curl_easy_init();
@@ -114,7 +156,7 @@ private:
         }
         
         std::string url = registry_url_ + path;
-        std::string response_body;
+        RegistryResponseBuffer response;
         
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
@@ -125,19 +167,31 @@ private:
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
-        
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
+        curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP);
+
         CURLcode res = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
         
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         
+        if (response.too_large) {
+            throw std::runtime_error("Registry response exceeded 1 MiB");
+        }
         if (res != CURLE_OK) {
             throw std::runtime_error("CURL error: " + std::string(curl_easy_strerror(res)));
         }
+        if (status != 200) {
+            throw std::runtime_error("Registry HTTP status: " + std::to_string(status));
+        }
         
-        return json::parse(response_body);
+        return json::parse(response.body);
     }
     
     // 发送 GET 请求
@@ -148,21 +202,33 @@ private:
         }
         
         std::string url = registry_url_ + path;
-        std::string response_body;
+        RegistryResponseBuffer response;
         
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
-        
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
+        curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP);
+
         CURLcode res = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
         curl_easy_cleanup(curl);
         
+        if (response.too_large) {
+            throw std::runtime_error("Registry response exceeded 1 MiB");
+        }
         if (res != CURLE_OK) {
             throw std::runtime_error("CURL error: " + std::string(curl_easy_strerror(res)));
         }
+        if (status != 200) {
+            throw std::runtime_error("Registry HTTP status: " + std::to_string(status));
+        }
         
-        return json::parse(response_body);
+        return json::parse(response.body);
     }
     
     // 启动心跳线程

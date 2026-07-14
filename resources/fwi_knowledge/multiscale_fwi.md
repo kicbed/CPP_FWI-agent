@@ -1,128 +1,98 @@
-# 多尺度反演 (Multiscale FWI)
+# 多尺度全波形反演（Multiscale FWI）
 
-## 一、概述
+## 一、基本思想
 
-多尺度反演是一种避免 cycle skipping 的经典策略，通过从低频到高频逐步引入数据，引导反演收敛到全局最小。
+多尺度 FWI 把反演划分为若干阶段，先拟合较平滑或运动学更简单的数据成分，再逐步
+增加细节。最常见的实现是从可靠的低频开始，逐渐提高截止频率或加入更高频带，并把
+上一阶段模型作为下一阶段的初始模型。
 
-**核心思想**: 低频数据约束长波长结构（背景速度），高频数据恢复短波长细节（构造形态）。
+它的主要作用是降低局部优化早期面对的非线性，并减轻 cycle skipping 风险；它不能
+保证收敛到全局最小值，也不能补回观测数据中不存在或信噪比不足的低频信息。
 
-## 二、理论基础
+## 二、频率、波长与模型尺度
 
-### 2.1 频率与尺度的关系
+局部波长满足
 
-| 频率范围 | 约束尺度 | 反映信息 |
-|----------|----------|----------|
-| 2–5 Hz | 数百米–公里 | 背景速度、大层位 |
-| 5–10 Hz | 百米级 | 主要构造、断层 |
-| 10–20 Hz | 十米级 | 薄层、细节 |
+$$
+\lambda(\mathbf x)=\frac{v(\mathbf x)}{f}.
+$$
 
-### 2.2 为什么低频能避免 cycle skipping
+降低频率会增大波长，并通常拓宽一个孤立到达的半周期相位容忍范围。因此低频阶段更
+适合建立模型的长波长背景，较高频阶段可在数据照明允许时补充更短波长结构。
 
-低频波形波长长，走时差对应的时间延迟相对较小，不容易超过半周期。
+但是，模型可恢复的空间波数还取决于传播速度、散射角、透射/反射类型、孔径、震源与
+检波器位置和正则化，不能仅凭频率给出固定的“米级分辨率”表格。例如同一 8 Hz 分量在
+1500 m/s 和 5500 m/s 区域的波长并不相同。
 
-**示例**:
-- 3 Hz 波形：$T = 333$ ms，半周期 $T/2 = 167$ ms
-- 10 Hz 波形：$T = 100$ ms，半周期 $T/2 = 50$ ms
+## 三、半周期解释的限定
 
-相同 100 ms 走时误差：
-- 3 Hz：未超半周期，不 cycle skip
-- 10 Hz：超半周期，发生 cycle skip
+对孤立、形状相近、近似窄带且主要只有走时偏移的事件，常用启发式是
 
-## 三、实现方法
+$$
+|\Delta t|\lesssim\frac{1}{2f}.
+$$
 
-### 3.1 频率域实现
+较低 $f$ 对同一个 $\Delta t$ 给出更长的半周期，所以错误周期配准的风险通常较低。
+这只是简化诊断：宽带波形、多事件干涉、振幅/极性变化和噪声下不存在单一的严格阈值。
+多尺度反演是否有效必须通过各频带数据拟合、梯度和模型更新共同验证。
 
-在频率域中，可以自然地选择单频率或频率组进行反演。
+## 四、常见实现
 
-**流程**:
-```
-1. 反演 ω₁ = 2π × 2 Hz  → 更新背景速度
-2. 反演 ω₂ = 2π × 4 Hz  → 细化大层位
-3. 反演 ω₃ = 2π × 8 Hz  → 恢复构造
-4. 反演 ω₄ = 2π × 15 Hz → 恢复细节
-```
+### 4.1 时间域的嵌套低通阶段
 
-**优点**: 频率选择直观
-**局限**: 需要频率域正演，内存需求大
-
-### 3.2 时间域实现（滤波法）
-
-在时间域中，通过对数据进行低通滤波实现多尺度。
-
-**流程**:
-```
-1. 对观测数据 d_obs 和震源子波应用 0–5 Hz 低通滤波
-2. 用滤波后数据反演 → 得到初始模型
-3. 将上一步结果作为初始模型，用 0–10 Hz 数据反演
-4. 重复，逐步增加高频
-```
-
-**优点**: 适用于时间域正演
-**局限**: 滤波可能引入 artifacts
-
-### 3.3 Laplace-Fourier 域
-
-结合 Laplace 衰减和 Fourier 变换，同时处理低频和衰减信息。
-
-**参考**: Shin & Cha (2008)
-
-## 四、代码示例
+每个阶段使用逐渐升高的低通截止频率。观测和模拟数据必须采用相同的滤波器（或使用
+与该频带一致的震源并保持正演/观测处理一致），不能只滤观测数据。
 
 ```python
-def multiscale_fwi(d_obs, source, model_init, freq_bands):
-    """
-    多尺度 FWI
-    
-    Parameters:
-    -----------
-    d_obs : ndarray
-        观测数据
-    source : Source
-        震源
-    model_init : Model
-        初始模型
-    freq_bands : list of tuples
-        频率带列表，如 [(2,5), (5,10), (10,20)]
-    """
-    model = model_init.copy()
-    
-    for fmin, fmax in freq_bands:
-        print(f"反演频带: {fmin}-{fmax} Hz")
-        
-        # 滤波观测数据
-        d_filtered = bandpass_filter(d_obs, fmin, fmax)
-        
-        # 反演
-        model = fwi_inversion(d_filtered, source, model)
-        
-        print(f"  模型更新完成")
-    
-    return model
+model = model_initial
+
+for cutoff_hz in cutoff_schedule:
+    for iteration in range(iterations_per_stage):
+        predicted = forward(model, source)
+        observed_band = zero_phase_lowpass(observed, cutoff_hz)
+        predicted_band = zero_phase_lowpass(predicted, cutoff_hz)
+        loss = 0.5 * squared_l2(predicted_band - observed_band)
+        model = optimizer_step(model, gradient(loss, model))
 ```
 
-## 五、工业实践
+滤波器的相位响应、端点瞬态和有效通带都要记录。若使用因果滤波，应确保两类数据具有
+一致相位响应。
 
-### 5.1 典型频率序列
+### 4.2 分频带或频率域阶段
 
-| 阶段 | 频率范围 | 目标 |
-|------|----------|------|
-| 1 | 2–5 Hz | 背景速度 |
-| 2 | 2–8 Hz | 大层位 |
-| 3 | 2–12 Hz | 主要构造 |
-| 4 | 2–20 Hz | 细节恢复 |
+可以使用重叠频带，或在频率域中逐步选取离散频率。频率选择应考虑最低有效频率、频率
+采样、模型更新幅度和相邻阶段的连续性。时间域与频率域各有不同的线性求解、内存和
+并行特性，不能笼统断言某一域一定更省内存或更稳定。
 
-### 5.2 注意事项
+### 4.3 其他“尺度”
 
-1. **低频质量**: 野外数据常缺乏 < 3 Hz 有效信号，需要特殊采集或数据重建
-2. **频率间隔**: 频率间隔不宜过大，否则相邻频带间模型不一致
-3. **正则化**: 每个频带都需要适当的正则化
+多尺度不只指频率。实践中还可逐步增加偏移距、时间窗、事件类型，或从包络/走时类
+目标过渡到逐采样波形目标。这些策略改变了数据复杂度，但每次阶段切换都可能改变
+目标函数，需检查损失值是否可比较以及模型是否仍满足约束。
 
-## 六、参考文献
+## 五、设计和验收建议
 
-1. **Bunks, C., et al.** (1995). Multiscale seismic waveform inversion. *Geophysics*, 60(5), 1457-1473.
+- 从数据中实际可用且信噪比足够的最低频率开始，而不是套用固定的 2 Hz、3 Hz 或
+  5 Hz 阈值。
+- 同时检查观测与模拟数据的频谱，避免反演模拟数据中没有的频率。
+- 频带切换时保存每阶段的配置、损失定义和模型；跨阶段目标函数数值未必可直接比较。
+- 用波形叠合或频带化相位差诊断 cycle skipping，而不是只看总损失下降。
+- 结合速度边界、平滑或其他合理正则化；多尺度本身不是正则化的替代品。
 
-2. **Sirgue, L., & Pratt, R. G.** (2004). Efficient waveform inversion and imaging: A strategy for selecting temporal frequencies. *Geophysics*, 69(1), 231-248.
+## 六、与本项目的关系
 
-3. **Shin, C., & Cha, Y. H.** (2008). Waveform inversion in the Laplace domain. *Geophysical Journal International*, 173(3), 922-931.
+当前 Marmousi 演示默认采用 10 m 网格和主频 8 Hz 的 Ricker 子波。这是一个宽带子波，
+“8 Hz”不是单一频率；默认的单阶段 L2 演示也不能自动称为多尺度 FWI。只有显式配置
+并记录多个频率阶段、且各阶段实际执行时，才应报告为频率递进反演。
 
-4. **Brossier, R., Operto, S., & Virieux, J.** (2009). Two-dimensional seismic imaging of the Valhall model from synthetic OBS data by frequency-domain acoustic full-waveform inversion. *SEG Technical Program Expanded Abstracts*.
+10 m 与 8 Hz 仅适用于本次小型合成验证，不能据此推导其他模型或实际数据的普遍采样、
+分辨率或起始频率建议。
+
+## 七、参考文献
+
+1. Bunks, C., Saleck, F. M., Zaleski, S., & Chavent, G. (1995).
+   Multiscale seismic waveform inversion. *Geophysics*, 60(5), 1457–1473.
+2. Sirgue, L., & Pratt, R. G. (2004). Efficient waveform inversion and imaging:
+   A strategy for selecting temporal frequencies. *Geophysics*, 69(1), 231–248.
+3. Virieux, J., & Operto, S. (2009). An overview of full-waveform inversion in
+   exploration geophysics. *Geophysics*, 74(6), WCC1–WCC26.

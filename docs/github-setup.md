@@ -1,220 +1,135 @@
-# GitHub 仓库绑定教程
+# GitHub SSH 配置与安全发布
 
-## 一、为什么需要绑定 GitHub
+本项目已经是 Git 仓库并已配置远端。日常开发时不要再次执行 `git init`、不要覆盖
+`.gitignore`，也不要用 `git reset --hard` 清理工作区。发布前先检查实际差异和敏感文件。
 
-- **版本控制**: 记录每次修改，可以回滚
-- **多人协作**: 团队成员可以同步代码
-- **备份**: 代码保存在云端，不怕丢失
-- **免密推送**: 不用每次输入密码
+## 1. 配置 SSH Key
 
-## 二、设置步骤
-
-### 步骤 1: 生成 SSH Key
+先查看是否已有可用公钥：
 
 ```bash
-# 生成 SSH Key（如果还没有）
-ssh-keygen -t ed25519 -C "your-email@example.com"
-
-# 一路回车使用默认设置
-# 生成的文件在 ~/.ssh/id_ed25519（私钥）和 ~/.ssh/id_ed25519.pub（公钥）
+ls -l ~/.ssh/*.pub 2>/dev/null
 ```
 
-### 步骤 2: 复制公钥
+没有时生成一对新密钥。建议为私钥设置口令，不要把私钥复制到仓库或聊天中：
 
 ```bash
-# 查看并复制公钥
+ssh-keygen -t ed25519 -C "your-email@example.com"
+```
+
+只复制 `.pub` 公钥内容：
+
+```bash
 cat ~/.ssh/id_ed25519.pub
 ```
 
-输出类似：
-```
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... your-email@example.com
-```
-
-**复制整行内容**。
-
-### 步骤 3: 添加公钥到 GitHub
-
-1. 打开 GitHub: https://github.com/settings/keys
-2. 点击 "New SSH key"
-3. Title: 填 "WSL" 或任意名称
-4. Key: 粘贴刚才复制的公钥
-5. 点击 "Add SSH key"
-
-### 步骤 4: 测试连接
+在 GitHub 的 **Settings → SSH and GPG keys → New SSH key** 中添加公钥，然后验证：
 
 ```bash
 ssh -T git@github.com
 ```
 
-预期输出：
-```
-Hi username! You've successfully authenticated, but GitHub does not provide shell access.
-```
+GitHub 会说明认证成功但不提供 shell，这是正常结果。
 
-### 步骤 5: 创建 GitHub 仓库
-
-1. 打开 https://github.com/new
-2. Repository name: `agent-communication`
-3. 选择 Private（私有仓库）
-4. 不要勾选 "Initialize this repository with a README"
-5. 点击 "Create repository"
-
-### 步骤 6: 初始化本地仓库并推送
+## 2. 检查本仓库远端
 
 ```bash
-# 进入项目目录
-cd /root/projects/project/agent-communication-main-v2
+cd /path/to/agent-communication-main-v2
+git remote -v
+git branch --show-current
+git status --short
+```
 
-# 初始化 Git
+远端应使用 SSH 形式，例如：
+
+```text
+git@github.com:OWNER/REPOSITORY.git
+```
+
+如果尚无 `origin`，先在 GitHub 创建空仓库，再添加它：
+
+```bash
+git remote add origin git@github.com:OWNER/REPOSITORY.git
+```
+
+如果 `origin` 已存在，不要重复添加；需要更换地址时先人工确认仓库归属，再执行
+`git remote set-url origin ...`。
+
+## 3. 安全提交与推送
+
+先同步远端信息并检查工作区：
+
+```bash
+git fetch --prune origin
+git status --short
+git diff --stat
+git diff
+```
+
+只暂存本次明确要发布的文件。不要习惯性使用 `git add .`：
+
+```bash
+git add README.md docs/DEPLOYMENT.md scripts/codex-project.sh
+git diff --cached --stat
+git diff --cached
+```
+
+确认暂存区不包含 `.env`、API Key、私钥、模型、运行结果、日志或编译目录后再提交：
+
+```bash
+git commit -m "docs: update deployment workflow"
+git push -u origin "$(git branch --show-current)"
+```
+
+后续同一分支通常只需 `git push`。本项目约定不要自动推送主分支；先在实现分支完成测试和
+评审，再按团队流程合并。
+
+## 4. 拉取与撤销
+
+工作区干净时优先快进拉取，避免意外生成合并提交：
+
+```bash
+git pull --ff-only
+```
+
+撤销暂存但保留本地修改：
+
+```bash
+git restore --staged path/to/file
+```
+
+已经发布的错误提交应创建可审计的反向提交：
+
+```bash
+git revert COMMIT_ID
+```
+
+不要在包含未保存修改的工作区使用 `git reset --hard`、`git checkout --` 或强制推送。
+
+## 5. 新仓库的首次发布（仅限全新目录）
+
+以下流程只适用于一个尚未初始化、且内容已经人工检查过的全新目录：
+
+```bash
+cd /path/to/new-repository
 git init
-
-# 添加所有文件
-git add .
-
-# 创建 .gitignore（排除不需要的文件）
-cat > .gitignore << 'EOF'
-# Build
-build/
-*.o
-*.so
-*.a
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Logs
-*.log
-deploy/logs/
-examples/ai_orchestrator/logs/
-
-# PIDs
-deploy/pids/
-examples/ai_orchestrator/pids/
-
-# Cache
-.claude/
-resources/embeddings/
-
-# Environment
-.env
-*.env.local
-EOF
-
-# 再次添加文件（.gitignore 会排除不需要的）
-git add .
-
-# 提交
-git commit -m "Initial commit: FWI Agent Platform"
-
-# 设置主分支
+git status --short
+# 先用编辑器创建并审查 .gitignore，再逐项添加需要发布的文件
+git add .gitignore README.md CMakeLists.txt src/ include/
+git diff --cached
+git commit -m "chore: initialize repository"
 git branch -M main
-
-# 添加远程仓库（替换为你的 GitHub 用户名）
-git remote add origin git@github.com:YOUR_USERNAME/agent-communication.git
-
-# 推送
+git remote add origin git@github.com:OWNER/REPOSITORY.git
 git push -u origin main
 ```
 
-## 三、日常使用
+路径不存在时不要照抄示例文件列表；根据实际项目逐项选择。
 
-### 拉取最新代码
+## 6. 大文件与本项目边界
 
-```bash
-git pull
-```
+本仓库不提交 CMake build、Python 虚拟环境、Deepwave/PyTorch 缓存、Marmousi 模型、
+`/root/fwi-runs` 结果、Redis 数据、日志或 PID。它们应由使用者在本地构建、下载或挂载。
+确实需要版本化的大型公开数据，应先讨论制品仓库或 Git LFS，而不是直接加入 Git 历史。
 
-### 提交修改
-
-```bash
-# 查看修改
-git status
-
-# 添加修改的文件
-git add <file>
-# 或添加所有修改
-git add .
-
-# 提交
-git commit -m "描述你的修改"
-
-# 推送
-git push
-```
-
-### 查看历史
-
-```bash
-# 查看提交历史
-git log --oneline
-
-# 查看某个文件的修改历史
-git log --follow -p -- <file>
-```
-
-### 回滚修改
-
-```bash
-# 回滚某个文件
-git checkout -- <file>
-
-# 回滚到某个提交
-git reset --hard <commit-id>
-```
-
-## 四、多人协作
-
-### 克隆仓库（其他成员）
-
-```bash
-# 其他成员需要先将自己的 SSH 公钥添加到 GitHub
-git clone git@github.com:YOUR_USERNAME/agent-communication.git
-cd agent-communication
-```
-
-### 分支管理
-
-```bash
-# 创建新功能分支
-git checkout -b feature/new-agent
-
-# 开发完成后合并到主分支
-git checkout main
-git merge feature/new-agent
-
-# 推送
-git push
-```
-
-## 五、常见问题
-
-### Q: 推送时要求输入密码
-
-说明 SSH Key 没有配置好，重新检查步骤 2-4。
-
-### Q: 权限被拒绝
-
-```bash
-# 检查 SSH Key 权限
-chmod 600 ~/.ssh/id_ed25519
-chmod 644 ~/.ssh/id_ed25519.pub
-```
-
-### Q: 大文件推送失败
-
-```bash
-# 使用 Git LFS 管理大文件
-git lfs install
-git lfs track "*.bin"
-git lfs track "*.dat"
-git add .gitattributes
-```
-
-## 六、参考
-
-- [GitHub SSH 文档](https://docs.github.com/en/authentication/connecting-to-github-with-ssh)
-- [Git 基础命令](https://git-scm.com/book/zh/v2/Git-%E5%9F%BA%E7%A1%80-%E8%8E%B7%E5%8F%96-Git-%E4%BB%93%E5%BA%93)
+参考：[GitHub SSH 文档](https://docs.github.com/en/authentication/connecting-to-github-with-ssh)
+和 [Pro Git](https://git-scm.com/book/zh/v2)。

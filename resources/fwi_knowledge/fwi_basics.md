@@ -1,138 +1,122 @@
-# 全波形反演 (Full Waveform Inversion, FWI) 基础理论
+# 全波形反演（Full-Waveform Inversion, FWI）基础
 
-## 一、概述
+## 一、FWI 在做什么
 
-全波形反演（Full Waveform Inversion, FWI）是一种高分辨率地震成像方法，通过最小化观测数据与模拟数据之间的残差来反演地下介质参数模型。
+FWI 通过波动方程生成模拟数据，并迭代调整介质模型，使选定和预处理后的模拟波形与
+观测波形相符。相比只拟合人工拾取走时，它可以利用振幅、相位和波形形状；但“全波
+形”不意味着所有记录都原样参与反演，实际流程通常会选择频带、时间窗、偏移距和事件。
 
-**核心思想**: 利用地震波形的全部信息（振幅、相位、走时、波形形状），而非仅走时或振幅，来重建地下速度结构。
+FWI 是非线性、通常非凸的反问题。结果受初始模型、采集照明、频带、噪声、震源估计、
+正演物理、参数化和正则化共同影响。目标函数下降只说明当前数据拟合改善，不单独证明
+模型唯一或地质正确。
 
-## 二、历史沿革
+## 二、二维常密度声学示例
 
-| 年份 | 里程碑 | 贡献者 |
-|------|--------|--------|
-| 1984 | 提出 FWI 理论框架 | Tarantola |
-| 1986 | 声波 FWI | Tarantola |
-| 1990 | 弹性波 FWI | Mora |
-| 1999 | 频率域 FWI | Pratt & Worthington |
-| 2006 | 多尺度 FWI | Bunks et al. |
-| 2009 | 包络反演 | Wu et al. |
-| 2013 | 自适应波形反演 AWI | Warner & Guasch |
-| 2019 | 深度学习辅助 FWI | Araya-Polo et al. |
-
-## 三、数学框架
-
-### 3.1 正演问题
-
-地震波传播由波动方程描述：
-
-**声波方程**:
-$$
-\frac{1}{v^2(\mathbf{x})} \frac{\partial^2 u}{\partial t^2} - \nabla^2 u = f(\mathbf{x}, t)
-$$
-
-其中：
-- $v(\mathbf{x})$: P 波速度
-- $u(\mathbf{x}, t)$: 波场（压力或位移）
-- $f(\mathbf{x}, t)$: 震源项
-
-**正演算子**: $\mathbf{d}^{syn} = \mathcal{F}[\mathbf{m}]$
-
-将模型参数 $\mathbf{m}$（如慢度 $s = 1/v$）映射为模拟地震记录。
-
-### 3.2 目标函数
-
-FWI 最小化如下最小二乘目标函数：
+一种常见归一化形式是
 
 $$
-J(\mathbf{m}) = \frac{1}{2} \sum_{s=1}^{N_s} \sum_{r=1}^{N_r} \int_0^T \left| d^{obs}_{s,r}(t) - d^{syn}_{s,r}(t; \mathbf{m}) \right|^2 dt
+\frac{1}{v^2(\mathbf x)}\frac{\partial^2u}{\partial t^2}
+-\nabla^2u=f(\mathbf x,t),
 $$
 
-其中：
-- $\mathbf{m}$: 模型参数（如慢度 $s(\mathbf{x}) = 1/v(\mathbf{x})$）
-- $d^{obs}_{s,r}(t)$: 第 $s$ 个震源、第 $r$ 个检波器的观测波形
-- $d^{syn}_{s,r}(t; \mathbf{m})$: 基于当前模型 $\mathbf{m}$ 的模拟波形
-- $N_s$: 震源数量
-- $N_r$: 检波器数量
-- $T$: 记录长度
-
-### 3.3 梯度计算
-
-目标函数对模型参数的梯度：
+其中 $v$ 是 P 波速度，$u$ 是标量波场，$f$ 是震源项。令平方慢度
+$m=1/v^2$，正演算子可以写作
 
 $$
-\nabla_{\mathbf{m}} J = -\sum_{s=1}^{N_s} \sum_{r=1}^{N_r} \int_0^T \frac{\partial d^{syn}_{s,r}}{\partial \mathbf{m}} \left( d^{obs}_{s,r}(t) - d^{syn}_{s,r}(t) \right) dt
+d^{syn}=\mathcal F(m).
 $$
 
-直接计算 Fréchet 导数矩阵 $\partial d^{syn} / \partial \mathbf{m}$ 计算量巨大。
+这个模型忽略密度变化、剪切波、各向异性、衰减和三维传播等效应。用于实际数据前，
+必须判断这些简化是否足以描述目标数据。
 
-**解决方案**: 伴随状态法（Adjoint-State Method）
+## 三、最小二乘目标函数
 
-## 四、伴随状态法 (Adjoint-State Method)
-
-### 4.1 核心思想
-
-通过一次正演模拟和一次伴随模拟，高效计算梯度，避免显式存储 Fréchet 矩阵。
-
-### 4.2 计算步骤
-
-1. **正演模拟**: 使用当前模型 $\mathbf{m}$，计算波场 $u(\mathbf{x}, t)$
-2. **计算残差**: $r_{s,r}(t) = d^{syn}_{s,r}(t) - d^{obs}_{s,r}(t)$
-3. **伴随模拟**: 将残差作为伴随源，时间反向传播，得到伴随波场 $u^\dagger(\mathbf{x}, t)$
-4. **计算梯度**:
-   $$
-   \nabla_{\mathbf{m}} J = -\sum_s \int_0^T u(\mathbf{x}, t) \frac{\partial^2 u^\dagger}{\partial t^2}(\mathbf{x}, t) dt
-   $$
-
-### 4.3 计算复杂度
-
-| 操作 | 复杂度 |
-|------|--------|
-| 正演模拟 | $O(N_s \times N_x \times N_t)$ |
-| 伴随模拟 | $O(N_s \times N_x \times N_t)$ |
-| 梯度计算 | $O(N_s \times N_x \times N_t)$ |
-| **总计** | $O(N_s \times N_x \times N_t)$ |
-
-相比直接计算 Fréchet 矩阵的 $O(N_s \times N_r \times N_x \times N_t)$，效率提升显著。
-
-## 五、优化算法
-
-### 5.1 梯度下降
+若残差定义为 $r=d^{syn}-d^{obs}$，常规逐采样 $L^2$ 目标为
 
 $$
-\mathbf{m}_{k+1} = \mathbf{m}_k - \alpha_k \nabla_{\mathbf{m}} J(\mathbf{m}_k)
+J(m)=\frac{1}{2}\sum_{s=1}^{N_s}\sum_{r=1}^{N_r}
+\int_0^T
+\left|d^{syn}_{s,r}(t;m)-d^{obs}_{s,r}(t)\right|^2dt.
 $$
 
-**优点**: 简单
-**缺点**: 收敛慢，对步长敏感
+在实际实现中还要明确：道权重、采样间隔因子、归一化、静音窗、滤波以及是否对炮次
+或检波器求平均。不同归一化会改变损失和梯度的数值尺度，因此不同程序或频带的 loss
+不能只凭绝对值直接比较。
 
-### 5.2 共轭梯度
+## 四、梯度
+
+线性化正演算子后，模型扰动满足
 
 $$
-\mathbf{m}_{k+1} = \mathbf{m}_k + \alpha_k \mathbf{p}_k
+\delta d=\mathcal F'(m)\,\delta m,
 $$
 
-其中搜索方向 $\mathbf{p}_k$ 由共轭条件确定。
+所以在相应内积下
 
-**优点**: 比梯度下降快
-**缺点**: 需要存储历史信息
+$$
+\nabla_m J=\mathcal F'(m)^*r.
+$$
 
-### 5.3 L-BFGS (Limited-memory BFGS)
+伴随状态法计算的是这个“Jacobian 的伴随作用于残差”，而不显式保存整个 Jacobian。
+对每个震源通常进行一次正演和一次伴随传播，再把梯度累加。
 
-准牛顿法，近似 Hessian 逆矩阵，只存储最近 $m$ 步信息。
+梯度的具体公式取决于模型参数化。对
+$A(m)u=m\,\partial_t^2u-\nabla^2u$，$m=1/v^2$ 是平方慢度；若直接优化速度 $v$，则需
+通过 $dm/dv=-2/v^3$ 转换。残差和拉格朗日函数的符号约定也会改变公式表面上的负号。
+详见 `adjoint_state.md`。
 
-**优点**: 收敛快，内存友好
-**缺点**: 需要调参
+自动微分得到的是离散计算图对实际优化张量的导数。方向导数或 Taylor 检验可用于确认
+它与所实现的离散目标函数一致。
 
-## 六、参考文献
+## 五、迭代更新
 
-1. **Tarantola, A.** (1984). Inversion of seismic reflection data in the acoustic approximation. *Geophysics*, 49(8), 1259-1266.
+抽象的一阶更新为
 
-2. **Tarantola, A.** (1986). A strategy for nonlinear elastic inversion of seismic reflection data. *Geophysics*, 51(10), 1893-1903.
+$$
+m_{k+1}=\Pi_{\mathcal C}
+\left[m_k-\alpha_k P_k\nabla J(m_k)\right],
+$$
 
-3. **Pratt, R. G., & Worthington, M. H.** (1990). Inverse theory applied to multi-source cross-hole tomography. *Geophysical Prospecting*, 38(3), 287-310.
+其中 $\alpha_k$ 是步长，$P_k$ 可表示预条件或优化器历史，$\Pi_{\mathcal C}$ 表示速度
+边界等可行域投影。常见选择包括：
 
-4. **Mora, P.** (1987). Nonlinear two-dimensional elastic inversion of multioffset seismic data. *Geophysics*, 52(9), 1211-1228.
+- 最速下降：实现简单，但对尺度和步长敏感；
+- 非线性共轭梯度：用少量向量构造新的搜索方向；
+- L-BFGS：用有限数量的模型/梯度差近似逆 Hessian，通常结合线搜索；
+- Adam：在自动微分原型中方便，但超参数和逐参数尺度会影响物理解释。
 
-5. **Virieux, J., & Operto, S.** (2009). An overview of full-waveform inversion in exploration geophysics. *Geophysics*, 74(6), WCC1-WCC26.
+不存在对所有 FWI 问题都最佳的优化器。每次迭代应检查损失、梯度和模型是否有限，
+记录失败迭代，并验证模型确实更新且满足物理边界。
 
-6. **Fichtner, A.** (2011). *Full Seismic Waveform Modelling and Inversion*. Springer.
+## 六、cycle skipping 与尺度
+
+如果初始模拟波形与观测波形错误地对应到相邻周期，局部 $L^2$ 优化可能发生 cycle
+skipping。对孤立窄带到达，“走时差约小于所选频率半周期”是常用启发式，不是宽带、
+多事件数据的严格判据。低到高频的多尺度反演可以减轻风险，但不能保证全局收敛。
+详见 `cycle_skipping.md` 与 `multiscale_fwi.md`。
+
+AWI 是基于卷积匹配滤波器的另一类目标函数，不是简单的动态加权 $L^2$ 残差；详见
+`awi.md`。
+
+## 七、本项目的适用范围
+
+当前项目验证的是二维、常密度、单参数 $V_p$、Deepwave scalar 和合成数据流程。
+观测数据和反演传播均由同一数值后端生成，属于合成端到端/“逆犯罪”验证，主要验证
+系统调用、梯度、优化和结果展示，不能据此宣称对实际数据具有普遍反演效果。
+
+Marmousi 演示使用 10 m 网格和主频 8 Hz 的 Ricker 子波；这些是当前实验参数，不是
+适用于所有模型的采样或频率结论。
+
+## 八、参考文献
+
+1. Tarantola, A. (1984). Inversion of seismic reflection data in the acoustic
+   approximation. *Geophysics*, 49(8), 1259–1266.
+2. Mora, P. (1987). Nonlinear two-dimensional elastic inversion of multioffset
+   seismic data. *Geophysics*, 52(9), 1211–1228.
+3. Bunks, C., Saleck, F. M., Zaleski, S., & Chavent, G. (1995). Multiscale
+   seismic waveform inversion. *Geophysics*, 60(5), 1457–1473.
+4. Pratt, R. G. (1999). Seismic waveform inversion in the frequency domain,
+   Part 1: Theory and verification in a physical scale model. *Geophysics*,
+   64(3), 888–901.
+5. Virieux, J., & Operto, S. (2009). An overview of full-waveform inversion in
+   exploration geophysics. *Geophysics*, 74(6), WCC1–WCC26.

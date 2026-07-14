@@ -6,9 +6,19 @@
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <string>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 
 using namespace a2a;
 using json = nlohmann::json;
+
+static std::string generate_context_id() {
+    static std::atomic<std::uint64_t> sequence{0};
+    const auto now = std::chrono::system_clock::now().time_since_epoch().count();
+    return "ctx-cli-" + std::to_string(now) + "-" +
+           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed) + 1);
+}
 
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
     userp->append((char*)contents, size * nmemb);
@@ -25,7 +35,7 @@ public:
         curl_global_cleanup();
     }
 
-    std::string send_message(const std::string& text, const std::string& context_id = "default") {
+    std::string send_message(const std::string& text, const std::string& context_id) {
         json request = {
             {"jsonrpc", "2.0"},
             {"id", std::to_string(++request_id_)},
@@ -116,7 +126,7 @@ int main(int argc, char* argv[]) {
     print_help();
 
     A2AClient client(server_url);
-    std::string context_id = "default";
+    std::string context_id = generate_context_id();
 
     std::string line;
     while (true) {

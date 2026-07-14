@@ -474,6 +474,82 @@ target_include_directories(test_fwi_tool_routing PRIVATE
 )
 add_test(NAME FWIToolRoutingTest COMMAND test_fwi_tool_routing)
 
+# Bounded and role-aware conversation context construction.
+add_executable(test_context_window test_context_window.cpp)
+target_link_libraries(test_context_window
+    orchestrator
+    a2a
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_context_window PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/third_party
+)
+add_test(NAME ContextWindowTest COMMAND test_context_window)
+
+add_executable(test_specialist_context test_specialist_context.cpp)
+target_link_libraries(test_specialist_context
+    a2a
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_specialist_context PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../examples/ai_orchestrator
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/third_party
+)
+add_test(NAME SpecialistContextTest COMMAND test_specialist_context)
+
+# Strict specialist LLM provider/key/endpoint mapping. The test is pure and
+# deliberately does not inspect API-key environment variables.
+add_executable(test_llm_runtime_config test_llm_runtime_config.cpp)
+target_link_libraries(test_llm_runtime_config
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_llm_runtime_config PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../examples/ai_orchestrator
+    ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/include
+)
+add_test(NAME LLMRuntimeConfigTest COMMAND test_llm_runtime_config)
+
+# Embedding cache persistence must not follow symlinks or write relative to an
+# untrusted launch directory.
+add_executable(test_vector_store_security test_vector_store_security.cpp)
+target_link_libraries(test_vector_store_security
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_vector_store_security PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator/include
+)
+add_test(NAME VectorStoreSecurityTest COMMAND test_vector_store_security)
+
+add_test(
+    NAME RuntimeSecretIsolationTest
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_runtime_secret_isolation.sh
+)
+
+# Pure local FWI document loading and relevance ranking. This test performs no
+# LLM or embedding network request.
+add_executable(test_fwi_knowledge_base test_fwi_knowledge_base.cpp)
+target_link_libraries(test_fwi_knowledge_base
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_fwi_knowledge_base PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator/include
+)
+add_test(NAME FWIKnowledgeBaseTest COMMAND test_fwi_knowledge_base)
+
 # RAG-MCP 属性测试
 # **Feature: rag-mcp, Property 1-8**
 # **Validates: Requirements 1.3, 3.2, 3.3, 3.4, 4.1, 4.3, 7.2, 7.3**

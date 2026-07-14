@@ -51,6 +51,18 @@ TEST(FWIToolRoutingTest, RoutesDemoAndCpuOnlyWhenExplicitlyRequested) {
 }
 
 TEST(FWIToolRoutingTest, CombinedRunAndResultStillSubmitsAsyncJob) {
+    // This is the natural-language form used by the Web UI. It deliberately
+    // omits the acronym "FWI" and the full model ID, so the deterministic
+    // router must recognise the whitelisted Marmousi alias plus the concrete
+    // inversion-test action instead of falling through to a code-writing LLM.
+    const auto colloquial = plan_fwi_tool_call(
+        "做一下marmousi的反演测试，迭代50次，完成后展示结果", kLastJob);
+    EXPECT_EQ(colloquial.tool_name, "fwi_submit_demo");
+    EXPECT_EQ(colloquial.arguments.at("model_id"), "marmousi_94_288");
+    EXPECT_EQ(colloquial.arguments.at("preset"), "fwi_demo");
+    EXPECT_EQ(colloquial.arguments.at("device"), "cuda");
+    EXPECT_EQ(colloquial.arguments.at("iterations"), 50);
+
     const auto smoke = plan_fwi_tool_call(
         "使用 marmousi_94_288 在 CUDA 上运行2次迭代的FWI并向我展示结果", kLastJob);
     EXPECT_EQ(smoke.tool_name, "fwi_submit_demo");
@@ -154,6 +166,16 @@ TEST(FWIToolRoutingTest, TheoryQuestionDoesNotLaunchComputation) {
     const auto how_to = plan_fwi_tool_call(
         "解释如何使用 marmousi_94_288 运行 FWI smoke test。", kLastJob);
     EXPECT_TRUE(how_to.tool_name.empty());
+
+    // Nearby wording must remain explanatory: adding an iteration number to
+    // a theory/result-analysis question is not authorisation to launch a job.
+    EXPECT_TRUE(plan_fwi_tool_call(
+        "解释一下 marmousi 的反演测试原理，迭代 50 次意味着什么。",
+        kLastJob).tool_name.empty());
+    const auto analyse_result = plan_fwi_tool_call(
+        "帮我分析一下 marmousi 的反演测试结果。", kLastJob);
+    EXPECT_NE(analyse_result.tool_name, "fwi_submit_demo");
+    EXPECT_EQ(analyse_result.tool_name, "fwi_get_result");
 }
 
 TEST(FWIToolRoutingTest, CapabilityQuestionDoesNotLaunchComputation) {
@@ -197,6 +219,8 @@ TEST(FWIToolRoutingTest, LiveRouterBypassRecognizesActionButNotTheory) {
 
     EXPECT_TRUE(engine.has_explicit_fwi_action(
         "使用 marmousi_94_288 运行两次迭代的 FWI smoke test。"));
+    EXPECT_TRUE(engine.has_explicit_fwi_action(
+        "做一下marmousi的反演测试，迭代50次，完成后展示结果"));
     EXPECT_FALSE(engine.has_explicit_fwi_action("什么是 FWI？"));
     EXPECT_FALSE(engine.has_explicit_fwi_action("你可以做 FWI 反演吗？"));
     EXPECT_FALSE(engine.has_explicit_fwi_action("不要运行 marmousi_94_288 FWI。"));
@@ -205,6 +229,28 @@ TEST(FWIToolRoutingTest, LiveRouterBypassRecognizesActionButNotTheory) {
     EXPECT_TRUE(engine.has_fwi_guidance_request("你可以做 FWI 反演吗？"));
     EXPECT_TRUE(engine.has_fwi_guidance_request("怎么启动一个 FWI 反演呢？"));
     EXPECT_TRUE(engine.has_fwi_guidance_request("不要运行 marmousi_94_288 FWI。"));
+}
+
+TEST(FWIToolRoutingTest, RemembersLatestFwiJobPerConversation) {
+    agent_rpc::mcp::MCPAgentIntegration integration;
+    NoopLLM llm;
+    ToolCallingEngine engine(&integration, llm);
+
+    constexpr const char* kContextA = "ctx-conversation-a";
+    constexpr const char* kContextB = "ctx-conversation-b";
+    constexpr const char* kJobB = "fwi-20260714T121500Z-012345abcdef";
+    const std::string previous_status = "查看刚才 FWI 任务的状态。";
+
+    engine.remember_fwi_job(kContextA, kLastJob);
+
+    EXPECT_TRUE(engine.has_explicit_fwi_action(previous_status, kContextA));
+    EXPECT_FALSE(engine.has_explicit_fwi_action(previous_status, kContextB));
+    EXPECT_FALSE(engine.has_explicit_fwi_action(previous_status));
+
+    engine.remember_fwi_job(kContextB, kJobB);
+
+    EXPECT_TRUE(engine.has_explicit_fwi_action(previous_status, kContextA));
+    EXPECT_TRUE(engine.has_explicit_fwi_action(previous_status, kContextB));
 }
 
 TEST(FWIToolRoutingTest, ExplicitStrictJobIdOverridesPreviousJob) {

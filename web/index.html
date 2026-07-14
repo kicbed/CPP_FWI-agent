@@ -27,22 +27,6 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked@14.1.3/marked.min.js"></script>
-  <script>
-    window.MathJax = {
-      tex: {
-        inlineMath: [['$', '$'], ['\\(', '\\)']],
-        displayMath: [['$$', '$$'], ['\\[', '\\]']],
-        processEscapes: true,
-      },
-      options: {
-        skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
-      },
-      startup: {
-        typeset: false,
-      },
-    };
-  </script>
-  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
   <link rel="icon" href="favicon.svg">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -117,9 +101,27 @@
     .markdown-body a { color: #4F46E5; text-decoration: underline; }
     .markdown-body hr { border: none; border-top: 1px solid #E2E8F0; margin: 16px 0; }
     .markdown-body strong { color: #0F172A; }
-    .markdown-body mjx-container { max-width: 100%; overflow-x: auto; overflow-y: hidden; }
-    .markdown-body mjx-container[display="true"] {
+    .markdown-body .katex { max-width: 100%; }
+    .markdown-body .katex-display {
+      max-width: 100%; overflow-x: auto; overflow-y: hidden;
       margin: 12px 0; padding: 4px 0;
+    }
+    .markdown-body .math-source {
+      max-width: 100%; color: #1E293B;
+    }
+    .markdown-body .math-source.math-inline {
+      display: inline-block; padding: 0 3px; border-radius: 4px;
+      font-family: Georgia, 'Times New Roman', serif;
+      background: rgba(79, 70, 229, 0.05);
+    }
+    .markdown-body .math-source.math-display {
+      display: block; overflow-x: auto; margin: 10px 0; padding: 9px 12px;
+      border-left: 3px solid #C7D2FE; border-radius: 0 6px 6px 0;
+      background: #F8FAFC; font-family: Georgia, 'Times New Roman', serif;
+      text-align: center; white-space: pre-wrap;
+    }
+    .markdown-body .math-source.math-fallback-visible {
+      text-align: left; color: #475569;
     }
 
     .workbench-card {
@@ -219,7 +221,10 @@
 
     <!-- Chat History -->
     <div class="flex-1 overflow-y-auto px-4 pt-4 min-h-0">
-      <p class="text-xs text-slate-400 uppercase tracking-wider mb-2 font-medium">历史对话</p>
+      <div class="flex items-center justify-between gap-2 mb-2">
+        <p class="text-xs text-slate-400 uppercase tracking-wider font-medium">历史对话</p>
+        <button id="clearAllChatsBtn" type="button" class="text-[11px] text-slate-400 hover:text-red-600 transition-colors" title="清空全部本地对话历史">清空全部</button>
+      </div>
       <div id="chatHistory" class="space-y-1"></div>
     </div>
 
@@ -389,6 +394,8 @@
           <button
             id="stopBtn"
             onclick="stopGeneration()"
+            title="停止浏览器等待；不能保证服务端任务已取消"
+            aria-label="停止等待响应"
             class="p-3 bg-red-50 hover:bg-red-100 border border-red-200 rounded-xl transition-all duration-200 hidden"
           >
             <svg class="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
@@ -453,17 +460,227 @@
   <div id="toast" class="fixed bottom-20 left-1/2 -translate-x-1/2 px-4 py-2 bg-slate-900 text-white border border-slate-700 rounded-lg text-sm shadow-xl transition-all duration-300 opacity-0 translate-y-2 pointer-events-none z-50"></div>
 
   <script>
-    // ===== State =====
+    // ===== Conversation storage and state =====
+    const CHAT_STORAGE_KEY = 'agent-chats';
+    const CHAT_ACTIVE_KEY = 'agent-active-chat';
+    const CHAT_MODE_KEY = 'agent-mode';
+    const CHAT_SCHEMA_VERSION = 2;
+    const MAX_STORED_CHATS = 50;
+    const MAX_STORED_MESSAGES = 200;
+    const MAX_MESSAGE_CHARACTERS = 250000;
+    let fallbackIdCounter = 0;
+
+    function normalizeMode(value) {
+      return value === 'grpc' ? 'grpc' : 'http';
+    }
+
+    function createStableId(prefix = 'id') {
+      const cryptoApi = typeof globalThis !== 'undefined' ? globalThis.crypto : null;
+      if (cryptoApi && typeof cryptoApi.randomUUID === 'function') {
+        return `${prefix}-${cryptoApi.randomUUID()}`;
+      }
+      fallbackIdCounter += 1;
+      const randomPart = Math.random().toString(36).slice(2, 12) || 'random';
+      return `${prefix}-${Date.now().toString(36)}-${fallbackIdCounter.toString(36)}-${randomPart}`;
+    }
+
+    function isSafeConversationId(value, maxLength = 256) {
+      return typeof value === 'string'
+        && value.length > 0
+        && value.length <= maxLength
+        && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value);
+    }
+
+    function isSafeContextId(value) {
+      return typeof value === 'string'
+        && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)
+        && value !== 'default';
+    }
+
+    function getBrowserStorage() {
+      try {
+        return window.localStorage;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function safeStorageRead(storage, key) {
+      if (!storage) return '';
+      try {
+        return storage.getItem(key) || '';
+      } catch (error) {
+        return '';
+      }
+    }
+
+    function safeStorageWrite(storage, key, value) {
+      if (!storage) return false;
+      try {
+        storage.setItem(key, value);
+        return true;
+      } catch (error) {
+        console.warn(`Unable to persist ${key}: ${error && error.name ? error.name : 'storage error'}`);
+        return false;
+      }
+    }
+
+    function safeStorageRemove(storage, key) {
+      if (!storage) return false;
+      try {
+        storage.removeItem(key);
+        return true;
+      } catch (error) {
+        return false;
+      }
+    }
+
+    function normalizeStoredMessage(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+      if (!['user', 'assistant', 'system'].includes(value.role) || typeof value.content !== 'string') return null;
+      const validStatuses = new Set([
+        'pending', 'partial', 'complete', 'error', 'cancelled', 'outcome_unknown',
+      ]);
+      const createdAt = Number.isFinite(value.createdAt) && value.createdAt > 0 ? value.createdAt : Date.now();
+      return {
+        id: isSafeConversationId(value.id, 128) ? value.id : createStableId('msg'),
+        requestId: isSafeConversationId(value.requestId, 128) ? value.requestId : '',
+        role: value.role,
+        content: value.content.slice(0, MAX_MESSAGE_CHARACTERS),
+        status: validStatuses.has(value.status) ? value.status : 'complete',
+        createdAt,
+        updatedAt: Number.isFinite(value.updatedAt) && value.updatedAt > 0 ? value.updatedAt : createdAt,
+      };
+    }
+
+    function normalizeStoredFwiJob(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+      const jobId = typeof value.job_id === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value.job_id)
+        ? value.job_id
+        : '';
+      if (!jobId) return null;
+      const copyString = (field, maxLength = 512) => typeof value[field] === 'string'
+        ? value[field].slice(0, maxLength)
+        : '';
+      return {
+        type: copyString('type', 64),
+        job_id: jobId,
+        status: copyString('status', 64) || 'queued',
+        stage: copyString('stage', 128),
+        message: copyString('message', 2000),
+        status_url: copyString('status_url', 512),
+        result_url: copyString('result_url', 512),
+        iteration: Number.isInteger(value.iteration) ? value.iteration : 0,
+        total_iterations: Number.isInteger(value.total_iterations) ? value.total_iterations : 0,
+      };
+    }
+
+    function createChatRecord(mode = 'http') {
+      const now = Date.now();
+      return {
+        id: createStableId('chat'),
+        contextId: createStableId('web'),
+        title: '新对话',
+        messages: [],
+        fwiJob: null,
+        mode: normalizeMode(mode),
+        createdAt: now,
+        time: now,
+      };
+    }
+
+    function normalizeStoredChat(value, fallbackId) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+      const idCandidate = isSafeConversationId(fallbackId, 128)
+        ? fallbackId
+        : value.id;
+      if (!isSafeConversationId(idCandidate, 128)) return null;
+      const messages = Array.isArray(value.messages)
+        ? value.messages.map(normalizeStoredMessage).filter(Boolean).slice(-MAX_STORED_MESSAGES)
+        : [];
+      const createdAt = Number.isFinite(value.createdAt) && value.createdAt > 0
+        ? value.createdAt
+        : (Number.isFinite(value.time) && value.time > 0 ? value.time : Date.now());
+      const updatedAt = Number.isFinite(value.time) && value.time > 0 ? value.time : createdAt;
+      const storedContext = isSafeContextId(value.contextId)
+        ? value.contextId
+        : createStableId('web');
+      return {
+        id: idCandidate,
+        contextId: storedContext,
+        title: typeof value.title === 'string' && value.title.trim()
+          ? value.title.trim().slice(0, 120)
+          : '新对话',
+        messages,
+        fwiJob: normalizeStoredFwiJob(value.fwiJob),
+        mode: normalizeMode(value.mode),
+        createdAt,
+        time: updatedAt,
+      };
+    }
+
+    function parseStoredChatState(rawValue, storedActiveId = '', storedMode = 'http') {
+      let parsed = null;
+      try {
+        parsed = rawValue ? JSON.parse(rawValue) : null;
+      } catch (error) {
+        parsed = null;
+      }
+
+      const isEnvelope = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        && parsed.schemaVersion === CHAT_SCHEMA_VERSION && parsed.chats
+        && typeof parsed.chats === 'object' && !Array.isArray(parsed.chats);
+      const rawChats = isEnvelope
+        ? parsed.chats
+        : (parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {});
+      const mode = normalizeMode(isEnvelope ? parsed.mode : storedMode);
+      const activeCandidate = isEnvelope && typeof parsed.activeChatId === 'string'
+        ? parsed.activeChatId
+        : storedActiveId;
+
+      const normalizedEntries = Object.entries(rawChats)
+        .map(([id, chat]) => normalizeStoredChat(chat, id))
+        .filter(Boolean)
+        .sort((a, b) => b.time - a.time)
+        .slice(0, MAX_STORED_CHATS);
+      const chats = Object.create(null);
+      normalizedEntries.forEach(chat => { chats[chat.id] = chat; });
+
+      let activeChatId = isSafeConversationId(activeCandidate, 128) && chats[activeCandidate]
+        ? activeCandidate
+        : (normalizedEntries[0] ? normalizedEntries[0].id : '');
+      if (!activeChatId) {
+        const initialChat = createChatRecord(mode);
+        chats[initialChat.id] = initialChat;
+        activeChatId = initialChat.id;
+      }
+      return { schemaVersion: CHAT_SCHEMA_VERSION, chats, activeChatId, mode };
+    }
+
+    function loadStoredChatState() {
+      const storage = getBrowserStorage();
+      return parseStoredChatState(
+        safeStorageRead(storage, CHAT_STORAGE_KEY),
+        safeStorageRead(storage, CHAT_ACTIVE_KEY),
+        safeStorageRead(storage, CHAT_MODE_KEY),
+      );
+    }
+
+    const restoredChatState = loadStoredChatState();
+    const restoredActiveChat = restoredChatState.chats[restoredChatState.activeChatId];
     const state = {
-      mode: 'http',
+      mode: restoredChatState.mode === 'grpc' ? 'http' : restoredChatState.mode,
+      preferredMode: restoredChatState.mode,
       grpcAvailable: false,
-      chatId: Date.now().toString(),
-      chats: JSON.parse(localStorage.getItem('agent-chats') || '{}'),
+      chatId: restoredChatState.activeChatId,
+      chats: restoredChatState.chats,
       streaming: false,
+      activeRequest: null,
       abortController: null,
-      contextId: null,
-      fwiJob: null,
+      contextId: restoredActiveChat.contextId,
+      fwiJob: restoredActiveChat.fwiJob,
       fwiPollTimer: null,
+      fwiReceiptMissing: false,
     };
 
     const CONFIG = {
@@ -483,10 +700,12 @@
 
     // ===== Init =====
     document.addEventListener('DOMContentLoaded', () => {
-      switchMode('http', { silent: true });
-      renderExperimentHistory();
       renderInspectorStatusGrid();
-      renderHistory();
+      updateModeControls();
+      persistChatState();
+      loadChat(state.chatId, { initial: true, preserveMode: true });
+      const clearAllButton = document.getElementById('clearAllChatsBtn');
+      if (clearAllButton) clearAllButton.addEventListener('click', clearAllChats);
       checkStatus();
       setInterval(checkStatus, 15000);
       document.getElementById('userInput').focus();
@@ -498,16 +717,22 @@
       const requestedMode = mode === 'grpc' ? 'grpc' : 'http';
       if (requestedMode === 'grpc' && !state.grpcAvailable) {
         state.mode = 'http';
-        localStorage.setItem('agent-mode', 'http');
+        if (!options.preservePreference) state.preferredMode = 'grpc';
+        persistChatState();
         updateModeControls();
         if (!options.silent) showToast('gRPC 桥未启动；请先运行 ./stop.sh，再运行 ./start.sh --grpc');
         return false;
       }
 
+      if (state.mode !== requestedMode && state.streaming) {
+        abortActiveRequest('transport_changed');
+      }
       mode = requestedMode;
       state.mode = mode;
-      localStorage.setItem('agent-mode', mode);
-      state.contextId = null;
+      if (!options.preservePreference) state.preferredMode = mode;
+      const chat = state.chats[state.chatId];
+      if (chat && !options.preservePreference) chat.mode = mode;
+      persistChatState();
 
       updateModeControls();
       if (!options.silent) showToast(`已切换到 ${mode === 'http' ? 'HTTP' : 'gRPC 桥'} 模式`);
@@ -543,81 +768,289 @@
           : '需使用 ./start.sh --grpc 启动并通过健康检查';
       }
       if (!state.grpcAvailable && state.mode === 'grpc') {
-        switchMode('http', { silent: true });
+        switchMode('http', { silent: true, preservePreference: true });
         showToast(reason || 'gRPC 桥已离线，已自动切回 HTTP');
+      } else if (state.grpcAvailable && state.preferredMode === 'grpc' && state.mode !== 'grpc' && !state.streaming) {
+        switchMode('grpc', { silent: true });
       } else {
         updateModeControls();
       }
     }
 
     // ===== Chat =====
-    function newChat() {
-      resetFwiPanel();
-      state.chatId = Date.now().toString();
-      state.contextId = null;
-      document.getElementById('messages').innerHTML = '';
-      document.getElementById('messages').classList.add('hidden');
-      document.getElementById('welcomeMsg').classList.remove('hidden');
-      document.getElementById('chatTitle').textContent = '新对话';
-      renderHistory();
+    function persistChatState() {
+      let entries = Object.values(state.chats)
+        .filter(chat => chat && isSafeConversationId(chat.id, 128))
+        .sort((a, b) => b.time - a.time);
+      const activeChat = state.chats[state.chatId];
+      if (activeChat) {
+        entries = [activeChat, ...entries.filter(chat => chat.id !== state.chatId)];
+      }
+      entries = entries.slice(0, MAX_STORED_CHATS);
+      const retained = Object.create(null);
+      entries.forEach(chat => { retained[chat.id] = chat; });
+      state.chats = retained;
+
+      const storage = getBrowserStorage();
+      const payload = JSON.stringify({
+        schemaVersion: CHAT_SCHEMA_VERSION,
+        activeChatId: state.chatId,
+        mode: normalizeMode(state.preferredMode || state.mode),
+        chats: state.chats,
+      });
+      const saved = safeStorageWrite(storage, CHAT_STORAGE_KEY, payload);
+      safeStorageWrite(storage, CHAT_ACTIVE_KEY, state.chatId);
+      safeStorageWrite(storage, CHAT_MODE_KEY, normalizeMode(state.preferredMode || state.mode));
+      return saved;
     }
 
-    function clearChat() {
-      resetFwiPanel();
+    function createStoredMessage(role, content, status = 'complete', requestId = '') {
+      const now = Date.now();
+      return normalizeStoredMessage({
+        id: createStableId('msg'),
+        requestId,
+        role,
+        content: String(content || ''),
+        status,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    function appendStoredMessage(chatId, role, content, status = 'complete', requestId = '') {
+      const chat = state.chats[chatId];
+      if (!chat) return null;
+      const message = createStoredMessage(role, content, status, requestId);
+      if (!message) return null;
+      const hadUserMessage = chat.messages.some(item => item.role === 'user');
+      chat.messages.push(message);
+      if (chat.messages.length > MAX_STORED_MESSAGES) {
+        chat.messages = chat.messages.slice(-MAX_STORED_MESSAGES);
+      }
+      if (role === 'user' && !hadUserMessage) {
+        chat.title = message.content.slice(0, 30) + (message.content.length > 30 ? '...' : '');
+      }
+      chat.time = Date.now();
+      persistChatState();
+      return message;
+    }
+
+    function buildClearedChatState(chats, currentChatId, mode, clearAll = false) {
+      const remaining = Object.create(null);
+      if (!clearAll) {
+        Object.entries(chats || {}).forEach(([id, chat]) => {
+          if (id !== currentChatId && isSafeConversationId(id, 128)) remaining[id] = chat;
+        });
+      }
+      const replacement = createChatRecord(mode);
+      remaining[replacement.id] = replacement;
+      return {
+        chats: remaining,
+        chatId: replacement.id,
+        contextId: replacement.contextId,
+        fwiJob: null,
+      };
+    }
+
+    function abortActiveRequest(reason = 'navigation') {
+      const request = state.activeRequest;
+      if (!request) return false;
+      request.cancelReason = reason;
+      const controller = request.controller || state.abortController;
+      if (controller && !controller.signal.aborted) controller.abort();
+      if (state.activeRequest === request) {
+        showTyping(false);
+      }
+      return true;
+    }
+
+    function showEmptyChat() {
       const msgs = document.getElementById('messages');
       msgs.innerHTML = '';
       msgs.classList.add('hidden');
       document.getElementById('welcomeMsg').classList.remove('hidden');
-      state.contextId = null;
+      document.getElementById('chatTitle').textContent = '新对话';
     }
 
-    function loadChat(chatId) {
+    function newChat() {
+      abortActiveRequest('new_chat');
       resetFwiPanel();
-      const chat = state.chats[chatId];
-      if (!chat) return;
-      state.chatId = chatId;
-      state.contextId = chat.contextId || null;
-
-      document.getElementById('welcomeMsg').classList.add('hidden');
-      const msgs = document.getElementById('messages');
-      msgs.classList.remove('hidden');
-      msgs.innerHTML = '';
-
-      chat.messages.forEach(m => {
-        appendMessage(m.role, m.content, false);
-      });
-
-      document.getElementById('chatTitle').textContent = chat.title || '对话';
-      scrollToBottom();
-      if (window.innerWidth < 768) toggleSidebar();
+      const current = state.chats[state.chatId];
+      if (current && current.messages.length === 0 && !current.fwiJob) delete state.chats[state.chatId];
+      const chat = createChatRecord(state.preferredMode || state.mode);
+      state.chats[chat.id] = chat;
+      state.chatId = chat.id;
+      state.contextId = chat.contextId;
+      state.fwiJob = null;
+      if (!persistChatState()) {
+        showToast('浏览器未允许保存更改；刷新后旧对话可能重新出现');
+      }
+      showEmptyChat();
+      renderHistory();
+      renderExperimentHistory();
     }
 
-    function saveChat(title, messages, contextId) {
-      state.chats[state.chatId] = { title, messages, contextId, mode: state.mode, time: Date.now() };
-      const keys = Object.keys(state.chats).sort((a, b) => state.chats[b].time - state.chats[a].time);
-      if (keys.length > 50) keys.slice(50).forEach(k => delete state.chats[k]);
-      localStorage.setItem('agent-chats', JSON.stringify(state.chats));
+    function clearChat() {
+      abortActiveRequest('clear_chat');
+      resetFwiPanel();
+      const cleared = buildClearedChatState(state.chats, state.chatId, state.preferredMode || state.mode, false);
+      state.chats = cleared.chats;
+      state.chatId = cleared.chatId;
+      state.contextId = cleared.contextId;
+      state.fwiJob = null;
+      if (!persistChatState()) {
+        showToast('浏览器拒绝保存清除结果；刷新后旧对话可能重新出现');
+      }
+      showEmptyChat();
       renderHistory();
+      renderExperimentHistory();
+    }
+
+    function clearAllChats() {
+      if (typeof window.confirm === 'function' && !window.confirm('确定清空全部本地对话历史吗？此操作不可撤销。')) return;
+      abortActiveRequest('clear_all_chats');
+      resetFwiPanel();
+      const storage = getBrowserStorage();
+      safeStorageRemove(storage, CHAT_STORAGE_KEY);
+      safeStorageRemove(storage, CHAT_ACTIVE_KEY);
+      const cleared = buildClearedChatState(state.chats, state.chatId, state.preferredMode || state.mode, true);
+      state.chats = cleared.chats;
+      state.chatId = cleared.chatId;
+      state.contextId = cleared.contextId;
+      state.fwiJob = null;
+      if (!persistChatState()) {
+        showToast('浏览器拒绝清除持久化历史；请在站点数据设置中手动删除');
+      }
+      showEmptyChat();
+      renderHistory();
+      renderExperimentHistory();
+    }
+
+    function deleteChat(chatId) {
+      if (!isSafeConversationId(chatId, 128) || !state.chats[chatId]) return false;
+      if (chatId === state.chatId) abortActiveRequest('delete_chat');
+      delete state.chats[chatId];
+      if (chatId !== state.chatId) {
+        if (!persistChatState()) {
+          showToast('浏览器拒绝保存删除结果；刷新后该对话可能重新出现');
+        }
+        renderHistory();
+        return true;
+      }
+
+      const remaining = Object.values(state.chats).sort((a, b) => b.time - a.time);
+      if (remaining.length === 0) {
+        const replacement = createChatRecord(state.preferredMode || state.mode);
+        state.chats[replacement.id] = replacement;
+        state.chatId = replacement.id;
+      } else {
+        state.chatId = remaining[0].id;
+      }
+      if (!persistChatState()) {
+        showToast('浏览器拒绝保存删除结果；刷新后历史可能重新出现');
+      }
+      loadChat(state.chatId, { initial: true });
+      return true;
+    }
+
+    function restoreFwiPanelForChat(chat) {
+      state.fwiJob = normalizeStoredFwiJob(chat && chat.fwiJob);
+      renderExperimentHistory();
+      if (!state.fwiJob) return;
+      if (state.fwiJob.status === 'succeeded') {
+        showFwiPanel(renderFwiStatusHtml(state.fwiJob));
+        loadFwiManifest(state.fwiJob.job_id, state.fwiJob.result_url, chat.id);
+      } else if (state.fwiJob.status === 'failed') {
+        showFwiPanel(renderFwiStatusHtml(state.fwiJob));
+      } else {
+        const renderer = state.fwiJob.type === 'fwi_job_submitted'
+          ? renderFwiSubmissionHtml
+          : renderFwiStatusHtml;
+        showFwiPanel(renderer(state.fwiJob));
+        scheduleFwiPoll();
+      }
+    }
+
+    function loadChat(chatId, options = {}) {
+      if (!isSafeConversationId(chatId, 128)) return false;
+      const chat = state.chats[chatId];
+      if (!chat) return false;
+      if (!options.initial && state.streaming) abortActiveRequest('load_chat');
+      resetFwiPanel();
+      state.chatId = chatId;
+      state.contextId = chat.contextId;
+      if (!options.preserveMode) {
+        state.preferredMode = normalizeMode(chat.mode);
+        state.mode = state.preferredMode === 'grpc' && !state.grpcAvailable ? 'http' : state.preferredMode;
+        updateModeControls();
+      }
+      persistChatState();
+
+      const msgs = document.getElementById('messages');
+      msgs.innerHTML = '';
+      if (chat.messages.length === 0) {
+        showEmptyChat();
+      } else {
+        document.getElementById('welcomeMsg').classList.add('hidden');
+        msgs.classList.remove('hidden');
+        chat.messages.forEach(message => appendMessage(message.role, message.content, false, false));
+        document.getElementById('chatTitle').textContent = chat.title || '对话';
+      }
+      renderHistory();
+      restoreFwiPanelForChat(chat);
+      scrollToBottom();
+      if (!options.initial && window.innerWidth < 768) toggleSidebar();
+      return true;
     }
 
     function renderHistory() {
       const container = document.getElementById('chatHistory');
       const entries = Object.entries(state.chats)
         .sort(([,a],[,b]) => b.time - a.time)
-        .slice(0, 20);
+        .slice(0, MAX_STORED_CHATS);
 
+      container.replaceChildren();
       if (entries.length === 0) {
-        container.innerHTML = '<p class="text-xs text-slate-400 text-center py-4">暂无对话</p>';
+        const empty = document.createElement('p');
+        empty.className = 'text-xs text-slate-400 text-center py-4';
+        empty.textContent = '暂无对话';
+        container.appendChild(empty);
         return;
       }
 
-      container.innerHTML = entries.map(([id, chat]) => {
+      entries.forEach(([id, chat]) => {
+        if (!isSafeConversationId(id, 128)) return;
         const active = id === state.chatId ? 'bg-accent/5 border-accent/20' : 'hover:bg-slate-50';
-        const modeIcon = chat.mode === 'grpc' ? '⚡' : '🌐';
-        return `<button onclick="loadChat('${id}')" class="w-full text-left px-3 py-2 rounded-lg border border-transparent text-sm truncate transition-all duration-150 ${active} text-slate-700">
-          <span class="text-xs mr-1">${modeIcon}</span>${escapeHtml(chat.title || '未命名对话')}
-        </button>`;
-      }).join('');
+        const row = document.createElement('div');
+        row.className = `group flex items-center gap-1 rounded-lg border border-transparent ${active}`;
+
+        const loadButton = document.createElement('button');
+        loadButton.type = 'button';
+        loadButton.dataset.chatId = id;
+        loadButton.className = 'min-w-0 flex-1 text-left px-3 py-2 text-sm truncate transition-all duration-150 text-slate-700';
+        const icon = document.createElement('span');
+        icon.className = 'text-xs mr-1';
+        icon.textContent = chat.mode === 'grpc' ? '⚡' : '🌐';
+        const title = document.createElement('span');
+        title.textContent = chat.title || '未命名对话';
+        loadButton.append(icon, title);
+        loadButton.addEventListener('click', () => loadChat(loadButton.dataset.chatId));
+
+        const deleteButton = document.createElement('button');
+        deleteButton.type = 'button';
+        deleteButton.dataset.chatId = id;
+        deleteButton.className = 'px-2 py-2 text-xs text-slate-300 hover:text-red-600 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-all';
+        deleteButton.title = '删除这条对话';
+        deleteButton.setAttribute('aria-label', `删除对话：${chat.title || '未命名对话'}`);
+        deleteButton.textContent = '×';
+        deleteButton.addEventListener('click', event => {
+          event.stopPropagation();
+          deleteChat(deleteButton.dataset.chatId);
+        });
+
+        row.append(loadButton, deleteButton);
+        container.appendChild(row);
+      });
     }
 
     // ===== Messaging =====
@@ -638,10 +1071,57 @@
       el.style.height = Math.min(el.scrollHeight, 160) + 'px';
     }
 
+    function isRequestCurrent(request) {
+      return Boolean(request && state.activeRequest === request && state.chatId === request.chatId);
+    }
+
+    function createRequestAbortError(message = 'Request is no longer active') {
+      const error = new Error(message);
+      error.name = 'AbortError';
+      return error;
+    }
+
+    function bindRequestController(request) {
+      const controller = new AbortController();
+      request.controller = controller;
+      state.abortController = controller;
+      return controller;
+    }
+
+    function updateRequestContext(request, contextId) {
+      if (!request || !isSafeContextId(contextId)) return false;
+      if (isSafeContextId(request.contextId) && request.contextId !== contextId) {
+        console.warn('Rejected unexpected contextId change from server');
+        return false;
+      }
+      const chat = state.chats[request.chatId];
+      if (!chat) return false;
+      request.contextId = contextId;
+      chat.contextId = contextId;
+      if (state.chatId === request.chatId) state.contextId = contextId;
+      persistChatState();
+      return true;
+    }
+
     async function sendMessage() {
       const input = document.getElementById('userInput');
       const text = input.value.trim();
       if (!text || state.streaming) return;
+
+      const chat = state.chats[state.chatId];
+      if (!chat) return;
+      chat.mode = state.mode;
+      const request = {
+        requestId: createStableId('req'),
+        chatId: chat.id,
+        contextId: chat.contextId,
+        mode: state.mode,
+        controller: null,
+        cancelReason: '',
+        dispatched: false,
+      };
+      state.activeRequest = request;
+      state.streaming = true;
 
       input.value = '';
       input.style.height = 'auto';
@@ -650,25 +1130,24 @@
       const msgs = document.getElementById('messages');
       msgs.classList.remove('hidden');
 
+      appendStoredMessage(request.chatId, 'user', text, 'complete', request.requestId);
       appendMessage('user', text);
+      document.getElementById('chatTitle').textContent = state.chats[request.chatId].title;
+      renderHistory();
       scrollToBottom();
 
-      const chatMessages = getChatMessages();
-      chatMessages.push({ role: 'user', content: text });
-      const title = text.slice(0, 30) + (text.length > 30 ? '...' : '');
-
       showTyping(true);
-      state.streaming = true;
       updateSendBtn();
 
       try {
         let response;
-        if (state.mode === 'http') {
-          response = await sendHttp(text);
+        if (request.mode === 'http') {
+          response = await sendHttp(text, request);
         } else {
-          response = await sendGrpc(text);
+          response = await sendGrpc(text, request);
         }
 
+        if (!isRequestCurrent(request)) throw createRequestAbortError('对话已切换，已丢弃过期响应');
         showTyping(false);
         let answer = response;
         let renderedInPlace = false;
@@ -676,143 +1155,158 @@
           answer = response.answer || '';
           renderedInPlace = !!response.renderedInPlace;
         }
-        const fwiPayload = extractFwiPayload(response) || extractFwiPayload(answer);
-        if (fwiPayload) handleFwiPayload(fwiPayload);
+        const fwiPayload = (response && typeof response === 'object' ? response.fwiPayload : null)
+          || extractFwiPayload(response)
+          || extractFwiPayload(answer);
+        if (fwiPayload) {
+          handleFwiPayload(fwiPayload, request.chatId);
+        } else if (isFwiExecutionRequest(text) && state.chatId === request.chatId) {
+          state.fwiReceiptMissing = true;
+          renderExperimentHistory();
+          showFwiPanel(renderMissingFwiReceiptHtml());
+        }
         if (!answer) answer = '无响应内容';
 
         if (!renderedInPlace) {
-          appendMessage('assistant', answer);
+          appendMessage('assistant', answer, false, false);
         }
-
-        chatMessages.push({ role: 'assistant', content: answer });
-        saveChat(title, chatMessages, state.contextId);
+        appendStoredMessage(request.chatId, 'assistant', answer, 'complete', request.requestId);
       } catch (err) {
-        showTyping(false);
-        if (err.name === 'AbortError') {
-          appendMessage('system', '⚠️ 已停止生成');
-        } else {
-          appendMessage('system', `❌ ${err.message}`);
+        const cancelled = err.name === 'AbortError';
+        const outcomeUnknown = request.dispatched;
+        const statusText = outcomeUnknown
+          ? (cancelled
+              ? '⚠️ 浏览器已停止等待，但服务端可能仍在处理，本次结果未知。若这是 FWI 请求，请先检查最近任务或运行目录，避免直接重复提交。'
+              : `⚠️ 请求已发出但响应失败（${err.message}），服务端执行结果未知。若这是 FWI 请求，请先检查最近任务或运行目录，避免直接重复提交。`)
+          : (cancelled ? '⚠️ 已在请求发出前停止等待' : `❌ ${err.message}`);
+        appendStoredMessage(
+          request.chatId,
+          'system',
+          statusText,
+          outcomeUnknown ? 'outcome_unknown' : (cancelled ? 'cancelled' : 'error'),
+          request.requestId,
+        );
+        if (state.chatId === request.chatId) {
+          showTyping(false);
+          appendMessage('system', statusText);
         }
       } finally {
-        state.streaming = false;
-        updateSendBtn();
-        scrollToBottom();
+        if (state.activeRequest === request) {
+          state.activeRequest = null;
+          state.abortController = null;
+          state.streaming = false;
+          updateSendBtn();
+          scrollToBottom();
+        }
       }
     }
 
     function stopGeneration() {
-      if (state.abortController) {
-        state.abortController.abort();
-      }
+      abortActiveRequest('user_stop');
     }
 
     // ===== HTTP Mode =====
-    async function sendHttp(text) {
-      state.abortController = new AbortController();
-      const id = 'req-' + Date.now();
-
-      try {
-        return await sendHttpStream(text, id);
-      } catch (e) {
-        if (e.name === 'AbortError') throw e;
-        return await sendHttpSync(text, id);
-      }
+    async function sendHttp(text, request) {
+      bindRequestController(request);
+      return sendHttpStream(text, request);
     }
 
-    async function sendHttpStream(text, id) {
+    async function sendHttpStream(text, request) {
       const body = {
-        jsonrpc: '2.0', id, method: 'message/stream',
+        jsonrpc: '2.0', id: request.requestId, method: 'message/stream',
         params: {
-          message: { role: 'user', contextId: state.contextId || undefined, parts: [{ kind: 'text', text }] },
+          message: { role: 'user', contextId: request.contextId, parts: [{ kind: 'text', text }] },
           historyLength: 10,
         },
       };
 
+      // AbortController only stops the browser from waiting. Once fetch starts,
+      // the server may already have accepted a state-changing FWI request.
+      request.dispatched = true;
       const resp = await fetch(CONFIG.http.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: state.abortController.signal,
+        signal: request.controller.signal,
       });
 
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
       const contentType = resp.headers.get('content-type') || '';
       if (contentType.includes('text/event-stream')) {
-        return await parseSSE(resp, id);
+        return await parseSSE(resp, request);
       }
 
       const data = await resp.json();
       if (data.error) throw new Error(data.error.message || '请求失败');
-      return extractAnswer(data.result);
+      if (data.result?.contextId) updateRequestContext(request, data.result.contextId);
+      return {
+        answer: extractAnswer(data.result),
+        renderedInPlace: false,
+        fwiPayload: extractFwiPayload(data),
+      };
     }
 
-    async function parseSSE(resp, id) {
+    async function parseSSE(resp, request) {
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
       let answer = '';
-      let contextId = state.contextId;
+      let streamEnded = false;
+      let fwiPayload = null;
+      let msgEl = null;
 
-      const msgEl = appendMessage('assistant', '', true);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const jsonStr = line.slice(6).trim();
-          if (!jsonStr || jsonStr === '[DONE]') continue;
-
-          try {
-            const event = JSON.parse(jsonStr);
-            const result = event.result;
-
-            if (result?.contextId) contextId = result.contextId;
-
-            const text = extractStreamText(result, answer);
-            if (text) {
-              answer += text;
-              updateStreamMessage(msgEl, answer);
-            }
-          } catch (e) {}
+      function consumeSseLine(rawLine) {
+        const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+        if (!line.startsWith('data:')) return;
+        const jsonStr = line.slice(5).trim();
+        if (!jsonStr) return;
+        if (jsonStr === '[DONE]') {
+          streamEnded = true;
+          return;
+        }
+        const event = JSON.parse(jsonStr);
+        if (event.error) throw new Error(event.error.message || '流式请求失败');
+        if (event.id != null && String(event.id) !== String(request.requestId)) return;
+        const eventFwiPayload = extractFwiPayload(event);
+        if (eventFwiPayload) fwiPayload = eventFwiPayload;
+        const result = event.result;
+        if (result?.contextId) updateRequestContext(request, result.contextId);
+        if (result?.type === 'stream_end') streamEnded = true;
+        const text = extractStreamText(result, answer);
+        if (text) {
+          answer += text;
+          updateStreamMessage(msgEl, answer);
         }
       }
 
-      if (contextId) state.contextId = contextId;
-      if (!answer) answer = '无响应内容';
-      finalizeStreamMessage(msgEl, answer);
-      return { answer, renderedInPlace: true };
-    }
-
-    async function sendHttpSync(text, id) {
-      const body = {
-        jsonrpc: '2.0', id, method: 'message/send',
-        params: {
-          message: { role: 'user', contextId: state.contextId || undefined, parts: [{ kind: 'text', text }] },
-          historyLength: 10,
-        },
-      };
-
-      const resp = await fetch(CONFIG.http.url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: state.abortController.signal,
-      });
-
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
-      const data = await resp.json();
-
-      if (data.error) throw new Error(data.error.message || '请求失败');
-      if (data.result?.contextId) state.contextId = data.result.contextId;
-
-      return extractAnswer(data.result);
+      try {
+        if (!isRequestCurrent(request)) throw createRequestAbortError();
+        msgEl = appendMessage('assistant', '', true);
+        while (true) {
+          if (!isRequestCurrent(request)) throw createRequestAbortError();
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          lines.forEach(consumeSseLine);
+        }
+        buffer += decoder.decode();
+        if (buffer.trim()) consumeSseLine(buffer);
+        if (!streamEnded) throw new Error('流式响应提前结束，未自动重发以避免重复执行任务');
+        if (!isRequestCurrent(request)) throw createRequestAbortError();
+        if (!answer) answer = '无响应内容';
+        finalizeStreamMessage(msgEl, answer);
+        return { answer, renderedInPlace: true, fwiPayload };
+      } catch (error) {
+        if (msgEl && typeof msgEl.remove === 'function') msgEl.remove();
+        try { await reader.cancel(); } catch (cancelError) {}
+        if (request.controller && !request.controller.signal.aborted) {
+          request.controller.abort();
+        }
+        throw error;
+      }
     }
 
     function extractStreamText(result, currentAnswer = '') {
@@ -941,7 +1435,11 @@
         visited.add(value);
         if (acceptedTypes.has(value.type)) return value;
 
-        const preferredKeys = ['text', 'content', 'result', 'message', 'answer', 'artifacts', 'parts', 'status'];
+        const preferredKeys = [
+          'fwiPayload', 'structuredContent', 'structured_content', 'tool_result',
+          'payload', 'data', 'output', 'text', 'content', 'result', 'message',
+          'answer', 'artifacts', 'parts', 'status',
+        ];
         for (const key of preferredKeys) {
           if (!(key in value)) continue;
           const found = visit(value[key], depth + 1);
@@ -953,10 +1451,43 @@
             if (found) return found;
           }
         }
+        const preferred = new Set(preferredKeys);
+        for (const key of Object.keys(value).slice(0, 100)) {
+          if (preferred.has(key)) continue;
+          const found = visit(value[key], depth + 1);
+          if (found) return found;
+        }
         return null;
       }
 
       return visit(input, 0);
+    }
+
+    function isFwiExecutionRequest(input) {
+      const text = typeof input === 'string' ? input.trim().toLowerCase() : '';
+      if (!text || text.length > 10000) return false;
+      const mentionsFwi = /\bfwi\b/i.test(text)
+        || text.includes('反演')
+        || text.includes('正演')
+        || text.includes('marmousi');
+      if (!mentionsFwi) return false;
+      const asksToExecute = /(运行|执行|启动|开始|提交|做一下|试一下|演示|测试|run|start|submit|execute)/i.test(text)
+        || /\d+\s*(次|轮)?\s*迭代/.test(text);
+      if (!asksToExecute) return false;
+      const theoryOnly = /(什么是|介绍|解释|原理|公式|为什么|what is|explain|theory)/i.test(text)
+        && !/(运行|执行|启动|开始|提交|run|start|submit|execute)/i.test(text);
+      return !theoryOnly;
+    }
+
+    function renderMissingFwiReceiptHtml() {
+      return `<div class="workbench-card border-red-200 bg-red-50 p-4 shadow-sm" data-fwi-view="missing-receipt" role="alert">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div><h3 class="font-heading font-semibold text-red-800">FWI 任务未提交</h3><p class="text-xs text-red-600 mt-1">没有收到可验证的任务回执</p></div>
+          <span class="data-pill warning">not submitted</span>
+        </div>
+        <p class="mt-3 text-sm text-red-700">回答中没有 <code>fwi_job_submitted</code> 和合法 <code>job_id</code>，因此前端不会把文本说明或 Python 代码当成已执行的反演。</p>
+        <p class="mt-2 text-xs text-red-600">请检查 MCP/FWI Runner 是否可用后重试；真实提交成功时这里会显示 job_id，右侧“最近 FWI 任务”会进入 queued/running 状态。</p>
+      </div>`;
     }
 
     function normalizeFwiJobId(value) {
@@ -1103,10 +1634,27 @@
       scrollToBottom();
     }
 
-    function resetFwiPanel() {
+    function persistFwiJobForChat(chatId, value) {
+      const chat = state.chats[chatId];
+      if (!chat) return null;
+      const normalized = normalizeStoredFwiJob(value);
+      chat.fwiJob = normalized;
+      chat.time = Date.now();
+      if (state.chatId === chatId) state.fwiJob = normalized;
+      persistChatState();
+      return normalized;
+    }
+
+    function resetFwiPanel(options = {}) {
       if (state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
       state.fwiPollTimer = null;
-      state.fwiJob = null;
+      state.fwiReceiptMissing = false;
+      if (options.clearJob) {
+        state.fwiJob = null;
+        const chat = state.chats[state.chatId];
+        if (chat) chat.fwiJob = null;
+        persistChatState();
+      }
       renderExperimentHistory();
       const panel = document.getElementById('fwiResultPanel');
       if (panel) {
@@ -1133,7 +1681,7 @@
       return payload;
     }
 
-    async function loadFwiManifest(jobId, resultUrl) {
+    async function loadFwiManifest(jobId, resultUrl, ownerChatId = state.chatId) {
       const safeJobId = normalizeFwiJobId(jobId);
       if (!safeJobId) return;
       const manifestUrl = sanitizeFwiArtifactUrl(resultUrl, safeJobId)
@@ -1148,8 +1696,10 @@
         manifest.job_id = safeJobId;
         manifest.metrics = { ...(manifest.metrics || {}), ...(metrics || {}) };
         if (config) manifest.config_resolved = config;
-        handleFwiPayload(manifest);
+        if (state.chatId !== ownerChatId || state.fwiJob?.job_id !== safeJobId) return;
+        handleFwiPayload(manifest, ownerChatId);
       } catch (error) {
+        if (state.chatId !== ownerChatId || state.fwiJob?.job_id !== safeJobId) return;
         showFwiPanel(renderFwiStatusHtml({
           job_id: safeJobId,
           status: 'failed',
@@ -1162,6 +1712,7 @@
     async function refreshFwiStatusForCurrentJob() {
       const current = state.fwiJob;
       if (!current) return;
+      const ownerChatId = state.chatId;
       const jobId = normalizeFwiJobId(current.job_id);
       const statusUrl = sanitizeFwiArtifactUrl(current.status_url, jobId)
         || (jobId ? `/fwi-artifacts/${jobId}/status.json` : '');
@@ -1174,23 +1725,37 @@
         status.type = 'fwi_job_status';
         status.job_id = jobId;
         status.status_url = statusUrl;
-        handleFwiPayload(status);
+        if (state.chatId !== ownerChatId || state.fwiJob?.job_id !== jobId) return;
+        handleFwiPayload(status, ownerChatId);
       } catch (error) {
+        if (state.chatId !== ownerChatId || state.fwiJob?.job_id !== jobId) return;
         showFwiPanel(renderFwiStatusHtml({ ...current, stage: 'status_poll', message: `状态刷新失败：${error.message}` }));
         scheduleFwiPoll(4000);
       }
     }
 
-    function handleFwiPayload(payload) {
+    function handleFwiPayload(payload, ownerChatId = state.chatId) {
       if (!payload || typeof payload !== 'object') return false;
       const type = payload.type;
       if (!['fwi_job_submitted', 'fwi_job_status', 'fwi_result'].includes(type)) return false;
+      const ownerChat = state.chats[ownerChatId];
+      if (!ownerChat) return false;
+      const isActiveChat = state.chatId === ownerChatId;
 
       if (type === 'fwi_result') {
-        if (state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
-        state.fwiPollTimer = null;
         const jobId = normalizeFwiJobId(payload.job_id);
-        state.fwiJob = jobId ? { ...(state.fwiJob || {}), job_id: jobId, status: payload.status || 'succeeded' } : state.fwiJob;
+        if (!jobId) return false;
+        if (isActiveChat) state.fwiReceiptMissing = false;
+        if (isActiveChat && state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
+        if (isActiveChat) state.fwiPollTimer = null;
+        persistFwiJobForChat(ownerChatId, {
+          ...(ownerChat.fwiJob || {}),
+          ...payload,
+          type: 'fwi_result',
+          job_id: jobId,
+          status: payload.status || 'succeeded',
+        });
+        if (!isActiveChat) return true;
         renderExperimentHistory();
         showFwiPanel(renderFwiResultHtml(payload));
         return true;
@@ -1201,22 +1766,29 @@
         showFwiPanel(renderFwiSubmissionHtml(payload));
         return false;
       }
+      if (isActiveChat) state.fwiReceiptMissing = false;
       const statusUrl = sanitizeFwiArtifactUrl(payload.status_url, jobId)
         || `/fwi-artifacts/${jobId}/status.json`;
-      state.fwiJob = { ...(state.fwiJob || {}), ...payload, job_id: jobId, status_url: statusUrl };
+      const job = persistFwiJobForChat(ownerChatId, {
+        ...(ownerChat.fwiJob || {}),
+        ...payload,
+        job_id: jobId,
+        status_url: statusUrl,
+      });
+      if (!job || !isActiveChat) return Boolean(job);
       renderExperimentHistory();
 
       if (type === 'fwi_job_submitted') {
-        showFwiPanel(renderFwiSubmissionHtml(state.fwiJob));
+        showFwiPanel(renderFwiSubmissionHtml(job));
         scheduleFwiPoll();
         return true;
       }
 
-      showFwiPanel(renderFwiStatusHtml(state.fwiJob));
+      showFwiPanel(renderFwiStatusHtml(job));
       if (payload.status === 'succeeded') {
         if (state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
         state.fwiPollTimer = null;
-        loadFwiManifest(jobId, payload.result_url);
+        loadFwiManifest(jobId, payload.result_url, ownerChatId);
       } else if (payload.status === 'failed') {
         if (state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
         state.fwiPollTimer = null;
@@ -1234,18 +1806,19 @@
     }
 
     // ===== gRPC Mode =====
-    async function sendGrpc(text) {
+    async function sendGrpc(text, request) {
       if (!state.grpcAvailable) {
         switchMode('http', { silent: true });
         throw new Error('gRPC 桥当前不可用。请运行 ./stop.sh 后使用 ./start.sh --grpc 重启，或继续使用 HTTP 模式。');
       }
-      state.abortController = new AbortController();
+      bindRequestController(request);
       try {
+        request.dispatched = true;
         const resp = await fetch(`${CONFIG.grpc.url}/api/query`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ question: text, context_id: state.contextId || '' }),
-          signal: state.abortController.signal,
+          body: JSON.stringify({ question: text, context_id: request.contextId }),
+          signal: request.controller.signal,
         });
 
         if (!resp.ok) {
@@ -1258,8 +1831,12 @@
           throw new Error(data.error || `服务返回错误 (code: ${data.status})`);
         }
 
-        if (data.context_id) state.contextId = data.context_id;
-        return data.answer || '无响应内容';
+        if (data.context_id) updateRequestContext(request, data.context_id);
+        return {
+          answer: data.answer || '无响应内容',
+          renderedInPlace: false,
+          fwiPayload: extractFwiPayload(data),
+        };
       } catch (error) {
         if (error && error.name === 'AbortError') throw error;
         setStatus('Grpc', false, '未连接');
@@ -1269,7 +1846,7 @@
     }
 
     // ===== UI Helpers =====
-    function appendMessage(role, content, streaming = false) {
+    function appendMessage(role, content, streaming = false, processStructured = true) {
       const msgs = document.getElementById('messages');
       const el = document.createElement('div');
       el.className = 'msg-enter';
@@ -1313,7 +1890,7 @@
           decorateRenderedContent(body);
           queueMathTypeset(body);
         }
-        processFwiPayloadFromAnswer(content);
+        if (processStructured) processFwiPayloadFromAnswer(content);
       }
       return el;
     }
@@ -1323,7 +1900,6 @@
       if (body) {
         body.innerHTML = renderMarkdown(content);
         decorateRenderedContent(body);
-        queueMathTypeset(body);
         scrollToBottom();
       }
     }
@@ -1346,7 +1922,6 @@
           </button>`;
           wrapper.appendChild(btn);
         }
-        processFwiPayloadFromAnswer(content);
       }
     }
 
@@ -1354,6 +1929,16 @@
     function renderExperimentHistory() {
       const container = document.getElementById('experimentHistory');
       if (!container) return;
+      if (state.fwiReceiptMissing) {
+        container.innerHTML = `<div class="workbench-card border-red-200 bg-red-50 w-full p-2" data-fwi-sidebar="missing-receipt" role="alert">
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-xs font-semibold text-red-700">未创建任务</span>
+            <span class="data-pill warning">no job_id</span>
+          </div>
+          <p class="text-[11px] text-red-600 mt-1">未收到 FWI Runner 回执；不要把代码回复当作执行成功。</p>
+        </div>`;
+        return;
+      }
       const job = state.fwiJob;
       if (!job) {
         container.innerHTML = '<p class="text-xs text-slate-400 py-2">尚未提交任务</p>';
@@ -1416,11 +2001,6 @@
       requestAnimationFrame(() => { area.scrollTop = area.scrollHeight; });
     }
 
-    function getChatMessages() {
-      const chat = state.chats[state.chatId];
-      return chat ? [...chat.messages] : [];
-    }
-
     function copyText(btn) {
       const mdBody = btn.closest('.border-slate-200').querySelector('.markdown-body');
       if (mdBody) {
@@ -1474,10 +2054,38 @@
       }
 
       await checkHttpStatus('Registry', 'http://localhost:8500/v1/agent/cards');
-      await checkHttpStatus('Embedding', 'http://localhost:6000/health');
+      await checkEmbeddingStatus();
       await checkHttpStatus('CodeAgent', 'http://localhost:5010/.well-known/agent-card.json');
       await checkHttpStatus('PlannerAgent', 'http://localhost:5011/.well-known/agent-card.json');
       setStatus('Mcp', null, '随 Orchestrator 按需调用');
+    }
+
+    async function checkEmbeddingStatus() {
+      try {
+        // The Web server probes only the configured loopback service and returns
+        // a sanitized same-origin status. The browser never contacts port 6000
+        // directly, so a missing CORS header cannot create a false offline state.
+        const resp = await fetch('/api/embedding-health', {
+          signal: AbortSignal.timeout(2500),
+        });
+        const health = resp.ok ? await resp.json() : null;
+        if (!health || health.type !== 'embedding_health') {
+          setStatus('Embedding', false, '状态不可用');
+        } else if (!health.enabled || health.status === 'disabled') {
+          setStatus('Embedding', null, '未启用（FWI 知识库仍可用）');
+        } else if (health.status === 'ok' && health.model_loaded === true) {
+          const detail = Number.isInteger(health.dimension)
+            ? `运行中 · ${health.dimension}维${health.device ? ` · ${health.device.toUpperCase()}` : ''}`
+            : '运行中';
+          setStatus('Embedding', true, detail);
+        } else if (health.status === 'misconfigured') {
+          setStatus('Embedding', false, '配置错误');
+        } else {
+          setStatus('Embedding', false, '未连接');
+        }
+      } catch (e) {
+        setStatus('Embedding', false, '状态不可用');
+      }
     }
 
     async function checkHttpStatus(name, url) {
@@ -1501,7 +2109,7 @@
         text.className = 'text-xs text-amber-600';
       } else if (online) {
         dot.className = 'w-2 h-2 rounded-full bg-emerald-500 status-online';
-        text.textContent = '运行中';
+        text.textContent = customText || '运行中';
         text.className = 'text-xs text-emerald-600';
       } else {
         dot.className = 'w-2 h-2 rounded-full bg-red-400';
@@ -1516,9 +2124,147 @@
     }
 
     // ===== Markdown Renderer =====
+    function protectMathExpressions(text) {
+      const source = String(text || '');
+      const expressions = [];
+      let markerSerial = 0;
+      let markerPrefix = '';
+      do {
+        markerPrefix = `MATHPLACEHOLDER${markerSerial}TOKEN`;
+        markerSerial += 1;
+      } while (source.includes(markerPrefix));
+
+      const isEscapedAt = index => {
+        let slashCount = 0;
+        for (let cursor = index - 1; cursor >= 0 && source[cursor] === '\\'; cursor -= 1) {
+          slashCount += 1;
+        }
+        return slashCount % 2 === 1;
+      };
+      const findClosing = (start, delimiter, allowNewline) => {
+        for (let cursor = start; cursor <= source.length - delimiter.length; cursor += 1) {
+          if (!allowNewline && source[cursor] === '\n') return -1;
+          if (source.startsWith(delimiter, cursor) && !isEscapedAt(cursor)) return cursor;
+        }
+        return -1;
+      };
+      const storeExpression = (raw, display) => {
+        const token = `${markerPrefix}${expressions.length}END`;
+        expressions.push({ token, raw, display });
+        return token;
+      };
+
+      let output = '';
+      let index = 0;
+      while (index < source.length) {
+        // Do not turn literal TeX examples in Markdown code into live formulae.
+        if (source[index] === '`') {
+          let markerLength = 1;
+          while (source[index + markerLength] === '`') markerLength += 1;
+          const marker = '`'.repeat(markerLength);
+          const close = source.indexOf(marker, index + markerLength);
+          if (close < 0) {
+            output += source.slice(index);
+            break;
+          }
+          output += source.slice(index, close + markerLength);
+          index = close + markerLength;
+          continue;
+        }
+
+        const lowerTail = source.slice(index).toLowerCase();
+        const rawCodeTag = lowerTail.startsWith('<code') ? 'code'
+          : (lowerTail.startsWith('<pre') ? 'pre' : '');
+        if (rawCodeTag) {
+          const closeTag = `</${rawCodeTag}>`;
+          const close = source.toLowerCase().indexOf(closeTag, index);
+          if (close >= 0) {
+            const end = close + closeTag.length;
+            output += source.slice(index, end);
+            index = end;
+            continue;
+          }
+        }
+
+        if (source.startsWith('$$', index) && !isEscapedAt(index)) {
+          const close = findClosing(index + 2, '$$', true);
+          if (close >= 0) {
+            const raw = source.slice(index, close + 2);
+            const body = source.slice(index + 2, close);
+            if (body.trim() && body.length <= 16000) {
+              output += storeExpression(raw, true);
+              index = close + 2;
+              continue;
+            }
+          }
+          output += '$$';
+          index += 2;
+          continue;
+        }
+
+        const slashDelimiter = source.startsWith('\\[', index) && !isEscapedAt(index)
+          ? { close: '\\]', display: true }
+          : (source.startsWith('\\(', index) && !isEscapedAt(index)
+            ? { close: '\\)', display: false }
+            : null);
+        if (slashDelimiter) {
+          const close = findClosing(index + 2, slashDelimiter.close, true);
+          if (close >= 0) {
+            const raw = source.slice(index, close + 2);
+            const body = source.slice(index + 2, close);
+            if (body.trim() && body.length <= 16000) {
+              output += storeExpression(raw, slashDelimiter.display);
+              index = close + 2;
+              continue;
+            }
+          }
+        }
+
+        if (source[index] === '$' && !isEscapedAt(index)
+            && source[index + 1] !== '$' && !/\s/.test(source[index + 1] || '')) {
+          let close = findClosing(index + 1, '$', false);
+          while (close >= 0 && (/\s/.test(source[close - 1] || '') || source[close + 1] === '$')) {
+            close = findClosing(close + 1, '$', false);
+          }
+          if (close >= 0) {
+            const body = source.slice(index + 1, close);
+            if (body.trim() && body.length <= 8000) {
+              output += storeExpression(source.slice(index, close + 1), false);
+              index = close + 1;
+              continue;
+            }
+          }
+        }
+
+        output += source[index];
+        index += 1;
+      }
+      return { source: output, expressions };
+    }
+
+    function restoreProtectedMath(html, expressions) {
+      if (!Array.isArray(expressions) || expressions.length === 0) return String(html || '');
+      // Only insert the fixed wrapper in text nodes. If a token occurred in a
+      // Markdown URL/attribute, restore it as escaped text to avoid changing
+      // already-sanitized markup structure after DOMPurify has run.
+      return String(html || '').split(/(<[^>]*>)/g).map(part => {
+        const insideTag = part.startsWith('<') && part.endsWith('>');
+        let restored = part;
+        expressions.forEach(expression => {
+          const escaped = escapeHtml(expression.raw);
+          const replacement = insideTag
+            ? escaped
+            : `<span class="math-source ${expression.display ? 'math-display' : 'math-inline'}" role="math" title="数学公式；渲染组件不可用时显示原始 TeX">${escaped}</span>`;
+          restored = restored.split(expression.token).join(replacement);
+        });
+        return restored;
+      }).join('');
+    }
+
     function renderMarkdownFallback(text) {
       if (!text) return '';
-      let html = escapeHtml(text);
+      const protectedMath = protectMathExpressions(text);
+      let html = escapeHtml(protectedMath.source);
 
       html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
         return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
@@ -1530,7 +2276,14 @@
       html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
       html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
       html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-      html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+      html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
+        // The fallback is used precisely when DOMPurify is unavailable, so it
+        // must not create active links for script/data/file/custom protocols.
+        const safeHref = /^(?:https?:\/\/|\/(?!\/)|#)/i.test(href.trim());
+        return safeHref
+          ? `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`
+          : `${label} (${href})`;
+      });
       html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
       html = html.replace(/^---$/gm, '<hr>');
       html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
@@ -1547,18 +2300,19 @@
       html = html.replace(/<p><\/p>/g, '');
       if (!html.startsWith('<')) html = '<p>' + html + '</p>';
 
-      return html;
+      return restoreProtectedMath(html, protectedMath.expressions);
     }
 
     function renderMarkdown(text) {
       if (!text) return '';
 
-      const source = String(text);
+      const protectedMath = protectMathExpressions(text);
+      const source = protectedMath.source;
       const markedLib = window.marked || (typeof marked !== 'undefined' ? marked : null);
       const purifier = window.DOMPurify || (typeof DOMPurify !== 'undefined' ? DOMPurify : null);
 
       if (!markedLib || !purifier) {
-        return renderMarkdownFallback(source);
+        return renderMarkdownFallback(text);
       }
 
       if (!window.__markedConfigured && markedLib.setOptions) {
@@ -1570,10 +2324,11 @@
       }
 
       const rawHtml = markedLib.parse(source);
-      return purifier.sanitize(rawHtml, {
+      const sanitized = purifier.sanitize(rawHtml, {
         USE_PROFILES: { html: true },
         ADD_ATTR: ['target', 'rel', 'class'],
       });
+      return restoreProtectedMath(sanitized, protectedMath.expressions);
     }
 
     function decorateRenderedContent(container) {
@@ -1584,18 +2339,119 @@
       });
     }
 
+    const KATEX_SCRIPT_URL = 'https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.js';
+    const KATEX_STYLESHEET_URL = 'https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.css';
+    const KATEX_SCRIPT_INTEGRITY = 'sha384-AtrdNsnxl/75rvBneBVH7DtOvCxSVahR2zWqle1coBKd8DEmLoviqNeJSx64gNAs';
+    const KATEX_STYLESHEET_INTEGRITY = 'sha384-vlBdW0r3AcZO/HboRPznQNowvexd3fY8qHOWkBi5q7KGgqJ+F48+DceybYmrVbmB';
+    let katexLoaderPromise = null;
+
+    function ensureKatexLoaded() {
+      if (katexLoaderPromise) return katexLoaderPromise;
+      katexLoaderPromise = new Promise((resolve, reject) => {
+        if (!document || !document.head || typeof document.createElement !== 'function') {
+          reject(new Error('Math renderer cannot be loaded in this environment'));
+          return;
+        }
+
+        const stylesheetReady = new Promise((resolveStyle, rejectStyle) => {
+          const existing = document.querySelector('link[data-math-renderer="katex"]');
+          if (existing) {
+            resolveStyle();
+            return;
+          }
+          const stylesheet = document.createElement('link');
+          stylesheet.rel = 'stylesheet';
+          stylesheet.href = KATEX_STYLESHEET_URL;
+          stylesheet.integrity = KATEX_STYLESHEET_INTEGRITY;
+          stylesheet.crossOrigin = 'anonymous';
+          stylesheet.referrerPolicy = 'no-referrer';
+          stylesheet.dataset.mathRenderer = 'katex';
+          stylesheet.onload = resolveStyle;
+          stylesheet.onerror = () => rejectStyle(new Error('Math stylesheet download failed'));
+          document.head.appendChild(stylesheet);
+        });
+
+        const scriptReady = (window.katex && typeof window.katex.render === 'function')
+          ? Promise.resolve()
+          : new Promise((resolveScript, rejectScript) => {
+              const script = document.createElement('script');
+              script.src = KATEX_SCRIPT_URL;
+              script.integrity = KATEX_SCRIPT_INTEGRITY;
+              script.crossOrigin = 'anonymous';
+              script.referrerPolicy = 'no-referrer';
+              script.async = true;
+              script.dataset.mathRenderer = 'katex';
+              script.onload = resolveScript;
+              script.onerror = () => rejectScript(new Error('Math renderer download failed'));
+              document.head.appendChild(script);
+            });
+
+        Promise.all([stylesheetReady, scriptReady]).then(() => {
+          if (!window.katex || typeof window.katex.render !== 'function') {
+            throw new Error('Math renderer did not initialize');
+          }
+          resolve(window.katex);
+        }).catch(reject);
+      });
+      return katexLoaderPromise;
+    }
+
+    function unwrapMathExpression(rawValue) {
+      const raw = String(rawValue || '');
+      if (raw.startsWith('$$') && raw.endsWith('$$') && raw.length >= 4) {
+        return raw.slice(2, -2);
+      }
+      if ((raw.startsWith('\\[') && raw.endsWith('\\]'))
+          || (raw.startsWith('\\(') && raw.endsWith('\\)'))) {
+        return raw.slice(2, -2);
+      }
+      if (raw.startsWith('$') && raw.endsWith('$') && raw.length >= 2) {
+        return raw.slice(1, -1);
+      }
+      return raw;
+    }
+
+    function markMathFallback(nodes) {
+      nodes.forEach(node => {
+        node.classList.add('math-fallback-visible');
+        node.setAttribute('title', '公式渲染组件未加载，当前显示原始 TeX 文本');
+      });
+    }
+
     function queueMathTypeset(container) {
-      if (!container || !window.MathJax || !window.MathJax.typesetPromise) return;
+      if (!container) return;
+      const pendingNodes = Array.from(container.querySelectorAll('.math-source'));
+      if (pendingNodes.length === 0) return;
       if (container._mathTypesetTimer) {
         clearTimeout(container._mathTypesetTimer);
       }
       container._mathTypesetTimer = setTimeout(() => {
-        try {
-          if (window.MathJax.typesetClear) {
-            window.MathJax.typesetClear([container]);
-          }
-          window.MathJax.typesetPromise([container]).catch(() => {});
-        } catch (e) {}
+        ensureKatexLoaded().then(katex => {
+          const currentNodes = Array.from(container.querySelectorAll('.math-source'));
+          if (currentNodes.length === 0) return;
+          currentNodes.forEach(node => {
+            if (node.dataset.mathTypeset === 'true') return;
+            const raw = node.textContent || '';
+            try {
+              katex.render(unwrapMathExpression(raw), node, {
+                displayMode: node.classList.contains('math-display'),
+                output: 'htmlAndMathml',
+                throwOnError: true,
+                trust: false,
+                strict: 'warn',
+                maxSize: 20,
+                maxExpand: 1000,
+              });
+              node.dataset.mathTypeset = 'true';
+              node.removeAttribute('title');
+            } catch (error) {
+              node.textContent = raw;
+              markMathFallback([node]);
+            }
+          });
+        }).catch(() => markMathFallback(
+          Array.from(container.querySelectorAll('.math-source')),
+        ));
       }, 0);
     }
 

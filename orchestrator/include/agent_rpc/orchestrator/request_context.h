@@ -10,6 +10,7 @@
 
 #include <string>
 #include <chrono>
+#include <atomic>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -43,7 +44,7 @@ struct RequestContext {
     /**
      * @brief Create a new RequestContext with auto-generated request_id
      */
-    static RequestContext create(const std::string& context_id = "default") {
+    static RequestContext create(const std::string& context_id = "") {
         RequestContext ctx;
         ctx.context_id = context_id;
         ctx.task_id = context_id;
@@ -68,7 +69,7 @@ struct RequestContext {
             {"request_id", request_id},
             {"context_id", context_id},
             {"task_id", task_id},
-            {"user_text", user_text.substr(0, 100)},  // Truncate for logging
+            {"user_text_bytes", user_text.size()},
             {"user_id", user_id},
             {"client_id", client_id},
             {"routing_mode", routing_mode},
@@ -82,9 +83,10 @@ private:
      * @brief Generate a simple UUID-like string
      */
     static std::string generate_uuid() {
-        static uint64_t counter = 0;
+        static std::atomic<uint64_t> counter{0};
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-        return "req-" + std::to_string(now) + "-" + std::to_string(++counter);
+        const auto sequence = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+        return "req-" + std::to_string(now) + "-" + std::to_string(sequence);
     }
 };
 

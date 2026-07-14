@@ -79,7 +79,8 @@ std::string RequestAdapter::generateMessageId() {
         now.time_since_epoch()).count();
     
     std::ostringstream oss;
-    oss << "msg-" << std::hex << timestamp << "-" << (++message_counter_);
+    const auto sequence = message_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
+    oss << "msg-" << std::hex << timestamp << "-" << sequence;
     return oss.str();
 }
 
@@ -89,7 +90,8 @@ std::string RequestAdapter::generateContextId() {
         now.time_since_epoch()).count();
     
     std::ostringstream oss;
-    oss << "ctx-" << std::hex << timestamp << "-" << (++context_counter_);
+    const auto sequence = context_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
+    oss << "ctx-" << std::hex << timestamp << "-" << sequence;
     return oss.str();
 }
 

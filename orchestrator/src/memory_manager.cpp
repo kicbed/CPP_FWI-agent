@@ -4,16 +4,22 @@
  */
 
 #include "agent_rpc/orchestrator/memory_manager.h"
+#include <algorithm>
 #include <iostream>
 #include <cstdarg>
 
 namespace agent_rpc {
 namespace orchestrator {
 
-MemoryManager::MemoryManager(const std::string& redis_host, int redis_port)
+MemoryManager::MemoryManager(const std::string& redis_host, int redis_port,
+                             std::size_t session_max_messages,
+                             std::size_t session_ttl_seconds)
     : context_(nullptr)
     , host_(redis_host)
-    , port_(redis_port) {
+    , port_(redis_port)
+    , session_max_messages_(std::max<std::size_t>(
+          2, session_max_messages - (session_max_messages % 2)))
+    , session_ttl_seconds_(session_ttl_seconds) {
 
     context_ = redisConnect(redis_host.c_str(), redis_port);
 
@@ -73,6 +79,35 @@ redisReply* MemoryManager::execute_command(const char* format, ...) {
     return reply;
 }
 
+redisReply* MemoryManager::execute_command_argv(
+    const std::vector<std::string>& arguments) {
+    if (arguments.empty()) {
+        throw std::invalid_argument("Redis command arguments cannot be empty");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    ensure_connection();
+
+    std::vector<const char*> argv;
+    std::vector<std::size_t> lengths;
+    argv.reserve(arguments.size());
+    lengths.reserve(arguments.size());
+    for (const auto& argument : arguments) {
+        argv.push_back(argument.data());
+        lengths.push_back(argument.size());
+    }
+    auto* reply = static_cast<redisReply*>(redisCommandArgv(
+        context_, static_cast<int>(argv.size()), argv.data(), lengths.data()));
+    if (reply == nullptr) {
+        throw std::runtime_error("MemoryManager Redis command failed");
+    }
+    if (reply->type == REDIS_REPLY_ERROR) {
+        const std::string error(reply->str, reply->len);
+        freeReplyObject(reply);
+        throw std::runtime_error("MemoryManager Redis error: " + error);
+    }
+    return reply;
+}
+
 // ============================================================================
 // Session Memory
 // ============================================================================
@@ -80,21 +115,43 @@ redisReply* MemoryManager::execute_command(const char* format, ...) {
 void MemoryManager::save_session_message(const std::string& context_id,
                                          const a2a::AgentMessage& message) {
     try {
-        std::string json_str = message.to_json();
-
-        auto reply = execute_command("RPUSH %s %s",
-                                    session_key(context_id).c_str(),
-                                    json_str.c_str());
-        freeReplyObject(reply);
-
-        // Limit to 1000 messages
-        reply = execute_command("LTRIM %s -1000 -1",
-                               session_key(context_id).c_str());
+        static const std::string script =
+            "redis.call('RPUSH',KEYS[1],ARGV[1]);"
+            "redis.call('LTRIM',KEYS[1],-tonumber(ARGV[2]),-1);"
+            "redis.call('EXPIRE',KEYS[1],tonumber(ARGV[3]));return 1";
+        auto reply = execute_command_argv({
+            "EVAL", script, "1", session_key(context_id), message.to_json(),
+            std::to_string(session_max_messages_),
+            std::to_string(session_ttl_seconds_),
+        });
         freeReplyObject(reply);
 
     } catch (const std::exception& e) {
         std::cerr << "[MemoryManager] save_session_message 错误: " << e.what() << std::endl;
     }
+}
+
+void MemoryManager::save_session_turn(
+    const std::string& context_id,
+    const a2a::AgentMessage& user_message,
+    const a2a::AgentMessage& assistant_message) {
+    if (user_message.role() != a2a::MessageRole::User ||
+        assistant_message.role() != a2a::MessageRole::Agent) {
+        throw std::invalid_argument(
+            "Conversation turn must contain user then assistant messages");
+    }
+
+    static const std::string script =
+        "redis.call('RPUSH',KEYS[1],ARGV[1],ARGV[2]);"
+        "redis.call('LTRIM',KEYS[1],-tonumber(ARGV[3]),-1);"
+        "redis.call('EXPIRE',KEYS[1],tonumber(ARGV[4]));return 1";
+    auto* reply = execute_command_argv({
+        "EVAL", script, "1", session_key(context_id),
+        user_message.to_json(), assistant_message.to_json(),
+        std::to_string(session_max_messages_),
+        std::to_string(session_ttl_seconds_),
+    });
+    freeReplyObject(reply);
 }
 
 std::vector<a2a::AgentMessage> MemoryManager::get_session_history(
@@ -137,6 +194,18 @@ std::vector<a2a::AgentMessage> MemoryManager::get_session_history(
     return history;
 }
 
+bool MemoryManager::delete_session(const std::string& context_id) {
+    try {
+        auto reply = execute_command("DEL %s", session_key(context_id).c_str());
+        const bool deleted = reply->integer > 0;
+        freeReplyObject(reply);
+        return deleted;
+    } catch (const std::exception& e) {
+        std::cerr << "[MemoryManager] delete_session 错误: " << e.what() << std::endl;
+        return false;
+    }
+}
+
 // ============================================================================
 // Agent Memory
 // ============================================================================
@@ -145,16 +214,14 @@ void MemoryManager::save_agent_memory(const std::string& agent_id,
                                       const std::string& context_id,
                                       const json& step) {
     try {
-        std::string json_str = step.dump();
-
-        auto reply = execute_command("RPUSH %s %s",
-                                    agent_key(agent_id, context_id).c_str(),
-                                    json_str.c_str());
-        freeReplyObject(reply);
-
-        // Limit to 500 steps per agent per context
-        reply = execute_command("LTRIM %s -500 -1",
-                               agent_key(agent_id, context_id).c_str());
+        static const std::string script =
+            "redis.call('RPUSH',KEYS[1],ARGV[1]);"
+            "redis.call('LTRIM',KEYS[1],-tonumber(ARGV[2]),-1);"
+            "redis.call('EXPIRE',KEYS[1],tonumber(ARGV[3]));return 1";
+        auto reply = execute_command_argv({
+            "EVAL", script, "1", agent_key(agent_id, context_id), step.dump(),
+            "500", std::to_string(session_ttl_seconds_),
+        });
         freeReplyObject(reply);
 
     } catch (const std::exception& e) {
@@ -207,11 +274,10 @@ std::vector<json> MemoryManager::get_agent_memory(const std::string& agent_id,
 
 void MemoryManager::save_task_state(const std::string& task_id, const json& state) {
     try {
-        std::string json_str = state.dump();
-
-        auto reply = execute_command("SET %s %s",
-                                    task_key(task_id).c_str(),
-                                    json_str.c_str());
+        auto reply = execute_command_argv({
+            "SETEX", task_key(task_id), std::to_string(session_ttl_seconds_),
+            state.dump(),
+        });
         freeReplyObject(reply);
 
     } catch (const std::exception& e) {

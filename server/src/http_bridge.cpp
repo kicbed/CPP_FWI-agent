@@ -39,7 +39,7 @@ public:
     static constexpr std::size_t kMaxHttpRequestBytes = 32 * 1024;
     static constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
     static constexpr std::size_t kMaxQuestionBytes = 8 * 1024;
-    static constexpr std::size_t kMaxContextIdBytes = 256;
+    static constexpr std::size_t kMaxContextIdBytes = 128;
     static constexpr std::size_t kMaxWorkers = 32;
 
     std::atomic<bool> running{false};
@@ -258,6 +258,32 @@ private:
         std::string method, path, body;
         parseHttpRequest(request, method, path, body);
 
+        const auto origins = headerValues(request, "origin");
+        if (origins.size() > 1 ||
+            (!origins.empty() && origins.front() != cors_origin_)) {
+            const nlohmann::json error = {
+                {"error", {{"type", "forbidden_origin"},
+                           {"message", "Request Origin is not allowed"}}},
+                {"status", 403}, {"transport", "grpc"}
+            };
+            sendHttpResponse(client_fd, 403, error.dump(), "application/json");
+            return;
+        }
+
+        if (method == "POST") {
+            const auto content_types = headerValues(request, "content-type");
+            if (content_types.size() != 1 ||
+                !isJsonContentType(content_types.front())) {
+                const nlohmann::json error = {
+                    {"error", {{"type", "unsupported_media_type"},
+                               {"message", "POST requires application/json"}}},
+                    {"status", 415}, {"transport", "grpc"}
+                };
+                sendHttpResponse(client_fd, 415, error.dump(), "application/json");
+                return;
+            }
+        }
+
         // CORS preflight
         if (method == "OPTIONS") {
             sendHttpResponse(client_fd, 200, nlohmann::json::object().dump(),
@@ -333,9 +359,15 @@ private:
             }
             context_id = context_it->get<std::string>();
         }
-        if (context_id.size() > kMaxContextIdBytes) {
+        const bool valid_context_id = context_id.empty() ||
+            (context_id.size() <= kMaxContextIdBytes &&
+             std::isalnum(static_cast<unsigned char>(context_id.front())) &&
+             std::all_of(context_id.begin(), context_id.end(), [](unsigned char c) {
+                 return std::isalnum(c) || c == '-' || c == '_';
+             }));
+        if (!valid_context_id) {
             sendJsonRequestError(client_fd, "invalid_context_id",
-                                 "'context_id' must not exceed 256 bytes");
+                                 "'context_id' must be empty or match [A-Za-z0-9][A-Za-z0-9_-]{0,127}");
             return;
         }
 
@@ -351,7 +383,7 @@ private:
         request.set_request_id(req_id);
         request.set_question(question);
         request.set_context_id(context_id);
-        request.set_history_length(5);
+        request.set_history_length(10);
         request.set_timeout_seconds(60);
 
         grpc::ClientContext grpc_context;
@@ -412,6 +444,35 @@ private:
             return static_cast<char>(std::tolower(c));
         });
         return value;
+    }
+
+    static std::vector<std::string> headerValues(
+        const std::string& request, const std::string& requested_name) {
+        std::vector<std::string> values;
+        std::size_t header_end = request.find("\r\n\r\n");
+        if (header_end == std::string::npos) header_end = request.find("\n\n");
+        if (header_end == std::string::npos) return values;
+        const std::string headers = request.substr(0, header_end);
+        std::size_t line_start = headers.find('\n');
+        if (line_start != std::string::npos) ++line_start;
+        while (line_start != std::string::npos && line_start < headers.size()) {
+            std::size_t line_end = headers.find('\n', line_start);
+            if (line_end == std::string::npos) line_end = headers.size();
+            const std::string line = headers.substr(line_start, line_end - line_start);
+            const auto colon = line.find(':');
+            if (colon != std::string::npos &&
+                lowerAscii(trimAscii(line.substr(0, colon))) == requested_name) {
+                values.push_back(trimAscii(line.substr(colon + 1)));
+            }
+            line_start = line_end == headers.size()
+                ? std::string::npos : line_end + 1;
+        }
+        return values;
+    }
+
+    static bool isJsonContentType(const std::string& value) {
+        return lowerAscii(trimAscii(value.substr(0, value.find(';')))) ==
+               "application/json";
     }
 
     static bool parseSize(const std::string& text, std::size_t& value) {
@@ -543,7 +604,10 @@ private:
         switch (code) {
             case 200: status_text = "OK"; break;
             case 400: status_text = "Bad Request"; break;
+            case 403: status_text = "Forbidden"; break;
+            case 405: status_text = "Method Not Allowed"; break;
             case 413: status_text = "Payload Too Large"; break;
+            case 415: status_text = "Unsupported Media Type"; break;
             case 404: status_text = "Not Found"; break;
             case 500: status_text = "Internal Server Error"; break;
             case 502: status_text = "Bad Gateway"; break;

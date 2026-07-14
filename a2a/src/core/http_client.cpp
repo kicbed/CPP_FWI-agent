@@ -6,6 +6,18 @@
 
 namespace a2a {
 
+static bool is_loopback_http_url(const std::string& url) {
+    return url.rfind("http://127.0.0.1:", 0) == 0 ||
+           url.rfind("http://localhost:", 0) == 0;
+}
+
+static void isolate_loopback_request(CURL* curl, const std::string& url) {
+    if (!is_loopback_http_url(url)) return;
+    // Internal A2A traffic must not leak through inherited WSL/host proxies.
+    curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+}
+
 // Callback for writing response data
 static size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
     size_t total_size = size * nmemb;
@@ -229,6 +241,7 @@ HttpResponse HttpClient::get(const std::string& url) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, impl_->timeout_);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    isolate_loopback_request(curl, url);
     
     // Add custom headers
     struct curl_slist* header_list = nullptr;
@@ -281,6 +294,7 @@ HttpResponse HttpClient::post(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, impl_->timeout_);
+    isolate_loopback_request(curl, url);
     
     // Set headers
     struct curl_slist* header_list = nullptr;
@@ -341,6 +355,7 @@ void HttpClient::post_stream(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);  // 禁用总超时
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);  // 最低速度 1 byte/s
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);  // 60秒内低于最低速度则超时
+    isolate_loopback_request(curl, url);
     
     // Set headers
     struct curl_slist* header_list = nullptr;

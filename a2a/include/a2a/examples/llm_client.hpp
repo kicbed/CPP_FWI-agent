@@ -14,6 +14,7 @@
 
 // 使用 config.h 中定义的 LLMProvider
 #include "agent_rpc/orchestrator/config.h"
+#include "a2a/examples/llm_url_policy.hpp"
 
 using json = nlohmann::json;
 
@@ -45,6 +46,12 @@ public:
                 model_ = model.empty() ? "qwen2.5:7b" : model;
                 api_url_ = api_url.empty() ? "http://localhost:11434/v1/chat/completions" : api_url;
                 break;
+        }
+
+        if (provider_ == LLMProvider::LOCAL &&
+            !agent_rpc::examples::is_strict_loopback_http_url(api_url_)) {
+            throw std::invalid_argument(
+                "local LLM endpoint must be strict loopback HTTP with a port and path");
         }
 
         curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -93,6 +100,53 @@ public:
     }
 
     std::string chat(const std::string& system_prompt, const std::string& user_message) {
+        json messages = json::array({
+            {{"role", "system"}, {"content", system_prompt}},
+            {{"role", "user"}, {"content", user_message}}
+        });
+        return chat_messages(messages);
+    }
+
+    /**
+     * Send prior conversation turns with their original user/assistant roles.
+     * `history_json` must be an array of {role, content} objects. Invalid
+     * entries and every role other than user/assistant are ignored so stored
+     * text can never manufacture another system message.
+     */
+    std::string chat_with_history(const std::string& system_prompt,
+                                  const std::string& history_json,
+                                  const std::string& user_message) {
+        json messages = json::array();
+        messages.push_back({{"role", "system"}, {"content", system_prompt}});
+
+        try {
+            const auto history = json::parse(history_json);
+            if (history.is_array()) {
+                std::size_t accepted = 0;
+                for (const auto& item : history) {
+                    if (accepted >= 50 || !item.is_object() ||
+                        !item.contains("role") || !item.at("role").is_string() ||
+                        !item.contains("content") || !item.at("content").is_string()) {
+                        continue;
+                    }
+                    const std::string role = item.at("role").get<std::string>();
+                    if (role != "user" && role != "assistant") continue;
+                    std::string content = item.at("content").get<std::string>();
+                    if (content.size() > 100000) content.resize(100000);
+                    messages.push_back({{"role", role}, {"content", content}});
+                    ++accepted;
+                }
+            }
+        } catch (const json::exception&) {
+            // Fail closed to an empty history; the current request still runs.
+        }
+
+        messages.push_back({{"role", "user"}, {"content", user_message}});
+        return chat_messages(messages);
+    }
+
+private:
+    std::string chat_messages(const json& messages) {
         json request_body;
         std::string auth_header;
 
@@ -102,10 +156,7 @@ public:
             case LLMProvider::LOCAL:
                 request_body = {
                     {"model", model_},
-                    {"messages", json::array({
-                        {{"role", "system"}, {"content", system_prompt}},
-                        {{"role", "user"}, {"content", user_message}}
-                    })},
+                    {"messages", messages},
                     {"max_tokens", 2000},
                     {"temperature", 0.7}
                 };
@@ -115,10 +166,7 @@ public:
                 request_body = {
                     {"model", model_},
                     {"input", {
-                        {"messages", json::array({
-                            {{"role", "system"}, {"content", system_prompt}},
-                            {{"role", "user"}, {"content", user_message}}
-                        })}
+                        {"messages", messages}
                     }},
                     {"parameters", {{"result_format", "message"}}}
                 };
@@ -129,8 +177,6 @@ public:
         std::string response = send_request(request_body.dump(), auth_header);
         return parse_response(response);
     }
-
-private:
     // 流式回调数据结构
     struct StreamData {
         std::string buffer;
@@ -152,6 +198,7 @@ private:
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        configure_transport(curl);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
 
         CURLcode res = curl_easy_perform(curl);
@@ -195,6 +242,7 @@ private:
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_write_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &stream_data);
+        configure_transport(curl);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
 
         CURLcode res = curl_easy_perform(curl);
@@ -301,6 +349,30 @@ private:
     static size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
         ((std::string*)userp)->append((char*)contents, size * nmemb);
         return size * nmemb;
+    }
+
+    void configure_transport(CURL* curl) const {
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+        if (provider_ == LLMProvider::LOCAL) {
+            // WSL often exports a localhost proxy that cannot be reached from
+            // NAT mode.  Local inference must never leave the loopback path.
+            curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
+#if LIBCURL_VERSION_NUM >= 0x075500
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http");
+#else
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP);
+#endif
+        } else {
+            // Cloud providers retain the operator's proxy configuration, but
+            // downgrade to cleartext HTTP is not permitted.
+#if LIBCURL_VERSION_NUM >= 0x075500
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+#else
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+#endif
+        }
     }
 
     std::string api_key_;

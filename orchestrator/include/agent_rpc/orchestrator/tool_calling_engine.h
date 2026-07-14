@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <regex>
+#include <unordered_map>
 
 using json = nlohmann::json;
 
@@ -69,9 +70,9 @@ inline std::string extract_fwi_job_id(const std::string& text) {
 }
 
 inline bool mentions_fwi_query(const std::string& query) {
-    return contains_any(
-        query, {"FWI", "fwi", "全波形反演", "声学反演", "Deepwave", "deepwave",
-                "marmousi_94_288", "Marmousi"});
+    const std::string lower_query = ascii_lower_copy(query);
+    return contains_any(query, {"全波形反演", "声学反演"}) ||
+           contains_any(lower_query, {"fwi", "deepwave", "marmousi"});
 }
 
 // A negated execution request must never be allowed to fall through to the
@@ -206,15 +207,26 @@ inline ToolCallResult plan_fwi_tool_call(const std::string& query,
     // 结果”. The result is asynchronous, so this call only submits and returns
     // the queued job; a later status/result request retrieves artifacts.
     const std::string lower_query = ascii_lower_copy(query);
-    const bool has_run_action = contains_run_command_word(query) || contains_any(
+    const bool has_standard_run_action = contains_run_command_word(query) || contains_any(
         query, {"执行", "提交", "启动", "开始"}) ||
         contains_any(lower_query, {"run", "execute", "submit", "start"});
+    // Users commonly say “做一下 Marmousi 的反演测试” without spelling out
+    // either FWI or “运行”. Accept that wording only when the colloquial verb
+    // is paired with a concrete inversion experiment noun; the model whitelist
+    // check below is still mandatory. This intentionally does not treat a
+    // generic “分析一下反演结果” as authority to start computation.
+    const bool has_colloquial_run_action =
+        contains_any(query, {"做一下", "做一个", "做个", "做一次", "进行", "开展"}) &&
+        (contains_any(query, {"反演测试", "反演实验", "反演演示", "反演计算", "全波形反演"}) ||
+         contains_any(lower_query, {"fwi test", "fwi demo", "fwi inversion"}));
+    const bool has_run_action = has_standard_run_action || has_colloquial_run_action;
     const bool asks_existing_state = contains_any(
         query, {"查看", "查询", "状态", "进度", "情况", "了吗", "了么", "是否已经",
                 "结果", "显示", "展示"}) ||
         contains_any(lower_query, {"status", "progress", "result", "show"});
     const bool asks_to_run_and_show = has_run_action &&
-        contains_any(query, {"并", "然后", "随后"}) &&
+        contains_any(query, {"并", "然后", "随后", "完成后", "结束后", "跑完后",
+                             "完成以后", "结束以后"}) &&
         contains_any(query, {"结果", "显示", "展示", "损失曲线"});
     const bool asks_to_run = has_run_action &&
                              (!asks_existing_state || asks_to_run_and_show);
@@ -291,13 +303,22 @@ public:
             return llm_client.chat(sys, user);
         }) {}
 
-    bool has_explicit_fwi_action(const std::string& query) {
-        std::string last_job_id;
-        {
-            std::lock_guard<std::mutex> lock(fwi_state_mutex_);
-            last_job_id = last_fwi_job_id_;
-        }
+    bool has_explicit_fwi_action(const std::string& query,
+                                 const std::string& context_id = {}) {
+        const std::string last_job_id = last_fwi_job_for_context(context_id);
         return !detail::plan_fwi_tool_call(query, last_job_id).tool_name.empty();
+    }
+
+    /** Seed or restore the latest FWI job for one conversation only. */
+    void remember_fwi_job(const std::string& context_id,
+                          const std::string& job_id) {
+        if (context_id.empty() || job_id.empty()) return;
+        std::lock_guard<std::mutex> lock(fwi_state_mutex_);
+        if (last_fwi_job_ids_.size() >= 1024 &&
+            last_fwi_job_ids_.find(context_id) == last_fwi_job_ids_.end()) {
+            last_fwi_job_ids_.erase(last_fwi_job_ids_.begin());
+        }
+        last_fwi_job_ids_[context_id] = job_id;
     }
 
     /**
@@ -321,7 +342,8 @@ public:
      * 3. Execute tool via MCP
      * 4. Return result
      */
-    std::string process(const std::string& query) {
+    std::string process(const std::string& query,
+                        const std::string& context_id = {}) {
         // Never let an FWI capability/how-to/negative/theory question reach
         // generic Tool-RAG. In particular, semantically similar knowledge
         // tools must not replace the honest runner guidance or launch a job.
@@ -331,19 +353,14 @@ public:
             return "";
         }
 
-        std::string last_job_id;
-        {
-            std::lock_guard<std::mutex> lock(fwi_state_mutex_);
-            last_job_id = last_fwi_job_id_;
-        }
+        const std::string last_job_id = last_fwi_job_for_context(context_id);
         const auto fwi_call = detail::plan_fwi_tool_call(query, last_job_id);
         if (!fwi_call.tool_name.empty()) {
             auto result = execute_tool(fwi_call);
             if (result.success && fwi_call.tool_name == "fwi_submit_demo") {
                 const std::string submitted_job_id = detail::extract_fwi_job_id(result.result);
                 if (!submitted_job_id.empty()) {
-                    std::lock_guard<std::mutex> lock(fwi_state_mutex_);
-                    last_fwi_job_id_ = submitted_job_id;
+                    remember_fwi_job(context_id, submitted_job_id);
                 }
             }
             return result.success ? result.result : std::string();
@@ -571,12 +588,9 @@ private:
 
         if (tool.name == "fwi_submit_demo" || tool.name == "fwi_get_status" ||
             tool.name == "fwi_get_result") {
-            std::string last_job_id;
-            {
-                std::lock_guard<std::mutex> lock(fwi_state_mutex_);
-                last_job_id = last_fwi_job_id_;
-            }
-            const auto call = detail::plan_fwi_tool_call(query, last_job_id);
+            // FWI tools are removed from generic candidates before this path;
+            // keep argument generation fail-closed if called directly.
+            const auto call = detail::plan_fwi_tool_call(query);
             if (call.tool_name == tool.name) return call.arguments;
         }
 
@@ -585,8 +599,15 @@ private:
 
     agent_rpc::mcp::MCPAgentIntegration* mcp_integration_;
     std::function<std::string(const std::string&, const std::string&)> chat_func_;
-    std::mutex fwi_state_mutex_;
-    std::string last_fwi_job_id_;
+    mutable std::mutex fwi_state_mutex_;
+    std::unordered_map<std::string, std::string> last_fwi_job_ids_;
+
+    std::string last_fwi_job_for_context(const std::string& context_id) const {
+        if (context_id.empty()) return "";
+        std::lock_guard<std::mutex> lock(fwi_state_mutex_);
+        const auto found = last_fwi_job_ids_.find(context_id);
+        return found == last_fwi_job_ids_.end() ? std::string() : found->second;
+    }
 };
 
 } // namespace orchestrator

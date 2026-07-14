@@ -518,6 +518,14 @@ bool MCPClient::startMCPServer() {
         // 子进程：运行MCP服务器
         close(stdin_pipe_fd[1]);  // 关闭写端
         close(stdout_pipe_fd[0]); // 关闭读端
+
+        // MCP tools (including the fixed-whitelist FWI runner) do not make
+        // provider LLM calls.  Do not expose parent credentials to plugins or
+        // to the worker process tree.
+        unsetenv("DEEPSEEK_API_KEY");
+        unsetenv("QWEN_API_KEY");
+        unsetenv("OPENAI_API_KEY");
+        unsetenv("DASHSCOPE_API_KEY");
         
         // 重定向stdin和stdout
         dup2(stdin_pipe_fd[0], STDIN_FILENO);
@@ -537,7 +545,7 @@ bool MCPClient::startMCPServer() {
         
         // 如果execv失败
         LOG_ERROR("Failed to execute MCP server: " + server_path_);
-        exit(1);
+        _exit(127);
     } else {
         // 父进程
         close(stdin_pipe_fd[0]);  // 关闭读端
@@ -955,5 +963,4 @@ size_t MCPClient::sseHeaderCallback(char* buffer, size_t size, size_t nitems, vo
 
 } // namespace mcp
 } // namespace agent_rpc
-
 

@@ -21,14 +21,15 @@
 | `deploy/scripts/stop.sh` | 根 `stop.sh` 的兼容入口 |
 | `deploy/scripts/start_http.sh` | 兼容入口，不再维护独立启动逻辑 |
 | `deploy/scripts/start_web.sh` | 兼容入口，不再维护独立启动逻辑 |
-| `deploy/scripts/start_grpc.sh` | 设置 `ENABLE_GRPC=true` 后转交根启动器的兼容包装 |
+| `deploy/scripts/start_grpc.sh` | 使用 `--grpc` 转交根启动器的兼容包装 |
 | `deploy/scripts/setup_embedding.sh` | 可选的本地 Embedding 准备工具 |
 
 `examples/ai_orchestrator/start_system.sh` 是根启动脚本使用的内部组件启动器，
 不应再作为 README 或新用户教程中的首选命令。
 
 旧 gRPC 脚本不再自动下载/启动 Embedding、调用 `pkill`/`fuser` 或拉起前台客户端；
-需要 gRPC Web 模式时直接使用 `ENABLE_GRPC=true ./start.sh`。
+需要 gRPC Web 模式时直接使用 `./start.sh --grpc`；该命令行开关不会被
+`.env` 中的 `ENABLE_GRPC=false` 覆盖。
 
 ## 不进入仓库的内容
 

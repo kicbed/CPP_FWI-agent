@@ -10,6 +10,7 @@
 
 #include <string>
 #include <vector>
+#include <stdexcept>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
@@ -37,6 +38,10 @@ class LocalEmbeddingService {
 public:
     explicit LocalEmbeddingService(const LocalEmbeddingConfig& config = LocalEmbeddingConfig())
         : config_(config) {
+        if (!isLoopbackBaseUrl(config_.api_url)) {
+            throw std::invalid_argument(
+                "Local embedding URL must be loopback HTTP with an explicit port");
+        }
         curl_global_init(CURL_GLOBAL_DEFAULT);
     }
 
@@ -106,55 +111,118 @@ public:
     }
 
 private:
-    static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
-        userp->append((char*)contents, size * nmemb);
-        return size * nmemb;
+    static constexpr std::size_t kMaxResponseBytes = 4U * 1024U * 1024U;
+
+    struct ResponseBuffer {
+        std::string body;
+        bool too_large = false;
+    };
+
+    static bool isLoopbackBaseUrl(const std::string& url) {
+        std::string port;
+        if (url.rfind("http://127.0.0.1:", 0) == 0) {
+            port = url.substr(std::string("http://127.0.0.1:").size());
+        } else if (url.rfind("http://localhost:", 0) == 0) {
+            port = url.substr(std::string("http://localhost:").size());
+        } else {
+            return false;
+        }
+        if (port.empty() || port.find_first_not_of("0123456789") != std::string::npos) {
+            return false;
+        }
+        try {
+            const unsigned long parsed = std::stoul(port);
+            return parsed > 0 && parsed <= 65535;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
+    static size_t WriteCallback(void* contents, size_t size, size_t nmemb,
+                                ResponseBuffer* output) {
+        const std::size_t bytes = size * nmemb;
+        if (bytes > kMaxResponseBytes - output->body.size()) {
+            output->too_large = true;
+            return 0;
+        }
+        output->body.append(static_cast<const char*>(contents), bytes);
+        return bytes;
     }
 
     std::string sendPostRequest(const std::string& url, const std::string& data) {
         CURL* curl = curl_easy_init();
         if (!curl) throw std::runtime_error("Failed to initialize CURL");
 
-        std::string response;
+        ResponseBuffer response;
         struct curl_slist* headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
 
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+                         static_cast<curl_off_t>(data.size()));
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, config_.timeout_ms);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP);
+        curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
 
         CURLcode res = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
 
+        if (response.too_large) {
+            throw std::runtime_error("Local embedding response exceeded 4 MiB");
+        }
         if (res != CURLE_OK) {
             throw std::runtime_error(std::string("CURL error: ") + curl_easy_strerror(res));
         }
+        if (status != 200) {
+            throw std::runtime_error(
+                "Local embedding HTTP status: " + std::to_string(status));
+        }
 
-        return response;
+        return response.body;
     }
 
     std::string sendGetRequest(const std::string& url) {
         CURL* curl = curl_easy_init();
         if (!curl) throw std::runtime_error("Failed to initialize CURL");
 
-        std::string response;
+        ResponseBuffer response;
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP);
+        curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
 
         CURLcode res = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
         curl_easy_cleanup(curl);
 
+        if (response.too_large) {
+            throw std::runtime_error("Local embedding response exceeded 4 MiB");
+        }
         if (res != CURLE_OK) {
             throw std::runtime_error(std::string("CURL error: ") + curl_easy_strerror(res));
         }
+        if (status != 200) {
+            throw std::runtime_error(
+                "Local embedding HTTP status: " + std::to_string(status));
+        }
 
-        return response;
+        return response.body;
     }
 
     LocalEmbeddingConfig config_;

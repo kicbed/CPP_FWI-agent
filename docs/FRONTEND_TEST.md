@@ -7,7 +7,7 @@
 ## 1. 进入仓库并准备本地配置
 
 ```bash
-cd /root/projects/project/agent-communication-main-v2
+cd /path/to/agent-communication-main-v2
 cp .env.example .env
 chmod 600 .env
 ```
@@ -22,6 +22,17 @@ git check-ignore .env
 ```
 
 预期权限为 `600`，`git check-ignore` 输出 `.env`。
+
+如果还要验收左侧的本地 Embedding 状态，首次先由你明确执行一次模型准备：
+
+```bash
+deploy/scripts/setup_embedding.sh
+```
+
+然后在 `.env` 中设置 `ROUTING_MODE=agent-rag`、`EMBEDDING_PROVIDER=local` 和
+`ENABLE_LOCAL_EMBEDDING=auto`。日常 `./start.sh` 只读取已经缓存的模型，不会静默下载；
+默认在 CPU 上运行，避免和 Deepwave 抢占同一张 GPU。FWI 本地文档检索本身不依赖这项
+可选服务。
 
 ## 2. 核对固定模型三件套
 
@@ -160,8 +171,17 @@ smoke 默认 2 次、demo 默认 5 次，也支持显式指定 1–100 次。可
 使用 marmousi_94_288 在 CUDA 上运行 50 次迭代的 FWI，并向我展示结果。
 ```
 
+下面这条更口语化的表达也必须得到完全相同的真实提交结果，不能只返回 Python 示例代码：
+
+```text
+做一下marmousi的反演测试，迭代50次，完成后展示结果
+```
+
 预期先异步返回新 `job_id`，状态中的 `total_iterations` 为 50；计算成功后页面自动加载
-结果。为缩短日常回归时间可以把 50 改为 3。超过 100、负数或小数应被明确拒绝且不创建任务。
+结果。右侧“最近 FWI 任务”应依次显示 `queued/running/succeeded`；如果回答里没有合法
+`fwi_job_submitted` 和 `job_id`，页面必须显示红色“FWI 任务未提交”，不要把说明文字或
+代码块当成运行成功。为缩短日常回归时间可以把 50 改为 3。超过 100、负数或小数应被明确
+拒绝且不创建任务。
 
 ### 5.3 查询刚才任务状态
 
@@ -268,7 +288,7 @@ PY
 
 对于 `fwi_demo`，只有 `final_loss < initial_loss` 才能标为成功。两次更新的 `fwi_smoke` 只要求数值链路和模型更新有效，不应据此声称反演质量改善。
 
-## 8. 理论问题不得启动任务
+## 8. 验收本地知识库、公式与“不启动任务”
 
 在终端记录当前 job 目录数量：
 
@@ -280,7 +300,24 @@ printf 'before=%s\n' "$BEFORE"
 回到 Web 输入：
 
 ```text
-什么是 FWI？只解释概念，不要运行任务。
+什么是 cycle skipping？请优先使用本地资料，解释半周期判据并给出公式。只回答理论，不要运行任务。
+```
+
+预期：
+
+- 回复在资料支持的结论后出现类似 `【本地资料：Cycle Skipping（周波跳跃）】` 的标注；
+- 半周期判据显示为排版后的行内或块级公式，而不是一整串未处理的 LaTeX；
+- 代码块中的 `$...$` 仍按代码显示，普通金额不会被误判为公式；
+- 如果外部 CDN 暂时不可用，公式区域会明确保留经过转义的原始 TeX，不会空白；
+- 不出现 `fwi_job_submitted`，也不生成新 job 目录。
+
+左侧 Embedding 仅表示 Agent-RAG 的 AgentCard 语义选路状态。启用了上一节的可选配置时，
+应显示“运行中 · 1024维 · CPU”；未启用时会显示“未启用（FWI 知识库仍可用）”。也可从
+Web 的同源、脱敏健康端点检查，不要让浏览器直接访问 6000：
+
+```bash
+curl --fail --silent http://127.0.0.1:8080/api/embedding-health \
+  | /root/.venvs/cpp-fwi-agent/bin/python -m json.tool
 ```
 
 回答完成后在终端检查：
@@ -291,7 +328,9 @@ printf 'after=%s\n' "$AFTER"
 test "$BEFORE" = "$AFTER" && printf '理论问题未创建任务：PASS\n'
 ```
 
-理论回答不应出现新的 `fwi_job_submitted` 或 job_id。
+理论回答不应出现新的 `fwi_job_submitted` 或 job_id。再用“什么是 FWI？只解释概念，
+不要运行任务。”复测基础资料也可以，但不要把“Embedding 在线”误当成本地 FWI 资料是否
+可用的唯一判断。
 
 ## 9. 常见失败排查
 

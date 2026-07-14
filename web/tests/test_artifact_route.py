@@ -3,6 +3,7 @@
 
 import base64
 import http.client
+import http.server
 import importlib.util
 import json
 import os
@@ -85,6 +86,15 @@ class ArtifactRouteTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(headers["content-type"], "image/png")
+        policy = headers["content-security-policy"]
+        self.assertIn("default-src 'self'", policy)
+        self.assertIn("script-src 'self' 'unsafe-inline'", policy)
+        self.assertIn("style-src 'self' 'unsafe-inline'", policy)
+        self.assertIn("https://cdn.jsdelivr.net", policy)
+        self.assertNotIn("localhost:6000", policy)
+        self.assertNotIn("127.0.0.1:6000", policy)
+        self.assertEqual(headers["x-content-type-options"], "nosniff")
+        self.assertEqual(headers["x-frame-options"], "DENY")
         self.assertEqual(body, self.png_bytes)
 
         status, headers, body = self.request(
@@ -163,6 +173,88 @@ class ArtifactRouteTest(unittest.TestCase):
             self.assertEqual(headers.get("vary"), "Origin")
         finally:
             serve.ALLOW_ORIGIN = ""
+
+    def test_embedding_health_is_same_origin_sanitized_and_loopback_only(self):
+        class UpstreamHealth(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/health":
+                    self.send_error(404)
+                    return
+                payload = json.dumps({
+                    "status": "ok",
+                    "model_loaded": True,
+                    "dimension": 1024,
+                    "model": "Qwen/Qwen3-Embedding-0.6B",
+                    "device": "cpu",
+                    "ignored": "must-not-be-proxied",
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format, *args):
+                pass
+
+        upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHealth)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        keys = ("ENABLE_LOCAL_EMBEDDING", "ROUTING_MODE", "EMBEDDING_PROVIDER",
+                "LOCAL_EMBEDDING_URL")
+        previous = {key: os.environ.get(key) for key in keys}
+        try:
+            os.environ["ENABLE_LOCAL_EMBEDDING"] = "true"
+            os.environ["LOCAL_EMBEDDING_URL"] = (
+                f"http://127.0.0.1:{upstream.server_address[1]}"
+            )
+            status, headers, body = self.request(serve.EMBEDDING_HEALTH_PATH)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+            health = json.loads(body)
+            self.assertEqual(health["status"], "ok")
+            self.assertEqual(health["dimension"], 1024)
+            self.assertEqual(health["device"], "cpu")
+            self.assertNotIn("ignored", health)
+
+            status, _, body = self.request(serve.EMBEDDING_HEALTH_PATH, method="HEAD")
+            self.assertEqual(status, 200)
+            self.assertEqual(body, b"")
+
+            # A deployment value can never turn this endpoint into an SSRF
+            # proxy. Non-loopback targets fail closed without being contacted.
+            os.environ["LOCAL_EMBEDDING_URL"] = "http://example.com:6000"
+            _, _, body = self.request(serve.EMBEDDING_HEALTH_PATH)
+            self.assertEqual(json.loads(body)["status"], "misconfigured")
+
+            os.environ["ENABLE_LOCAL_EMBEDDING"] = "false"
+            _, _, body = self.request(serve.EMBEDDING_HEALTH_PATH)
+            disabled = json.loads(body)
+            self.assertFalse(disabled["enabled"])
+            self.assertEqual(disabled["status"], "disabled")
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_unsafe_run_roots_are_rejected(self):
+        original = os.environ.get("FWI_RUN_ROOT")
+        try:
+            for unsafe in ("/", "/etc", str(WEB_DIR.parent)):
+                with self.subTest(root=unsafe):
+                    os.environ["FWI_RUN_ROOT"] = unsafe
+                    with self.assertRaises(ValueError):
+                        serve.fwi_run_root()
+        finally:
+            if original is None:
+                os.environ.pop("FWI_RUN_ROOT", None)
+            else:
+                os.environ["FWI_RUN_ROOT"] = original
 
 
 if __name__ == "__main__":

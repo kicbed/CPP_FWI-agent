@@ -40,14 +40,27 @@ deploy/pids/
 examples/ai_orchestrator/pids/
 .runtime/
 
+# ==================== 本地 Redis 对话状态 ====================
+/redis-data/
+appendonlydir/
+*.aof
+dump.rdb
+
 # ==================== 向量缓存 ====================
 resources/embeddings/
 local_knowledge/
 
 # ==================== 环境变量 ====================
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+credentials*.json
+secrets*.json
 
 # ==================== Python ====================
 __pycache__/
@@ -58,6 +71,13 @@ __pycache__/
 .venv/
 venv/
 env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+node_modules/
+coverage/
 
 # ==================== 模型缓存 ====================
 .cache/

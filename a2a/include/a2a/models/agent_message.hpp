@@ -7,6 +7,8 @@
 #include <memory>
 #include <optional>
 #include <ctime>
+#include <atomic>
+#include <chrono>
 
 namespace a2a {
 
@@ -121,7 +123,11 @@ public:
      */
     static AgentMessage create() {
         AgentMessage msg;
-        msg.message_id_ = "msg-" + std::to_string(std::time(nullptr));
+        static std::atomic<std::uint64_t> counter{0};
+        const auto now = std::chrono::system_clock::now().time_since_epoch().count();
+        const auto sequence = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+        msg.message_id_ = "msg-" + std::to_string(now) + "-" +
+                          std::to_string(sequence);
         return msg;
     }
 

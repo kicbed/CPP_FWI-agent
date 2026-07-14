@@ -20,6 +20,8 @@ CODE_AGENT_PORT="${CODE_AGENT_PORT:-5010}"
 EXPERIMENT_PLANNER_AGENT_PORT="${EXPERIMENT_PLANNER_AGENT_PORT:-5011}"
 REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
 REDIS_PORT="${REDIS_PORT:-6379}"
+REDIS_PERSISTENCE="${REDIS_PERSISTENCE:-true}"
+REDIS_DATA_DIR="${REDIS_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cpp-fwi-agent/redis}"
 
 MCP_SERVER="${MCP_SERVER:-$PROJECT_ROOT/mcp_server_integrated/build/mcp_server}"
 MCP_PLUGINS="${MCP_PLUGINS:-$PROJECT_ROOT/mcp_server_integrated/build/plugins}"
@@ -28,6 +30,43 @@ ENABLE_MCP="${ENABLE_MCP:-false}"
 die() {
     printf '错误: %s\n' "$*" >&2
     return 1
+}
+
+validate_redis_data_dir() {
+    local requested="$1" resolved critical entry basename
+    [[ "$requested" == /* && "$requested" != *$'\r'* && "$requested" != *$'\n'* ]] || \
+        die "REDIS_DATA_DIR 必须是无换行的绝对路径" || return
+    [[ ! -L "$requested" ]] || die "REDIS_DATA_DIR 不能是符号链接" || return
+    resolved="$(realpath -m -- "$requested")"
+
+    for critical in / /etc /usr /bin /sbin /lib /lib32 /lib64 /boot /proc /sys /dev /run; do
+        if [[ "$resolved" == "$critical" || "$resolved" == "$critical/"* ]]; then
+            die "REDIS_DATA_DIR 不能位于系统敏感目录: $critical" || return
+        fi
+    done
+    [[ "$resolved" != /var ]] || die "REDIS_DATA_DIR 不能直接指向 /var" || return
+    if [[ "$resolved" == "$PROJECT_ROOT" || "$resolved" == "$PROJECT_ROOT/"* ||
+          "$PROJECT_ROOT" == "$resolved/"* || "$resolved" == "$HOME" ||
+          "$HOME" == "$resolved/"* ]]; then
+        die "REDIS_DATA_DIR 不能是仓库/HOME 本身、其上级或仓库内目录" || return
+    fi
+    if [[ -e "$resolved" ]]; then
+        [[ -d "$resolved" && ! -L "$resolved" ]] || \
+            die "REDIS_DATA_DIR 必须是非符号链接目录" || return
+        [[ ! -L "$resolved/.cpp-fwi-agent-redis-dir" ]] || \
+            die "REDIS_DATA_DIR 管理标记不能是符号链接" || return
+        if [[ ! -f "$resolved/.cpp-fwi-agent-redis-dir" ]]; then
+            while IFS= read -r -d '' entry; do
+                [[ ! -L "$entry" ]] || die "REDIS_DATA_DIR 含有符号链接" || return
+                basename="${entry##*/}"
+                case "$basename" in
+                    appendonlydir|appendonly.aof|dump.rdb|redis.log) ;;
+                    *) die "拒绝接管非空的非专用 REDIS_DATA_DIR: $resolved" || return ;;
+                esac
+            done < <(find "$resolved" -mindepth 1 -maxdepth 1 -print0)
+        fi
+    fi
+    printf '%s\n' "$resolved"
 }
 
 if [[ "${FWI_ENV_LOADED:-false}" != true && -e "$PROJECT_ROOT/.env" ]]; then
@@ -53,12 +92,45 @@ api_key_is_configured() {
         deepseek) [[ -n "${DEEPSEEK_API_KEY:-}" ]] ;;
         qwen) [[ -n "${QWEN_API_KEY:-}" ]] ;;
         openai) [[ -n "${OPENAI_API_KEY:-}" ]] ;;
-        *) [[ -n "${QWEN_API_KEY:-${DEEPSEEK_API_KEY:-${OPENAI_API_KEY:-}}}" ]] ;;
+        *) return 1 ;;
     esac
 }
 
+case "$LLM_PROVIDER" in
+    local|deepseek|qwen|openai) ;;
+    *) die "LLM_PROVIDER 只能是 deepseek、qwen、openai 或 local" ;;
+esac
 api_key_is_configured || die "未为 LLM_PROVIDER=$LLM_PROVIDER 配置 API Key；请复制 .env.example 为 .env 后填写。"
 printf '使用 LLM provider: %s（密钥仅通过继承环境传递）\n' "$LLM_PROVIDER"
+
+# Keep only the selected provider credential in Agent process environments.
+# DashScope is retained separately only when it is the configured embedding
+# provider for the Orchestrator.
+case "$LLM_PROVIDER" in
+    local)
+        unset DEEPSEEK_API_KEY QWEN_API_KEY OPENAI_API_KEY
+        ;;
+    deepseek)
+        unset QWEN_API_KEY OPENAI_API_KEY
+        ;;
+    qwen)
+        unset DEEPSEEK_API_KEY OPENAI_API_KEY
+        ;;
+    openai)
+        unset DEEPSEEK_API_KEY QWEN_API_KEY
+        ;;
+esac
+if [[ "${EMBEDDING_PROVIDER:-local}" != dashscope ]]; then
+    unset DASHSCOPE_API_KEY
+fi
+provider_secret_free_env=(
+    env
+    -u DEEPSEEK_API_KEY
+    -u QWEN_API_KEY
+    -u OPENAI_API_KEY
+    -u DASHSCOPE_API_KEY
+)
+specialist_agent_env=(env -u DASHSCOPE_API_KEY)
 
 required_binaries=(
     ai_registry_server ai_math_agent ai_fwi_theory_agent
@@ -74,9 +146,25 @@ if [[ "$ENABLE_MCP" == true ]]; then
 elif [[ "$ENABLE_MCP" != false ]]; then
     die "ENABLE_MCP 只能是 true 或 false"
 fi
+[[ "$REDIS_PERSISTENCE" == true || "$REDIS_PERSISTENCE" == false ]] || \
+    die "REDIS_PERSISTENCE 只能是 true 或 false"
+REDIS_DATA_DIR="$(validate_redis_data_dir "$REDIS_DATA_DIR")"
 
 mkdir -p -- "$LOG_DIR" "$PID_DIR"
 chmod 700 "$LOG_DIR" "$PID_DIR"
+find "$LOG_DIR" -maxdepth 1 -type f -exec chmod 600 -- {} +
+
+# AgentRetriever used to persist relative to the launcher's current working
+# directory.  Pin it to a private, ignored (and Docker-writable) runtime area.
+embedding_cache_parent="$LOG_DIR/cpp-fwi-agent"
+embedding_cache_dir="$embedding_cache_parent/embeddings"
+[[ ! -L "$embedding_cache_parent" && ! -L "$embedding_cache_dir" ]] || \
+    die "Embedding 缓存目录不能是符号链接"
+mkdir -p -- "$embedding_cache_dir"
+[[ -d "$embedding_cache_parent" && -d "$embedding_cache_dir" ]] || \
+    die "无法创建受控 Embedding 缓存目录"
+chmod 700 -- "$embedding_cache_parent" "$embedding_cache_dir"
+export AGENT_EMBEDDING_CACHE_DIR="$embedding_cache_dir"
 
 port_in_use() {
     ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .
@@ -159,7 +247,32 @@ else
     command -v redis-server >/dev/null 2>&1 || die "Redis 未运行且找不到 redis-server"
     command -v redis-cli >/dev/null 2>&1 || die "找不到 redis-cli，无法进行 Redis 健康检查"
     port_in_use "$REDIS_PORT" && die "Redis 端口 $REDIS_PORT 已被非预期服务占用"
-    nohup redis-server --bind 127.0.0.1 --port "$REDIS_PORT" --daemonize no --save '' --appendonly no \
+    redis_persistence_args=(--save '' --appendonly no)
+    if [[ "$REDIS_PERSISTENCE" == true ]]; then
+        if [[ -e "$REDIS_DATA_DIR" && ( ! -d "$REDIS_DATA_DIR" || -L "$REDIS_DATA_DIR" ) ]]; then
+            die "REDIS_DATA_DIR 必须是非符号链接目录: $REDIS_DATA_DIR"
+        fi
+        mkdir -p -- "$REDIS_DATA_DIR"
+        [[ "$(stat -c '%u' "$REDIS_DATA_DIR")" == "$(id -u)" ]] || \
+            die "REDIS_DATA_DIR 必须归当前用户所有"
+        if [[ ! -e "$REDIS_DATA_DIR/.cpp-fwi-agent-redis-dir" ]]; then
+            printf 'managed-by=cpp-fwi-agent\n' > "$REDIS_DATA_DIR/.cpp-fwi-agent-redis-dir"
+        fi
+        chmod 700 -- "$REDIS_DATA_DIR"
+        chmod 600 -- "$REDIS_DATA_DIR/.cpp-fwi-agent-redis-dir"
+        redis_persistence_args=(
+            --dir "$REDIS_DATA_DIR"
+            --appendonly yes
+            --appendfsync everysec
+            --save ''
+        )
+        printf '对话状态持久化已启用（Redis AOF；保留期由应用 TTL 配置）。\n'
+    else
+        printf '对话状态持久化已关闭；停止内置 Redis 后后端上下文会丢失。\n'
+    fi
+    nohup "${provider_secret_free_env[@]}" \
+        redis-server --bind 127.0.0.1 --port "$REDIS_PORT" --daemonize no \
+        "${redis_persistence_args[@]}" \
         > "$LOG_DIR/redis.log" 2>&1 &
     redis_pid=$!
     write_pid redis "$redis_pid"
@@ -179,24 +292,25 @@ if [[ "$ENABLE_MCP" == true ]]; then
 fi
 
 printf '启动 Registry 和 Agent 服务……\n'
-launch_service registry "$REGISTRY_PORT" "$BIN_DIR/ai_registry_server" "$REGISTRY_PORT"
+launch_service registry "$REGISTRY_PORT" \
+    "${provider_secret_free_env[@]}" "$BIN_DIR/ai_registry_server" "$REGISTRY_PORT"
 launch_service math_agent "$MATH_AGENT_PORT" \
-    "$BIN_DIR/ai_math_agent" math-1 "$MATH_AGENT_PORT" "$registry_url" "$key_sentinel" \
+    "${specialist_agent_env[@]}" "$BIN_DIR/ai_math_agent" math-1 "$MATH_AGENT_PORT" "$registry_url" "$key_sentinel" \
     --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT" "${mcp_args[@]}"
 launch_service fwi_theory_agent "$FWI_THEORY_PORT" \
-    "$BIN_DIR/ai_fwi_theory_agent" fwi-theory-1 "$FWI_THEORY_PORT" "$registry_url" "$key_sentinel" \
+    "${specialist_agent_env[@]}" "$BIN_DIR/ai_fwi_theory_agent" fwi-theory-1 "$FWI_THEORY_PORT" "$registry_url" "$key_sentinel" \
     --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT"
 launch_service fwi_teaching_agent "$FWI_TEACHING_PORT" \
-    "$BIN_DIR/ai_fwi_teaching_agent" fwi-teaching-1 "$FWI_TEACHING_PORT" "$registry_url" "$key_sentinel" \
+    "${specialist_agent_env[@]}" "$BIN_DIR/ai_fwi_teaching_agent" fwi-teaching-1 "$FWI_TEACHING_PORT" "$registry_url" "$key_sentinel" \
     --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT"
 launch_service general_research_agent "$GENERAL_RESEARCH_PORT" \
-    "$BIN_DIR/ai_general_research_agent" general-research-1 "$GENERAL_RESEARCH_PORT" "$registry_url" "$key_sentinel" \
+    "${specialist_agent_env[@]}" "$BIN_DIR/ai_general_research_agent" general-research-1 "$GENERAL_RESEARCH_PORT" "$registry_url" "$key_sentinel" \
     --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT"
 launch_service code_agent "$CODE_AGENT_PORT" \
-    "$BIN_DIR/ai_code_agent" code-agent-1 "$CODE_AGENT_PORT" "$registry_url" "$key_sentinel" \
+    "${specialist_agent_env[@]}" "$BIN_DIR/ai_code_agent" code-agent-1 "$CODE_AGENT_PORT" "$registry_url" "$key_sentinel" \
     --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT" --project-root "$PROJECT_ROOT"
 launch_service experiment_planner_agent "$EXPERIMENT_PLANNER_AGENT_PORT" \
-    "$BIN_DIR/ai_experiment_planner_agent" experiment-planner-1 "$EXPERIMENT_PLANNER_AGENT_PORT" "$registry_url" "$key_sentinel" \
+    "${specialist_agent_env[@]}" "$BIN_DIR/ai_experiment_planner_agent" experiment-planner-1 "$EXPERIMENT_PLANNER_AGENT_PORT" "$registry_url" "$key_sentinel" \
     --redis-host "$REDIS_HOST" --redis-port "$REDIS_PORT" --algorithm-dir "$PROJECT_ROOT/resources/algorithms"
 launch_service orchestrator "$ORCHESTRATOR_PORT" \
     "$BIN_DIR/ai_orchestrator" orch-1 "$ORCHESTRATOR_PORT" "$registry_url" "$key_sentinel" \
@@ -204,6 +318,8 @@ launch_service orchestrator "$ORCHESTRATOR_PORT" \
 
 export ORCHESTRATOR_PORT REGISTRY_PORT REDIS_HOST REDIS_PORT BIN_DIR PROJECT_ROOT
 export ENABLE_MCP MCP_SERVER MCP_PLUGINS
+# The watchdog is the one intentional non-Agent exception: it retains the
+# already-minimized Orchestrator environment so it can restart that process.
 nohup "$SCRIPT_DIR/watchdog.sh" > "$LOG_DIR/watchdog.log" 2>&1 &
 write_pid watchdog "$!"
 

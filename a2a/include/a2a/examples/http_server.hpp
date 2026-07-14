@@ -6,6 +6,7 @@
 #include <thread>
 #include <iostream>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -13,6 +14,11 @@
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
+#include <algorithm>
+#include <cctype>
+#include <cerrno>
+#include <limits>
+#include <vector>
 
 /**
  * @brief 简单的 HTTP 服务器
@@ -115,16 +121,182 @@ public:
     }
 
 private:
+    static constexpr std::size_t kMaxHeaderBytes = 16 * 1024;
+    static constexpr std::size_t kMaxBodyBytes = 32 * 1024;
+
+    enum class ReadResult { Ok, BadRequest, TooLarge, Disconnected };
+
+    static bool send_all(int fd, const std::string& data) {
+        std::size_t offset = 0;
+        while (offset < data.size()) {
+            const ssize_t written = send(
+                fd, data.data() + offset, data.size() - offset, MSG_NOSIGNAL);
+            if (written > 0) {
+                offset += static_cast<std::size_t>(written);
+                continue;
+            }
+            if (written < 0 && errno == EINTR) continue;
+            return false;
+        }
+        return true;
+    }
+
+    static std::string trim_ascii(std::string value) {
+        const auto not_space = [](unsigned char c) {
+            return std::isspace(c) == 0;
+        };
+        value.erase(value.begin(), std::find_if(
+            value.begin(), value.end(), [&](char c) {
+                return not_space(static_cast<unsigned char>(c));
+            }));
+        value.erase(std::find_if(
+            value.rbegin(), value.rend(), [&](char c) {
+                return not_space(static_cast<unsigned char>(c));
+            }).base(), value.end());
+        return value;
+    }
+
+    static std::vector<std::string> header_values(
+        const std::string& request, const std::string& requested_name) {
+        std::vector<std::string> values;
+        const auto header_end = request.find("\r\n\r\n");
+        if (header_end == std::string::npos) return values;
+        std::istringstream headers(request.substr(0, header_end));
+        std::string line;
+        std::getline(headers, line);  // request line
+        while (std::getline(headers, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::string name = trim_ascii(line.substr(0, colon));
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char value) {
+                               return static_cast<char>(std::tolower(value));
+                           });
+            if (name == requested_name) {
+                values.push_back(trim_ascii(line.substr(colon + 1)));
+            }
+        }
+        return values;
+    }
+
+    static bool is_json_content_type(const std::string& value) {
+        std::string media_type = value.substr(0, value.find(';'));
+        media_type = trim_ascii(std::move(media_type));
+        std::transform(media_type.begin(), media_type.end(), media_type.begin(),
+                       [](unsigned char character) {
+                           return static_cast<char>(std::tolower(character));
+                       });
+        return media_type == "application/json";
+    }
+
+    static ReadResult read_request(int fd, std::string* request) {
+        struct timeval timeout {};
+        timeout.tv_sec = 10;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+        std::size_t expected_size = 0;
+        bool parsed_headers = false;
+        char buffer[4096];
+        while (true) {
+            const ssize_t count = recv(fd, buffer, sizeof(buffer), 0);
+            if (count == 0) return ReadResult::Disconnected;
+            if (count < 0) {
+                if (errno == EINTR) continue;
+                return ReadResult::Disconnected;
+            }
+            request->append(buffer, static_cast<std::size_t>(count));
+
+            const std::size_t header_end = request->find("\r\n\r\n");
+            if (!parsed_headers) {
+                if (header_end == std::string::npos) {
+                    if (request->size() > kMaxHeaderBytes) {
+                        return ReadResult::TooLarge;
+                    }
+                    continue;
+                }
+                if (header_end + 4 > kMaxHeaderBytes) {
+                    return ReadResult::TooLarge;
+                }
+
+                std::size_t content_length = 0;
+                bool saw_content_length = false;
+                bool unsupported_transfer_encoding = false;
+                std::istringstream headers(request->substr(0, header_end));
+                std::string line;
+                std::getline(headers, line);  // request line
+                while (std::getline(headers, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    const auto colon = line.find(':');
+                    if (colon == std::string::npos) continue;
+                    std::string name = trim_ascii(line.substr(0, colon));
+                    std::transform(name.begin(), name.end(), name.begin(),
+                                   [](unsigned char c) {
+                                       return static_cast<char>(std::tolower(c));
+                                   });
+                    const std::string value = trim_ascii(line.substr(colon + 1));
+                    if (name == "transfer-encoding" && !value.empty() &&
+                        value != "identity") {
+                        unsupported_transfer_encoding = true;
+                    }
+                    if (name != "content-length") continue;
+                    if (value.empty() || !std::all_of(
+                            value.begin(), value.end(), [](unsigned char c) {
+                                return std::isdigit(c) != 0;
+                            })) {
+                        return ReadResult::BadRequest;
+                    }
+                    unsigned long long parsed = 0;
+                    try {
+                        parsed = std::stoull(value);
+                    } catch (const std::exception&) {
+                        return ReadResult::BadRequest;
+                    }
+                    if (parsed > kMaxBodyBytes) return ReadResult::TooLarge;
+                    if (saw_content_length && content_length != parsed) {
+                        return ReadResult::BadRequest;
+                    }
+                    content_length = static_cast<std::size_t>(parsed);
+                    saw_content_length = true;
+                }
+                if (unsupported_transfer_encoding) return ReadResult::BadRequest;
+                expected_size = header_end + 4 + content_length;
+                parsed_headers = true;
+            }
+
+            if (request->size() >= expected_size) {
+                request->resize(expected_size);
+                return ReadResult::Ok;
+            }
+            if (request->size() > kMaxHeaderBytes + kMaxBodyBytes) {
+                return ReadResult::TooLarge;
+            }
+        }
+    }
+
+    static void send_simple_error(int fd, int status, const char* reason) {
+        const std::string body = std::string("{\"error\":\"") + reason + "\"}";
+        std::ostringstream response;
+        response << "HTTP/1.1 " << status << ' ' << reason << "\r\n"
+                 << "Content-Type: application/json\r\n"
+                 << "Connection: close\r\n"
+                 << "Content-Length: " << body.size() << "\r\n\r\n"
+                 << body;
+        send_all(fd, response.str());
+    }
+
     void handle_client(int client_fd) {
-        char buffer[8192] = {0};
-        ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
-        
-        if (bytes_read <= 0) {
+        std::string request;
+        const ReadResult read_result = read_request(client_fd, &request);
+        if (read_result != ReadResult::Ok) {
+            if (read_result == ReadResult::TooLarge) {
+                send_simple_error(client_fd, 413, "Payload Too Large");
+            } else if (read_result == ReadResult::BadRequest) {
+                send_simple_error(client_fd, 400, "Bad Request");
+            }
             close(client_fd);
             return;
         }
-        
-        std::string request(buffer, bytes_read);
         
         // 解析 HTTP 请求
         std::istringstream request_stream(request);
@@ -138,6 +310,29 @@ private:
             body = request.substr(body_pos + 4);
         }
 
+        const auto origins = header_values(request, "origin");
+        if (origins.size() > 1 ||
+            (!origins.empty() &&
+             (cors_origin_.empty() || origins.front() != cors_origin_))) {
+            send_simple_error(client_fd, 403, "Forbidden Origin");
+            close(client_fd);
+            return;
+        }
+
+        if (method == "POST") {
+            const auto content_types = header_values(request, "content-type");
+            if (content_types.size() != 1 ||
+                !is_json_content_type(content_types.front())) {
+                send_simple_error(client_fd, 415, "Unsupported Media Type");
+                close(client_fd);
+                return;
+            }
+        } else if (method != "GET" && method != "OPTIONS") {
+            send_simple_error(client_fd, 405, "Method Not Allowed");
+            close(client_fd);
+            return;
+        }
+
         // CORS 预检请求 (OPTIONS)
         if (method == "OPTIONS") {
             std::ostringstream response;
@@ -149,7 +344,7 @@ private:
             response << "Content-Length: 0\r\n";
             response << "\r\n";
             std::string response_str = response.str();
-            write(client_fd, response_str.c_str(), response_str.length());
+            send_all(client_fd, response_str);
             close(client_fd);
             return;
         }
@@ -165,7 +360,7 @@ private:
             response << "\r\n";
             response << health_body;
             std::string response_str = response.str();
-            write(client_fd, response_str.c_str(), response_str.length());
+            send_all(client_fd, response_str);
             close(client_fd);
             return;
         }
@@ -213,7 +408,7 @@ private:
         response << response_body;
 
         std::string response_str = response.str();
-        write(client_fd, response_str.c_str(), response_str.length());
+        send_all(client_fd, response_str);
 
         close(client_fd);
     }
@@ -234,7 +429,7 @@ private:
         header << "\r\n";
         
         std::string header_str = header.str();
-        if (write(client_fd, header_str.c_str(), header_str.length()) < 0) {
+        if (!send_all(client_fd, header_str)) {
             close(client_fd);
             return;
         }
@@ -244,13 +439,12 @@ private:
             handler(body, [client_fd](const std::string& event_data) -> bool {
                 // 格式化为 SSE 事件
                 std::string sse_event = "data: " + event_data + "\n\n";
-                ssize_t written = write(client_fd, sse_event.c_str(), sse_event.length());
-                return written > 0;
+                return send_all(client_fd, sse_event);
             });
         } catch (const std::exception& e) {
             // 发送错误事件
             std::string error_event = "data: {\"error\":\"" + std::string(e.what()) + "\"}\n\n";
-            write(client_fd, error_event.c_str(), error_event.length());
+            send_all(client_fd, error_event);
         }
         
         close(client_fd);

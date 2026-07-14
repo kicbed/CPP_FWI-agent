@@ -1,5 +1,9 @@
 # Embedding 升级说明
 
+> **历史设计记录。** 本文描述的是早期 DashScope Embedding 方案，不代表当前默认
+> 实现。当前版本可使用本地 Qwen Embedding 做 AgentCard 路由，离线时回退关键词；FWI
+> 本地文档检索是独立链路。实际配置请看 `README.md` 和 `docs/DEPLOYMENT.md`。
+
 ## 一、问题
 
 原来 Agent-RAG 使用关键词匹配，没有复用现有的 EmbeddingService，且每次都要重新计算向量。
@@ -186,7 +190,7 @@ Agent 注册
 
 ```bash
 # 启用 Embedding 模式
-export DASHSCOPE_API_KEY=sk-your-dashscope-api-key
+export DASHSCOPE_API_KEY="<your-dashscope-api-key>"
 
 # 不设置则使用关键词模式（回退）
 ```

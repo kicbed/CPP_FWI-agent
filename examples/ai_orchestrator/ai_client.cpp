@@ -22,9 +22,19 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 
 using namespace a2a;
 using json = nlohmann::json;
+
+static std::string new_context_id() {
+    static std::atomic<std::uint64_t> sequence{0};
+    const auto now = std::chrono::system_clock::now().time_since_epoch().count();
+    return "ctx-cli-" + std::to_string(now) + "-" +
+           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed) + 1);
+}
 
 // ============================================================
 // 颜色
@@ -273,7 +283,7 @@ int main(int argc, char* argv[]) {
 
             // n = 新建
             if (input == "n" || input == "N") {
-                ctx = "ctx-" + std::to_string(std::time(nullptr));
+                ctx = new_context_id();
                 chat_mode = true;
                 std::cout << C::CL;
                 std::cout << "\n" << C::CY << "  ┌─────────────────────────────────────────────────────────────────┐" << C::R << "\n";
@@ -322,7 +332,7 @@ int main(int argc, char* argv[]) {
             } catch(...) {}
 
             // 默认：新建对话
-            ctx = "ctx-" + std::to_string(std::time(nullptr));
+            ctx = new_context_id();
             chat_mode = true;
             std::cout << C::CL;
             std::cout << "\n" << C::G << "  ✓ 开始新对话" << C::R << "\n\n";

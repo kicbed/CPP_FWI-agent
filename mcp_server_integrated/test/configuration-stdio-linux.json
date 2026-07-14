@@ -1,10 +1,10 @@
 {
   "mcpServers": {
     "mcp-server": {
-      "command": "/home/giuseppe/Documents/GITHUB/mcp_server/build/mcp_server",
+      "command": "./build/mcp_server",
       "args": [
-        "-l","/home/giuseppe/Documents/GITHUB/mcp_server/build/logs",
-        "-p","/home/giuseppe/Documents/GITHUB/mcp_server/build/plugins"
+        "-l","./build/logs",
+        "-p","./build/plugins"
       ],
       "env": {
         "CUSTOM_API_KEY_1": "your-api-key-here",

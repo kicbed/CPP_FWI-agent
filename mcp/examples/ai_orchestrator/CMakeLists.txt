@@ -1,6 +1,10 @@
 # AI Orchestrator Example
 # 基于 a2a-cpp/examples/multi_agent_demo 的集成示例
 
+message(FATAL_ERROR
+    "mcp/examples/ai_orchestrator is a retired legacy snapshot and must not be built. "
+    "Use examples/ai_orchestrator through the repository root CMake project.")
+
 cmake_minimum_required(VERSION 3.15)
 
 # 查找 hiredis (Redis 客户端)

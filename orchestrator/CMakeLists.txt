@@ -7,6 +7,7 @@ cmake_minimum_required(VERSION 3.15)
 # Source files
 set(ORCHESTRATOR_SOURCES
     src/agent_router.cpp
+    src/context_window.cpp
     src/memory_manager.cpp
 )
 
@@ -17,6 +18,7 @@ set(ORCHESTRATOR_HEADERS
     include/agent_rpc/orchestrator/request_context.h
     include/agent_rpc/orchestrator/trace_logger.h
     include/agent_rpc/orchestrator/config.h
+    include/agent_rpc/orchestrator/context_window.h
     include/agent_rpc/orchestrator/memory_manager.h
 )
 

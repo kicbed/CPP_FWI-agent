@@ -2,6 +2,7 @@
 #include "json.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <cstdint>
@@ -169,6 +170,19 @@ int main() {
 
     const json traversal = call(plugin, "fwi_get_status", {{"job_id", "../../root"}});
     require(traversal.at("isError") == true, "path traversal job_id must be rejected");
+
+    require(::setenv("FWI_RUN_ROOT", "/", 1) == 0,
+            "could not set unsafe FWI_RUN_ROOT for test");
+    const json unsafe_root = call(plugin, "fwi_get_status", {
+        {"job_id", "fwi-20000101T000000Z-000000000000"}
+    });
+    require(unsafe_root.at("isError") == true,
+            "filesystem root must be rejected as FWI_RUN_ROOT");
+    require(payload(unsafe_root).at("message").get<std::string>().find("dedicated") !=
+                std::string::npos,
+            "unsafe run-root rejection must be explicit");
+    require(::setenv("FWI_RUN_ROOT", kRunRoot, 1) == 0,
+            "could not restore FWI_RUN_ROOT after test");
 
     const fs::path root(kRunRoot);
     fs::create_directories(root);

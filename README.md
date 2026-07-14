@@ -17,7 +17,17 @@
 ./stop.sh
 ```
 
-`stop.sh` 可以重复执行；已经停止的服务不会导致脚本失败。
+`stop.sh` 可以重复执行；已经停止的服务不会导致脚本失败。它不删除 Redis/浏览器历史，
+也不等于取消已提交的 FWI 任务。
+
+新开一个了解本项目约束和已采纳决策的 Codex 开发会话：
+
+```bash
+./scripts/codex-project.sh
+```
+
+它与产品服务的 `start.sh` 相互独立；启动前检查可运行
+`./scripts/codex-project.sh --check`，详细边界见后文的 Codex 工作流文档。
 
 需要使用 Web 的 gRPC 模式时，也仍从同一个根入口启动：
 
@@ -35,6 +45,9 @@
 
 - 更换/注册模型及当前全部反演参数：[模型与数值配置指南](docs/MODEL_GUIDE.md)
 - 自己从浏览器逐步验收：[Web 前端端到端测试](docs/FRONTEND_TEST.md)
+- 会话隔离、上下文窗口、历史保留与隐私：[对话上下文与历史管理](docs/CONVERSATION_MANAGEMENT.md)
+- 跨 Codex 会话延续的已采纳方向与待实现项：[项目持续开发与已采纳决策](docs/PROJECT_CONTINUITY.md)
+- 在仓库内安全启动新 Codex 会话：[Codex 项目入口与跨会话工作流](docs/CODEX_WORKFLOW.md)
 
 ## 当前能做什么
 
@@ -45,6 +58,9 @@
 - 提供 `forward`、2 次迭代 `fwi_smoke` 和 5 次迭代 `fwi_demo` preset。
 - 生成模型、炮集、残差、损失曲线、状态、指标和 manifest 等结构化产物。
 - 通过白名单 MCP 工具异步提交任务，并在 Web UI 中查看状态、指标和图片。
+- FWI 理论问题会先检索仓库内受控的本地知识文档；该检索不依赖 Embedding 在线。
+- Agent-RAG 可选用本地 Qwen Embedding 做 AgentCard 语义路由，离线时退回关键词匹配。
+- Web 对行内和块级 LaTeX 公式按需渲染，渲染组件不可用时保留可读 TeX。
 
 这不是生产级反演系统。观测数据与反演传播均由 Deepwave 生成，属于合成端到端/逆犯罪验证，主要用于验证系统调用、梯度、优化和结果展示流程，不能据此宣称对实际数据的普遍反演效果。
 
@@ -64,6 +80,10 @@
 ```text
 什么是 FWI？只解释概念，不要运行任务。
 ```
+
+此类理论问题会使用 `resources/fwi_knowledge` 等本地资料作为有界参考，并要求在资料
+支持的结论后标注对应本地文档标题。Embedding 状态与这套文档检索是两件事：Embedding 只用于
+Agent-RAG 路由，即使它被禁用或暂时离线，本地 FWI 知识仍然可用。
 
 如果只想确认能力或查看启动方法，可以问：
 
@@ -142,7 +162,8 @@ python -m fwi_worker invert \
 查看任务状态：
 
 ```bash
-python -m fwi_worker status --run-dir /root/fwi-runs/<job_id>
+JOB_ID=fwi-YYYYMMDDTHHMMSSZ-xxxxxxxxxxxx
+python -m fwi_worker status --run-dir "/root/fwi-runs/$JOB_ID"
 ```
 
 ## 架构
@@ -168,6 +189,16 @@ FWI_RUN_ROOT ── 状态、指标、数组和 PNG 结果
 ```
 
 数值算法只存在于独立 Python Worker 中；C++ MCP 插件只负责白名单参数校验、安全启动、状态查询和结果读取。通用 JobBackend 的 dry-run 限制没有被解除。
+
+首次启用本地 Agent-RAG Embedding 时先显式准备模型缓存：
+
+```bash
+deploy/scripts/setup_embedding.sh
+```
+
+随后设置 `ROUTING_MODE=agent-rag`、`EMBEDDING_PROVIDER=local` 和
+`ENABLE_LOCAL_EMBEDDING=auto`，根 `start.sh`/`stop.sh` 会统一托管服务。日常启动不会
+自动下载模型，默认使用 CPU，避免与 Deepwave FWI 争用 GPU。详细配置见部署文档。
 
 ## 快速测试
 
@@ -201,22 +232,40 @@ CUDA 运行前建议确认：
 
 ## 安全边界
 
-- 不要提交 `.env`，不要把 API Key 写入命令、README、配置样例或日志。
-- MCP 只接受固定的 `model_id`、preset 和 `cpu|cuda`，不接受 shell、Python 路径、模型路径或额外参数。
+- 不要提交 `.env`，不要把 API Key 写入命令、README、配置样例或日志。`.env` 由 Bash
+  `source` 加载，只能使用自己创建且权限为 600 的可信赋值文件；它不是 secret manager。
+- 根启动器只让需要调用 LLM 的 Agent 继承当前 provider 的 Key；Redis、Registry、Web、
+  gRPC、Embedding、MCP 和 FWI Worker 会显式剥离 provider Key。为自动重启 Orchestrator，
+  watchdog 仍保留已最小化的当前 LLM 凭据，以及仅在使用 DashScope Embedding 时所需的
+  对应凭据；同一操作系统账号仍应视为同一安全边界。
+- 使用云端 LLM 时，当前问题和有界历史会发往该 provider 的固定官方 endpoint；
+  不要在聊天中粘贴 Key 或未授权数据。`local` provider 只允许带显式端口和路径的严格
+  loopback HTTP endpoint，并会绕过系统代理且拒绝重定向。
+- AgentCard 向量缓存写入忽略的私有运行目录，使用不跟随符号链接的文件访问和原子替换；
+  缓存只是性能优化，损坏或身份不匹配时会重新计算或退回关键词路由。
+- MCP 只接受固定的 `model_id`、preset、`cpu|cuda` 和仅反演可用的 `iterations=1..100`，
+  不接受 shell、Python 路径、模型路径或任意额外参数；单个 runner 并发上限为 2 个作业。
 - Worker 通过部署时受控的绝对 Python 路径、固定模块和参数数组启动；该路径不接受 MCP 用户输入，不使用 `std::system`，也不执行用户提供的任意命令。
 - Artifact 路由会解析并约束真实路径，拒绝 `..`、绝对路径、符号链接逃逸、目录列表和非白名单后缀。
 - 当前 Web 服务面向本机实验使用，不带身份认证；不要直接暴露到公网。
+- 每个 Web 对话使用独立 `contextId`；历史采用有界完整回合窗口并按会话隔离 FWI 工具状态。内置
+  Redis 默认在仓库外使用 AOF `everysec` 持久化；session 每回合刷新 TTL，tool state 只在新
+  job_id 落盘时刷新。异常崩溃可能丢失最后约 1 秒，当前也没有备份/HA。浏览器
+  localStorage 与 Redis 数据均为明文，敏感实验应使用加密磁盘或关闭持久化并清除本地历史。
+- 专业 Agent 接收有界、保留原始角色的上下文 envelope，不再共享一份 legacy history；
+  Web 服务设置 CSP 等安全响应头。但前端依赖仍来自固定第三方 CDN，高敏感离线环境应先
+  将这些依赖本地化，且不要把当前无登录鉴权的服务暴露给其他用户。
 - 当前不连接 SSH、Slurm、PBS 或远程集群，也不支持任意本地作业后端。
 
 ## 范围与限制
 
-当前只覆盖二维常密度声学、单参数 `Vp`、单频 8 Hz、CPU/单 GPU 和小规模合成验证。尚不支持弹性波、密度或 `Vs` 反演、3D、MPI、多 GPU、SEG-Y 直接读取、远程调度、复杂目标函数和任务取消。
+当前只覆盖二维常密度声学、单参数 `Vp`、主频 8 Hz 的宽带 Ricker 子波、当前单阶段反演、CPU/单 GPU 和小规模合成验证。尚不支持弹性波、密度或 `Vs` 反演、3D、MPI、多 GPU、SEG-Y 直接读取、远程调度、复杂目标函数和任务取消。
 
 当前参数策略是“用户明确给值就校验后执行，省略时使用记录在 resolved config 中的保守
 默认值”。由 Agent 提议参数后等待人工审批，或由用户授权 Agent 全权选择参数的交互工作流
 尚未实现，作为后续功能保留。
 
-完整的宿主机环境配置、仓库外 Python venv、Docker 隔离、模型放置、启动参数、健康检查、日志、故障排查及卸载步骤见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。模型注册和参数解释见 [docs/MODEL_GUIDE.md](docs/MODEL_GUIDE.md)，浏览器验收步骤见 [docs/FRONTEND_TEST.md](docs/FRONTEND_TEST.md)。
+完整的宿主机环境配置、仓库外 Python venv、Docker 隔离、模型放置、启动参数、健康检查、日志、故障排查及卸载步骤见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。模型注册和参数解释见 [docs/MODEL_GUIDE.md](docs/MODEL_GUIDE.md)，浏览器验收步骤见 [docs/FRONTEND_TEST.md](docs/FRONTEND_TEST.md)，上下文与历史语义见 [docs/CONVERSATION_MANAGEMENT.md](docs/CONVERSATION_MANAGEMENT.md)。
 
 ## 许可证与使用提示
 
