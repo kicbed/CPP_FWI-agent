@@ -7,7 +7,7 @@
 | 分支 | 定位 | Deepwave 二维声学 FWI |
 |---|---|---|
 | `main` | 多 Agent 通信框架基线 | 不包含当前实验 Worker 和一键部署改造 |
-| `feature/fwi-deepwave-2d-acoustic` | 当天可运行的端到端 FWI MVP | 支持 Deepwave `scalar`、CPU/单张 NVIDIA GPU、正演、2/5 次迭代 FWI、MCP 和 Web 图片展示 |
+| `feature/fwi-deepwave-2d-acoustic` | 可运行的端到端 FWI MVP | 支持 Deepwave `scalar`、CPU/单张 NVIDIA GPU、正演、默认 2/5 次或显式 1–100 次迭代、MCP、真实 gRPC bridge 和 Web 图片展示 |
 
 因此，旧文档中“项目不执行真实 CUDA”的笼统说法已经不准确。更精确的边界是：
 
@@ -30,6 +30,21 @@ chmod 600 .env
 ./start.sh
 # 浏览器打开 http://127.0.0.1:8080
 ```
+
+默认使用 HTTP。需要在 Web 中测试 gRPC 模式时使用：
+
+```bash
+./start.sh --grpc
+```
+
+启动反演可直接输入：
+
+```text
+使用 marmousi_94_288 在 CUDA 上运行 50 次迭代的 FWI，并向我展示结果。
+```
+
+任务会先异步返回 `job_id`，成功后页面再加载真实指标和图片。`fwi_smoke` / `fwi_demo`
+省略迭代数时默认 2 / 5 次；显式值必须是 1–100 的整数。
 
 一键关闭：
 
@@ -67,7 +82,7 @@ ctest --test-dir build --output-on-failure
 - `.env`、API Key、私钥、模型、运行结果、日志、PID、虚拟环境和本地构建目录都不应进入 Git；
 - 模型和 FWI 结果位于仓库外，拉取代码后在自己的环境中编译；
 - 当前 Web 服务没有用户认证，默认只应监听回环地址，不要直接暴露到公网；
-- FWI MCP 入口只接受固定的 `model_id`、preset 和 `cpu|cuda`，不接受路径、Python 可执行文件或 shell 参数。
+- FWI MCP 入口只接受固定的 `model_id`、preset、`cpu|cuda` 和有界整数 `iterations`，不接受路径、Python 可执行文件或 shell 参数。
 
 ## 实验性质说明
 
