@@ -198,7 +198,12 @@ int main(int argc, char **argv) {
                         if (res_ptr) {
                             try {
                                 response["result"] = json::parse(res_ptr);
-                                response["result"]["isError"] = false;
+                                // Preserve a plugin's explicit tool-level error. This is
+                                // required for strict argument validation (including the
+                                // fixed-whitelist FWI runner) to reach MCP clients.
+                                if (!response["result"].contains("isError")) {
+                                    response["result"]["isError"] = false;
+                                }
                             } catch (const json::parse_error& e) {
                                 response["result"]["isError"] = true;
                                 response["result"]["content"] = json::array();

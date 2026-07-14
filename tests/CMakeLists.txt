@@ -456,6 +456,24 @@ target_include_directories(test_mcp_integration PRIVATE
 
 add_test(NAME MCPIntegrationTest COMMAND test_mcp_integration)
 
+# Deterministic routing for the fixed-whitelist Deepwave FWI MCP tools.
+add_executable(test_fwi_tool_routing test_fwi_tool_routing.cpp)
+target_link_libraries(test_fwi_tool_routing
+    agent_rpc_mcp
+    agent_rpc_common
+    GTest::gtest
+    GTest::gtest_main
+    pthread
+)
+target_include_directories(test_fwi_tool_routing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../mcp/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../a2a/third_party
+)
+add_test(NAME FWIToolRoutingTest COMMAND test_fwi_tool_routing)
+
 # RAG-MCP 属性测试
 # **Feature: rag-mcp, Property 1-8**
 # **Validates: Requirements 1.3, 3.2, 3.3, 3.4, 4.1, 4.3, 7.2, 7.3**

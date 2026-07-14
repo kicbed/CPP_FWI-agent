@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(mcp_server)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
@@ -74,3 +76,4 @@ add_subdirectory(plugins/calculator)
 
 # FWI Plugins
 add_subdirectory(plugins/fwi-metadata)
+add_subdirectory(plugins/fwi-runner)

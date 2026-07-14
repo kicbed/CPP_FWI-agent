@@ -21,6 +21,10 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <initializer_list>
+#include <algorithm>
+#include <mutex>
+#include <regex>
 
 using json = nlohmann::json;
 
@@ -37,6 +41,93 @@ struct ToolCallResult {
     std::string result;
     std::string error;
 };
+
+namespace detail {
+
+inline bool contains_any(const std::string& text,
+                         std::initializer_list<const char*> needles) {
+    for (const char* needle : needles) {
+        if (text.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+inline std::string extract_fwi_job_id(const std::string& text) {
+    static const std::regex pattern(R"(fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12})");
+    std::smatch match;
+    return std::regex_search(text, match, pattern) ? match.str(0) : std::string();
+}
+
+inline bool is_fwi_theory_query(const std::string& query) {
+    const bool mentions_fwi = contains_any(
+        query, {"FWI", "fwi", "全波形反演", "声学反演"});
+    const bool asks_theory = contains_any(
+        query, {"什么是", "解释", "理论", "原理", "公式", "为什么", "为何", "区别",
+                "如何", "怎么", "方法", "步骤"});
+    return mentions_fwi && asks_theory;
+}
+
+/**
+ * Deterministic routing for the fixed FWI execution surface. It intentionally
+ * requires an execution/status/result intent, so a theory question can never
+ * submit a numerical job merely because the same acronym appears.
+ */
+inline ToolCallResult plan_fwi_tool_call(const std::string& query,
+                                         const std::string& last_job_id = {}) {
+    ToolCallResult call{false, "", json::object(), "", ""};
+    if (is_fwi_theory_query(query)) return call;
+
+    const std::string explicit_job_id = extract_fwi_job_id(query);
+    const std::string job_id = explicit_job_id.empty() ? last_job_id : explicit_job_id;
+    const bool mentions_fwi = contains_any(
+        query, {"FWI", "fwi", "全波形反演", "声学反演", "反演", "Marmousi",
+                "marmousi_94_288"});
+    const bool refers_to_previous = contains_any(query, {"刚才", "上一个", "上一项"});
+
+    if (contains_any(query, {"状态", "进度", "status", "progress"}) &&
+        (mentions_fwi || refers_to_previous || !explicit_job_id.empty())) {
+        if (job_id.empty()) return call;
+        call.success = true;
+        call.tool_name = "fwi_get_status";
+        call.arguments = {{"job_id", job_id}};
+        return call;
+    }
+
+    if (contains_any(query, {"显示", "结果", "损失曲线", "loss curve", "炮集",
+                             "反演模型"}) &&
+        (mentions_fwi || refers_to_previous || !explicit_job_id.empty())) {
+        if (job_id.empty()) return call;
+        call.success = true;
+        call.tool_name = "fwi_get_result";
+        call.arguments = {{"job_id", job_id}};
+        return call;
+    }
+
+    const bool asks_to_run = contains_any(
+        query, {"运行", "执行", "提交", "启动", "开始", "run", "demo", "演示",
+                "smoke", "test", "测试"});
+    const bool names_model = contains_any(query, {"marmousi_94_288", "Marmousi", "marmousi"});
+    if (!asks_to_run || !mentions_fwi || !names_model) return call;
+
+    std::string preset = "fwi_demo";
+    if (contains_any(query, {"正演", "forward"})) {
+        preset = "forward";
+    } else if (contains_any(query, {"smoke", "两次迭代", "2次迭代", "2 次迭代"})) {
+        preset = "fwi_smoke";
+    }
+
+    const std::string device = contains_any(query, {"CPU", "cpu"}) ? "cpu" : "cuda";
+    call.success = true;
+    call.tool_name = "fwi_submit_demo";
+    call.arguments = {
+        {"model_id", "marmousi_94_288"},
+        {"preset", preset},
+        {"device", device}
+    };
+    return call;
+}
+
+}  // namespace detail
 
 /**
  * @brief Tool Calling Engine
@@ -59,6 +150,15 @@ public:
             return llm_client.chat(sys, user);
         }) {}
 
+    bool has_explicit_fwi_action(const std::string& query) {
+        std::string last_job_id;
+        {
+            std::lock_guard<std::mutex> lock(fwi_state_mutex_);
+            last_job_id = last_fwi_job_id_;
+        }
+        return !detail::plan_fwi_tool_call(query, last_job_id).tool_name.empty();
+    }
+
     /**
      * @brief Process a query with tool calling
      * @param query User query
@@ -75,8 +175,41 @@ public:
             return "";
         }
 
+        std::string last_job_id;
+        {
+            std::lock_guard<std::mutex> lock(fwi_state_mutex_);
+            last_job_id = last_fwi_job_id_;
+        }
+        const auto fwi_call = detail::plan_fwi_tool_call(query, last_job_id);
+        if (!fwi_call.tool_name.empty()) {
+            auto result = execute_tool(fwi_call);
+            if (result.success && fwi_call.tool_name == "fwi_submit_demo") {
+                const std::string submitted_job_id = detail::extract_fwi_job_id(result.result);
+                if (!submitted_job_id.empty()) {
+                    std::lock_guard<std::mutex> lock(fwi_state_mutex_);
+                    last_fwi_job_id_ = submitted_job_id;
+                }
+            }
+            return result.success ? result.result : std::string();
+        }
+
+        // A theory query may use FWI vocabulary that is close to the runner's
+        // embedding. Keep it on the explanatory path instead of asking an LLM
+        // tool selector to decide whether to launch a job.
+        if (detail::is_fwi_theory_query(query)) return "";
+
         // Step 1: Retrieve candidate tools
         auto candidates = retrieve_tools(query, 5);
+        // FWI job tools are stateful and security-sensitive. They are selected
+        // only by the deterministic intent/whitelist planner above, never by
+        // the generic LLM fallback (which could otherwise launch on a merely
+        // semantically similar theory question).
+        candidates.erase(
+            std::remove_if(candidates.begin(), candidates.end(), [](const auto& tool) {
+                return tool.name == "fwi_submit_demo" || tool.name == "fwi_get_status" ||
+                       tool.name == "fwi_get_result";
+            }),
+            candidates.end());
         if (candidates.empty()) {
             return "";
         }
@@ -285,11 +418,24 @@ private:
             return {{"query", query}};
         }
 
+        if (tool.name == "fwi_submit_demo" || tool.name == "fwi_get_status" ||
+            tool.name == "fwi_get_result") {
+            std::string last_job_id;
+            {
+                std::lock_guard<std::mutex> lock(fwi_state_mutex_);
+                last_job_id = last_fwi_job_id_;
+            }
+            const auto call = detail::plan_fwi_tool_call(query, last_job_id);
+            if (call.tool_name == tool.name) return call.arguments;
+        }
+
         return json::object();
     }
 
     agent_rpc::mcp::MCPAgentIntegration* mcp_integration_;
     std::function<std::string(const std::string&, const std::string&)> chat_func_;
+    std::mutex fwi_state_mutex_;
+    std::string last_fwi_job_id_;
 };
 
 } // namespace orchestrator

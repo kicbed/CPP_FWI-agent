@@ -143,6 +143,8 @@
     .kv-grid dd { color: #1E293B; overflow-wrap: anywhere; }
     .kv-grid dt:last-of-type, .kv-grid dd:last-of-type { border-bottom: 0; }
     .status-dot { width: 8px; height: 8px; border-radius: 999px; background: #CBD5E1; }
+    .fwi-figure-card img { display: block; width: 100%; height: auto; background: #F1F5F9; }
+    .fwi-figure-card img.hidden { display: none; }
 
     @keyframes pulse-green {
       0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.4); }
@@ -338,6 +340,9 @@
       <!-- Messages container -->
       <div id="messages" class="max-w-3xl mx-auto space-y-4 hidden"></div>
 
+      <!-- Structured FWI job/result output -->
+      <section id="fwiResultPanel" aria-live="polite" class="max-w-5xl mx-auto mt-4 hidden"></section>
+
       <!-- Typing indicator -->
       <div id="typingIndicator" class="max-w-3xl mx-auto hidden">
         <div class="flex items-start gap-3 msg-enter">
@@ -455,6 +460,8 @@
       abortController: null,
       contextId: null,
       selectedAlgorithmId: 'fwi-cuda-mpi',
+      fwiJob: null,
+      fwiPollTimer: null,
     };
 
     const CONFIG = {
@@ -611,6 +618,7 @@
 
     // ===== Chat =====
     function newChat() {
+      resetFwiPanel();
       state.chatId = Date.now().toString();
       state.contextId = null;
       document.getElementById('messages').innerHTML = '';
@@ -622,6 +630,7 @@
     }
 
     function clearChat() {
+      resetFwiPanel();
       const msgs = document.getElementById('messages');
       msgs.innerHTML = '';
       msgs.classList.add('hidden');
@@ -631,6 +640,7 @@
     }
 
     function loadChat(chatId) {
+      resetFwiPanel();
       const chat = state.chats[chatId];
       if (!chat) return;
       state.chatId = chatId;
@@ -734,6 +744,8 @@
           answer = response.answer || '';
           renderedInPlace = !!response.renderedInPlace;
         }
+        const fwiPayload = extractFwiPayload(response) || extractFwiPayload(answer);
+        if (fwiPayload) handleFwiPayload(fwiPayload);
         if (!answer) answer = '无响应内容';
 
         if (!renderedInPlace) {
@@ -935,6 +947,355 @@
       }
 
       return JSON.stringify(result, null, 2);
+    }
+
+    // ===== FWI Structured Results =====
+    function extractFwiPayload(input) {
+      const acceptedTypes = new Set(['fwi_job_submitted', 'fwi_job_status', 'fwi_result']);
+      const visited = new WeakSet();
+
+      function parseJsonCandidates(text) {
+        const source = String(text || '').trim();
+        const parsed = [];
+        if (!source) return parsed;
+
+        try {
+          parsed.push(JSON.parse(source));
+          return parsed;
+        } catch (e) {}
+
+        for (const match of source.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+          try { parsed.push(JSON.parse(match[1].trim())); } catch (e) {}
+        }
+
+        for (let start = 0; start < source.length; start += 1) {
+          if (source.charCodeAt(start) !== 123) continue;
+          let depth = 0;
+          let inString = false;
+          let escaped = false;
+          for (let end = start; end < source.length; end += 1) {
+            const char = source[end];
+            if (inString) {
+              if (escaped) escaped = false;
+              else if (char === '\\') escaped = true;
+              else if (char === '"') inString = false;
+              continue;
+            }
+            if (char === '"') inString = true;
+            else if (char.charCodeAt(0) === 123) depth += 1;
+            else if (char.charCodeAt(0) === 125) {
+              depth -= 1;
+              if (depth === 0) {
+                try { parsed.push(JSON.parse(source.slice(start, end + 1))); } catch (e) {}
+                break;
+              }
+            }
+          }
+        }
+        return parsed;
+      }
+
+      function visit(value, depth) {
+        if (value == null || depth > 10) return null;
+        if (typeof value === 'string') {
+          for (const candidate of parseJsonCandidates(value)) {
+            const found = visit(candidate, depth + 1);
+            if (found) return found;
+          }
+          return null;
+        }
+        if (typeof value !== 'object') return null;
+        if (visited.has(value)) return null;
+        visited.add(value);
+        if (acceptedTypes.has(value.type)) return value;
+
+        const preferredKeys = ['text', 'content', 'result', 'message', 'answer', 'artifacts', 'parts', 'status'];
+        for (const key of preferredKeys) {
+          if (!(key in value)) continue;
+          const found = visit(value[key], depth + 1);
+          if (found) return found;
+        }
+        if (Array.isArray(value)) {
+          for (const item of value.slice(0, 100)) {
+            const found = visit(item, depth + 1);
+            if (found) return found;
+          }
+        }
+        return null;
+      }
+
+      return visit(input, 0);
+    }
+
+    function normalizeFwiJobId(value) {
+      const jobId = typeof value === 'string' ? value : '';
+      return /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(jobId) ? jobId : '';
+    }
+
+    function sanitizeFwiArtifactUrl(value, expectedJobId = '') {
+      if (typeof value !== 'string' || value.includes('?') || value.includes('#') || value.includes('\\')) return '';
+      const match = value.match(/^\/fwi-artifacts\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(.+)$/);
+      if (!match) return '';
+      if (expectedJobId && match[1] !== expectedJobId) return '';
+      const parts = match[2].split('/');
+      if (parts.some(part => !part || part === '.' || part === '..')) return '';
+      if (!/\.(?:json|csv|png)$/i.test(parts[parts.length - 1])) return '';
+      if (parts.some(part => !/^[A-Za-z0-9._-]+$/.test(part))) return '';
+      return value;
+    }
+
+    function renderFwiSubmissionHtml(payload) {
+      const jobId = normalizeFwiJobId(payload && payload.job_id);
+      const status = String((payload && payload.status) || 'queued');
+      const statusUrl = sanitizeFwiArtifactUrl(payload && payload.status_url, jobId);
+      if (!jobId || !statusUrl) {
+        return `<div class="workbench-card border-red-200 p-4"><h3 class="font-heading font-semibold text-red-700">FWI Result</h3><p class="mt-2 text-sm text-red-600">任务响应包含无效的 job_id 或 status_url，已拒绝轮询。</p></div>`;
+      }
+      return `<div class="workbench-card p-4 shadow-sm" data-fwi-view="submitted">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div><h3 class="font-heading font-semibold text-slate-900">FWI Result</h3><p class="text-xs text-slate-500 mt-1">二维常密度声学实验任务</p></div>
+          <span class="data-pill warning">${escapeHtml(status)}</span>
+        </div>
+        <dl class="kv-grid mt-4"><dt>job_id</dt><dd class="font-mono">${escapeHtml(jobId)}</dd><dt>status</dt><dd>${escapeHtml(status)}</dd><dt>status_url</dt><dd class="font-mono">${escapeHtml(statusUrl)}</dd></dl>
+        <button type="button" onclick="refreshFwiStatusForCurrentJob()" class="mt-3 px-3 py-2 rounded-lg bg-accent text-white text-xs font-semibold hover:bg-accent-dark">刷新状态</button>
+      </div>`;
+    }
+
+    function renderFwiStatusHtml(payload) {
+      const jobId = normalizeFwiJobId(payload && payload.job_id);
+      const status = String((payload && payload.status) || 'unknown');
+      const stage = String((payload && payload.stage) || '—');
+      const message = String((payload && payload.message) || '等待任务更新');
+      const iteration = Number.isFinite(Number(payload && payload.iteration)) ? Number(payload.iteration) : 0;
+      const total = Number.isFinite(Number(payload && payload.total_iterations)) ? Number(payload.total_iterations) : 0;
+      const progress = total > 0 ? `${iteration} / ${total}` : String(iteration);
+      const failed = status === 'failed';
+      return `<div class="workbench-card ${failed ? 'border-red-200' : ''} p-4 shadow-sm" data-fwi-view="status">
+        <div class="flex flex-wrap items-center justify-between gap-3"><div><h3 class="font-heading font-semibold text-slate-900">FWI Result</h3><p class="text-xs text-slate-500 mt-1">任务状态</p></div><span class="data-pill ${status === 'succeeded' ? '' : 'warning'}">${escapeHtml(status)}</span></div>
+        <dl class="kv-grid mt-4"><dt>job_id</dt><dd class="font-mono">${escapeHtml(jobId || 'invalid')}</dd><dt>stage</dt><dd>${escapeHtml(stage)}</dd><dt>iteration</dt><dd>${escapeHtml(progress)}</dd><dt>message</dt><dd class="${failed ? 'text-red-600' : ''}">${escapeHtml(message)}</dd></dl>
+        ${failed ? '' : '<button type="button" onclick="refreshFwiStatusForCurrentJob()" class="mt-3 px-3 py-2 rounded-lg bg-accent text-white text-xs font-semibold hover:bg-accent-dark">刷新状态</button>'}
+      </div>`;
+    }
+
+    function renderFwiResultHtml(manifest) {
+      const result = manifest && typeof manifest === 'object' ? manifest : {};
+      const metrics = result.metrics && typeof result.metrics === 'object' ? result.metrics : {};
+      const config = result.config_resolved && typeof result.config_resolved === 'object'
+        ? result.config_resolved : (result.config && typeof result.config === 'object' ? result.config : {});
+      const jobId = normalizeFwiJobId(result.job_id);
+
+      function pick(...keys) {
+        for (const key of keys) {
+          if (metrics[key] !== undefined && metrics[key] !== null) return metrics[key];
+          if (config[key] !== undefined && config[key] !== null) return config[key];
+        }
+        return null;
+      }
+      function format(value, suffix = '') {
+        if (value === null || value === undefined || value === '') return '—';
+        if (Array.isArray(value)) return `${value.map(item => String(item)).join(' × ')}${suffix}`;
+        if (typeof value === 'number') {
+          if (!Number.isFinite(value)) return '非有限值';
+          const absolute = Math.abs(value);
+          const text = absolute !== 0 && (absolute < 1e-3 || absolute >= 1e6)
+            ? value.toExponential(4) : Number(value.toPrecision(6)).toString();
+          return `${text}${suffix}`;
+        }
+        return `${String(value)}${suffix}`;
+      }
+
+      const lossReduction = pick('loss_reduction_fraction');
+      const initialError = pick('initial_model_relative_l2');
+      const finalError = pick('final_model_relative_l2');
+      const modelError = initialError !== null || finalError !== null
+        ? `${format(initialError)} → ${format(finalError)}` : '—';
+      const rows = [
+        ['shape [z × x]', format(pick('model_shape', 'shape'))],
+        ['dx / dz', `${format(pick('dx_m'), ' m')} / ${format(pick('dz_m'), ' m')}`],
+        ['source frequency', format(pick('source_frequency_hz', 'frequency_hz'), ' Hz')],
+        ['dt / nt', `${format(pick('dt_s'), ' s')} / ${format(pick('nt'))}`],
+        ['shots / receivers', `${format(pick('n_shots'))} / ${format(pick('n_receivers'))}`],
+        ['iterations', format(pick('iterations', 'total_iterations'))],
+        ['initial loss', format(pick('initial_loss'))],
+        ['final loss', format(pick('final_loss'))],
+        ['loss reduction', typeof lossReduction === 'number' && Number.isFinite(lossReduction) ? `${(lossReduction * 100).toFixed(2)}%` : format(lossReduction)],
+        ['model relative L2', modelError],
+        ['observed/predicted L2', format(pick('observed_predicted_relative_l2'))],
+        ['device', format(pick('device_name', 'device'))],
+        ['runtime', format(pick('elapsed_seconds'), ' s')],
+      ];
+
+      const requiredFigures = [
+        ['true_model', '真实速度模型'],
+        ['initial_model', '初始速度模型'],
+        ['inverted_model', '反演速度模型'],
+        ['model_error', '模型误差'],
+        ['shot_gathers', '观测 / 模拟 / 残差炮集'],
+        ['loss_curve', '损失曲线'],
+      ];
+      const figures = Array.isArray(result.figures) ? result.figures : [];
+      const cards = requiredFigures.map(([id, fallbackTitle]) => {
+        const figure = figures.find(item => item && item.id === id);
+        const title = figure && figure.title ? String(figure.title) : fallbackTitle;
+        const url = figure ? sanitizeFwiArtifactUrl(figure.url, jobId) : '';
+        if (!figure) {
+          return `<article class="fwi-figure-card rounded-lg border border-amber-200 bg-amber-50 overflow-hidden" data-fwi-figure="${id}"><div class="p-3"><h4 class="text-sm font-semibold text-slate-800">${escapeHtml(title)}</h4><p class="text-xs text-amber-700 mt-2">manifest 未提供该图片。</p></div></article>`;
+        }
+        if (!url || !/\.png$/i.test(url)) {
+          return `<article class="fwi-figure-card rounded-lg border border-red-200 bg-red-50 overflow-hidden" data-fwi-figure="${id}"><div class="p-3"><h4 class="text-sm font-semibold text-slate-800">${escapeHtml(title)}</h4><p class="text-xs text-red-600 mt-2">图片地址缺失或不安全，已拒绝加载。</p></div></article>`;
+        }
+        return `<article class="fwi-figure-card rounded-lg border border-slate-200 bg-white overflow-hidden" data-fwi-figure="${id}">
+          <div class="p-3 border-b border-slate-100"><h4 class="text-sm font-semibold text-slate-800">${escapeHtml(title)}</h4></div>
+          <img src="${escapeHtml(url)}" alt="${escapeHtml(title)}" loading="lazy" onerror="handleFwiImageError(this)">
+          <p class="fwi-image-error hidden p-3 text-xs text-red-600" role="alert">图片加载失败：artifact 不存在或无法解码。</p>
+        </article>`;
+      }).join('');
+
+      const summary = String(result.summary || 'Deepwave 二维常密度声学 FWI 实验结果');
+      return `<div class="workbench-card p-4 shadow-sm" data-fwi-view="result">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div><h3 class="font-heading font-semibold text-slate-900">FWI Result</h3><p class="text-xs text-slate-500 mt-1">${escapeHtml(summary)}</p></div>
+          <span class="data-pill">${escapeHtml(String(result.status || 'succeeded'))}</span>
+        </div>
+        <p class="mt-3 text-xs text-slate-500">job_id: <span class="font-mono text-slate-700">${escapeHtml(jobId || 'unknown')}</span></p>
+        <div class="mt-4">${renderKeyValueGrid(rows)}</div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">${cards}</div>
+      </div>`;
+    }
+
+    function showFwiPanel(html) {
+      const panel = document.getElementById('fwiResultPanel');
+      if (!panel) return;
+      panel.innerHTML = html;
+      panel.classList.remove('hidden');
+      scrollToBottom();
+    }
+
+    function resetFwiPanel() {
+      if (state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
+      state.fwiPollTimer = null;
+      state.fwiJob = null;
+      const panel = document.getElementById('fwiResultPanel');
+      if (panel) {
+        panel.innerHTML = '';
+        panel.classList.add('hidden');
+      }
+    }
+
+    function scheduleFwiPoll(delayMs = 1500) {
+      if (state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
+      state.fwiPollTimer = setTimeout(() => {
+        state.fwiPollTimer = null;
+        refreshFwiStatusForCurrentJob();
+      }, delayMs);
+    }
+
+    async function fetchFwiJson(url, expectedJobId) {
+      const safeUrl = sanitizeFwiArtifactUrl(url, expectedJobId);
+      if (!safeUrl || !/\.json$/i.test(safeUrl)) throw new Error('不安全的 FWI artifact URL');
+      const response = await fetch(safeUrl, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`artifact HTTP ${response.status}`);
+      const payload = await response.json();
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('artifact JSON 格式无效');
+      return payload;
+    }
+
+    async function loadFwiManifest(jobId, resultUrl) {
+      const safeJobId = normalizeFwiJobId(jobId);
+      if (!safeJobId) return;
+      const manifestUrl = sanitizeFwiArtifactUrl(resultUrl, safeJobId)
+        || `/fwi-artifacts/${safeJobId}/manifest.json`;
+      try {
+        const manifest = await fetchFwiJson(manifestUrl, safeJobId);
+        const [metrics, config] = await Promise.all([
+          fetchFwiJson(`/fwi-artifacts/${safeJobId}/metrics.json`, safeJobId).catch(() => null),
+          fetchFwiJson(`/fwi-artifacts/${safeJobId}/config.resolved.json`, safeJobId).catch(() => null),
+        ]);
+        manifest.type = 'fwi_result';
+        manifest.job_id = safeJobId;
+        manifest.metrics = { ...(manifest.metrics || {}), ...(metrics || {}) };
+        if (config) manifest.config_resolved = config;
+        handleFwiPayload(manifest);
+      } catch (error) {
+        showFwiPanel(renderFwiStatusHtml({
+          job_id: safeJobId,
+          status: 'failed',
+          stage: 'load_result',
+          message: `结果加载失败：${error.message}`,
+        }));
+      }
+    }
+
+    async function refreshFwiStatusForCurrentJob() {
+      const current = state.fwiJob;
+      if (!current) return;
+      const jobId = normalizeFwiJobId(current.job_id);
+      const statusUrl = sanitizeFwiArtifactUrl(current.status_url, jobId)
+        || (jobId ? `/fwi-artifacts/${jobId}/status.json` : '');
+      if (!jobId || !statusUrl) {
+        showFwiPanel(renderFwiStatusHtml({ status: 'failed', stage: 'validate', message: '无效的任务标识或状态地址' }));
+        return;
+      }
+      try {
+        const status = await fetchFwiJson(statusUrl, jobId);
+        status.type = 'fwi_job_status';
+        status.job_id = jobId;
+        status.status_url = statusUrl;
+        handleFwiPayload(status);
+      } catch (error) {
+        showFwiPanel(renderFwiStatusHtml({ ...current, stage: 'status_poll', message: `状态刷新失败：${error.message}` }));
+        scheduleFwiPoll(4000);
+      }
+    }
+
+    function handleFwiPayload(payload) {
+      if (!payload || typeof payload !== 'object') return false;
+      const type = payload.type;
+      if (!['fwi_job_submitted', 'fwi_job_status', 'fwi_result'].includes(type)) return false;
+
+      if (type === 'fwi_result') {
+        if (state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
+        state.fwiPollTimer = null;
+        const jobId = normalizeFwiJobId(payload.job_id);
+        state.fwiJob = jobId ? { ...(state.fwiJob || {}), job_id: jobId, status: payload.status || 'succeeded' } : state.fwiJob;
+        showFwiPanel(renderFwiResultHtml(payload));
+        return true;
+      }
+
+      const jobId = normalizeFwiJobId(payload.job_id);
+      if (!jobId) {
+        showFwiPanel(renderFwiSubmissionHtml(payload));
+        return false;
+      }
+      const statusUrl = sanitizeFwiArtifactUrl(payload.status_url, jobId)
+        || `/fwi-artifacts/${jobId}/status.json`;
+      state.fwiJob = { ...(state.fwiJob || {}), ...payload, job_id: jobId, status_url: statusUrl };
+
+      if (type === 'fwi_job_submitted') {
+        showFwiPanel(renderFwiSubmissionHtml(state.fwiJob));
+        scheduleFwiPoll();
+        return true;
+      }
+
+      showFwiPanel(renderFwiStatusHtml(state.fwiJob));
+      if (payload.status === 'succeeded') {
+        if (state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
+        state.fwiPollTimer = null;
+        loadFwiManifest(jobId, payload.result_url);
+      } else if (payload.status === 'failed') {
+        if (state.fwiPollTimer) clearTimeout(state.fwiPollTimer);
+        state.fwiPollTimer = null;
+      } else {
+        scheduleFwiPoll();
+      }
+      return true;
+    }
+
+    function handleFwiImageError(image) {
+      if (!image || !image.parentElement) return;
+      image.classList.add('hidden');
+      const error = image.parentElement.querySelector('.fwi-image-error');
+      if (error) error.classList.remove('hidden');
     }
 
     // ===== gRPC Mode =====
@@ -1194,6 +1555,8 @@
 
     function updateInspectorFromAnswer(content) {
       if (!content) return;
+      const fwiPayload = extractFwiPayload(content);
+      if (fwiPayload) handleFwiPayload(fwiPayload);
       const lower = content.toLowerCase();
       if (lower.includes('frequency-extrapolation') || lower.includes('frequency extrapolation')) {
         selectAlgorithm('frequency-extrapolation');

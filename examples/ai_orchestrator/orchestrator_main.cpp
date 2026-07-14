@@ -235,8 +235,13 @@ private:
 
                 std::string response_text;
 
-                // 根据路由模式选择路由策略
-                if (orch_config_.routing_mode == RoutingMode::AGENT_RAG) {
+                // Fixed FWI execution/status/result intents bypass probabilistic
+                // intent routing in both rule and Agent-RAG modes. The planner
+                // explicitly excludes theory questions.
+                if (tool_calling_engine_.has_explicit_fwi_action(user_text)) {
+                    trace_logger_.log_info(ctx, "ROUTING", "deterministic-fwi-tool");
+                    response_text = handle_fwi_query(user_text, context_id);
+                } else if (orch_config_.routing_mode == RoutingMode::AGENT_RAG) {
                     // Agent-RAG 动态路由
                     trace_logger_.log_info(ctx, "ROUTING", "agent-rag mode");
                     response_text = route_with_agent_rag(user_text, context_id, ctx);
@@ -359,7 +364,9 @@ private:
             write_callback(start_event.dump());
 
             // 识别意图
-            std::string intent = analyze_intent(user_text);
+            std::string intent = tool_calling_engine_.has_explicit_fwi_action(user_text)
+                ? "fwi"
+                : analyze_intent(user_text);
             trace_logger_.log_system(LogLevel::INFO, "识别意图: " + intent);
 
             // 发送意图识别事件
@@ -741,6 +748,14 @@ std::string analyze_intent(const std::string& text) {
      */
     std::string handle_fwi_query(const std::string& query, const std::string& context_id) {
         try {
+            // Explicit run/status/result intents are handled by the fixed,
+            // whitelist-only MCP FWI surface. Theory questions return no tool
+            // plan and continue to the explanatory LLM path below.
+            std::string tool_result = tool_calling_engine_.process(query);
+            if (!tool_result.empty()) {
+                return tool_result;
+            }
+
             // Use MemoryManager to get session history
             auto history = memory_manager_.get_session_history(context_id, 5);
 
@@ -775,9 +790,10 @@ std::string analyze_intent(const std::string& text) {
                 "3. 可以用生活类比帮助理解抽象概念（例如：FWI 像闭着眼睛摸大象来推断形状）\n"
                 "4. 如果用户问的是教学类问题，用\"概念 → 直觉 → 数学 → 代码思路\"的结构回答\n"
                 "5. 如果用户要求用特定语言回答，必须遵守\n\n"
-                "## 当前限制\n"
-                "当前版本尚未接入真实反演计算模块和速度模型数据。"
-                "如果用户要求执行实际 FWI 计算，请说明这是理论指导，建议用户提供模型参数后可扩展。\n\n"
+                "## 当前计算范围\n"
+                "当前版本仅接入固定白名单 marmousi_94_288 的实验性二维常密度声学 Deepwave 演示；"
+                "它属于合成端到端/逆犯罪验证，不代表实际数据上的普遍反演效果。"
+                "其他模型、多参数、弹性波、三维或远程集群计算仍只提供理论指导。\n\n"
                 "历史对话：\n" + history_text;
 
             return llm_client_.chat(system_prompt, query);
