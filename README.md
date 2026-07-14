@@ -20,14 +20,10 @@
 `stop.sh` 可以重复执行；已经停止的服务不会导致脚本失败。它不删除 Redis/浏览器历史，
 也不等于取消已提交的 FWI 任务。
 
-新开一个了解本项目约束和已采纳决策的 Codex 开发会话：
-
-```bash
-./scripts/codex-project.sh
-```
-
-它与产品服务的 `start.sh` 相互独立；启动前检查可运行
-`./scripts/codex-project.sh --check`，详细边界见后文的 Codex 工作流文档。
+使用 Codex 继续开发时，在本仓库或其子目录中正常打开新会话后直接提问即可。根目录
+`AGENTS.md` 会自动要求 Codex 读取已采纳决策并检查当前 Git、测试、服务和任务状态；
+不需要记忆或手动运行项目专用 Codex 脚本。跨会话记录规则和安全边界见后文的 Codex
+工作流文档。
 
 需要使用 Web 的 gRPC 模式时，也仍从同一个根入口启动：
 
@@ -47,7 +43,7 @@
 - 自己从浏览器逐步验收：[Web 前端端到端测试](docs/FRONTEND_TEST.md)
 - 会话隔离、上下文窗口、历史保留与隐私：[对话上下文与历史管理](docs/CONVERSATION_MANAGEMENT.md)
 - 跨 Codex 会话延续的已采纳方向与待实现项：[项目持续开发与已采纳决策](docs/PROJECT_CONTINUITY.md)
-- 在仓库内安全启动新 Codex 会话：[Codex 项目入口与跨会话工作流](docs/CODEX_WORKFLOW.md)
+- 新 Codex 会话如何自动接续项目：[Codex 自动接续与跨会话工作流](docs/CODEX_WORKFLOW.md)
 
 ## 当前能做什么
 

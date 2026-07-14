@@ -5,6 +5,10 @@ umask 077
 
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 LAUNCHER="$REPO_ROOT/scripts/codex-project.sh"
+PROJECT_AGENTS="$REPO_ROOT/AGENTS.md"
+PROJECT_README="$REPO_ROOT/README.md"
+PROJECT_WORKFLOW="$REPO_ROOT/docs/CODEX_WORKFLOW.md"
+PROJECT_CONTINUITY="$REPO_ROOT/docs/PROJECT_CONTINUITY.md"
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TMP_ROOT"' EXIT
 
@@ -20,6 +24,22 @@ assert_contains() {
 
 [[ -x "$LAUNCHER" ]] || fail "launcher is missing or not executable"
 bash -n "$LAUNCHER"
+
+# Ordinary Codex sessions must discover the continuity workflow through the
+# repository AGENTS.md; the helper is not a command the user has to remember.
+grep -Fq '<!-- codex-auto-bootstrap: v1 -->' "$PROJECT_AGENTS" || \
+    fail "AGENTS.md does not declare the automatic bootstrap contract"
+grep -Fq 'Never ask the user to run `scripts/codex-project.sh`' "$PROJECT_AGENTS" || \
+    fail "AGENTS.md may delegate the internal helper to the user"
+grep -Fq '正常打开新会话后直接提问即可' "$PROJECT_README" || \
+    fail "README does not advertise direct Codex questions"
+grep -Fq '**不是用户入口**' "$PROJECT_WORKFLOW" || \
+    fail "workflow does not classify the helper as internal"
+grep -Fq '视为对该决定的明确批准' "$PROJECT_CONTINUITY" || \
+    fail "continuity file does not preserve explicit user approval"
+if grep -Fxq './scripts/codex-project.sh' "$PROJECT_README"; then
+    fail "README still presents the helper as a user command"
+fi
 
 # The collector itself must stay local/read-only. Codex may use its normal API
 # connection after exec, but the launcher performs no endpoint/network probe.

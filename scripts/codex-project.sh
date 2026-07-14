@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Start Codex with a fresh, read-only snapshot of this repository's state.
+# Internal Codex diagnostics and compatibility launcher. Normal repository
+# sessions load AGENTS.md automatically; users do not need to run this helper.
 
 set -Eeuo pipefail
 umask 077
@@ -27,6 +28,9 @@ Options:
 
 All text after -- is treated as one initial request. It is never evaluated as
 shell input and is not forwarded as Codex command-line options.
+
+Normal project use does not require this command. Open Codex in the repository
+and ask a question; AGENTS.md provides the automatic session bootstrap.
 USAGE
 }
 
