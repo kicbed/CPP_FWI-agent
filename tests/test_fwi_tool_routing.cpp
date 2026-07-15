@@ -151,12 +151,17 @@ TEST(FWIToolRoutingTest, ExplicitIterationCountIsPreservedUpToSafetyLimit) {
     EXPECT_EQ(rounds.tool_name, "fwi_submit_demo");
     EXPECT_EQ(rounds.arguments.at("iterations"), 50);
 
+    const auto upper_bound = plan_fwi_tool_call(
+        "使用 marmousi_94_288 在 CUDA 上运行 10000 次迭代的 FWI。");
+    EXPECT_EQ(upper_bound.tool_name, "fwi_submit_demo");
+    EXPECT_EQ(upper_bound.arguments.at("iterations"), 10000);
+
     EXPECT_TRUE(has_invalid_fwi_iteration_request(
         "使用 marmousi_94_288 运行 0 次迭代的 FWI。"));
     EXPECT_TRUE(has_invalid_fwi_iteration_request(
-        "使用 marmousi_94_288 运行 101 次迭代的 FWI。"));
+        "使用 marmousi_94_288 运行 10001 次迭代的 FWI。"));
     EXPECT_TRUE(plan_fwi_tool_call(
-        "使用 marmousi_94_288 运行 101 次迭代的 FWI。", kLastJob).tool_name.empty());
+        "使用 marmousi_94_288 运行 10001 次迭代的 FWI。", kLastJob).tool_name.empty());
     EXPECT_TRUE(has_invalid_fwi_iteration_request(
         "使用 marmousi_94_288 运行 2.5 次迭代的 FWI。"));
     EXPECT_TRUE(has_invalid_fwi_iteration_request(

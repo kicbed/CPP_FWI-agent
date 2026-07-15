@@ -148,7 +148,7 @@ curl --fail --silent http://127.0.0.1:50052/health
 预期出现 Guided FWI 表单，而不是旧 `fwi_job_submitted` 结果或一段示例代码。表单应显示：
 
 - session scope 与 P1 capability；
-- 固定 `marmousi_94_288@1.0.0` 数据和 `deepwave.acoustic_fwi@1.0.0` 算法；
+- 固定 `marmousi_94_288@1.0.0` 数据和 `deepwave.acoustic_fwi@1.1.0` 算法；
 - 只有实验目标、注册数据、preset、device、iterations 和 seed 等受控字段，没有服务器
   路径、shell 或 Worker job ID 输入。
 
@@ -178,7 +178,20 @@ curl --fail --silent http://127.0.0.1:50052/health
 pre-runtime 草稿，没有发送运行中 cancel。放弃后重新打开 Smoke 入口，创建另一个任务
 继续下一步。
 
-### 5.3 人工批准、真实状态和结果
+### 5.3 验收 10000 次上限而不启动长任务
+
+把 iterations 改为 `10000`，只点击 **生成 Draft / Plan 确认卡**，不要批准。预期：
+
+- 表单接受整数 10000，Draft/Plan 保留该值并停在 `AwaitingApproval`；
+- 算法版本为 `deepwave.acoustic_fwi@1.1.0`，旧 `1.0.0` 快照仍保持上限 100；
+- 页面显示长任务警告，且创建确认卡不会新增 Worker job；
+- 点击 **放弃草稿** 后变为 `Cancelled`。
+
+再输入 `10001`、`2.5` 或 `-3`。预期前端明确拒绝，不能创建 Draft、Plan 或 Worker job。
+10000 只是显式校验上限；默认 smoke/demo 仍为 2/5 次，P1 没有运行中取消、checkpoint、
+retry 或完成时间保证。
+
+### 5.4 人工批准、真实状态和结果
 
 在新任务的确认卡点击 **批准运行**。预期：
 
@@ -195,7 +208,7 @@ pre-runtime 草稿，没有发送运行中 cancel。放弃后重新打开 Smoke 
 mutation，不是 P2 task retry。Artifact GET 临时失败或不足两个时，应显示
 **重新获取 artifacts（GET）**，不重跑 Worker。
 
-### 5.4 重启边界
+### 5.5 重启边界
 
 `./stop.sh` 后用 `./start.sh --no-build` 重启，SQLite 终态、事件和 artifact 仍可通过已知
 `task_id` 查询。P1 页面不持久化当前卡、不提供任务列表或刷新后自动恢复；这些仍属 P2。

@@ -53,8 +53,10 @@ Store 在一个 `BEGIN IMMEDIATE` 中按以下顺序执行：
 完成；Adapter `submit`/Worker `Popen` 只会在 SQLite commit 后发生。
 
 P1 capability 精确限制为：单节点、无依赖、`acoustic_fwi_2d`、
-`deepwave.acoustic_fwi@1.0.0`、`marmousi_94_288@1.0.0`、`fwi_smoke|fwi_demo`，以及固定
-`fwi.deepwave_adapter@1.0.0`。多节点即使通过通用 Gate 也被拒绝，留给 P3。
+当前 `deepwave.acoustic_fwi@1.1.0`、`marmousi_94_288@1.0.0`、`fwi_smoke|fwi_demo`，以及固定
+`fwi.deepwave_adapter@1.1.0`。原始 P1.1c checkpoint 使用的 Algorithm/Adapter `1.0.0` 快照
+保持不可变；D-006/P1-006 通过 minor version 扩展显式迭代上限。多节点即使通过通用 Gate
+也被拒绝，留给 P3。
 
 ## 3. Fingerprint 语义
 

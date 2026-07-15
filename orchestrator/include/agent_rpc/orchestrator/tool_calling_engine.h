@@ -214,7 +214,7 @@ inline std::optional<int> extract_requested_fwi_iterations(const std::string& qu
 inline bool has_invalid_fwi_iteration_request(const std::string& query) {
     if (!mentions_fwi_query(query)) return false;
     const auto iterations = extract_requested_fwi_iterations(query);
-    return iterations.has_value() && (*iterations < 1 || *iterations > 100);
+    return iterations.has_value() && (*iterations < 1 || *iterations > 10000);
 }
 
 inline bool is_fwi_theory_query(const std::string& query) {

@@ -9,9 +9,11 @@ from typing import Any, Mapping, Protocol
 from .fwi_adapter import (
     ADAPTER_VERSION,
     LOGICAL_ENTRYPOINT,
+    SUPPORTED_ADAPTER_VERSIONS,
     AdapterError,
     AdapterHandle,
     DeepwaveAdapter,
+    is_supported_receipt_binding,
 )
 from .task_store import DispatchIntentSnapshot, TaskSnapshot
 
@@ -166,15 +168,25 @@ class DeepwaveTaskDispatcher:
     def _handle_from_intent(intent: DispatchIntentSnapshot) -> AdapterHandle:
         if (
             intent.adapter_id != LOGICAL_ENTRYPOINT
-            or intent.adapter_version != ADAPTER_VERSION
+            or intent.adapter_version not in SUPPORTED_ADAPTER_VERSIONS
             or intent.state != "dispatched"
             or intent.handle is None
         ):
             raise DispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
         try:
-            return AdapterHandle(**copy.deepcopy(intent.handle))
+            handle = AdapterHandle(**copy.deepcopy(intent.handle))
         except (TypeError, ValueError) as error:
             raise DispatchError("DISPATCH_RECEIPT_INVALID") from error
+        if (
+            handle.adapter_version != intent.adapter_version
+            or not is_supported_receipt_binding(
+                handle.algorithm,
+                handle.adapter_version,
+                handle.fingerprint,
+            )
+        ):
+            raise DispatchError("DISPATCH_RECEIPT_INVALID")
+        return handle
 
     def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
         handle = self._handle_from_intent(intent)

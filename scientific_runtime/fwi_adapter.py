@@ -39,16 +39,29 @@ from jsonschema import Draft7Validator
 
 from scientific_runtime_contracts import schema_errors
 
-from .fwi_registry import load_deepwave_manifest
+from .fwi_registry import (
+    DEEPWAVE_ALGORITHM_ID,
+    DEEPWAVE_ALGORITHM_VERSION,
+    load_deepwave_manifest,
+)
 
 
-ALGORITHM_ID = "deepwave.acoustic_fwi"
-ALGORITHM_VERSION = "1.0.0"
-ADAPTER_VERSION = "1.0.0"
+ALGORITHM_ID = DEEPWAVE_ALGORITHM_ID
+ALGORITHM_VERSION = DEEPWAVE_ALGORITHM_VERSION
+ADAPTER_VERSION = "1.1.0"
+SUPPORTED_RECEIPT_BINDINGS = frozenset(
+    {
+        ("1.0.0", "1.0.0"),
+        (ALGORITHM_VERSION, ADAPTER_VERSION),
+    }
+)
+SUPPORTED_ADAPTER_VERSIONS = frozenset(
+    adapter_version for _, adapter_version in SUPPORTED_RECEIPT_BINDINGS
+)
 LOGICAL_ENTRYPOINT = "fwi.deepwave_adapter"
 MODEL_ID = "marmousi_94_288"
 BOUND_MANIFEST_HASH = (
-    "sha256:20c22a2c54259622435850b05eb7eeb020ff4d74af2cec51439aa465793f8dcd"
+    "sha256:7edc327f9ead8fe547b9b09e87c262584118dbf0492789e12031438ef926a6e5"
 )
 CONTROL_DIRECTORY = ".scientific-runtime-adapter-v1"
 MAX_JSON_BYTES = 8 * 1024 * 1024
@@ -69,6 +82,28 @@ NODE_IDEMPOTENCY_KEY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
 )
 JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+
+
+def is_supported_receipt_binding(
+    algorithm: Mapping[str, Any],
+    adapter_version: Any,
+    fingerprint: Mapping[str, Any],
+) -> bool:
+    """Accept only immutable Algorithm/Adapter pairs emitted by P1."""
+
+    if (
+        not isinstance(algorithm, Mapping)
+        or set(algorithm) != {"id", "version"}
+        or algorithm.get("id") != ALGORITHM_ID
+        or not isinstance(adapter_version, str)
+        or (algorithm.get("version"), adapter_version)
+        not in SUPPORTED_RECEIPT_BINDINGS
+        or not isinstance(fingerprint, Mapping)
+        or fingerprint.get("algorithm") != dict(algorithm)
+        or fingerprint.get("adapter_version") != adapter_version
+    ):
+        return False
+    return True
 
 
 class AdapterError(RuntimeError):
@@ -1218,9 +1253,13 @@ class DeepwaveAdapter:
                 "TASK_TYPE_UNSUPPORTED_IN_P1",
                 ["P1 standard Adapter supports only inversion presets"],
             )
-        if not 1 <= value["iterations"] <= 100:
+        maximum = self._manifest["parameter_schema"]["properties"]["iterations"][
+            "maximum"
+        ]
+        if not 1 <= value["iterations"] <= maximum:
             raise AdapterValidationError(
-                "PARAMETERS_INVALID", ["inversion iterations must be in 1..100"]
+                "PARAMETERS_INVALID",
+                [f"inversion iterations must be in 1..{maximum}"],
             )
         return value
 
@@ -1573,7 +1612,14 @@ class DeepwaveAdapter:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private record fields are inconsistent"
             )
-        if value["schema_version"] != "1.0.0" or value["adapter_version"] != ADAPTER_VERSION:
+        if (
+            value["schema_version"] != "1.0.0"
+            or not is_supported_receipt_binding(
+                value["algorithm"],
+                value["adapter_version"],
+                value["fingerprint"],
+            )
+        ):
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private record version is unsupported"
             )
@@ -1847,7 +1893,11 @@ class DeepwaveAdapter:
             not handle.submission_id.startswith("submission-")
             or not JOB_ID.fullmatch(handle.job_id)
             or PLAN_HASH.fullmatch(handle.plan_hash) is None
-            or handle.adapter_version != ADAPTER_VERSION
+            or not is_supported_receipt_binding(
+                handle.algorithm,
+                handle.adapter_version,
+                handle.fingerprint,
+            )
             or self._submission_id(
                 handle.task_id,
                 handle.plan_hash,

@@ -1186,7 +1186,7 @@ std::string analyze_intent(const std::string& text,
                         "确认卡，可修改参数；只有批准当前 `plan_hash` 后才会提交。"
                         "批准前不会创建 FWI job。\n\n"
                         "P1 Guided 当前支持 `fwi_smoke` / `fwi_demo`、CPU 或 CUDA、"
-                        "1～100 次迭代；正演 / `forward` 暂不支持，也不会被静默改成反演。\n\n"
+                        "1～10000 次迭代；正演 / `forward` 暂不支持，也不会被静默改成反演。\n\n"
                         "批准后页面会保留稳定 `task_id`，轮询持久化状态与事件；"
                         "成功后只展示并提供受控下载的反演速度模型 NPY 和损失曲线 CSV "
                         "artifacts。普通聊天通道不会调用旧 `fwi_submit_demo`。";
@@ -1200,8 +1200,9 @@ std::string analyze_intent(const std::string& text,
                     "- 两次迭代 CUDA smoke：`使用 marmousi_94_288 运行两次迭代的二维声学 FWI smoke test。`\n"
                     "- 两次迭代 CPU smoke：`使用 marmousi_94_288 在 CPU 上运行两次迭代的二维声学 FWI smoke test。`\n"
                     "- 默认五次迭代 CUDA demo：`使用 marmousi_94_288 运行二维声学 FWI demo。`\n"
-                    "- 显式迭代数（1～100）：`使用 marmousi_94_288 在 CUDA 上运行 50 次迭代的 FWI。`\n\n"
-                    "不写迭代数时，smoke 默认 2 次、demo 默认 5 次；显式迭代数必须是 1～100 的正整数。\n\n"
+                    "- 显式迭代数（1～10000）：`使用 marmousi_94_288 在 CUDA 上运行 500 次迭代的 FWI。`\n\n"
+                    "不写迭代数时，smoke 默认 2 次、demo 默认 5 次；显式迭代数必须是 1～10000 的正整数。"
+                    "超过 100 次可能长时间占用计算资源，当前不支持运行中取消。\n\n"
                     "提交后可发送 `查看刚才 FWI 任务的状态。`；成功后发送 "
                     "`显示刚才的反演结果和损失曲线。`\n\n"
                     "当前不支持通过聊天传入任意模型路径，也不做弹性波、3D、MPI、多 GPU 或真实数据效果承诺。";
@@ -1210,14 +1211,14 @@ std::string analyze_intent(const std::string& text,
             if (has_invalid_iterations) {
                 if (!allow_legacy_fwi_submit) {
                     return
-                        "Guided 表单已拒绝本次 FWI 请求：迭代数必须是 1～100 "
+                        "Guided 表单已拒绝本次 FWI 请求：迭代数必须是 1～10000 "
                         "的整数，系统不会静默替换越界值。本次没有创建 `task_id` "
                         "或 FWI job。\n\n"
-                        "请把迭代数改为 1～100 的整数，然后重新进入 Guided "
+                        "请把迭代数改为 1～10000 的整数，然后重新进入 Guided "
                         "Draft / Plan 确认卡；只有批准当前 `plan_hash` 后才会提交。";
                 }
                 return
-                    "本次未提交 FWI 任务：显式迭代数必须是 1～100 的正整数，"
+                    "本次未提交 FWI 任务：显式迭代数必须是 1～10000 的正整数，"
                     "系统不会静默替换越界值。\n\n"
                     "可改为发送：\n"
                     "- `使用 marmousi_94_288 在 CUDA 上运行两次迭代的 FWI smoke test。`\n"

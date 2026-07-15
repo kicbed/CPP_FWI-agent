@@ -1,0 +1,48 @@
+{
+  "schema_version": "1.0.0",
+  "id": "deepwave.acoustic_fwi",
+  "version": "1.1.0",
+  "task_types": ["acoustic_forward_2d", "acoustic_fwi_2d"],
+  "parameter_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "preset": {"enum": ["forward", "fwi_smoke", "fwi_demo"]},
+      "device": {"enum": ["cpu", "cuda"]},
+      "iterations": {"type": "integer", "minimum": 0, "maximum": 10000},
+      "seed": {"type": "integer", "minimum": 0}
+    },
+    "required": ["preset", "device", "iterations", "seed"]
+  },
+  "inputs": [
+    {"port": "model", "data_type": "velocity_model_2d"}
+  ],
+  "outputs": [
+    {"port": "inverted_model", "data_type": "inverted_velocity_model_2d"},
+    {"port": "loss", "data_type": "loss_curve"}
+  ],
+  "resource_limits": {
+    "devices": ["cpu", "cuda"],
+    "max_gpu_count": 1,
+    "max_cpu_cores": 16,
+    "max_memory_mb": 65536,
+    "max_wall_time_seconds": 7200
+  },
+  "security": {
+    "allowlisted": true,
+    "side_effects": ["compute", "write_artifacts"],
+    "arbitrary_paths": false,
+    "shell": false,
+    "network_access": false
+  },
+  "adapter": {
+    "protocol": "algorithm-adapter-v1",
+    "version": "1.1.0",
+    "entrypoint_ref": "fwi.deepwave_adapter",
+    "methods": ["validate", "estimate", "submit", "status", "cancel", "collect"],
+    "idempotent_submit": true,
+    "checkpoint_capable": false
+  },
+  "extensions": {}
+}

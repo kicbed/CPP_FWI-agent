@@ -83,6 +83,7 @@ int main() {
     require(plugin != nullptr, "CreatePlugin failed");
     require(plugin->Initialize() == 1, "plugin initialization failed");
     require(std::string(plugin->GetName()) == "fwi-runner", "unexpected plugin name");
+    require(std::string(plugin->GetVersion()) == "1.1.0", "unexpected plugin version");
     require(plugin->GetToolCount() == 3, "unexpected tool count");
 
     std::set<std::string> names;
@@ -97,6 +98,13 @@ int main() {
     require(names == std::set<std::string>({"fwi_submit_demo", "fwi_get_status", "fwi_get_result"}),
             "unexpected FWI tool names");
 
+    const std::string submit_description = plugin->GetTool(0)->description;
+    require(submit_description.find("10000") != std::string::npos,
+            "submit description must expose the current iteration bound");
+    require(submit_description.find("取消") != std::string::npos &&
+                submit_description.find("timeout") != std::string::npos,
+            "submit description must disclose long-run reliability limits");
+
     const json submit_schema = json::parse(plugin->GetTool(0)->inputSchema);
     require(submit_schema.at("properties").contains("iterations"),
             "submit schema must expose iterations");
@@ -104,7 +112,7 @@ int main() {
             "submit schema must require integer iterations");
     require(submit_schema.at("properties").at("iterations").at("minimum") == 1,
             "submit schema iteration minimum mismatch");
-    require(submit_schema.at("properties").at("iterations").at("maximum") == 100,
+    require(submit_schema.at("properties").at("iterations").at("maximum") == 10000,
             "submit schema iteration bound mismatch");
     require(std::find(submit_schema.at("required").begin(),
                       submit_schema.at("required").end(), "iterations") ==
@@ -124,7 +132,7 @@ int main() {
 
     const json too_many_iterations = call(plugin, "fwi_submit_demo", {
         {"model_id", "marmousi_94_288"}, {"preset", "fwi_demo"}, {"device", "cpu"},
-        {"iterations", 101}
+        {"iterations", 10001}
     });
     require(too_many_iterations.at("isError") == true,
             "iteration counts above the safety bound must be rejected");

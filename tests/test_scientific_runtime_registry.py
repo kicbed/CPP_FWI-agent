@@ -204,7 +204,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         dataset_v2 = copy.deepcopy(dataset_v1)
         dataset_v2["version"] = "1.0.1"
         manifest_v2 = copy.deepcopy(manifest_v1)
-        manifest_v2["version"] = "1.0.1"
+        manifest_v2["version"] = "1.2.0"
         self.registry.register_dataset(dataset=dataset_v2)
         self.registry.register_algorithm(manifest=manifest_v2)
 
@@ -216,8 +216,107 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         )
         self.assertEqual(
             [value["version"] for value in self.registry.list_algorithms()],
-            ["1.0.0", "1.0.1"],
+            ["1.1.0", "1.2.0"],
         )
+
+    def test_packaged_algorithm_upgrade_preserves_legacy_parameter_policy(self) -> None:
+        legacy = load_deepwave_manifest("1.0.0")
+        current = load_deepwave_manifest()
+        legacy_json, legacy_hash = encode_document(legacy)
+        self.assertEqual(
+            legacy_hash,
+            "sha256:20c22a2c54259622435850b05eb7eeb020ff4d74af2cec51439aa465793f8dcd",
+        )
+        self.assertEqual(legacy["version"], "1.0.0")
+        self.assertEqual(
+            legacy["parameter_schema"]["properties"]["iterations"]["maximum"],
+            100,
+        )
+        self.assertEqual(legacy["adapter"]["version"], "1.0.0")
+        self.assertEqual(current["version"], "1.1.0")
+        self.assertEqual(
+            current["parameter_schema"]["properties"]["iterations"]["maximum"],
+            10000,
+        )
+        self.assertEqual(current["adapter"]["version"], "1.1.0")
+
+        self.registry.register_algorithm(manifest=legacy)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            legacy_row_before = connection.execute(
+                """
+                SELECT document_json, document_hash
+                FROM algorithm_registry
+                WHERE algorithm_id = ? AND version = ?
+                """,
+                (legacy["id"], legacy["version"]),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(legacy_row_before, (legacy_json, legacy_hash))
+        legacy_before = self.registry.get_algorithm(
+            algorithm_id=legacy["id"], version=legacy["version"]
+        )
+        reopened = RegistryService(
+            SQLiteTaskStore(self.database_path), clock=lambda: NOW
+        )
+        reopened.register_algorithm(manifest=current)
+        self.assertEqual(
+            reopened.get_algorithm(
+                algorithm_id=legacy["id"], version=legacy["version"]
+            ),
+            legacy_before,
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            legacy_row_after = connection.execute(
+                """
+                SELECT document_json, document_hash
+                FROM algorithm_registry
+                WHERE algorithm_id = ? AND version = ?
+                """,
+                (legacy["id"], legacy["version"]),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(legacy_row_after, legacy_row_before)
+        self.assertEqual(
+            [value["version"] for value in reopened.list_algorithms()],
+            ["1.0.0", "1.1.0"],
+        )
+
+    def test_iteration_policy_is_bound_to_algorithm_version(self) -> None:
+        self.registry.register_dataset(dataset=dataset_for())
+        legacy = load_deepwave_manifest("1.0.0")
+        current = load_deepwave_manifest()
+        self.registry.register_algorithm(manifest=legacy)
+        self.registry.register_algorithm(manifest=current)
+        service = self.service()
+
+        legacy_draft = task_draft()
+        legacy_draft["draft_id"] = "draft-legacy-limit"
+        legacy_draft["algorithm"]["version"] = "1.0.0"
+        legacy_draft["parameters"]["iterations"] = 10000
+        with self.assertRaisesRegex(
+            TaskValidationError, "PARAMETER_SCHEMA_MISMATCH"
+        ):
+            service.create_task(
+                project_id=PROJECT_ID,
+                principal_id=PRINCIPAL_ID,
+                draft=legacy_draft,
+                idempotency_key="legacy-limit-rejected",
+            )
+
+        current_draft = task_draft()
+        current_draft["draft_id"] = "draft-current-limit"
+        current_draft["parameters"]["iterations"] = 10000
+        created = service.create_task(
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            draft=current_draft,
+            idempotency_key="current-limit-accepted",
+        )
+        self.assertEqual(created.snapshot.draft["parameters"]["iterations"], 10000)
 
     def test_invalid_registry_documents_never_persist(self) -> None:
         invalid_dataset = dataset_for()

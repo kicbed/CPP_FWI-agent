@@ -19,7 +19,11 @@ from scientific_runtime_contracts import (
     schema_errors,
 )
 
-from .fwi_registry import load_deepwave_manifest
+from .fwi_registry import (
+    DEEPWAVE_ALGORITHM_ID,
+    DEEPWAVE_ALGORITHM_VERSION,
+    load_deepwave_manifest,
+)
 from .task_dispatcher import DispatchError, DispatchPreparation, TaskDispatcher
 from .task_store import (
     ALLOWED_TRANSITIONS,
@@ -997,8 +1001,8 @@ class TaskService:
             if node.get("dependencies") != []:
                 reasons.append("dependencies_unsupported")
             if node.get("algorithm") != {
-                "id": "deepwave.acoustic_fwi",
-                "version": "1.0.0",
+                "id": DEEPWAVE_ALGORITHM_ID,
+                "version": DEEPWAVE_ALGORITHM_VERSION,
             }:
                 reasons.append("algorithm_unsupported")
             if node.get("parameters", {}).get("preset") not in {
@@ -1016,13 +1020,13 @@ class TaskService:
         ):
             reasons.append("dataset_unsupported")
         manifest = context.registry.algorithms.get(
-            ("deepwave.acoustic_fwi", "1.0.0")
+            (DEEPWAVE_ALGORITHM_ID, DEEPWAVE_ALGORITHM_VERSION)
         )
         if self._p1_manifest is None or manifest != self._p1_manifest:
             reasons.append("adapter_binding_mismatch")
         if (
             preparation.adapter_id != "fwi.deepwave_adapter"
-            or preparation.adapter_version != "1.0.0"
+            or preparation.adapter_version != self._p1_manifest["adapter"]["version"]
         ):
             reasons.append("dispatcher_unsupported")
         expected_request = self._expected_dispatch_request(snapshot)
@@ -1230,6 +1234,11 @@ class TaskService:
             except TaskStoreConflict as store_error:
                 raise TaskConflict(str(store_error)) from store_error
         else:
+            fingerprint = (
+                handle.get("fingerprint")
+                if isinstance(handle, Mapping)
+                else None
+            )
             receipt_event = {
                 "schema_version": "1.0.0",
                 "event_id": "dispatch-receipt-validation",
@@ -1239,14 +1248,25 @@ class TaskService:
                 "event_type": "node_started",
                 "task_status": "Running",
                 "occurred_at": self._clock(),
-                "fingerprint": (
-                    handle.get("fingerprint")
-                    if isinstance(handle, Mapping)
-                    else None
-                ),
+                "fingerprint": fingerprint,
                 "extensions": {},
             }
             try:
+                if (
+                    not isinstance(handle, Mapping)
+                    or not isinstance(fingerprint, Mapping)
+                    or handle.get("adapter_version") != claimed.adapter_version
+                    or fingerprint.get("adapter_version")
+                    != claimed.adapter_version
+                    or handle.get("algorithm")
+                    != claimed.request.get("algorithm")
+                    or fingerprint.get("algorithm")
+                    != claimed.request.get("algorithm")
+                ):
+                    raise TaskValidationError(
+                        "DISPATCH_RECEIPT_INVALID",
+                        ["receipt identity differs from its immutable intent"],
+                    )
                 self._validate_schema("run-event.schema.json", receipt_event)
                 _validate_run_event_binding(admitted.snapshot, receipt_event)
             except TaskValidationError:

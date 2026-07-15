@@ -371,7 +371,8 @@ Compose 使用以下限制：
 - 删除 Linux capabilities，并设置 `no-new-privileges`；
 - 不挂载 Docker socket，不使用 privileged 模式；
 - MCP FWI runner 只接受固定 model/preset/device 和仅反演可用的
-  `iterations=1..100`，使用固定 argv 启动 Worker，单个 runner 最多并发 2 个作业；
+  `iterations=1..10000`，使用固定 argv 启动 Worker，单个 runner 最多并发 2 个作业；默认
+  smoke/demo 仍为 2/5 次，长任务在 P1 没有运行中取消或 timeout 保证；
 - `.env` 不进入镜像，数值 Worker 也不会继承 Agent 的 API key/token/secret 环境。
 
 由于固定模型和结果路径位于 `/root`，容器当前以容器内 root 运行；这不授予宿主机 root

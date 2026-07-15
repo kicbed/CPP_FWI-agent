@@ -19,7 +19,8 @@
 | `scientific_runtime/task_store.py` | 连续 migration、原子注册/读取、hash/index/core identity 复核和同连接 snapshot helper |
 | `scientific_runtime/registry_service.py` | Schema/manifest 校验、受信任 provisioning 边界以及 project/principal/permission 限域读取 |
 | `scientific_runtime/fwi_registry.py` | 固定 Marmousi sidecar/hash 验证到无路径 DatasetRef 的映射，以及已审 Deepwave manifest 加载 |
-| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1.json` | P0 最小 FWI AlgorithmManifest 的版本固定副本 |
+| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1.json` | 原始 `1.0.0` / iterations≤100 AlgorithmManifest 的不可变副本 |
+| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_1.json` | D-006 当前 `1.1.0` / iterations≤10000 AlgorithmManifest 的版本固定副本 |
 | `tests/test_scientific_runtime_registry.py` | migration、并发、不可变性、权限、损坏、TaskService/Gate 和预算测试 |
 
 普通 TaskService 和未来 Web 只读注册结果，不获得 registry mutation。当前 mutation 方法是内部
@@ -78,8 +79,11 @@ P0 side-effect-free Gate 同步收紧为 plan 输入/输出 port 集合必须与
 - 调用方提供且通过 Schema 的真实 project/principal access scope；
 - 无 `path`、`source_path`、运行目录或其他本机位置。
 
-Deepwave manifest 固定为 `deepwave.acoustic_fwi@1.0.0`，保留 P0 的 typed parameters、I/O、
-policy resource caps、安全声明和 Adapter v1 metadata。
+P1.1b 原始 Deepwave manifest 固定为 `deepwave.acoustic_fwi@1.0.0`，保留 P0 的 typed
+parameters、I/O、policy resource caps、安全声明和 Adapter v1 metadata。D-006/P1-006 没有
+原地修改该身份，而是新增 `deepwave.acoustic_fwi@1.1.0` 和 Adapter `1.1.0`，把显式迭代上限
+扩展到 10000。启动既有数据库时会保留旧 snapshot 并注册新版本；旧 snapshot 在读取时继续
+接受 Schema/hash/索引一致性验证。新 Guided 任务只选 `1.1.0`。
 
 在本 P1.1b checkpoint 中，`fwi.deepwave_adapter` 尚未实现；后续 P1.2a 已为固定
 `acoustic_fwi_2d` 反演补齐六方法、幂等的标准 Adapter。**registered/allowlisted 不等于 executable/ready**

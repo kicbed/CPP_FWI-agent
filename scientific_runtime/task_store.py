@@ -2605,6 +2605,7 @@ class SQLiteTaskStore:
             or algorithm != request.get("algorithm")
             or not isinstance(fingerprint, Mapping)
             or fingerprint.get("algorithm") != request.get("algorithm")
+            or fingerprint.get("adapter_version") != intent.adapter_version
             or fingerprint.get("seed") != request.get("parameters", {}).get("seed")
             or fingerprint.get("hardware", {}).get("device")
             != request.get("resources", {}).get("device")

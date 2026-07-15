@@ -718,8 +718,8 @@ function testHonestFwiControlsAndNoPlaceholderFeatures() {
   assert.match(html, /openGuidedFwi\(\{ preset: 'fwi_demo', device: 'cpu', iterations: 5 \}\)/);
   assert.doesNotMatch(html, /onclick="sendQuick\(/);
   assert.match(html, /自定义迭代/);
-  assert.match(html, /1–100 次/);
-  assert.match(html, /运行 50 次迭代的 FWI/);
+  assert.match(html, /1–10000 次/);
+  assert.match(html, /运行 500 次迭代的 FWI/);
   assert.doesNotMatch(html, /CUDA-MPI FWI/);
   assert.doesNotMatch(html, /marmousi2 dry-run/);
   assert.doesNotMatch(html, /queued draft/);
@@ -978,7 +978,7 @@ function makeGuidedTask(overrides = {}) {
       goal: '<img src=x onerror=alert(1)>',
       dataset: { id: 'marmousi_94_288', version: '1.0.0' },
       parameters: {
-        preset: 'fwi_smoke', device: 'cpu', iterations: 2, seed: 0,
+        preset: 'fwi_smoke', device: 'cpu', iterations: overrides.iterations ?? 2, seed: 0,
       },
     },
     plan: {
@@ -1025,10 +1025,10 @@ function testGuidedFormHasStrictBoundaries() {
   };
   assert.equal(api.validateGuidedFwiForm(base).ok, true);
   assert.equal(api.validateGuidedFwiForm({
-    ...base, preset: 'fwi_demo', device: 'cuda', iterations: 100, seed: 2147483647,
+    ...base, preset: 'fwi_demo', device: 'cuda', iterations: 10000, seed: 2147483647,
   }).ok, true);
   for (const patch of [
-    { iterations: 0 }, { iterations: 101 }, { iterations: 1.5 }, { iterations: '01' },
+    { iterations: 0 }, { iterations: 10001 }, { iterations: 1.5 }, { iterations: '01' },
     { seed: -1 }, { seed: 2147483648 }, { seed: '1.0' },
     { preset: 'custom' }, { device: 'auto' }, { dataset_id: '../secret' },
     { dataset_version: 'latest' }, { goal: '' }, { goal: 'x'.repeat(2001) },
@@ -1047,6 +1047,16 @@ function testGuidedFormHasStrictBoundaries() {
   assert.equal(api.guidedOverridesFromExecutionText('运行50轮 FWI').iterations, '50');
   assert.equal(api.guidedOverridesFromExecutionText('Run Marmousi FWI for 10 iterations').iterations, '10');
   assert.equal(api.guidedOverridesFromExecutionText('Run Marmousi FWI, iterations: 12').iterations, '12');
+  const maximumIterations = api.guidedOverridesFromExecutionText('运行 Marmousi FWI，迭代 10000 次');
+  assert.equal(maximumIterations.iterations, '10000');
+  assert.equal(api.validateGuidedFwiForm({
+    ...base, iterations: maximumIterations.iterations,
+  }).ok, true);
+  const excessiveIterations = api.guidedOverridesFromExecutionText('运行 Marmousi FWI，迭代 10001 次');
+  assert.equal(excessiveIterations.iterations, '10001');
+  assert.equal(api.validateGuidedFwiForm({
+    ...base, iterations: excessiveIterations.iterations,
+  }).ok, false);
   const negativeIterations = api.guidedOverridesFromExecutionText('运行 Marmousi FWI，迭代 -3 次');
   assert.equal(negativeIterations.iterations, '-3');
   const catalog = {
@@ -1074,7 +1084,8 @@ function testGuidedFormHasStrictBoundaries() {
   });
   assert.equal(rejectedForward.ok, false);
   assert.match(rejectedForward.errors.join('；'), /P1 Guided 当前不支持正演\/forward/);
-  assert.match(html, /id="guidedIterations"[^>]+min="1" max="100" step="1"/);
+  assert.match(html, /id="guidedIterations"[^>]+min="1" max="10000" step="1"/);
+  assert.match(html, /超过 100 次可能长时间占用计算资源；当前不支持运行中取消/);
   assert.match(html, /id="guidedSeed"[^>]+min="0" max="2147483647" step="1"/);
 }
 
@@ -1126,7 +1137,7 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   const api = loadGuidedFunctions();
   const catalog = {
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.0.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.1.0' },
   };
   const reviewTask = api.normalizeGuidedTaskProjection(makeGuidedTask());
   assert.equal(api.isGuidedReviewReady(reviewTask, catalog), true);
@@ -1135,6 +1146,18 @@ function testGuidedTaskAndCrashStatesAreHonest() {
     approval: { approval_id: 'approval-guided-1', decision: 'approved' },
   }));
   assert.equal(api.isGuidedApprovedSubmitPending(approvedSubmitPendingTask, catalog), true);
+  const maximumProjection = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    iterations: 10000,
+    status: 'Running',
+    dispatch: { state: 'dispatched' },
+    adapter_status: {
+      status: 'Running', stage: 'invert', completed: 9999, total: 10000,
+      message: 'long validation run',
+    },
+  }));
+  assert.equal(maximumProjection.draft.iterations, 10000);
+  assert.equal(maximumProjection.adapter.completed, 9999);
+  assert.equal(maximumProjection.adapter.total, 10000);
   assert.equal(api.isGuidedReviewReady({
     ...reviewTask, plan: { ...reviewTask.plan, nodeCount: 2 },
   }, catalog), false);
@@ -1216,13 +1239,13 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
         path: '/root/private/model.npy',
       },
     }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.0.0', entrypoint: '/root/run.py' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.1.0', entrypoint: '/root/run.py' },
   });
   assert.equal(catalog.datasets[0].metadata.path, undefined);
   assert.equal(catalog.datasets[0].relative_path, undefined);
   assert.deepEqual(
     JSON.parse(JSON.stringify(catalog.algorithm)),
-    { id: 'deepwave.acoustic_fwi', version: '1.0.0' },
+    { id: 'deepwave.acoustic_fwi', version: '1.1.0' },
   );
   assert.doesNotMatch(extractFunction('renderGuidedCatalogPreview'), /relative_path|entrypoint|JSON\.stringify/);
 }

@@ -37,6 +37,7 @@ required_files=(
     scientific_runtime/fwi_adapter.py
     scientific_runtime/registry_service.py
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1.json
+    scientific_runtime/registrations/deepwave_acoustic_fwi_v1_1.json
     scientific_runtime/task_store.py
     scientific_runtime/task_service.py
     scientific_runtime/task_dispatcher.py
@@ -75,6 +76,7 @@ require_text AGENTS.md 'docs/GIT_AND_PROMPT_POLICY.md'
 require_text docs/PROJECT_CONTINUITY.md '## D-003：'
 require_text docs/PROJECT_CONTINUITY.md '## D-004：'
 require_text docs/PROJECT_CONTINUITY.md '## D-005：'
+require_text docs/PROJECT_CONTINUITY.md '## D-006：'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
 require_text docs/PROJECT_CONTINUITY.md 'P0 + P1 最小持久垂直切片 Verified / P2 Pending'
@@ -100,7 +102,7 @@ require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '实现状态
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md 'Guided 路由 fail closed 为 503'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '仍属 Pending：运行中 cancel'
 require_text docs/PROJECT_PROGRESS.md '<!-- project-progress-schema: v1 -->'
-require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1 Verified；P2 Pending（按用户要求暂停）**'
+require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1 Verified（含 D-006/P1-006）；P2 Pending（按用户要求暂停）**'
 require_text docs/PROJECT_PROGRESS.md '| P0 最小 FWI 契约 | Verified |'
 require_text docs/PROJECT_PROGRESS.md '| P1 最小持久垂直切片 | Verified |'
 require_text docs/PROJECT_PROGRESS.md '停在 P2 之前'

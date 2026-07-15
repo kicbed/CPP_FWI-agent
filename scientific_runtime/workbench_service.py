@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping
 
 from scientific_runtime_contracts import compute_plan_hash
 
+from .fwi_registry import DEEPWAVE_ALGORITHM_ID, DEEPWAVE_ALGORITHM_VERSION
 from .registry_service import (
     RegistryConflict,
     RegistryCorruption,
@@ -39,10 +40,11 @@ from .task_store import DispatchIntentSnapshot, TaskSnapshot, TaskStoreError
 
 DATASET_ID = "marmousi_94_288"
 DATASET_VERSION = "1.0.0"
-ALGORITHM_ID = "deepwave.acoustic_fwi"
-ALGORITHM_VERSION = "1.0.0"
+ALGORITHM_ID = DEEPWAVE_ALGORITHM_ID
+ALGORITHM_VERSION = DEEPWAVE_ALGORITHM_VERSION
 TASK_TYPE = "acoustic_fwi_2d"
 NODE_ID = "invert"
+MAX_FWI_ITERATIONS = 10_000
 
 FORM_FIELDS = frozenset(
     {
@@ -316,7 +318,7 @@ class GuidedWorkbench:
                 "fields": sorted(FORM_FIELDS),
                 "presets": sorted(PRESETS),
                 "devices": sorted(DEVICES),
-                "iterations": {"minimum": 1, "maximum": 100},
+                "iterations": {"minimum": 1, "maximum": MAX_FWI_ITERATIONS},
                 "seed": {"minimum": 0, "maximum": 2147483647},
             },
             "features": {
@@ -404,9 +406,13 @@ class GuidedWorkbench:
                 "DEVICE_UNSUPPORTED", ["device must be cpu or cuda"]
             )
         iterations = form["iterations"]
-        if type(iterations) is not int or not 1 <= iterations <= 100:
+        if (
+            type(iterations) is not int
+            or not 1 <= iterations <= MAX_FWI_ITERATIONS
+        ):
             raise WorkbenchValidationError(
-                "ITERATIONS_OUT_OF_RANGE", ["iterations must be an integer from 1 to 100"]
+                "ITERATIONS_OUT_OF_RANGE",
+                [f"iterations must be an integer from 1 to {MAX_FWI_ITERATIONS}"],
             )
         seed = form["seed"]
         if type(seed) is not int or not 0 <= seed <= 2147483647:

@@ -117,7 +117,7 @@
       "properties": {
         "preset": {"enum": ["forward", "fwi_smoke", "fwi_demo"]},
         "device": {"enum": ["cpu", "cuda"]},
-        "iterations": {"type": "integer", "minimum": 0, "maximum": 100},
+        "iterations": {"type": "integer", "minimum": 0, "maximum": 10000},
         "seed": {"type": "integer", "minimum": 0, "maximum": 2147483647}
       },
       "allOf": [
@@ -127,7 +127,7 @@
         },
         {
           "if": {"properties": {"preset": {"enum": ["fwi_smoke", "fwi_demo"]}}},
-          "then": {"properties": {"iterations": {"minimum": 1, "maximum": 100}}}
+          "then": {"properties": {"iterations": {"minimum": 1, "maximum": 10000}}}
         }
       ]
     },

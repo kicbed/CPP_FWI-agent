@@ -45,7 +45,7 @@ constexpr const char* kModule = "fwi_worker";
 constexpr const char* kDefaultRunRoot = "/root/fwi-runs";
 constexpr const char* kModelId = "marmousi_94_288";
 constexpr std::size_t kMaxJsonBytes = 8U * 1024U * 1024U;
-constexpr std::int64_t kMaxIterations = 100;
+constexpr std::int64_t kMaxIterations = 10000;
 constexpr std::size_t kMaxActiveJobs = 2;
 
 #ifndef FWI_PROJECT_ROOT
@@ -92,8 +92,8 @@ void release_worker_slot() {
 static PluginTool methods[] = {
     {
         "fwi_submit_demo",
-        "运行固定白名单 Marmousi 二维常密度声学 Deepwave 演示。仅在用户明确要求运行正演或 FWI 时调用；iterations 可在 1 到 100 之间显式指定，未指定时 smoke=2、demo=5。FWI 理论问题不要调用。提交后立即返回异步 job_id；单个 runner 最多同时运行 2 个作业。",
-        R"({"type":"object","additionalProperties":false,"properties":{"model_id":{"type":"string","enum":["marmousi_94_288"],"description":"固定白名单模型"},"preset":{"type":"string","enum":["forward","fwi_smoke","fwi_demo"],"description":"forward=合成正演；fwi_smoke/fwi_demo 提供不同默认值，均可用 iterations 覆盖"},"device":{"type":"string","enum":["cuda","cpu"],"description":"单 CUDA GPU 或 CPU"},"iterations":{"type":"integer","minimum":1,"maximum":100,"description":"仅用于反演，允许1到100。省略时 smoke=2、demo=5；正演请省略"}},"required":["model_id","preset","device"]})"
+        "运行固定白名单 Marmousi 二维常密度声学 Deepwave 演示。仅在用户明确要求运行正演或 FWI 时调用；iterations 可在 1 到 10000 之间显式指定，未指定时 smoke=2、demo=5。超过 100 次可能长时间占用 runner slot，当前没有运行中取消或 timeout。FWI 理论问题不要调用。提交后立即返回异步 job_id；单个 runner 最多同时运行 2 个作业。",
+        R"({"type":"object","additionalProperties":false,"properties":{"model_id":{"type":"string","enum":["marmousi_94_288"],"description":"固定白名单模型"},"preset":{"type":"string","enum":["forward","fwi_smoke","fwi_demo"],"description":"forward=合成正演；fwi_smoke/fwi_demo 提供不同默认值，均可用 iterations 覆盖"},"device":{"type":"string","enum":["cuda","cpu"],"description":"单 CUDA GPU 或 CPU"},"iterations":{"type":"integer","minimum":1,"maximum":10000,"description":"仅用于反演，允许1到10000。省略时 smoke=2、demo=5；正演请省略"}},"required":["model_id","preset","device"]})"
     },
     {
         "fwi_get_status",
@@ -551,7 +551,7 @@ json submit_demo(const json& args) {
     }
     if (preset != "forward" &&
         (requested_iterations < 1 || requested_iterations > kMaxIterations)) {
-        throw std::invalid_argument("iterations must be between 1 and 100 for inversion");
+        throw std::invalid_argument("iterations must be between 1 and 10000 for inversion");
     }
     const int iterations = static_cast<int>(requested_iterations);
 
@@ -669,7 +669,7 @@ json error_response(const std::string& message) {
 }  // namespace
 
 const char* GetNameImpl() { return "fwi-runner"; }
-const char* GetVersionImpl() { return "1.0.0"; }
+const char* GetVersionImpl() { return "1.1.0"; }
 PluginType GetTypeImpl() { return PLUGIN_TYPE_TOOLS; }
 int InitializeImpl() {
     try {

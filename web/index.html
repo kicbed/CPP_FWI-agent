@@ -437,7 +437,7 @@
           <p><span class="font-semibold text-slate-800">方程：</span>二维常密度声学，单参数 Vp</p>
           <p><span class="font-semibold text-slate-800">后端：</span>Deepwave scalar，CPU / 单 NVIDIA GPU</p>
           <p><span class="font-semibold text-slate-800">P1 Guided：</span>smoke 默认 2 次，demo 默认 5 次；正演 / forward 暂不支持</p>
-          <p><span class="font-semibold text-slate-800">自定义迭代：</span>请求中可显式写 1–100 次，例如“运行 50 次迭代的 FWI”</p>
+          <p><span class="font-semibold text-slate-800">自定义迭代：</span>请求中可显式写 1–10000 次，例如“运行 500 次迭代的 FWI”</p>
           <p><span class="font-semibold text-slate-800">数据：</span>合成观测；结果仅用于端到端流程验证</p>
         </div>
       </section>
@@ -1795,7 +1795,7 @@
       const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
       const errors = [];
       const goal = typeof source.goal === 'string' ? source.goal.trim() : '';
-      const iterations = guidedIntegerValue(source.iterations, 1, 100);
+      const iterations = guidedIntegerValue(source.iterations, 1, 10000);
       const seed = guidedIntegerValue(source.seed, 0, 2147483647);
       const unsupportedForward = source.unsupported_operation === 'forward'
         || hasGuidedUnsupportedForwardIntent(goal);
@@ -1805,7 +1805,7 @@
       if (!isSafeGuidedVersion(source.dataset_version)) errors.push('数据集版本无效');
       if (!['fwi_smoke', 'fwi_demo'].includes(source.preset)) errors.push('预设仅允许 smoke 或 demo');
       if (!['cpu', 'cuda'].includes(source.device)) errors.push('设备仅允许 CPU 或 CUDA');
-      if (iterations === null) errors.push('迭代次数必须是 1–100 的整数');
+      if (iterations === null) errors.push('迭代次数必须是 1–10000 的整数');
       if (seed === null) errors.push('随机种子必须是 0–2147483647 的整数');
       return {
         ok: errors.length === 0,
@@ -1880,7 +1880,7 @@
           datasetVersion: isSafeGuidedVersion(draftDataset.version) ? draftDataset.version : '',
           preset: ['fwi_smoke', 'fwi_demo'].includes(draftParameters.preset) ? draftParameters.preset : '',
           device: ['cpu', 'cuda'].includes(draftParameters.device) ? draftParameters.device : '',
-          iterations: guidedIntegerValue(draftParameters.iterations, 1, 100),
+          iterations: guidedIntegerValue(draftParameters.iterations, 1, 10000),
           seed: guidedIntegerValue(draftParameters.seed, 0, 2147483647),
         },
         plan: {
@@ -1902,8 +1902,8 @@
         adapter: {
           status: adapterStatus,
           stage: boundedGuidedText(adapterSource.stage, 80),
-          completed: guidedIntegerValue(adapterSource.completed, 0, 100),
-          total: guidedIntegerValue(adapterSource.total, 0, 100),
+          completed: guidedIntegerValue(adapterSource.completed, 0, 10000),
+          total: guidedIntegerValue(adapterSource.total, 0, 10000),
           message: boundedGuidedText(adapterSource.message, 500),
         },
       };
@@ -2109,8 +2109,9 @@
           <label class="text-xs font-semibold text-slate-600">设备
             <select id="guidedDevice" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm"><option value="cpu"${form.device === 'cpu' ? ' selected' : ''}>CPU</option><option value="cuda"${form.device === 'cuda' ? ' selected' : ''}>CUDA</option></select>
           </label>
-          <label class="text-xs font-semibold text-slate-600">迭代次数（1–100）
-            <input id="guidedIterations" type="number" min="1" max="100" step="1" value="${escapeHtml(String(form.iterations))}" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm" required>
+          <label class="text-xs font-semibold text-slate-600">迭代次数（1–10000）
+            <input id="guidedIterations" type="number" min="1" max="10000" step="1" value="${escapeHtml(String(form.iterations))}" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm" required>
+            <span class="mt-1 block font-normal text-amber-700">超过 100 次可能长时间占用计算资源；当前不支持运行中取消。</span>
           </label>
           <label class="text-xs font-semibold text-slate-600">随机种子（0–2147483647）
             <input id="guidedSeed" type="number" min="0" max="2147483647" step="1" value="${escapeHtml(String(form.seed))}" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm" required>

@@ -78,7 +78,7 @@ class FakeDispatcher:
         ]
         return DispatchPreparation(
             adapter_id="fwi.deepwave_adapter",
-            adapter_version="1.0.0",
+            adapter_version="1.1.0",
             request=request,
             queue_fingerprint=current_fingerprint,
         )
@@ -1701,7 +1701,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         def invalid_dispatch(intent):
             handle = valid_dispatch(intent)
-            handle["fingerprint"].pop("runtime")
+            handle["fingerprint"]["adapter_version"] = "1.0.0"
             return handle
 
         dispatcher.dispatch = invalid_dispatch

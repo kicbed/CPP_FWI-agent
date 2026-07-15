@@ -59,7 +59,7 @@
               "properties": {
                 "type": {"const": "integer"},
                 "minimum": {"const": 0},
-                "maximum": {"const": 100}
+                "maximum": {"enum": [100, 10000]}
               }
             },
             "seed": {

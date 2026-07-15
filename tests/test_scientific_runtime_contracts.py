@@ -19,6 +19,7 @@ HASH_A = "sha256:" + "a" * 64
 HASH_B = "sha256:" + "b" * 64
 HASH_C = "sha256:" + "c" * 64
 HASH_D = "sha256:" + "d" * 64
+ALGORITHM_VERSION = "1.1.0"
 
 
 def dataset_ref() -> dict:
@@ -53,7 +54,7 @@ def algorithm_manifest() -> dict:
     return {
         "schema_version": "1.0.0",
         "id": "deepwave.acoustic_fwi",
-        "version": "1.0.0",
+        "version": ALGORITHM_VERSION,
         "task_types": ["acoustic_forward_2d", "acoustic_fwi_2d"],
         "parameter_schema": {
             "$schema": "http://json-schema.org/draft-07/schema#",
@@ -62,7 +63,7 @@ def algorithm_manifest() -> dict:
             "properties": {
                 "preset": {"enum": ["forward", "fwi_smoke", "fwi_demo"]},
                 "device": {"enum": ["cpu", "cuda"]},
-                "iterations": {"type": "integer", "minimum": 0, "maximum": 100},
+                "iterations": {"type": "integer", "minimum": 0, "maximum": 10000},
                 "seed": {"type": "integer", "minimum": 0},
             },
             "required": ["preset", "device", "iterations", "seed"],
@@ -88,7 +89,7 @@ def algorithm_manifest() -> dict:
         },
         "adapter": {
             "protocol": "algorithm-adapter-v1",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "entrypoint_ref": "fwi.deepwave_adapter",
             "methods": ["validate", "estimate", "submit", "status", "cancel", "collect"],
             "idempotent_submit": True,
@@ -117,7 +118,7 @@ def task_draft() -> dict:
         "goal": "Run the registered Marmousi Deepwave FWI smoke baseline.",
         "task_type": "acoustic_fwi_2d",
         "datasets": [dataset_ref()],
-        "algorithm": {"id": "deepwave.acoustic_fwi", "version": "1.0.0"},
+        "algorithm": {"id": "deepwave.acoustic_fwi", "version": ALGORITHM_VERSION},
         "parameters": {
             "preset": "fwi_smoke",
             "device": "cuda",
@@ -147,7 +148,10 @@ def plan_graph() -> dict:
         "nodes": [
             {
                 "node_id": "invert",
-                "algorithm": {"id": "deepwave.acoustic_fwi", "version": "1.0.0"},
+                "algorithm": {
+                    "id": "deepwave.acoustic_fwi",
+                    "version": ALGORITHM_VERSION,
+                },
                 "inputs": [
                     {
                         "port": "model",
@@ -213,7 +217,9 @@ def approval_decision(plan: dict | None = None) -> dict:
                     for key in ("id", "version", "content_hash", "data_type")
                 }
             ],
-            "algorithms": [{"id": "deepwave.acoustic_fwi", "version": "1.0.0"}],
+            "algorithms": [
+                {"id": "deepwave.acoustic_fwi", "version": ALGORITHM_VERSION}
+            ],
             "resource_limits": resources(),
             "side_effects": ["compute", "write_artifacts"],
             "max_tasks": 1,
@@ -235,8 +241,8 @@ def fingerprint(*, dirty: bool = False) -> dict:
         source["diff_hash"] = HASH_C
     return {
         "provenance_mode": "reproducible",
-        "algorithm": {"id": "deepwave.acoustic_fwi", "version": "1.0.0"},
-        "adapter_version": "1.0.0",
+        "algorithm": {"id": "deepwave.acoustic_fwi", "version": ALGORITHM_VERSION},
+        "adapter_version": "1.1.0",
         "source": source,
         "environment": {"environment_lock_hash": HASH_B},
         "runtime": {
@@ -296,7 +302,10 @@ def artifact_manifest(plan: dict | None = None) -> dict:
         "fingerprint": fingerprint(),
         "lineage": {
             "plan_hash": current_plan["plan_hash"],
-            "algorithm": {"id": "deepwave.acoustic_fwi", "version": "1.0.0"},
+            "algorithm": {
+                "id": "deepwave.acoustic_fwi",
+                "version": ALGORITHM_VERSION,
+            },
             "inputs": [
                 {
                     key: dataset[key]
@@ -362,6 +371,16 @@ class ScientificRuntimeSchemaTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(schema_errors(name, value), [])
 
+        legacy_manifest = algorithm_manifest()
+        legacy_manifest["version"] = "1.0.0"
+        legacy_manifest["parameter_schema"]["properties"]["iterations"][
+            "maximum"
+        ] = 100
+        legacy_manifest["adapter"]["version"] = "1.0.0"
+        self.assertEqual(
+            schema_errors("algorithm-manifest.schema.json", legacy_manifest), []
+        )
+
     def test_missing_and_unknown_top_level_fields_are_rejected(self) -> None:
         missing = dataset_ref()
         missing.pop("content_hash")
@@ -386,7 +405,11 @@ class ScientificRuntimeSchemaTest(unittest.TestCase):
         self.assertTrue(schema_errors("task-draft.schema.json", draft))
 
         draft = task_draft()
-        draft["parameters"]["iterations"] = 101
+        draft["parameters"]["iterations"] = 10000
+        self.assertEqual(schema_errors("task-draft.schema.json", draft), [])
+
+        draft = task_draft()
+        draft["parameters"]["iterations"] = 10001
         self.assertTrue(schema_errors("task-draft.schema.json", draft))
 
         draft = task_draft()

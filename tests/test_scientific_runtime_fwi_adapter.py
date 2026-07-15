@@ -42,7 +42,7 @@ PLAN_HASH = "sha256:" + "d" * 64
 
 
 def algorithm_identity() -> dict[str, Any]:
-    return {"id": "deepwave.acoustic_fwi", "version": "1.0.0"}
+    return {"id": "deepwave.acoustic_fwi", "version": "1.1.0"}
 
 
 def dataset_ref(*, content_hash: str = HASH_DATASET) -> dict[str, Any]:
@@ -96,7 +96,7 @@ def development_fingerprint() -> dict[str, Any]:
     return {
         "provenance_mode": "development",
         "algorithm": algorithm_identity(),
-        "adapter_version": "1.0.0",
+        "adapter_version": "1.1.0",
         "source": {"identity_complete": False, "dirty": None},
         "environment": {"environment_lock_hash": HASH_ENVIRONMENT},
         "runtime": {
@@ -527,7 +527,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.adapter.validate(**copy.deepcopy(valid))
         demo_cuda = copy.deepcopy(valid)
         demo_cuda["parameters"].update(
-            {"preset": "fwi_demo", "device": "cuda", "iterations": 100}
+            {"preset": "fwi_demo", "device": "cuda", "iterations": 10000}
         )
         demo_cuda["resources"].update({"device": "cuda", "gpu_count": 1})
         self.adapter.validate(**demo_cuda)
@@ -631,7 +631,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         invalid_seed["parameters"]["seed"] = True
         invalid_cases["boolean seed"] = invalid_seed
 
-        for value in (0, 101, "2", 2.0, True):
+        for value in (0, 10001, "2", 2.0, True):
             invalid = copy.deepcopy(valid)
             invalid["parameters"]["iterations"] = value
             invalid_cases[f"invalid iterations {value!r}"] = invalid
@@ -1009,6 +1009,81 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                     status_path.symlink_to(outside)
                 with self.assertRaises((ValueError, RuntimeError, OSError)):
                     self.adapter.status(handle)
+
+    def test_current_dispatcher_reads_legacy_adapter_receipts(self) -> None:
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-legacy-receipt",
+            idempotency_key="task-legacy-receipt:invert:0001",
+        )
+        self.write_success_artifacts(run_dir)
+
+        record_path = self.submission_record_path(handle)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["algorithm"]["version"] = "1.0.0"
+        record["adapter_version"] = "1.0.0"
+        record["fingerprint"]["algorithm"]["version"] = "1.0.0"
+        record["fingerprint"]["adapter_version"] = "1.0.0"
+        record["request_hash"] = fwi_adapter_module._sha256_document(
+            self.adapter._record_request_payload(record)
+        )
+        self.adapter._write_submission(record_path, record)
+        legacy_handle = self.adapter._handle_from_record(record)
+
+        intent = DispatchIntentSnapshot(
+            intent_id="dispatch-legacy-receipt",
+            task_id=record["task_id"],
+            plan_id="plan-legacy-receipt",
+            plan_hash=record["plan_hash"],
+            approval_id="approval-legacy-receipt",
+            node_id=record["node_id"],
+            node_idempotency_key=record["idempotency_key"],
+            adapter_id="fwi.deepwave_adapter",
+            adapter_version="1.0.0",
+            request={},
+            request_hash="sha256:" + "e" * 64,
+            queue_fingerprint=copy.deepcopy(record["fingerprint"]),
+            state="dispatched",
+            handle=legacy_handle.as_dict(),
+            failure_code=None,
+            created_at=NOW,
+            dispatch_claimed_at=NOW,
+            outcome_recorded_at=NOW,
+        )
+        dispatcher = DeepwaveTaskDispatcher(self.adapter)
+        self.assertEqual(dispatcher.status(intent)["status"], "Succeeded")
+        artifacts = dispatcher.collect(intent)
+        self.assertEqual(len(artifacts), 2)
+        artifact, data = dispatcher.read_artifact(
+            intent, artifacts[0]["artifact_id"]
+        )
+        self.assertEqual(artifact["fingerprint"]["adapter_version"], "1.0.0")
+        self.assertEqual(
+            artifact["lineage"]["algorithm"]["version"], "1.0.0"
+        )
+        self.assertEqual(len(data), artifact["size_bytes"])
+
+        mismatched_intent = dataclasses.replace(intent, adapter_version="1.1.0")
+        with self.assertRaisesRegex(DispatchError, "DISPATCH_RECEIPT_INVALID"):
+            dispatcher.status(mismatched_intent)
+        dispatching_legacy = dataclasses.replace(
+            intent, state="dispatching", handle=None
+        )
+        with self.assertRaisesRegex(DispatchError, "DISPATCH_INTENT_INVALID"):
+            dispatcher.dispatch(dispatching_legacy)
+
+        record["algorithm"]["version"] = "1.1.0"
+        record["fingerprint"]["algorithm"]["version"] = "1.1.0"
+        record["request_hash"] = fwi_adapter_module._sha256_document(
+            self.adapter._record_request_payload(record)
+        )
+        self.adapter._write_submission(record_path, record)
+        mixed_handle = self.adapter._handle_from_record(record)
+        with self.assertRaisesRegex(
+            RuntimeError, "private record version is unsupported"
+        ):
+            self.adapter._read_submission(record_path)
+        with self.assertRaisesRegex(RuntimeError, "ADAPTER_HANDLE_INVALID"):
+            self.adapter.status(mixed_handle)
 
     def test_cancel_is_a_stable_p1_noop(self) -> None:
         handle, _ = self.submit_and_run_dir()

@@ -32,7 +32,7 @@ class ConfigAndModelIOTest(unittest.TestCase):
 
     def test_explicit_inversion_iteration_count_is_bounded(self) -> None:
         for preset in ("fwi_smoke", "fwi_demo"):
-            for iterations in (1, 50, 100):
+            for iterations in (1, 50, 100, 10000):
                 with self.subTest(preset=preset, iterations=iterations):
                     config = resolve_config(
                         {
@@ -43,7 +43,7 @@ class ConfigAndModelIOTest(unittest.TestCase):
                     )
                     self.assertEqual(config.iterations, iterations)
 
-            for iterations in (-1, 0, 101):
+            for iterations in (-1, 0, 10001):
                 with self.subTest(preset=preset, iterations=iterations):
                     with self.assertRaises(ValueError):
                         resolve_config(

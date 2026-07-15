@@ -19,9 +19,17 @@ from scientific_runtime_contracts import schema_errors
 from .registry_service import RegistryResult, RegistryService, RegistryValidationError
 
 
-DEEPWAVE_MANIFEST_PATH = (
-    Path(__file__).with_name("registrations") / "deepwave_acoustic_fwi_v1.json"
-)
+DEEPWAVE_ALGORITHM_ID = "deepwave.acoustic_fwi"
+DEEPWAVE_ALGORITHM_VERSION = "1.1.0"
+DEEPWAVE_LEGACY_ALGORITHM_VERSION = "1.0.0"
+DEEPWAVE_MANIFEST_PATHS = {
+    DEEPWAVE_LEGACY_ALGORITHM_VERSION: (
+        Path(__file__).with_name("registrations") / "deepwave_acoustic_fwi_v1.json"
+    ),
+    DEEPWAVE_ALGORITHM_VERSION: (
+        Path(__file__).with_name("registrations") / "deepwave_acoustic_fwi_v1_1.json"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -30,8 +38,21 @@ class FWIBaselineRegistration:
     algorithm: RegistryResult
 
 
-def load_deepwave_manifest() -> dict[str, Any]:
-    value = json.loads(DEEPWAVE_MANIFEST_PATH.read_text(encoding="utf-8"))
+def load_deepwave_manifest(
+    version: str = DEEPWAVE_ALGORITHM_VERSION,
+) -> dict[str, Any]:
+    if not isinstance(version, str):
+        raise RegistryValidationError(
+            "PACKAGED_MANIFEST_UNAVAILABLE",
+            ["packaged Deepwave manifest version must be a string"],
+        )
+    path = DEEPWAVE_MANIFEST_PATHS.get(version)
+    if path is None:
+        raise RegistryValidationError(
+            "PACKAGED_MANIFEST_UNAVAILABLE",
+            [f"no packaged Deepwave manifest exists for version {version!r}"],
+        )
+    value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise RegistryValidationError(
             "PACKAGED_MANIFEST_INVALID", ["packaged manifest must be an object"]
@@ -39,6 +60,11 @@ def load_deepwave_manifest() -> dict[str, Any]:
     errors = schema_errors("algorithm-manifest.schema.json", value)
     if errors:
         raise RegistryValidationError("PACKAGED_MANIFEST_INVALID", errors)
+    if value.get("id") != DEEPWAVE_ALGORITHM_ID or value.get("version") != version:
+        raise RegistryValidationError(
+            "PACKAGED_MANIFEST_INVALID",
+            ["packaged manifest identity does not match its versioned path"],
+        )
     return value
 
 

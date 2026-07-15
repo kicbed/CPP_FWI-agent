@@ -71,7 +71,7 @@ class FakeDispatcher:
         ]
         return DispatchPreparation(
             adapter_id="fwi.deepwave_adapter",
-            adapter_version="1.0.0",
+            adapter_version="1.1.0",
             request=request,
             queue_fingerprint=queue_fingerprint,
         )
@@ -171,6 +171,13 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertFalse(capabilities["features"]["running_cancel"])
         self.assertFalse(capabilities["features"]["automatic_reconciliation"])
         self.assertEqual(
+            capabilities["form"]["iterations"], {"minimum": 1, "maximum": 10000}
+        )
+        self.assertEqual(
+            capabilities["algorithm"],
+            {"id": "deepwave.acoustic_fwi", "version": "1.1.0"},
+        )
+        self.assertEqual(
             capabilities["capabilities"],
             {
                 "cancel": False,
@@ -186,6 +193,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(catalog["datasets"][0]["id"], "marmousi_94_288")
         self.assertNotIn("access_scope", catalog["datasets"][0])
         self.assertEqual(len(catalog["algorithms"]), 1)
+        self.assertEqual(catalog["algorithms"][0]["version"], "1.1.0")
         serialized = repr(catalog)
         self.assertNotIn("entrypoint_ref", serialized)
         self.assertNotIn("/root/", serialized)
@@ -231,6 +239,24 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         with self.assertRaises(WorkbenchValidationError) as caught:
             self.workbench.create_task(guided_form(iterations=True), "bad-bool")
         self.assertEqual(caught.exception.code, "ITERATIONS_OUT_OF_RANGE")
+
+    def test_iteration_upper_bound_creates_only_a_pre_runtime_plan(self) -> None:
+        result = self.workbench.create_task(
+            guided_form(iterations=10000), "create-max-iterations"
+        )
+        snapshot = self.store.get_task(result["task_id"])
+        self.assertEqual(snapshot.status, "AwaitingApproval")
+        self.assertEqual(snapshot.draft["parameters"]["iterations"], 10000)
+        self.assertEqual(snapshot.draft["resources"]["wall_time_seconds"], 7200)
+        self.assertIsNone(self.store.get_dispatch_intent(result["task_id"]))
+
+        for index, value in enumerate((0, 10001, -3, 2.5, "10000", True)):
+            with self.subTest(iterations=value):
+                with self.assertRaises(WorkbenchValidationError) as caught:
+                    self.workbench.create_task(
+                        guided_form(iterations=value), f"bad-iterations-{index}"
+                    )
+                self.assertEqual(caught.exception.code, "ITERATIONS_OUT_OF_RANGE")
 
     def test_revise_uses_cas_builds_new_plan_and_replays_exactly(self) -> None:
         created = self.workbench.create_task(guided_form(), "create-revise")

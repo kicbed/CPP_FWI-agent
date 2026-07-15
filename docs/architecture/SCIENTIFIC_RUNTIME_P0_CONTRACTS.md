@@ -204,7 +204,7 @@ Schema、Registry、权限或 approval 检查。
 | `resources/fwi_models/model_metadata.json` | shape、spacing、速度范围、来源说明 | 主要描述大模型；缺当前 `marmousi_94_288` 的不可变 catalog version/access scope | 仅作说明性 metadata 来源 |
 | `fwi_worker/model_io.py` sidecar | 当前真实 `marmousi_94_288` shape/dtype/physics/unit/hash 双校验 | 包含本机路径，且由 Worker 私有代码读取；不能让浏览器/LLM 传入路径 | P1 导入时提取安全 metadata/hash，Task 只保留 DatasetRef |
 | `fwi_worker/FWIConfig` | fixed model ID、preset、cpu/cuda、严格 iterations、seed 和数值上限 | 包含 Worker 私有路径和更多数值字段；没有 plan/approval 身份 | v1 先规范化为最小 `fwi_parameters`，Adapter 内再解析固定配置 |
-| MCP `fwi_submit_demo` | 固定 `marmousi_94_288`、`forward|fwi_smoke|fwi_demo`、cpu/cuda、iterations 1–100、无额外字段、受控 spawn | job 状态在运行目录；无 SQLite task/approval/plan hash；最多两个进程只是本地 runner 限制 | P1 Adapter 前继续作为安全回归基线，不绕过批准接入 |
+| MCP `fwi_submit_demo` | 固定 `marmousi_94_288`、`forward|fwi_smoke|fwi_demo`、cpu/cuda、iterations 1–10000、无额外字段、受控 spawn | job 状态在运行目录；无 SQLite task/approval/plan hash；最多两个进程只是本地 runner 限制 | P1 Adapter 前继续作为安全回归基线，不绕过批准接入；上限由后续 D-006/P1-006 扩大 |
 | 旧 FWI `status.json/progress.jsonl` | queued/running/succeeded/failed、真实进度 | 无 task/node identity、单调 sequence、lease/cancel/retry/reconciliation | P1/P2 由 `RunEvent` 适配并持久化 |
 | 旧 FWI `manifest.json` | metrics、图、URL、合成验证免责声明 | 含绝对 artifact path、缺 content hash/lineage/完整 provenance | `collect` 只输出受控 relative path/URL 并补 hash/fingerprint |
 

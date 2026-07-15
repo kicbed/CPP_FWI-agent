@@ -3,11 +3,11 @@
 <!-- project-progress-schema: v1 -->
 
 - 最后更新：2026-07-15
-- 活跃决策：`D-003`、`D-004`；`D-005` 仍为 Proposed
+- 活跃决策：`D-003`、`D-004`、`D-006`；`D-005` 仍为 Proposed
 - 活跃分支：`feature/scientific-agent-runtime`
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
 - 总体状态：**P0 + P1 已验证；P2 Pending，未开始**
-- 当前阶段：**P1 Verified；P2 Pending（按用户要求暂停）**
+- 当前阶段：**P1 Verified（含 D-006/P1-006）；P2 Pending（按用户要求暂停）**
 - 下一动作：等待用户明确启动 P2；在此之前只使用已验证的 P1 Guided Web 闭环
 - 当前阻塞：无
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
@@ -22,7 +22,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 |---|---|---|---|---|
 | 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
 | P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 28/28；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
-| P1 最小持久垂直切片 | Verified | P1.1a Task Store + P1.1b Registry + P1.2a fixed Adapter + P1.1c atomic submit/dispatch + P1 Guided Web/API/status/artifact 闭环 | Scientific Runtime 139/139、CTest 39/39、MCP 1/1、FWI 27/27、Web/Workbench 27/27、Embedding 6/6、UI/launcher/governance PASS；真实 CUDA 一迭代、Web source-policy 与重启后查询 PASS | —（P1 完成，停在 P2 之前） |
+| P1 最小持久垂直切片 | Verified | P1.1a Task Store + P1.1b Registry + P1.2a fixed Adapter + P1.1c atomic submit/dispatch + P1 Guided Web/API/status/artifact 闭环 + D-006 高迭代边界维护 | Scientific Runtime 143/143、CTest 39/39、MCP 1/1、FWI 27/27、Web/Workbench 27/27、Embedding 6/6、UI/launcher/governance PASS；真实 CUDA 一迭代、Web source-policy/重启后查询及既有数据库 1.0→1.1 兼容读取 PASS | —（P1 完成，停在 P2 之前） |
 | P2 持久可靠性加固 | Pending | 无 | 无 | lease、取消、重试、恢复和 SSE 通过 |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
@@ -42,6 +42,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 - 当前通用 Orchestrator 仍以固定/单跳路由为主；P1 已把 SQLite task/registry、完整 Gate、
   approval budget、固定 FWI Adapter、atomic submit/one-shot dispatch 和同源 Guided Web/API 接成最小
   闭环，但仍无 DAG 调度、运行中取消、lease/retry/SSE 或中断后自动恢复。
+- D-006/P1-006 已把当前固定 FWI 的显式整数上限扩展为 10000；新提交使用
+  Algorithm/Adapter `1.1.0`，旧 `1.0.0` manifest 与已 dispatch 收据保持只读兼容。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
 - 2026-07-15 用户的风险评估已收紧顺序：最小 FWI Schema 先行，最小 SQLite TaskService
   提前到首个垂直切片，Redis 不作为任务事实源，P4 Agent Planner 后置。
@@ -201,6 +203,27 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
   临时 task/job ID 不写入本账本；
 - 详见 `docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md`。
 
+### P1-006 / D-006 高迭代上限验证（2026-07-15）
+
+- Contract、Registry、Workbench、Adapter、Worker、MCP、C++ planner 与 Web UI 的当前反演
+  边界统一为严格整数 `1..10000`；`10001`、小数、负数、布尔值和服务端字符串均拒绝，
+  smoke/demo 默认仍为 2/5 次；
+- 不原地修改 `deepwave.acoustic_fwi@1.0.0` / Adapter `1.0.0`。新提交固定使用
+  Algorithm/Adapter `1.1.0`；MCP `fwi-runner` 公开合同同步为 `1.1.0`。读取端仅接受
+  Algorithm/Adapter/fingerprint 的 `1.0↔1.0` 或 `1.1↔1.1` 绑定，旧版不能用于新 dispatch；
+- 现有仓库外 SQLite 经根启动器重开后同时保留 `1.0.0`（max=100）并注册 `1.1.0`
+  （max=10000）；旧文档/hash 未变，已有两个旧 dispatched 成功任务的状态及两组 artifact
+  均可通过当前 HTTP/TaskService 链路读取，且没有重新 dispatch；
+- 真实 HTTP 接受 10000 并只创建 `AwaitingApproval` Draft/Plan；现场随后放弃为 `Cancelled`，
+  全程没有新增 dispatch 或 Worker job。10001 返回 422 且没有创建 task/dispatch/job；
+- Scientific Runtime 143/143（Contract 28、Registry 27、TaskService 55、Adapter 19、Workbench
+  14）、根 CTest 39/39、MCP 1/1、FWI Worker 27/27、Web/Workbench 27/27、Embedding 6/6、
+  UI Node、launcher、continuity、runtime-secret、`codex-project --check`、shell syntax 与
+  `git diff --check` 全部 PASS；
+- 没有执行真实 10000 次数值回归。Worker 当前每轮原子重写并 `fsync` 累计 `loss.csv`，高次数
+  存在 O(N²) 写放大；7200 秒只是资源策略上限，不是 runtime timeout。P1 仍没有运行中取消、
+  timeout、checkpoint、retry 或 reconciliation，10000 不构成性能或完成时间承诺。
+
 ### 停在 P2 之前
 
 P1 的必需交付与退出测试已通过。按用户要求，本 checkpoint 不启动 P2；运行中 cancel、
@@ -237,6 +260,7 @@ Pending。D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 | 2026-07-15 | P1-003 / P1.2a | Pending → Verified（fixed Adapter）；P1 仍 In progress | 固定 Deepwave 六方法 Adapter、Registry/local identity 双边界、跨进程幂等、固定 launcher、脱敏状态、严格 artifact collect | Adapter 17/17、Scientific Runtime 100/100、真实 CUDA 一次迭代 submit/status/collect/replay；全量回归 PASS | P1.1c 原子 Gate/budget/submit intent/Queued；事务后 dispatch 与 Guided Web |
 | 2026-07-15 | P1-004 / P1.1c | Pending → Verified（atomic submit backend）；P1 仍 In progress | SQLite v3、同事务 Gate/budget/idempotency/intent/task_queued/Queued、固定 one-shot dispatcher、preflight/actual fingerprint receipt、显式 crash states | Scientific Runtime 117/117；CTest 39/39、MCP 1/1、FWI 27/27、Web/embedding 13/13、UI/governance PASS | P1 Guided Web 选择/确认/批准/状态/结果闭环；P2 recovery 仍 pending |
 | 2026-07-15 | P1-005 / Guided Web | Pending → Verified；P1 完成 | SQLite v4 mutation/abandonment、固定 Guided composer、同源 Workbench API、Web legacy-submit opt-out、确认/修改/批准/放弃 UI、status/event/artifact 闭环 | Runtime 139/139、CTest 39/39、MCP 1/1、FWI 27/27、Web 27/27、Embedding 6/6 及 UI/governance PASS；真实 CUDA、两个下载、source-policy、Web 重启和根启动器 PASS | 按用户要求停在 P2 之前；等待明确启动 P2 |
+| 2026-07-15 | P1-006 / D-006 | Accepted / Implemented → Verified（P1 配置维护；P2 未开始） | 新 Algorithm/Adapter 与 MCP runner `1.1.0`、`1..10000` 全链路边界、旧 `1.0.0` 只读兼容、长任务警告 | Runtime 143/143；CTest 39/39、MCP 1/1、FWI 27/27、Web 27/27、Embedding 6/6、UI/governance PASS；既有 DB/API 边界验证 PASS | 按用户要求停在 P2 之前 |
 
 记录规则：
 

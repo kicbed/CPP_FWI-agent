@@ -128,7 +128,7 @@ class FWIConfig(BaseModel):
     # The MCP surface permits an explicit, bounded iteration count.  Keep the
     # same upper bound in the numerical worker so bypassing MCP cannot create
     # an unbounded local run by accident.
-    iterations: int = Field(strict=True, ge=0, le=100)
+    iterations: int = Field(strict=True, ge=0, le=10000)
     optimizer: Literal["adam", "sgd"] = "adam"
     learning_rate: float = Field(gt=0)
     gradient_clip_quantile: float = Field(gt=0, le=1)
@@ -137,7 +137,7 @@ class FWIConfig(BaseModel):
     def validate_consistency(self) -> "FWIConfig":
         if self.preset in {"fwi_smoke", "fwi_demo"}:
             if self.iterations < 1:
-                raise ValueError("inversion iterations must be between 1 and 100")
+                raise ValueError("inversion iterations must be between 1 and 10000")
         elif self.preset in {"forward", "marmousi_94_288_demo"} and self.iterations != 0:
             raise ValueError("forward-only presets require iterations=0")
         if self.velocity_min_mps >= self.velocity_max_mps:

@@ -18,8 +18,9 @@
 
 1. Web 从同源 session endpoint 取得服务器绑定的 scope、P1 capability 和进程生命周期内的
    CSRF token；服务重启后必须重新取得；
-2. 从 immutable Catalog 读取唯一受支持的 `marmousi_94_288@1.0.0` 与
-   `deepwave.acoustic_fwi@1.0.0`，页面只展示无路径 metadata；
+2. 从 immutable Catalog 读取唯一受支持的 `marmousi_94_288@1.0.0` 与当前
+   `deepwave.acoustic_fwi@1.1.0`，页面只展示无路径 metadata；旧算法 `1.0.0` 快照保留但不供
+   新 Guided 任务选择；
 3. 浏览器只提交七个字段：`goal`、dataset ID/version、`preset`、`device`、`iterations`、
    `seed`；服务器组装完整 TaskDraft、资源上限、单节点 Plan 和 node idempotency key；
 4. 页面展示真实 `task_id`、draft revision、计划和 canonical `plan_hash`。修改使用 revision
@@ -35,6 +36,10 @@
 
 执行型 FWI 快捷按钮和聊天文本统一进入这张确认卡。理论问题仍走原聊天路径；旧 MCP/FWI
 Result renderer 保留作兼容回归，但不再允许日常 Web 操作绕过批准卡直接执行。
+
+D-006/P1-006 把显式反演迭代上限从 100 提升到 10000，同时保留 smoke/demo 默认 2/5 次、
+人工批准和严格整数校验。变更使用新的 Algorithm/Adapter `1.1.0` 身份，不原地改写已注册的
+`1.0.0` manifest。大于 100 次时页面提示长任务风险；P1 仍不提供运行中取消或完成时间保证。
 
 普通 Web 聊天的 HTTP/A2A 请求固定携带字符串
 `metadata.allow_legacy_fwi_submit="false"`；可选 gRPC bridge 固定接收布尔 `false`，再以
