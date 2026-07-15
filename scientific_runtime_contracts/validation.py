@@ -334,6 +334,14 @@ def evaluate_execution_gate(
             GateViolation("APPROVAL_TASK_BUDGET_EXHAUSTED", "/approval/scope/max_tasks", "approval task budget is exhausted")
         )
 
+    if draft["status"] != "AwaitingApproval":
+        violations.append(
+            GateViolation(
+                "DRAFT_NOT_AWAITING_APPROVAL",
+                "/draft/status",
+                "draft must be AwaitingApproval before execution",
+            )
+        )
     if draft["missing_fields"] or plan["missing_fields"]:
         violations.append(
             GateViolation("UNRESOLVED_FIELDS", "/draft/missing_fields", "all required fields must be resolved before execution")
@@ -341,6 +349,14 @@ def evaluate_execution_gate(
     if plan["draft"] != {"draft_id": draft["draft_id"], "revision": draft["revision"]}:
         violations.append(
             GateViolation("DRAFT_REVISION_MISMATCH", "/plan/draft", "plan does not target the current draft revision")
+        )
+    if plan["task_type"] != draft["task_type"]:
+        violations.append(
+            GateViolation(
+                "TASK_TYPE_OUTSIDE_DRAFT",
+                "/plan/task_type",
+                "plan task_type differs from the current TaskDraft",
+            )
         )
 
     violations.extend(_dag_errors(plan["nodes"]))
@@ -367,6 +383,22 @@ def evaluate_execution_gate(
         if algorithm != draft["algorithm"]:
             violations.append(
                 GateViolation("ALGORITHM_OUTSIDE_DRAFT", node_path + "/algorithm", "P0 plan algorithm differs from the current TaskDraft")
+            )
+        if node["parameters"] != draft["parameters"]:
+            violations.append(
+                GateViolation(
+                    "PARAMETERS_OUTSIDE_DRAFT",
+                    node_path + "/parameters",
+                    "P0 plan node parameters differ from the current TaskDraft",
+                )
+            )
+        if node["resources"] != draft["resources"]:
+            violations.append(
+                GateViolation(
+                    "RESOURCES_OUTSIDE_DRAFT",
+                    node_path + "/resources",
+                    "P0 plan node resources differ from the current TaskDraft",
+                )
             )
         preset = node["parameters"]["preset"]
         if (

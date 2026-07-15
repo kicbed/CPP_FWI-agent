@@ -6,9 +6,10 @@
 - 活跃决策：`D-003`、`D-004`；`D-005` 仍为 Proposed
 - 活跃分支：`feature/scientific-agent-runtime`
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
-- 总体状态：**P0 已完成并验证；Ready to start P1 最小持久垂直切片**
-- 当前阶段：**P1（尚未开始）**
-- 下一动作：P1.1 实现 SQLite WAL 最小 Task Store/TaskService 的持久身份、幂等创建、事件和状态查询
+- 总体状态：**P0 已完成并验证；P1 进行中，P1.1a SQLite 持久基础已验证**
+- 当前阶段：**P1（In progress；P1.1 为 Partially implemented）**
+- 下一动作：P1.1b/P1.2 持久化最小 Dataset Catalog/Algorithm Registry 快照，为同事务
+  Gate、批准预算和 submit 幂等建立前置条件；Deepwave Adapter 就绪前不进入 `Queued`
 - 当前阻塞：无
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
 
@@ -21,8 +22,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | 阶段 | 状态 | 已完成内容 | 验证证据 | 下一出口条件 |
 |---|---|---|---|---|
 | 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
-| P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计 | 合同 23/23、CTest 39/39、FWI Runner 1/1、FWI Python 26/26、Web Python 7/7、UI/governance：PASS | —（阶段完成） |
-| P1 最小持久垂直切片 | Pending | 无 | 无 | SQLite TaskService→FWI Adapter→Guided Web |
+| P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 一致性 | 合同当前 27/27；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 26/26、Web Python 7/7、UI/governance PASS | —（阶段完成） |
+| P1 最小持久垂直切片 | In progress | P1.1a：SQLite WAL Task Store、受项目/主体约束的 TaskService、持久 task/draft/plan/approval/event/create-idempotency；无 submit/queue 入口 | P1.1a 33/33、合同组合 60/60；CTest 39/39、runner 1/1、FWI 26/26、Web 13/13、UI/governance PASS | 完成 Catalog/Registry、同事务 Gate/批准预算/submit 幂等、Deepwave Adapter 和 Guided Web |
 | P2 持久可靠性加固 | Pending | 无 | 无 | lease、取消、重试、恢复和 SSE 通过 |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
@@ -39,17 +40,18 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 - 当前可运行基线是实验分支上的 Deepwave 二维声学 FWI MVP。
 - 现有 FWI 固定白名单、参数校验、独立 Worker 和 artifact 路由是迁移时必须保护的安全边界。
-- 当前通用 Orchestrator 仍以固定/单跳路由为主；P0 只有 TaskDraft/PlanGraph 等合同和无副作用
-  参考 Gate，尚无持久 TaskService、审批 API、DAG 调度、服务端取消或重启恢复。
+- 当前通用 Orchestrator 仍以固定/单跳路由为主；独立 P1.1a 模块已有 SQLite 持久基础，
+  但尚无 submit/queue 入口、审批 API、DAG 调度、服务端取消或运行中断后的恢复。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
 - 2026-07-15 用户的风险评估已收紧顺序：最小 FWI Schema 先行，最小 SQLite TaskService
   提前到首个垂直切片，Redis 不作为任务事实源，P4 Agent Planner 后置。
 - Git 动态快照（截至 2026-07-15）：当前实现分支基于 `ffeb5bc`；本地 `main`
   相对 `origin/main` 为 ahead 57 / behind 2。下次操作必须现场重查，不把快照当成永久事实。
 
-### 尚未开始
+### 尚未开始或尚未完成
 
-- 没有创建 SQLite TaskService、运行数据库、Dataset Catalog 注册或新 Web API。
+- 没有部署运行数据库、Dataset Catalog/Algorithm Registry 注册、submit 事务或新 Web API；
+- P1.1 的 submit 幂等只预留了 migration 约束，尚无产品代码路径；
 - 没有把现有 FWI 改造成通用 Algorithm Adapter。
 - 没有实现 Guided/Agent 新 UI、审批卡、DAG 或子 Agent 调度。
 
@@ -88,13 +90,36 @@ upstream 和 `ffeb5bc` ancestor，运行只读 helper，随后以代码和测试
 P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `FWI_RUN_ROOT` 执行边界。
 这些验证证明合同和回归基线通过，不证明 P1 TaskService 或科学效果。
 
-### 下一可执行切片：P1.1
+### P1.1a SQLite 持久基础验证（2026-07-15）
 
-1. 定义最小 SQLite migration 和 storage interface，启用 WAL；SQLite 是唯一任务事实源；
-2. 持久化 immutable task ID、draft revision、plan、approval、task state、append-only event 和
-   create/submit idempotency mapping；
-3. 先实现创建与状态查询的服务层及重启后身份/事件仍可查询测试；
-4. 未完成批准事务和 Deepwave Adapter 前不提交真实 FWI job，不提前制作表面 Web 闭环；
+- `scientific_runtime/migrations/0001_task_store.sql` 与
+  `scientific_runtime/task_store.py`：版本化 migration/checksum、WAL、外键、事务、CAS、不可变
+  task/plan/approval、append-only event 和 create 幂等；数据库路径必须为私有绝对路径，读取时
+  校验文档 hash 与索引身份；store 与 migration trigger 都禁止任务直接从 runtime 状态创建，
+  专用 application ID、串行空库首迁移、live schema/quick/FK 校验拒绝误接管、初始化竞态或
+  结构漂移，runtime status 必须有连续且匹配的事件历史，
+  Git/Docker 构建上下文都排除数据库和 sidecar；
+- `scientific_runtime/task_service.py`：所有读写绑定 `project_id`/`principal_id`，guided 批准者
+  必须等于当前主体；验证 draft/plan、算法/资源/数据引用、DAG、事件状态、节点和执行指纹；
+- `scientific_runtime_contracts/validation.py`：Gate 增加 `AwaitingApproval` 及
+  task type/parameters/resources 的 draft-plan 一致性；
+- 创建、查询、CAS、并发幂等、事务回滚、重启恢复、损坏检测、授权和事件原子性已由
+  `tests/test_scientific_runtime_task_service.py` 33 个测试覆盖；合同当前为 27 个测试；
+- 产品服务故意没有 submit/queue 方法；测试仅在隔离临时库中直接构造 post-submit 状态，
+  用于验证 P1.1a 事件持久边界；P2 checkpoint/wait/retry/cancel 仍被拒绝；
+- 这只使 **P1.1a Verified**。P1.1 parent 仍为 **Partially implemented**：Catalog/Registry、
+  批准预算、Gate + plan + approval + submit-idempotency + `Queued` 同事务，以及 Deepwave Adapter
+  尚未实现；P3 前即使 v1 Schema 可表示 DAG，首个真实 submit 仍必须增加单 FWI 节点能力门；
+- D-005 未获批；本切片未审计、迁移或删除旧 prompt-like 文件，也未改变 `FWI_RUN_ROOT`。
+
+### 下一可执行切片：P1.1b/P1.2 前置注册
+
+1. 增加最小不可变 Dataset Catalog 和 Algorithm Registry 存储，先注册 Marmousi 数据与当前
+   Deepwave FWI 算法/版本/资源/输入输出快照；
+2. 用注册快照替代仅由调用方提供的 Gate 元数据，并明确批准预算的持久字段；
+3. 设计并测试 Gate、plan、approval、预算与 submit idempotency 的单 SQLite 事务，但在
+   Deepwave Adapter 可接管真实 FWI 提交前不暴露 `Queued` 产品入口；
+4. 保持固定 MCP 白名单、结构化校验、私有运行根和单节点能力门，不提前实现 P3 DAG；
 5. D-005 未获批，继续不审计、迁移或删除旧 prompt-like 文件。
 
 ## 新会话恢复协议
@@ -122,6 +147,7 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
 | 2026-07-15 | PREP-002 / D-004 | Partially implemented → Verified | 独立实现分支首个 SSH checkpoint | `b5ac633` 本地/upstream 一致 | 准备阶段仅余首个新会话冷启动演练 |
 | 2026-07-15 | PREP-003 | Implemented → Verified | 真实新会话 branch/diff/ancestor/ledger/helper reconciliation | live preflight + governance tests：PASS | 准备阶段完成 |
 | 2026-07-15 | P0-001 | Pending → Verified | 七类 Schema、canonical/hash、Gate、fingerprint、状态/API/Adapter/Proto、威胁与差异审计 | contract 23/23、CTest 39/39、runner 1/1、FWI 26/26、Web 7/7、UI/governance：PASS | P0 阶段完成；P1.1 SQLite Task Store/TaskService |
+| 2026-07-15 | P1-001 / P1.1a | Pending → Verified（foundation）；P1.1 → Partially implemented | SQLite migration/store、受 scope 约束的 TaskService、task/draft/plan/approval/event/create-idempotency、Gate 补强 | contract 27/27、TaskService 33/33、组合 60/60；CTest 39/39、runner 1/1、FWI 26/26、Web 13/13、UI/governance PASS | P1.1b/P1.2 Catalog/Registry；同事务 submit 与 Adapter 仍 pending |
 
 记录规则：
 

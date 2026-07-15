@@ -73,6 +73,7 @@ python -m pip install "torch==2.12.0" \
 ```bash
 python -m pip install \
   "deepwave==0.0.27" \
+  "jsonschema==3.2.0" \
   "numpy>=1.26,<3" \
   "scipy>=1.11,<2" \
   "matplotlib>=3.8,<4" \

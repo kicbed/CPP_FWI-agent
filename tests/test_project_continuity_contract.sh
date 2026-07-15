@@ -19,12 +19,19 @@ require_text() {
 }
 
 required_files=(
+    .dockerignore
     AGENTS.md
     docs/PROJECT_CONTINUITY.md
     docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md
     docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md
+    docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md
     docs/PROJECT_PROGRESS.md
     docs/GIT_AND_PROMPT_POLICY.md
+    scientific_runtime/__init__.py
+    scientific_runtime/task_store.py
+    scientific_runtime/task_service.py
+    scientific_runtime/migrations/0001_task_store.sql
+    tests/test_scientific_runtime_task_service.py
     contracts/scientific_runtime/v1/common.schema.json
     contracts/scientific_runtime/v1/dataset-ref.schema.json
     contracts/scientific_runtime/v1/algorithm-manifest.schema.json
@@ -49,19 +56,25 @@ require_text docs/PROJECT_CONTINUITY.md '## D-004：'
 require_text docs/PROJECT_CONTINUITY.md '## D-005：'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
-require_text docs/PROJECT_CONTINUITY.md 'P0 contracts Verified / Durable runtime pending'
+require_text docs/PROJECT_CONTINUITY.md 'P0 contracts + P1.1a SQLite foundation Verified / P1 in progress'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '<!-- scientific-agent-runtime-plan: v1 -->'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '实现状态：**Pending**'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '<!-- scientific-runtime-p0-contracts: v1 -->'
-require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'TaskService、API、调度和 Adapter 尚未实现'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'P1.1a TaskStore/TaskService 持久基础已验证'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '调度和 Adapter 尚未实现'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '<!-- scientific-runtime-p1-task-store: v1 -->'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '父工作项 P1.1 仍为 **Partially implemented**'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '也没有开放 `submit`/`Queued` 入口'
 require_text docs/PROJECT_PROGRESS.md '<!-- project-progress-schema: v1 -->'
-require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1（尚未开始）**'
+require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1（In progress；P1.1 为 Partially implemented）**'
 require_text docs/PROJECT_PROGRESS.md '| P0 最小 FWI 契约 | Verified |'
-require_text docs/PROJECT_PROGRESS.md '下一可执行切片：P1.1'
+require_text docs/PROJECT_PROGRESS.md '下一可执行切片：P1.1b/P1.2 前置注册'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'D-005` / **Proposed'
 require_text docs/GIT_AND_PROMPT_POLICY.md '.local-prompts/'
+require_text .dockerignore '**/*.sqlite3-*'
+require_text .dockerignore '**/*.db-*'
 
 for phase in P0 P1 P2 P3 P4 P5 P6; do
     grep -Eq "^### ${phase}：" docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md || \

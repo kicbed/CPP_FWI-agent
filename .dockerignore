@@ -53,6 +53,12 @@ venv
 # Runtime logs/PIDs and other generated artifacts
 **/logs
 **/pids
+**/*.sqlite
+**/*.sqlite-*
+**/*.sqlite3
+**/*.sqlite3-*
+**/*.db
+**/*.db-*
 *.log
 coverage*
 htmlcov

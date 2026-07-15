@@ -324,6 +324,14 @@ def rehash(plan: dict, approval: dict | None = None) -> None:
         approval["plan_hash"] = plan["plan_hash"]
 
 
+def append_second_plan_node(plan: dict) -> dict:
+    node = copy.deepcopy(plan["nodes"][0])
+    node["node_id"] = "invert-second"
+    node["idempotency_key"] = "task-001:invert-second:0001"
+    plan["nodes"].append(node)
+    return node
+
+
 class ScientificRuntimeSchemaTest(unittest.TestCase):
     def test_all_public_schemas_are_valid_draft_07(self) -> None:
         for name in (
@@ -569,6 +577,51 @@ class ScientificRuntimeExecutionGateTest(unittest.TestCase):
         draft["status"] = "NeedsInput"
         draft["missing_fields"] = ["parameters.iterations"]
         self.assert_has_code(self.evaluate(draft=draft), "UNRESOLVED_FIELDS")
+
+    def test_draft_must_be_awaiting_approval_before_execution(self) -> None:
+        draft = task_draft()
+        draft["status"] = "Draft"
+        self.assertEqual(
+            [(violation.code, violation.path) for violation in self.evaluate(draft=draft)],
+            [("DRAFT_NOT_AWAITING_APPROVAL", "/draft/status")],
+        )
+
+    def test_plan_task_type_cannot_drift_from_the_draft(self) -> None:
+        draft = task_draft()
+        draft["task_type"] = "acoustic_forward_2d"
+        self.assertEqual(
+            [(violation.code, violation.path) for violation in self.evaluate(draft=draft)],
+            [("TASK_TYPE_OUTSIDE_DRAFT", "/plan/task_type")],
+        )
+
+    def test_each_plan_node_parameters_must_match_the_draft(self) -> None:
+        plan = plan_graph()
+        second = append_second_plan_node(plan)
+        second["parameters"]["iterations"] = 3
+        approval = approval_decision(plan)
+        rehash(plan, approval)
+        self.assertEqual(
+            [
+                (violation.code, violation.path)
+                for violation in self.evaluate(plan=plan, approval=approval)
+            ],
+            [("PARAMETERS_OUTSIDE_DRAFT", "/plan/nodes/1/parameters")],
+        )
+
+    def test_each_plan_node_resources_must_match_the_draft(self) -> None:
+        plan = plan_graph()
+        second = append_second_plan_node(plan)
+        second["resources"]["cpu_cores"] = 5
+        approval = approval_decision(plan)
+        approval["scope"]["resource_limits"]["cpu_cores"] = 5
+        rehash(plan, approval)
+        self.assertEqual(
+            [
+                (violation.code, violation.path)
+                for violation in self.evaluate(plan=plan, approval=approval)
+            ],
+            [("RESOURCES_OUTSIDE_DRAFT", "/plan/nodes/1/resources")],
+        )
 
     def test_malformed_and_duplicate_idempotency_keys_are_rejected(self) -> None:
         plan = plan_graph()

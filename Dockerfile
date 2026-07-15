@@ -38,6 +38,7 @@ RUN python3 -m venv /root/.venvs/cpp-fwi-agent \
         "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}" \
     && /root/.venvs/cpp-fwi-agent/bin/python -m pip install --no-cache-dir \
         "deepwave==0.0.27" \
+        "jsonschema==3.2.0" \
         "matplotlib>=3.8,<4" \
         "numpy>=1.26,<3" \
         "pillow>=10,<13" \

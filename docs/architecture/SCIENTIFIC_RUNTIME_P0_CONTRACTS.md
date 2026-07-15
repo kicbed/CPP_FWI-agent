@@ -6,7 +6,8 @@
 - 合同版本：`1.0.0`
 - JSON Schema 方言：Draft-07
 - 实现阶段：P0.1
-- 运行时状态：**合同参考实现；TaskService、API、调度和 Adapter 尚未实现**
+- 运行时状态：**P0 合同参考实现；P1.1a TaskStore/TaskService 持久基础已验证，submit/API/
+  调度和 Adapter 尚未实现**
 
 本文是七类公共对象、规范化、状态转换、确定性执行门、API 草案和 Algorithm Adapter v1
 的 P0 规范。它只覆盖已注册 `marmousi_94_288` 到 Deepwave 二维声学 FWI artifact 的最小
@@ -103,7 +104,8 @@ P0 只定义规则和参考 Gate，不实现状态存储。P1 的 SQLite TaskSer
 2. PlanGraph 自身 hash 正确，approval 的 `plan_id`/`plan_hash` 与当前 plan 完全一致；
 3. decision 为 approved，尚未过期、不早于 plan、决定时间不在未来，actor 与提交主体匹配，
    approval 的任务预算未耗尽；P0/P1 Guided 阶段不激活 Agent delegation；
-4. plan 指向当前 draft revision，draft/plan 无未解决字段；
+4. draft 当前状态为 `AwaitingApproval`，plan 指向当前 draft revision，draft/plan 无未解决
+   字段；P0 最小 FWI plan 的 task type、每个节点的算法、参数和资源必须与该 draft 一致；
 5. 每个 dataset `id@version` 已注册，类型和 content hash 一致；当前 principal/project 具有
    `execute` 权限；数据在 approval scope 内；
 6. 每个 algorithm `id@version` 已注册、版本已 pin、manifest 合法且 allowlisted，并在
@@ -233,3 +235,7 @@ P0 不能防止尚未实现的 API/TaskService 竞态、进程丢失或取消失
 
 本切片不实现：SQLite、task ID 持久化、Dataset Catalog 写入、审批 API、Deepwave Adapter、
 Web 确认卡、SSE、取消、lease、重试、reconciliation、DAG scheduler 或 Agent Planner。
+
+后续状态：SQLite/task identity/草稿、plan、approval 和 event 持久基础已在 P1.1a 实现；该
+事实不改变本节对历史 P0 切片边界的描述。P1.1a 详情见
+`docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md`。
