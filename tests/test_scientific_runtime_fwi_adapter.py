@@ -21,6 +21,12 @@ from unittest.mock import patch
 import numpy as np
 import scientific_runtime.fwi_adapter as fwi_adapter_module
 
+from scientific_runtime import (
+    DeepwaveTaskDispatcher,
+    DispatchError,
+    DispatchIntentSnapshot,
+    TaskSnapshot,
+)
 from scientific_runtime.fwi_adapter import (
     DeepwaveAdapter,
     SafeSubprocessWorkerLauncher,
@@ -675,12 +681,100 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(
             handle_document["idempotency_key"], "task-001:invert:0001"
         )
+        private_record = json.loads(
+            self.submission_record_path(handle).read_text(encoding="utf-8")
+        )
+        self.assertEqual(handle_document["fingerprint"], private_record["fingerprint"])
         encoded_handle = json.dumps(handle_document, sort_keys=True)
         self.assertNotIn(str(self.run_root), encoded_handle)
         self.assertNotIn("run_dir", handle_document)
         self.assertNotIn("config_path", handle_document)
         self.assertEqual(_status_name(self.adapter.status(handle)), "queued")
         self.assertEqual(run_dir, call["run_dir"])
+
+    def test_fixed_task_dispatcher_maps_snapshot_to_adapter_and_receipt(self) -> None:
+        dataset = copy.deepcopy(self.dataset)
+        snapshot = TaskSnapshot(
+            task_id="task-bridge-001",
+            project_id="project-1",
+            principal_id="user-1",
+            status="AwaitingApproval",
+            draft={"datasets": [dataset]},
+            plan={
+                "plan_id": "plan-bridge-001",
+                "plan_hash": PLAN_HASH,
+                "task_type": "acoustic_fwi_2d",
+                "nodes": [
+                    {
+                        "node_id": "invert",
+                        "algorithm": algorithm_identity(),
+                        "inputs": [
+                            {
+                                "port": "model",
+                                "dataset": {
+                                    key: dataset[key]
+                                    for key in (
+                                        "id",
+                                        "version",
+                                        "content_hash",
+                                        "data_type",
+                                    )
+                                },
+                            }
+                        ],
+                        "parameters": parameters(),
+                        "resources": resources(),
+                        "idempotency_key": "task-bridge-001:invert:0001",
+                    }
+                ],
+            },
+            approval=None,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        bridge = DeepwaveTaskDispatcher(self.adapter)
+        prepared = bridge.prepare(snapshot)
+        self.assertEqual(prepared.adapter_id, "fwi.deepwave_adapter")
+        self.assertEqual(prepared.request["task_id"], snapshot.task_id)
+        self.assertEqual(
+            prepared.request["normalized_config_hash"],
+            prepared.queue_fingerprint["normalized_config_hash"],
+        )
+        intent = DispatchIntentSnapshot(
+            intent_id="dispatch-bridge-001",
+            task_id=snapshot.task_id,
+            plan_id=snapshot.plan["plan_id"],
+            plan_hash=snapshot.plan["plan_hash"],
+            approval_id="approval-bridge-001",
+            node_id="invert",
+            node_idempotency_key="task-bridge-001:invert:0001",
+            adapter_id=prepared.adapter_id,
+            adapter_version=prepared.adapter_version,
+            request=prepared.request,
+            request_hash="sha256:" + "e" * 64,
+            queue_fingerprint=prepared.queue_fingerprint,
+            state="dispatching",
+            handle=None,
+            failure_code=None,
+            created_at=NOW,
+            dispatch_claimed_at=NOW,
+            outcome_recorded_at=None,
+        )
+        handle = bridge.dispatch(intent)
+        self.assertEqual(handle["task_id"], snapshot.task_id)
+        self.assertEqual(
+            handle["fingerprint"]["normalized_config_hash"],
+            prepared.request["normalized_config_hash"],
+        )
+        self.assertEqual(handle["fingerprint"]["input_hashes"], [HASH_DATASET])
+        self.assertEqual(len(self.launcher.calls), 1)
+        self.assertEqual(bridge.dispatch(intent), handle)
+        self.assertEqual(len(self.launcher.calls), 1)
+
+        invalid = dataclasses.replace(intent, adapter_id="untrusted.dynamic")
+        with self.assertRaises(DispatchError) as raised:
+            bridge.dispatch(invalid)
+        self.assertEqual(raised.exception.code, "DISPATCH_INTENT_INVALID")
 
     def test_submit_is_idempotent_sequentially_and_across_instances(self) -> None:
         request = self.submit_kwargs()

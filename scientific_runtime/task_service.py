@@ -1,7 +1,8 @@
-"""Validated, side-effect-free P1.1 service for durable task aggregates."""
+"""Validated P1 task service with atomic admission and post-commit dispatch."""
 
 from __future__ import annotations
 
+import copy
 import re
 import uuid
 from dataclasses import dataclass
@@ -11,12 +12,20 @@ from typing import Any, Callable, Mapping
 from jsonschema import Draft7Validator
 from jsonschema.exceptions import SchemaError
 
-from scientific_runtime_contracts import compute_plan_hash, schema_errors
+from scientific_runtime_contracts import (
+    compute_plan_hash,
+    evaluate_execution_gate,
+    schema_errors,
+)
 
+from .fwi_registry import load_deepwave_manifest
+from .task_dispatcher import DispatchError, DispatchPreparation, TaskDispatcher
 from .task_store import (
     ALLOWED_TRANSITIONS,
     IdempotencyConflict,
     TASK_STATUSES,
+    DispatchIntentSnapshot,
+    SubmitGateContext,
     TaskSnapshot,
     TaskStore,
     TaskStoreConflict,
@@ -75,13 +84,29 @@ class TaskConflict(TaskServiceError):
 
 
 class TaskIdempotencyConflict(TaskConflict):
-    """A create key was reused for different request content."""
+    """A mutation key was reused for different request content."""
+
+
+class TaskDispatchError(TaskServiceError):
+    """Trusted Adapter preparation could not produce an admissible request."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
 
 
 @dataclass(frozen=True)
 class CreateTaskResult:
     snapshot: TaskSnapshot
     replayed: bool
+
+
+@dataclass(frozen=True)
+class SubmitTaskResult:
+    snapshot: TaskSnapshot
+    intent: DispatchIntentSnapshot
+    replayed: bool
+    dispatch_attempted: bool
 
 
 def _utc_now() -> str:
@@ -275,13 +300,7 @@ def _validate_plan_draft_consistency(
 
 
 class TaskService:
-    """Create and query durable tasks without submitting numerical work.
-
-    P1.1 intentionally has no queue/submit method.  Dataset Catalog snapshots,
-    the current draft/plan/approval, approval budget consumption, the full
-    deterministic gate, submit idempotency, and the Queued event must first be
-    combined in one later SQLite transaction.
-    """
+    """Durable P1 task aggregate and one fixed, approved dispatch boundary."""
 
     def __init__(
         self,
@@ -289,10 +308,16 @@ class TaskService:
         *,
         task_id_factory: Callable[[], str] = _task_id,
         clock: Callable[[], str] = _utc_now,
+        dispatcher: TaskDispatcher | None = None,
     ) -> None:
         self._store = store
         self._task_id_factory = task_id_factory
         self._clock = clock
+        self._dispatcher = dispatcher
+        # Cache the trusted packaged binding before any submit transaction.
+        self._p1_manifest = (
+            load_deepwave_manifest() if dispatcher is not None else None
+        )
 
     @staticmethod
     def _validate_schema(name: str, value: Mapping[str, Any]) -> None:
@@ -675,6 +700,383 @@ class TaskService:
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
 
+    @staticmethod
+    def _parse_gate_time(value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as error:
+            raise TaskDispatchError("SUBMIT_CLOCK_INVALID") from error
+        if parsed.tzinfo is None:
+            raise TaskDispatchError("SUBMIT_CLOCK_INVALID")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _expected_dispatch_request(snapshot: TaskSnapshot) -> dict[str, Any]:
+        plan = snapshot.plan
+        if plan is None or len(plan.get("nodes", [])) != 1:
+            raise TaskValidationError(
+                "PLAN_CAPABILITY_UNSUPPORTED_IN_P1", ["single_node_required"]
+            )
+        node = plan["nodes"][0]
+        if len(node.get("inputs", [])) != 1:
+            raise TaskValidationError(
+                "PLAN_CAPABILITY_UNSUPPORTED_IN_P1", ["single_input_required"]
+            )
+        identity = node["inputs"][0]["dataset"]
+        dataset = next(
+            (
+                value
+                for value in snapshot.draft.get("datasets", [])
+                if all(
+                    value.get(key) == identity.get(key)
+                    for key in ("id", "version", "content_hash", "data_type")
+                )
+            ),
+            None,
+        )
+        if dataset is None:
+            raise TaskValidationError(
+                "PLAN_CAPABILITY_UNSUPPORTED_IN_P1", ["dataset_binding_invalid"]
+            )
+        return {
+            "task_id": snapshot.task_id,
+            "node_id": node["node_id"],
+            "plan_hash": plan["plan_hash"],
+            "idempotency_key": node["idempotency_key"],
+            "project_id": snapshot.project_id,
+            "principal_id": snapshot.principal_id,
+            "algorithm": copy.deepcopy(node["algorithm"]),
+            "dataset": copy.deepcopy(dataset),
+            "task_type": plan["task_type"],
+            "parameters": copy.deepcopy(node["parameters"]),
+            "resources": copy.deepcopy(node["resources"]),
+        }
+
+    def _authorize_submit(
+        self,
+        context: SubmitGateContext,
+        *,
+        approval_id: str,
+        preparation: DispatchPreparation,
+        gate_time: datetime,
+    ) -> None:
+        snapshot = context.snapshot
+        if snapshot.plan is None or snapshot.approval is None:
+            raise TaskConflict("task has no current plan and approval")
+        if snapshot.approval.get("approval_id") != approval_id:
+            raise TaskConflict("approval is not current for this task")
+        violations = evaluate_execution_gate(
+            draft=snapshot.draft,
+            plan=snapshot.plan,
+            approval=snapshot.approval,
+            dataset_registry=context.registry.datasets,
+            algorithm_registry=context.registry.algorithms,
+            principal_id=snapshot.principal_id,
+            project_id=snapshot.project_id,
+            approval_tasks_used=context.budget.tasks_used,
+            now=gate_time,
+        )
+        if violations:
+            raise TaskValidationError(
+                "EXECUTION_GATE_REJECTED",
+                [
+                    f"{violation.code} {violation.path}: {violation.message}"
+                    for violation in violations
+                ],
+            )
+
+        plan = snapshot.plan
+        node = plan["nodes"][0] if len(plan.get("nodes", [])) == 1 else None
+        reasons: list[str] = []
+        if node is None:
+            reasons.append("single_node_required")
+        else:
+            if node.get("dependencies") != []:
+                reasons.append("dependencies_unsupported")
+            if node.get("algorithm") != {
+                "id": "deepwave.acoustic_fwi",
+                "version": "1.0.0",
+            }:
+                reasons.append("algorithm_unsupported")
+            if node.get("parameters", {}).get("preset") not in {
+                "fwi_smoke",
+                "fwi_demo",
+            }:
+                reasons.append("preset_unsupported")
+        if plan.get("task_type") != "acoustic_fwi_2d":
+            reasons.append("task_type_unsupported")
+        datasets = snapshot.draft.get("datasets", [])
+        if (
+            len(datasets) != 1
+            or datasets[0].get("id") != "marmousi_94_288"
+            or datasets[0].get("version") != "1.0.0"
+        ):
+            reasons.append("dataset_unsupported")
+        manifest = context.registry.algorithms.get(
+            ("deepwave.acoustic_fwi", "1.0.0")
+        )
+        if self._p1_manifest is None or manifest != self._p1_manifest:
+            reasons.append("adapter_binding_mismatch")
+        if (
+            preparation.adapter_id != "fwi.deepwave_adapter"
+            or preparation.adapter_version != "1.0.0"
+        ):
+            reasons.append("dispatcher_unsupported")
+        expected_request = self._expected_dispatch_request(snapshot)
+        prepared_request = copy.deepcopy(preparation.request)
+        normalized_config_hash = prepared_request.pop(
+            "normalized_config_hash", None
+        )
+        if prepared_request != expected_request:
+            reasons.append("dispatch_request_drift")
+        fingerprint = preparation.queue_fingerprint
+        if (
+            not isinstance(normalized_config_hash, str)
+            or fingerprint.get("provenance_mode") != "development"
+            or fingerprint.get("source", {}).get("identity_complete") is not False
+            or fingerprint.get("normalized_config_hash") != normalized_config_hash
+            or node is None
+            or fingerprint.get("algorithm") != node.get("algorithm")
+            or fingerprint.get("seed") != node.get("parameters", {}).get("seed")
+            or fingerprint.get("hardware", {}).get("device")
+            != node.get("resources", {}).get("device")
+            or fingerprint.get("input_hashes")
+            != [binding["dataset"]["content_hash"] for binding in node.get("inputs", [])]
+        ):
+            reasons.append("queue_fingerprint_drift")
+        if reasons:
+            raise TaskValidationError(
+                "PLAN_CAPABILITY_UNSUPPORTED_IN_P1", sorted(set(reasons))
+            )
+
+    def _build_submit_admission(
+        self,
+        context: SubmitGateContext,
+        *,
+        approval_id: str,
+        preparation: DispatchPreparation,
+        request_hash: str,
+        now: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._authorize_submit(
+            context,
+            approval_id=approval_id,
+            preparation=preparation,
+            gate_time=self._parse_gate_time(now),
+        )
+        snapshot = context.snapshot
+        if snapshot.plan is None:
+            raise TaskConflict("task has no current plan")
+        node = snapshot.plan["nodes"][0]
+        token = request_hash.removeprefix("sha256:")[:32]
+        intent = {
+            "schema_version": "1.0.0",
+            "intent_id": f"dispatch-{token}",
+            "task_id": snapshot.task_id,
+            "plan_id": snapshot.plan["plan_id"],
+            "plan_hash": snapshot.plan["plan_hash"],
+            "approval_id": approval_id,
+            "node_id": node["node_id"],
+            "node_idempotency_key": node["idempotency_key"],
+            "adapter": {
+                "id": preparation.adapter_id,
+                "version": preparation.adapter_version,
+            },
+            "request": copy.deepcopy(preparation.request),
+            "queue_fingerprint": copy.deepcopy(preparation.queue_fingerprint),
+            "created_at": now,
+        }
+        queued_event = {
+            "schema_version": "1.0.0",
+            "event_id": f"event-queued-{token}",
+            "sequence": 1,
+            "task_id": snapshot.task_id,
+            "event_type": "task_queued",
+            "task_status": "Queued",
+            "occurred_at": now,
+            "fingerprint": copy.deepcopy(preparation.queue_fingerprint),
+            "extensions": {
+                "agent_rpc.dispatch": {
+                    "state": "pending",
+                    "fingerprint_basis": "adapter_preflight",
+                    "worker_runtime_started": False,
+                }
+            },
+        }
+        self._validate_schema("run-event.schema.json", queued_event)
+        return intent, queued_event
+
+    def submit_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        approval_id: str,
+        idempotency_key: str,
+    ) -> SubmitTaskResult:
+        """Atomically admit one approved FWI node, then dispatch it once."""
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        _validate_opaque_id(approval_id, field="approval_id")
+        _validate_idempotency_key(idempotency_key)
+        _, request_hash = encode_document(
+            {
+                "task_id": task_id,
+                "project_id": project_id,
+                "principal_id": principal_id,
+                "approval_id": approval_id,
+            }
+        )
+        try:
+            replay = self._store.lookup_submit_task(
+                project_id=project_id,
+                principal_id=principal_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        if replay is not None:
+            return SubmitTaskResult(
+                snapshot=replay.snapshot,
+                intent=replay.intent,
+                replayed=True,
+                dispatch_attempted=False,
+            )
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        current = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if current.status != "AwaitingApproval":
+            raise TaskConflict("task is not awaiting approval")
+        if (
+            current.approval is None
+            or current.approval.get("approval_id") != approval_id
+        ):
+            raise TaskConflict("approval is not current for this task")
+        self._expected_dispatch_request(current)
+        try:
+            preparation = self._dispatcher.prepare(current)
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("DISPATCH_PREPARATION_UNAVAILABLE") from error
+        try:
+            admitted = self._store.submit_task(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                approval_id=approval_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                admit=lambda context, now: self._build_submit_admission(
+                    context,
+                    approval_id=approval_id,
+                    preparation=preparation,
+                    request_hash=request_hash,
+                    now=now,
+                ),
+                clock=self._clock,
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        if admitted.replayed:
+            return SubmitTaskResult(
+                snapshot=admitted.snapshot,
+                intent=admitted.intent,
+                replayed=True,
+                dispatch_attempted=False,
+            )
+        try:
+            claimed, is_new_claim = self._store.claim_dispatch(
+                intent_id=admitted.intent.intent_id, now=self._clock()
+            )
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        if not is_new_claim:
+            return SubmitTaskResult(
+                snapshot=admitted.snapshot,
+                intent=claimed,
+                replayed=False,
+                dispatch_attempted=False,
+            )
+        try:
+            handle = self._dispatcher.dispatch(claimed)
+        except DispatchError as error:
+            try:
+                final_intent = self._store.record_dispatch_reconciliation(
+                    intent_id=claimed.intent_id,
+                    failure_code=error.code,
+                    now=self._clock(),
+                )
+            except TaskStoreConflict as store_error:
+                raise TaskConflict(str(store_error)) from store_error
+        except Exception:
+            try:
+                final_intent = self._store.record_dispatch_reconciliation(
+                    intent_id=claimed.intent_id,
+                    failure_code="DISPATCH_UNAVAILABLE",
+                    now=self._clock(),
+                )
+            except TaskStoreConflict as store_error:
+                raise TaskConflict(str(store_error)) from store_error
+        else:
+            receipt_event = {
+                "schema_version": "1.0.0",
+                "event_id": "dispatch-receipt-validation",
+                "sequence": 2,
+                "task_id": claimed.task_id,
+                "node_id": claimed.node_id,
+                "event_type": "node_started",
+                "task_status": "Running",
+                "occurred_at": self._clock(),
+                "fingerprint": (
+                    handle.get("fingerprint")
+                    if isinstance(handle, Mapping)
+                    else None
+                ),
+                "extensions": {},
+            }
+            try:
+                self._validate_schema("run-event.schema.json", receipt_event)
+                _validate_run_event_binding(admitted.snapshot, receipt_event)
+            except TaskValidationError:
+                try:
+                    final_intent = self._store.record_dispatch_reconciliation(
+                        intent_id=claimed.intent_id,
+                        failure_code="DISPATCH_RECEIPT_INVALID",
+                        now=self._clock(),
+                    )
+                except TaskStoreConflict as store_error:
+                    raise TaskConflict(str(store_error)) from store_error
+            else:
+                try:
+                    final_intent = self._store.record_dispatch_success(
+                        intent_id=claimed.intent_id,
+                        handle=handle,
+                        now=self._clock(),
+                    )
+                except TaskStoreConflict as store_error:
+                    raise TaskConflict(str(store_error)) from store_error
+        return SubmitTaskResult(
+            snapshot=admitted.snapshot,
+            intent=final_intent,
+            replayed=False,
+            dispatch_attempted=True,
+        )
+
+    def get_dispatch_intent(
+        self, task_id: str, *, project_id: str, principal_id: str
+    ) -> DispatchIntentSnapshot | None:
+        self.get_task(task_id, project_id=project_id, principal_id=principal_id)
+        return self._store.get_dispatch_intent(task_id)
+
     def list_run_events(
         self,
         task_id: str,
@@ -712,9 +1114,9 @@ class TaskService:
     ) -> TaskSnapshot:
         """Persist a validated post-queue event with its state transition.
 
-        ``task_queued`` is deliberately reserved: P1.1 has no Dataset Catalog
-        transaction, approval-budget consumer, or submit API, so this service
-        cannot authorize entry into Queued.
+        ``task_queued`` remains reserved for :meth:`submit_task`, where the
+        Gate, approval budget, intent, idempotency record, event, and state are
+        committed atomically.
         """
 
         _validate_opaque_id(task_id, field="task_id")
@@ -725,7 +1127,7 @@ class TaskService:
             )
         self._validate_schema("run-event.schema.json", event)
         if event["event_type"] == "task_queued":
-            raise TaskConflict("task_queued is reserved for the future atomic submit path")
+            raise TaskConflict("task_queued is reserved for the atomic submit path")
         _validate_run_event_semantics(event)
         if expected_status in {"Waiting", "Retrying"} or event["task_status"] in {
             "Waiting",
@@ -753,6 +1155,26 @@ class TaskService:
                 ],
             )
         _validate_run_event_binding(current, event)
+        if expected_status == "Queued":
+            intent = self._store.get_dispatch_intent(task_id)
+            if (
+                intent is None
+                or intent.state != "dispatched"
+                or intent.handle is None
+            ):
+                raise TaskConflict(
+                    "runtime events require a completed dispatch receipt"
+                )
+            if event.get("node_id") != intent.node_id:
+                raise TaskValidationError(
+                    "RUN_EVENT_NODE_UNKNOWN",
+                    ["event node_id differs from the dispatched P1 node"],
+                )
+            if event.get("fingerprint") != intent.handle.get("fingerprint"):
+                raise TaskValidationError(
+                    "RUN_EVENT_FINGERPRINT_MISMATCH",
+                    ["event fingerprint differs from the Adapter dispatch receipt"],
+                )
         try:
             return self._store.commit_runtime_transition(
                 task_id=task_id,

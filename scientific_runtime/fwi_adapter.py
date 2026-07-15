@@ -127,6 +127,7 @@ class AdapterValidation:
     worker_config: dict[str, Any]
     normalized_config_hash: str
     device_details: dict[str, Any]
+    fingerprint: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return copy.deepcopy(
@@ -143,6 +144,7 @@ class AdapterValidation:
                 "worker_config": self.worker_config,
                 "normalized_config_hash": self.normalized_config_hash,
                 "device_details": self.device_details,
+                "fingerprint": self.fingerprint,
             }
         )
 
@@ -177,6 +179,7 @@ class AdapterHandle:
     plan_hash: str
     request_hash: str
     algorithm: dict[str, str]
+    fingerprint: dict[str, Any]
     adapter_version: str = ADAPTER_VERSION
 
     def as_dict(self) -> dict[str, Any]:
@@ -190,6 +193,7 @@ class AdapterHandle:
                 "plan_hash": self.plan_hash,
                 "request_hash": self.request_hash,
                 "algorithm": self.algorithm,
+                "fingerprint": self.fingerprint,
                 "adapter_version": self.adapter_version,
             }
         )
@@ -1361,7 +1365,7 @@ class DeepwaveAdapter:
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
     ) -> AdapterValidation:
-        return self._validate_request(
+        validated = self._validate_request(
             project_id=project_id,
             principal_id=principal_id,
             algorithm=algorithm,
@@ -1370,6 +1374,23 @@ class DeepwaveAdapter:
             parameters=parameters,
             resources=resources,
             verify_runtime=True,
+        )
+        fingerprint = self._validate_fingerprint(
+            self._fingerprint_factory(
+                algorithm=validated.algorithm,
+                normalized_config_hash=validated.normalized_config_hash,
+                input_hashes=[validated.dataset["content_hash"]],
+                seed=validated.parameters["seed"],
+                device=validated.parameters["device"],
+                device_details=validated.device_details,
+            ),
+            validated=validated,
+        )
+        return AdapterValidation(
+            **{
+                **validated.as_dict(),
+                "fingerprint": fingerprint,
+            }
         )
 
     def estimate(self, **kwargs: Any) -> AdapterEstimate:
@@ -1496,6 +1517,7 @@ class DeepwaveAdapter:
             plan_hash=record["plan_hash"],
             request_hash=record["request_hash"],
             algorithm=copy.deepcopy(record["algorithm"]),
+            fingerprint=copy.deepcopy(record["fingerprint"]),
             adapter_version=record["adapter_version"],
         )
 
@@ -1743,17 +1765,11 @@ class DeepwaveAdapter:
             created_at = self._clock()
             _parse_timestamp(created_at, code="CLOCK_INVALID")
             job_id = self._job_id(submission_id, created_at)
-            fingerprint = self._validate_fingerprint(
-                self._fingerprint_factory(
-                    algorithm=validated.algorithm,
-                    normalized_config_hash=validated.normalized_config_hash,
-                    input_hashes=[validated.dataset["content_hash"]],
-                    seed=validated.parameters["seed"],
-                    device=validated.parameters["device"],
-                    device_details=validated.device_details,
-                ),
-                validated=validated,
-            )
+            if validated.fingerprint is None:
+                raise AdapterUnavailable(
+                    "FINGERPRINT_INVALID: live validation returned no fingerprint"
+                )
+            fingerprint = copy.deepcopy(validated.fingerprint)
             record: dict[str, Any] = {
                 "schema_version": "1.0.0",
                 **request_payload,

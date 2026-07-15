@@ -6,11 +6,10 @@
 - 活跃决策：`D-003`、`D-004`；`D-005` 仍为 Proposed
 - 活跃分支：`feature/scientific-agent-runtime`
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
-- 总体状态：**P0 已完成并验证；P1 进行中，P1.1a Task Store、P1.1b Registry 基础与 P1.2a Deepwave Adapter 已验证**
-- 当前阶段：**P1（In progress；P1.1 为 Partially implemented）**
-- 下一动作：P1.1c 把 current registry/draft/plan/approval/budget、完整 Gate、submit
-  idempotency、durable dispatch intent 与首个 queued event 合并为单 SQLite 事务；事务提交后
-  才能调用 Adapter，不能在事务内直接 `Popen`
+- 总体状态：**P0 已验证；P1 进行中，P1.1c 原子 submit/Queued 与一次性 dispatch 后端已验证**
+- 当前阶段：**P1（In progress；持久后端闭环 Verified，Guided Web Pending）**
+- 下一动作：实现 Guided Web 的注册数据选择、确定性 TaskDraft/参数确认、批准/修改/放弃，
+  并用真实 SQLite `task_id`、dispatch 状态和 Adapter status/collect 展示任务与结果
 - 当前阻塞：无
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
 
@@ -24,7 +23,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 |---|---|---|---|---|
 | 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
 | P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 28/28；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
-| P1 最小持久垂直切片 | In progress | P1.1a Task Store + P1.1b immutable Catalog/Registry + P1.2a 固定单节点 Deepwave Adapter；仍无产品 submit/queue 入口 | Adapter 17/17、Registry 22/22、TaskService 33/33、contract 28/28（组合 100/100）；真实 Adapter CUDA smoke、CTest 39/39、runner 1/1、FWI 27/27、Web/embedding 13/13、UI/governance PASS | 同事务 Gate/budget/submit intent/Queued、事务后 dispatch 与 Guided Web |
+| P1 最小持久垂直切片 | In progress | P1.1a Task Store + P1.1b Registry + P1.2a fixed Adapter + P1.1c 原子 Gate/budget/submit intent/Queued 与事务后 one-shot dispatch | Scientific Runtime 117/117（contract 28、Registry 24、TaskService 47、Adapter 18）；CTest 39/39、MCP 1/1、FWI 27/27、Web/embedding 13/13、UI/governance PASS | Guided Web 选择/确认/批准/状态/结果闭环 |
 | P2 持久可靠性加固 | Pending | 无 | 无 | lease、取消、重试、恢复和 SSE 通过 |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
@@ -41,9 +40,9 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 - 当前可运行基线是实验分支上的 Deepwave 二维声学 FWI MVP。
 - 现有 FWI 固定白名单、参数校验、独立 Worker 和 artifact 路由是迁移时必须保护的安全边界。
-- 当前通用 Orchestrator 仍以固定/单跳路由为主；独立 P1.1a/P1.1b 模块已有 SQLite 持久
-  task/registry 基础，P1.2a 已有固定 FWI Adapter，但尚无把二者连接的 submit/queue 入口、审批
-  API、DAG 调度、服务端取消或运行中断后的恢复。
+- 当前通用 Orchestrator 仍以固定/单跳路由为主；P1.1c 已把 SQLite task/registry、完整 Gate、
+  approval budget 和固定 FWI Adapter 接成原子 submit/Queued + one-shot dispatch 后端，但尚无
+  HTTP/Guided Web 入口、DAG 调度、服务端取消或运行中断后的自动恢复。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
 - 2026-07-15 用户的风险评估已收紧顺序：最小 FWI Schema 先行，最小 SQLite TaskService
   提前到首个垂直切片，Redis 不作为任务事实源，P4 Agent Planner 后置。
@@ -52,9 +51,10 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 ### 尚未开始或尚未完成
 
-- 没有部署运行数据库、submit 事务或新 Web API；Catalog/Registry 只有持久组件、受信任
-  bootstrap 和测试注册，不等于已部署服务；
-- P1.1 的 submit 幂等只预留了 migration 约束，批准预算也只持久化未消费，尚无产品提交路径；
+- 没有部署运行数据库或新 Web API；Catalog/Registry/submit 目前是持久组件和测试验证边界，
+  不等于已部署服务；
+- P1.1c 已实现后端 submit 幂等、预算消费、durable intent 与 Queued；pending/dispatching 的
+  自动 reconciliation、退款、重试和进程恢复仍未实现；
 - Deepwave Adapter 只覆盖固定 `acoustic_fwi_2d` 单节点，尚未成为通用 Algorithm SDK；旧
   forward 因输出语义不匹配而未接入标准 Adapter；
 - 没有实现 Guided/Agent 新 UI、审批卡、DAG 或子 Agent 调度。
@@ -152,16 +152,35 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
   一次迭代的 submit→status→collect 与跨实例 replay 通过；这是合成链路证据，不是科学效果外推；
 - 详见 `docs/architecture/SCIENTIFIC_RUNTIME_P1_FWI_ADAPTER.md`。
 
-### 下一可执行切片：P1.1c 原子 submit intent 与 Queued
+### P1.1c 原子 submit 与一次性 dispatch 验证（2026-07-15）
 
-1. 在单个 `BEGIN IMMEDIATE` 中读取 current task/draft/plan/approval/Registry/budget，执行完整
-   Gate 和单 FWI 节点 capability guard，消费预算、写 submit idempotency、durable dispatch
-   intent、`Queued` task snapshot 与第一个 `task_queued` event；
-2. SQLite 提交成功后再由受控 dispatcher 调用 Adapter。不能在数据库事务内直接 `Popen`，也
-   不能先启动 Worker 再补 task 状态；P1 对未完成 dispatch 明确失败/待 reconciliation，不提前
-   声称具备 P2 自动恢复；
-3. 然后接 Guided Web 的数据选择、参数确认和批准闭环；不提前实现 P2 cancel/lease/retry 或
-   P3 DAG；D-005 未获批，继续不迁移旧 prompt-like 文件。
+- `0003_submit_dispatch.sql` 增加不可变 dispatch intent/claim/outcome 与 typed submit-idempotency
+  link；fresh/v1/v2→v3 和并发升级保留 checksum/schema/integrity 核对；无法解释的旧 runtime、
+  已消费预算或 submit 行会使升级整笔回滚，不伪造 intent；
+- `TaskService.submit_task` 只接受 task/scope/current approval/mutation key。精确 replay 在
+  expiry/budget/status/preflight 前返回；submit key 与 PlanGraph node key 严格分域；
+- 单个 `BEGIN IMMEDIATE` 重读 current aggregate、Registry 和 budget，执行完整 Gate 与固定
+  Marmousi/Deepwave 单节点 capability guard，原子消费预算、写 intent/idempotency、首个
+  `task_queued` 并进入 `Queued`；任一步失败全部回滚；
+- `DeepwaveTaskDispatcher` 只用固定代码映射。Adapter preflight 在事务前，`submit/Popen` 在
+  commit 后；queued fingerprint 明确是 development preflight evidence 且无 node ID，成功
+  handle 返回实际 fingerprint，第一个 node event 必须与 receipt 完全一致；
+- dispatch 状态为 pending→dispatching→dispatched/reconciliation_required。P1 exact replay
+  不自动重发；两个 crash window 可见但不猜测性恢复，不把 Adapter 异常擅自标成 task Failed，
+  不退款、不实现 lease/retry/cancel；
+- Scientific Runtime 117/117：contract 28、Registry 24、TaskService 47、Adapter 18；主 CTest
+  39/39、MCP 1/1、FWI Worker 27/27、Web/embedding 13/13、UI、launcher、continuity、
+  runtime-secret、`codex-project --check` 与 `git diff --check` 全部 PASS；
+- 详见 `docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md`。
+
+### 下一可执行切片：P1 Guided Web 闭环
+
+1. 从当前 immutable Catalog 读取注册 Marmousi，提供确定性数据选择/预览和 FWI 参数表单；
+2. 组装/编辑 TaskDraft 与单节点 PlanGraph，完成“批准运行 / 修改 / 放弃草稿”；放弃只适用于
+   pre-runtime，运行中取消仍属于 P2；
+3. submit 后展示真实 SQLite `task_id` 与 dispatch/Adapter status，成功后 collect 并展示受控
+   ArtifactManifest；刷新恢复、SSE、自动 reconciliation 不提前冒充已实现；
+4. 不提前实现 P2 cancel/lease/retry 或 P3 DAG；D-005 未获批，继续不迁移旧 prompt-like 文件。
 
 ## 新会话恢复协议
 
@@ -191,6 +210,7 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
 | 2026-07-15 | P1-001 / P1.1a | Pending → Verified（foundation）；P1.1 → Partially implemented | SQLite migration/store、受 scope 约束的 TaskService、task/draft/plan/approval/event/create-idempotency、Gate 补强 | contract 27/27、TaskService 33/33、组合 60/60；CTest 39/39、runner 1/1、FWI 26/26、Web 13/13、UI/governance PASS | P1.1b/P1.2 Catalog/Registry；同事务 submit 与 Adapter 仍 pending |
 | 2026-07-15 | P1-002 / P1.1b | Pending → Verified（registry foundation）；P1.1 仍 Partially implemented | SQLite v2 migration、immutable Catalog/Registry、approval budget 行、server-owned snapshot validation、path-free Marmousi/Deepwave registration | Registry 22/22、TaskService 33/33、contract 28/28；CTest 39/39、runner 1/1、FWI 27/27、Web/embedding 13/13、UI/governance PASS | P1.2a Deepwave Adapter；同事务 submit/Queued 仍 pending |
 | 2026-07-15 | P1-003 / P1.2a | Pending → Verified（fixed Adapter）；P1 仍 In progress | 固定 Deepwave 六方法 Adapter、Registry/local identity 双边界、跨进程幂等、固定 launcher、脱敏状态、严格 artifact collect | Adapter 17/17、Scientific Runtime 100/100、真实 CUDA 一次迭代 submit/status/collect/replay；全量回归 PASS | P1.1c 原子 Gate/budget/submit intent/Queued；事务后 dispatch 与 Guided Web |
+| 2026-07-15 | P1-004 / P1.1c | Pending → Verified（atomic submit backend）；P1 仍 In progress | SQLite v3、同事务 Gate/budget/idempotency/intent/task_queued/Queued、固定 one-shot dispatcher、preflight/actual fingerprint receipt、显式 crash states | Scientific Runtime 117/117；CTest 39/39、MCP 1/1、FWI 27/27、Web/embedding 13/13、UI/governance PASS | P1 Guided Web 选择/确认/批准/状态/结果闭环；P2 recovery 仍 pending |
 
 记录规则：
 

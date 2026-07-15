@@ -34,15 +34,24 @@ from .registry_service import (
 
 from .task_service import (
     CreateTaskResult,
+    SubmitTaskResult,
     TaskConflict,
+    TaskDispatchError,
     TaskIdempotencyConflict,
     TaskNotFound,
     TaskService,
     TaskServiceError,
     TaskValidationError,
 )
+from .task_dispatcher import (
+    DeepwaveTaskDispatcher,
+    DispatchError,
+    DispatchPreparation,
+    TaskDispatcher,
+)
 from .task_store import (
     ApprovalBudget,
+    DispatchIntentSnapshot,
     RegistrySnapshots,
     RegistryWriteRecord,
     SQLiteTaskStore,
@@ -69,7 +78,11 @@ __all__ = [
     "AdapterValidationError",
     "ApprovalBudget",
     "CreateTaskResult",
+    "DeepwaveTaskDispatcher",
     "DeepwaveAdapter",
+    "DispatchError",
+    "DispatchIntentSnapshot",
+    "DispatchPreparation",
     "FWIBaselineRegistration",
     "RegistryConflict",
     "RegistryCorruption",
@@ -83,6 +96,8 @@ __all__ = [
     "SafeSubprocessWorkerLauncher",
     "SQLiteTaskStore",
     "TaskConflict",
+    "TaskDispatchError",
+    "TaskDispatcher",
     "TaskIdempotencyConflict",
     "TaskNotFound",
     "TaskService",
@@ -93,6 +108,7 @@ __all__ = [
     "TaskStoreCorruption",
     "TaskStoreError",
     "TaskStoreUnavailable",
+    "SubmitTaskResult",
     "TaskValidationError",
     "load_deepwave_manifest",
     "register_verified_fwi_baseline",

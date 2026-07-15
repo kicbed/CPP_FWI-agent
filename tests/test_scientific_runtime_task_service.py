@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import fcntl
+import json
 import os
 import sqlite3
 import tempfile
@@ -11,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from scientific_runtime import (
+    DispatchError,
+    DispatchPreparation,
     RegistryService,
     SQLiteTaskStore,
     TaskConflict,
@@ -26,9 +29,11 @@ from scientific_runtime import (
 from scientific_runtime_contracts import compute_plan_hash, schema_errors
 from scientific_runtime.task_store import APPLICATION_ID, encode_document
 from tests.test_scientific_runtime_contracts import (
+    append_second_plan_node,
     algorithm_manifest,
     approval_decision,
     dataset_ref,
+    fingerprint,
     plan_graph,
     run_event,
     task_draft,
@@ -38,6 +43,66 @@ from tests.test_scientific_runtime_contracts import (
 NOW = "2026-07-15T03:00:00Z"
 PROJECT_ID = "project-1"
 PRINCIPAL_ID = "user-1"
+
+
+def dispatch_fingerprint() -> dict:
+    value = fingerprint()
+    value["provenance_mode"] = "development"
+    value["source"] = {"identity_complete": False, "dirty": None}
+    return value
+
+
+class FakeDispatcher:
+    def __init__(self, store: SQLiteTaskStore, *, failure_code: str | None = None):
+        self.store = store
+        self.failure_code = failure_code
+        self.prepare_calls = 0
+        self.dispatch_calls = 0
+        self.lock = threading.Lock()
+
+    def prepare(self, snapshot):
+        with self.lock:
+            self.prepare_calls += 1
+        request = TaskService._expected_dispatch_request(snapshot)
+        current_fingerprint = dispatch_fingerprint()
+        request["normalized_config_hash"] = current_fingerprint[
+            "normalized_config_hash"
+        ]
+        return DispatchPreparation(
+            adapter_id="fwi.deepwave_adapter",
+            adapter_version="1.0.0",
+            request=request,
+            queue_fingerprint=current_fingerprint,
+        )
+
+    def dispatch(self, intent):
+        # This read uses a second connection and proves that Adapter dispatch is
+        # invoked only after the admission transaction committed.
+        visible = self.store.get_task(intent.task_id)
+        assert visible is not None and visible.status == "Queued"
+        budget = self.store.get_approval_budget(
+            task_id=intent.task_id, approval_id=intent.approval_id
+        )
+        assert budget is not None and budget.tasks_used == 1
+        assert self.store.get_dispatch_intent(intent.task_id).state == "dispatching"
+        with self.lock:
+            self.dispatch_calls += 1
+        if self.failure_code is not None:
+            raise DispatchError(self.failure_code)
+        return {
+            "submission_id": "submission-test-001",
+            "task_id": intent.task_id,
+            "node_id": intent.node_id,
+            "job_id": "fwi-20260715T030000Z-000000000001",
+            "idempotency_key": intent.node_idempotency_key,
+            "plan_hash": intent.plan_hash,
+            "request_hash": "sha256:" + "a" * 64,
+            "algorithm": copy.deepcopy(intent.request["algorithm"]),
+            # The queued fingerprint is preflight evidence.  Runtime events
+            # bind to the actual fingerprint returned in this receipt.
+            "fingerprint": fingerprint(),
+            "adapter_version": intent.adapter_version,
+        }
 
 
 class ScientificRuntimeTaskServiceTest(unittest.TestCase):
@@ -95,6 +160,10 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "approvals",
                 "run_events",
                 "idempotency_records",
+                "dispatch_intents",
+                "dispatch_attempts",
+                "dispatch_outcomes",
+                "submit_idempotency_links",
             },
         )
         connection = sqlite3.connect(self.database_path)
@@ -104,63 +173,25 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             connection.close()
 
     def seed_validated_queue_event(self, task_id: str) -> dict:
-        """Seed a post-submit fixture directly; P1.1 exposes no queue method."""
+        """Admit a real P1 submit fixture through the atomic product boundary."""
 
-        event = run_event()
-        event.update(
-            {
-                "event_id": "event-queued-001",
-                "sequence": 1,
-                "task_id": task_id,
-                "event_type": "task_queued",
-                "task_status": "Queued",
-            }
+        snapshot = self.store.get_task(task_id)
+        self.assertIsNotNone(snapshot)
+        self.assertIsNotNone(snapshot.approval)
+        dispatcher = FakeDispatcher(self.store)
+        service = self.submit_service(dispatcher)
+        result = service.submit_task(
+            task_id=task_id,
+            approval_id=snapshot.approval["approval_id"],
+            idempotency_key=f"seed-queue-{task_id}",
+            **self.scope,
         )
-        event.pop("node_id", None)
-        self.assertEqual(schema_errors("run-event.schema.json", event), [])
-        document_json, document_hash = encode_document(event)
-        _, fingerprint_hash = encode_document(event["fingerprint"])
-        connection = sqlite3.connect(self.database_path, isolation_level=None)
-        try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                INSERT INTO run_events(
-                    task_id, sequence, event_id, event_type, task_status,
-                    node_id, fingerprint_hash, document_json, document_hash,
-                    occurred_at, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    event["sequence"],
-                    event["event_id"],
-                    event["event_type"],
-                    event["task_status"],
-                    None,
-                    fingerprint_hash,
-                    document_json,
-                    document_hash,
-                    event["occurred_at"],
-                    NOW,
-                ),
-            )
-            connection.execute(
-                "UPDATE tasks SET status = 'Queued', updated_at = ? WHERE task_id = ?",
-                (NOW, task_id),
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-        return event
+        self.assertEqual(result.intent.state, "dispatched")
+        return service.list_run_events(task_id, **self.scope)[0]
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 2)
+        self.assertEqual(self.store.migration_version(), 3)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -176,7 +207,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 2)
+        self.assertEqual(reopened.migration_version(), 3)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -217,12 +248,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 2)] * 8)
+        self.assertEqual(results, [("wal", 3)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 3")
+            connection.execute("PRAGMA user_version = 4")
             connection.commit()
         finally:
             connection.close()
@@ -1184,6 +1215,546 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             results = list(executor.map(revise, ["winner one", "winner two"]))
         self.assertEqual(results.count("conflict"), 1)
         self.assertEqual(len(self.store.draft_history(task_id)), 2)
+
+    def submit_service(
+        self,
+        dispatcher: FakeDispatcher,
+        *,
+        clock=lambda: NOW,
+    ) -> TaskService:
+        return TaskService(self.store, clock=clock, dispatcher=dispatcher)
+
+    def test_atomic_submit_consumes_budget_queues_and_dispatches_after_commit(
+        self,
+    ) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        service = self.submit_service(dispatcher)
+
+        result = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-operation-key",
+            **self.scope,
+        )
+
+        self.assertFalse(result.replayed)
+        self.assertTrue(result.dispatch_attempted)
+        self.assertEqual(result.snapshot.status, "Queued")
+        self.assertEqual(result.intent.state, "dispatched")
+        self.assertIsNotNone(result.intent.dispatch_claimed_at)
+        self.assertIsNotNone(result.intent.outcome_recorded_at)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.raw_count("dispatch_intents"), 1)
+        self.assertEqual(self.raw_count("dispatch_attempts"), 1)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        self.assertEqual(self.raw_count("submit_idempotency_links"), 1)
+        budget = self.store.get_approval_budget(
+            task_id=task_id, approval_id=approval["approval_id"]
+        )
+        self.assertEqual((budget.tasks_used, budget.max_tasks), (1, 1))
+        events = service.list_run_events(task_id, **self.scope)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            (events[0]["sequence"], events[0]["event_type"], events[0]["task_status"]),
+            (1, "task_queued", "Queued"),
+        )
+        self.assertNotIn("node_id", events[0])
+        self.assertEqual(
+            events[0]["extensions"]["agent_rpc.dispatch"],
+            {
+                "state": "pending",
+                "fingerprint_basis": "adapter_preflight",
+                "worker_runtime_started": False,
+            },
+        )
+
+        replay = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-operation-key",
+            **self.scope,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertFalse(replay.dispatch_attempted)
+        self.assertEqual(replay.intent, result.intent)
+        self.assertEqual(dispatcher.prepare_calls, 1)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.raw_count("run_events"), 1)
+
+    def test_submit_adapter_error_is_sticky_reconciliation_not_task_failure(
+        self,
+    ) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(
+            self.store, failure_code="SUBMISSION_RECONCILIATION_REQUIRED"
+        )
+        service = self.submit_service(dispatcher)
+
+        result = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-reconciliation-key",
+            **self.scope,
+        )
+        self.assertEqual(result.snapshot.status, "Queued")
+        self.assertEqual(result.intent.state, "reconciliation_required")
+        self.assertEqual(
+            result.intent.failure_code, "SUBMISSION_RECONCILIATION_REQUIRED"
+        )
+        self.assertEqual(len(service.list_run_events(task_id, **self.scope)), 1)
+
+        replay = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-reconciliation-key",
+            **self.scope,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.intent.state, "reconciliation_required")
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+
+    def test_invalid_dispatch_receipt_requires_reconciliation(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        valid_dispatch = dispatcher.dispatch
+
+        def invalid_dispatch(intent):
+            handle = valid_dispatch(intent)
+            handle["fingerprint"].pop("runtime")
+            return handle
+
+        dispatcher.dispatch = invalid_dispatch
+        result = self.submit_service(dispatcher).submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-invalid-receipt",
+            **self.scope,
+        )
+        self.assertEqual(result.snapshot.status, "Queued")
+        self.assertEqual(result.intent.state, "reconciliation_required")
+        self.assertEqual(result.intent.failure_code, "DISPATCH_RECEIPT_INVALID")
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+
+    def test_submit_exact_replay_precedes_expiry_budget_and_preflight(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        now = [NOW]
+        dispatcher = FakeDispatcher(self.store)
+        service = self.submit_service(dispatcher, clock=lambda: now[0])
+        first = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-replay-before-gate",
+            **self.scope,
+        )
+        now[0] = "2026-07-16T03:00:00Z"
+        dispatcher.failure_code = "PREPARE_MUST_NOT_RUN"
+        replay = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-replay-before-gate",
+            **self.scope,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.intent, first.intent)
+        self.assertEqual(dispatcher.prepare_calls, 1)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+
+    def test_submit_gate_time_is_sampled_after_waiting_for_write_lock(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        now = [NOW]
+        entered_store = threading.Event()
+        original_submit = self.store.submit_task
+
+        def coordinated_submit(**kwargs):
+            entered_store.set()
+            return original_submit(**kwargs)
+
+        self.store.submit_task = coordinated_submit
+        blocker = sqlite3.connect(self.database_path, isolation_level=None)
+        blocker.execute("PRAGMA foreign_keys = ON")
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            service = self.submit_service(dispatcher, clock=lambda: now[0])
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    service.submit_task,
+                    task_id=task_id,
+                    approval_id=approval["approval_id"],
+                    idempotency_key="submit-lock-expiry",
+                    **self.scope,
+                )
+                self.assertTrue(entered_store.wait(timeout=5))
+                now[0] = approval["expires_at"]
+                blocker.commit()
+                with self.assertRaises(TaskValidationError) as raised:
+                    future.result(timeout=5)
+                self.assertEqual(raised.exception.code, "EXECUTION_GATE_REJECTED")
+        finally:
+            if blocker.in_transaction:
+                blocker.rollback()
+            blocker.close()
+            self.store.submit_task = original_submit
+        self.assertEqual(self.store.get_task(task_id).status, "AwaitingApproval")
+        self.assertEqual(self.raw_count("dispatch_intents"), 0)
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+
+    def test_submit_gate_or_capability_failure_has_no_atomic_side_effects(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        plan, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        expired = self.submit_service(
+            dispatcher, clock=lambda: approval["expires_at"]
+        )
+        with self.assertRaises(TaskValidationError) as raised:
+            expired.submit_task(
+                task_id=task_id,
+                approval_id=approval["approval_id"],
+                idempotency_key="submit-expired-key",
+                **self.scope,
+            )
+        self.assertEqual(raised.exception.code, "EXECUTION_GATE_REJECTED")
+        self.assertEqual(self.store.get_task(task_id).status, "AwaitingApproval")
+        self.assertEqual(self.raw_count("dispatch_intents"), 0)
+        self.assertEqual(self.raw_count("run_events"), 0)
+        self.assertEqual(
+            self.store.get_approval_budget(
+                task_id=task_id, approval_id=approval["approval_id"]
+            ).tasks_used,
+            0,
+        )
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+
+        multi_plan = plan_graph()
+        multi_plan["plan_id"] = "plan-multi-node"
+        append_second_plan_node(multi_plan)
+        multi_plan["plan_hash"] = compute_plan_hash(multi_plan)
+        self.service.persist_plan(task_id=task_id, plan=multi_plan, **self.scope)
+        multi_approval = approval_decision(multi_plan)
+        multi_approval["approval_id"] = "approval-multi-node"
+        self.service.persist_approval(
+            task_id=task_id, approval=multi_approval, **self.scope
+        )
+        with self.assertRaises(TaskValidationError) as raised:
+            self.submit_service(dispatcher).submit_task(
+                task_id=task_id,
+                approval_id=multi_approval["approval_id"],
+                idempotency_key="submit-multi-node-key",
+                **self.scope,
+            )
+        self.assertEqual(
+            raised.exception.code, "PLAN_CAPABILITY_UNSUPPORTED_IN_P1"
+        )
+        self.assertEqual(self.store.get_task(task_id).status, "AwaitingApproval")
+
+    def test_submit_idempotency_conflict_and_new_key_cannot_duplicate_task(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        service = self.submit_service(dispatcher)
+        service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-bound-key",
+            **self.scope,
+        )
+        with self.assertRaises(TaskIdempotencyConflict):
+            service.submit_task(
+                task_id=task_id,
+                approval_id="approval-different",
+                idempotency_key="submit-bound-key",
+                **self.scope,
+            )
+        with self.assertRaises(TaskConflict):
+            service.submit_task(
+                task_id=task_id,
+                approval_id=approval["approval_id"],
+                idempotency_key="submit-new-key",
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("dispatch_intents"), 1)
+        self.assertEqual(self.raw_count("run_events"), 1)
+
+    def test_submit_rejects_same_version_registry_manifest_drift(self) -> None:
+        database_path = Path(self.temporary.name) / "manifest-drift.sqlite3"
+        store = SQLiteTaskStore(database_path)
+        registry = RegistryService(store, clock=lambda: NOW)
+        registry.register_dataset(dataset=dataset_ref())
+        drifted_manifest = algorithm_manifest()
+        drifted_manifest["extensions"] = {
+            "org.example.drift": {"reason": "same version is not the packaged binding"}
+        }
+        registry.register_algorithm(manifest=drifted_manifest)
+        service = TaskService(
+            store,
+            task_id_factory=lambda: "task-manifest-drift",
+            clock=lambda: NOW,
+        )
+        task_id = service.create_task(
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            draft=task_draft(),
+            idempotency_key="create-manifest-drift",
+        ).snapshot.task_id
+        plan = plan_graph()
+        service.persist_plan(task_id=task_id, plan=plan, **self.scope)
+        approval = approval_decision(plan)
+        service.persist_approval(task_id=task_id, approval=approval, **self.scope)
+        dispatcher = FakeDispatcher(store)
+        with self.assertRaises(TaskValidationError) as raised:
+            TaskService(store, clock=lambda: NOW, dispatcher=dispatcher).submit_task(
+                task_id=task_id,
+                approval_id=approval["approval_id"],
+                idempotency_key="submit-manifest-drift",
+                **self.scope,
+            )
+        self.assertEqual(
+            raised.exception.code, "PLAN_CAPABILITY_UNSUPPORTED_IN_P1"
+        )
+        self.assertIn("adapter_binding_mismatch", raised.exception.errors)
+        self.assertEqual(store.get_task(task_id).status, "AwaitingApproval")
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+
+    def test_concurrent_same_submit_key_converges_to_one_dispatch(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        barrier = threading.Barrier(8)
+
+        def submit(_: int):
+            service = TaskService(
+                SQLiteTaskStore(self.database_path),
+                clock=lambda: NOW,
+                dispatcher=dispatcher,
+            )
+            barrier.wait(timeout=10)
+            return service.submit_task(
+                task_id=task_id,
+                approval_id=approval["approval_id"],
+                idempotency_key="concurrent-submit-key",
+                **self.scope,
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(submit, range(8)))
+        self.assertEqual(sum(not result.replayed for result in results), 1)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.raw_count("dispatch_intents"), 1)
+        self.assertEqual(self.raw_count("dispatch_attempts"), 1)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        self.assertEqual(self.raw_count("run_events"), 1)
+        self.assertEqual(
+            self.store.get_approval_budget(
+                task_id=task_id, approval_id=approval["approval_id"]
+            ).tasks_used,
+            1,
+        )
+
+    def test_concurrent_different_submit_keys_admit_only_one_task(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        barrier = threading.Barrier(8)
+
+        def submit(index: int) -> str:
+            service = TaskService(
+                SQLiteTaskStore(self.database_path),
+                clock=lambda: NOW,
+                dispatcher=dispatcher,
+            )
+            barrier.wait(timeout=10)
+            try:
+                result = service.submit_task(
+                    task_id=task_id,
+                    approval_id=approval["approval_id"],
+                    idempotency_key=f"different-submit-key-{index}",
+                    **self.scope,
+                )
+                return "admitted" if not result.replayed else "replayed"
+            except TaskConflict:
+                return "conflict"
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(submit, range(8)))
+        self.assertEqual(results.count("admitted"), 1)
+        self.assertEqual(results.count("conflict"), 7)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.raw_count("dispatch_intents"), 1)
+        self.assertEqual(self.raw_count("run_events"), 1)
+        self.assertEqual(
+            self.store.get_approval_budget(
+                task_id=task_id, approval_id=approval["approval_id"]
+            ).tasks_used,
+            1,
+        )
+
+    def test_submit_status_failure_rolls_back_every_admission_write(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER fail_queued_status_for_test
+                BEFORE UPDATE OF status ON tasks
+                WHEN NEW.status = 'Queued'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected queued failure');
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        dispatcher = FakeDispatcher(self.store)
+        with self.assertRaises(TaskConflict):
+            self.submit_service(dispatcher).submit_task(
+                task_id=task_id,
+                approval_id=approval["approval_id"],
+                idempotency_key="submit-rollback-key",
+                **self.scope,
+            )
+        self.assertEqual(self.store.get_task(task_id).status, "AwaitingApproval")
+        for table in (
+            "dispatch_intents",
+            "dispatch_attempts",
+            "dispatch_outcomes",
+            "submit_idempotency_links",
+            "run_events",
+        ):
+            self.assertEqual(self.raw_count(table), 0)
+        self.assertEqual(
+            self.store.get_approval_budget(
+                task_id=task_id, approval_id=approval["approval_id"]
+            ).tasks_used,
+            0,
+        )
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+
+    def test_commit_before_dispatch_crash_stays_pending_and_is_not_retried(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        original_claim = self.store.claim_dispatch
+
+        def simulate_crash(**_kwargs):
+            raise TaskStoreConflict("simulated process loss after commit")
+
+        self.store.claim_dispatch = simulate_crash
+        try:
+            with self.assertRaises(TaskConflict):
+                self.submit_service(dispatcher).submit_task(
+                    task_id=task_id,
+                    approval_id=approval["approval_id"],
+                    idempotency_key="submit-before-dispatch-crash",
+                    **self.scope,
+                )
+        finally:
+            self.store.claim_dispatch = original_claim
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+        self.assertEqual(self.store.get_dispatch_intent(task_id).state, "pending")
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+
+        replay = self.submit_service(dispatcher).submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-before-dispatch-crash",
+            **self.scope,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.intent.state, "pending")
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+
+    def test_started_worker_without_receipt_stays_dispatching_and_is_not_retried(
+        self,
+    ) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        original_record = self.store.record_dispatch_success
+
+        def lose_receipt(**_kwargs):
+            raise TaskStoreConflict("simulated receipt persistence loss")
+
+        self.store.record_dispatch_success = lose_receipt
+        try:
+            with self.assertRaises(TaskConflict):
+                self.submit_service(dispatcher).submit_task(
+                    task_id=task_id,
+                    approval_id=approval["approval_id"],
+                    idempotency_key="submit-after-worker-crash",
+                    **self.scope,
+                )
+        finally:
+            self.store.record_dispatch_success = original_record
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(
+            self.store.get_dispatch_intent(task_id).state, "dispatching"
+        )
+
+        replay = self.submit_service(dispatcher).submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-after-worker-crash",
+            **self.scope,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.intent.state, "dispatching")
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+
+    def test_hash_consistent_dispatch_request_tampering_fails_closed(self) -> None:
+        created = self.create()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_plan_and_approval(task_id)
+        self.submit_service(FakeDispatcher(self.store)).submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-before-intent-tamper",
+            **self.scope,
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            row = connection.execute(
+                "SELECT request_json FROM dispatch_intents WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            document = json.loads(row[0])
+            document["request"]["parameters"]["iterations"] += 1
+            document_json, document_hash = encode_document(document)
+            connection.execute("DROP TRIGGER dispatch_intents_are_immutable")
+            connection.execute(
+                """
+                UPDATE dispatch_intents
+                SET request_json = ?, request_hash = ?
+                WHERE task_id = ?
+                """,
+                (document_json, document_hash, task_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(
+            TaskStoreCorruption, "payload differs from current plan"
+        ):
+            self.store.get_task(task_id)
 
 
 if __name__ == "__main__":

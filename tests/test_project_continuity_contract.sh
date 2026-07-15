@@ -28,6 +28,7 @@ required_files=(
     docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_FWI_ADAPTER.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md
+    docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md
     docs/PROJECT_PROGRESS.md
     docs/GIT_AND_PROMPT_POLICY.md
     scientific_runtime/__init__.py
@@ -37,8 +38,10 @@ required_files=(
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1.json
     scientific_runtime/task_store.py
     scientific_runtime/task_service.py
+    scientific_runtime/task_dispatcher.py
     scientific_runtime/migrations/0001_task_store.sql
     scientific_runtime/migrations/0002_catalog_registry.sql
+    scientific_runtime/migrations/0003_submit_dispatch.sql
     tests/test_scientific_runtime_registry.py
     tests/test_scientific_runtime_fwi_adapter.py
     tests/test_scientific_runtime_task_service.py
@@ -67,7 +70,7 @@ require_text docs/PROJECT_CONTINUITY.md '## D-004：'
 require_text docs/PROJECT_CONTINUITY.md '## D-005：'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
-require_text docs/PROJECT_CONTINUITY.md 'P0 contracts + P1.1a Task Store + P1.1b Registry + P1.2a fixed Deepwave Adapter Verified / P1 in progress'
+require_text docs/PROJECT_CONTINUITY.md 'P0 + P1.1c atomic submit backend + P1.2a fixed Adapter Verified / P1 Guided Web pending'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '<!-- scientific-agent-runtime-plan: v1 -->'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '实现状态：**Pending**'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '<!-- scientific-runtime-p0-contracts: v1 -->'
@@ -82,10 +85,13 @@ require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_FWI_ADAPTER.md 'registry_sn
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '<!-- scientific-runtime-p1-task-store: v1 -->'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '父工作项 P1.1 仍为 **Partially implemented**'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '也没有开放 `submit`/`Queued` 入口'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md '<!-- scientific-runtime-p1-submit: v1 -->'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md 'pending -> dispatching -> dispatched'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md '不自动重发、退款、取消或标记 task Failed'
 require_text docs/PROJECT_PROGRESS.md '<!-- project-progress-schema: v1 -->'
-require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1（In progress；P1.1 为 Partially implemented）**'
+require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1（In progress；持久后端闭环 Verified，Guided Web Pending）**'
 require_text docs/PROJECT_PROGRESS.md '| P0 最小 FWI 契约 | Verified |'
-require_text docs/PROJECT_PROGRESS.md '下一可执行切片：P1.1c 原子 submit intent 与 Queued'
+require_text docs/PROJECT_PROGRESS.md '下一可执行切片：P1 Guided Web 闭环'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'D-005` / **Proposed'

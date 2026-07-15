@@ -12,6 +12,10 @@
 Adapter 接入 TaskService、HTTP、MCP 或 `Queued` 状态转换。它是可供后续事务性提交路径调用的
 受控组件，不是已经开放的产品执行入口，也不是通用 scheduler。
 
+后续状态：P1.1c 已通过 `scientific_runtime/task_dispatcher.py` 把该固定 Adapter 接到原子
+TaskService admission；HTTP/Guided Web 仍未接入。`validate` 现在返回无启动 preflight
+fingerprint，成功 handle 返回实际 dispatch fingerprint，供 SQLite 首个 node event 绑定。
+
 ## 1. 文件与责任
 
 | 文件 | 责任 |
@@ -101,7 +105,7 @@ seed，但明确声明：
   ArtifactManifest Schema 合法，跨 Adapter 实例 replay 返回相同 handle；
 - 该 smoke 是固定小型合成 Marmousi 链路证据，不是一般反演质量或生产可靠性证明。
 
-仍 Pending：SQLite 中 Gate + current draft/plan/approval/registry + budget consumption + submit
-idempotency + 首个 `task_queued` 的原子状态变化；事务提交后的 durable dispatch/reconciliation
-边界；HTTP/Guided Web；P2 cancel/lease/retry/recovery；P3 DAG。数据库事务内不能直接调用
-`Popen`，否则会产生“Worker 已启动但事务回滚”或“已排队但未启动”的不可恢复缝隙。
+后续 P1.1c 已完成 SQLite 中 Gate + current draft/plan/approval/registry + budget consumption +
+submit idempotency + durable intent + 首个 `task_queued` 的原子状态变化，以及事务后 one-shot
+dispatch/receipt 边界。仍 Pending：HTTP/Guided Web；P2 cancel/lease/retry/自动 reconciliation；
+P3 DAG。两个 crash window 以 pending/dispatching 明确暴露，不在 P1 猜测性恢复。

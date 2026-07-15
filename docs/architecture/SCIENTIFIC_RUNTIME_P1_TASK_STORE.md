@@ -14,6 +14,10 @@ Dataset Catalog、Deepwave Adapter 或 Worker，也没有开放 `submit`/`Queued
 Dataset Catalog/Algorithm Registry、SQLite v2 升级和批准预算持久行；这不改变本文对历史
 P1.1a 切片的范围描述，submit/Adapter/`Queued` 仍未实现。
 
+再后续状态：P1.1c 已在 `docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md` 实现并验证
+SQLite v3、同事务 Gate/预算/submit intent/首个 `task_queued`/`Queued` 和事务后一次性
+Deepwave dispatch。以下“未实现”段落是 P1.1a checkpoint 的历史边界，不代表当前工作树。
+
 ## 1. 文件与边界
 
 | 文件 | 责任 |
@@ -125,3 +129,6 @@ fingerprint 稳定性，以及 P1.1a 无 Queued 入口。
 Worker handle、Web/API、运行中取消、lease、retry、reconciliation 和 SSE。
 P1 后续 submit 还必须增加“当前 runtime 只支持单个 FWI 节点”的 capability guard；P0 v1
 合同允许多节点，但 DAG 调度属于 P3，不能把任意 Gate-pass 多节点计划提前入队。
+
+上述 submit/Adapter/handle/capability 项已由后续 P1.1c/P1.2a 完成；Web/API、运行中取消、
+lease、retry、自动 reconciliation 和 SSE 仍 Pending。

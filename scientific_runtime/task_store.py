@@ -16,7 +16,7 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 MIGRATIONS_DIRECTORY = Path(__file__).with_name("migrations")
@@ -132,6 +132,48 @@ class ApprovalBudget:
 
 
 @dataclass(frozen=True)
+class SubmitGateContext:
+    """Current server-owned submit inputs pinned by one write transaction."""
+
+    snapshot: TaskSnapshot
+    registry: RegistrySnapshots
+    budget: ApprovalBudget
+
+
+@dataclass(frozen=True)
+class DispatchIntentSnapshot:
+    """Durable P1 dispatch state; pending intents require P2 reconciliation."""
+
+    intent_id: str
+    task_id: str
+    plan_id: str
+    plan_hash: str
+    approval_id: str
+    node_id: str
+    node_idempotency_key: str
+    adapter_id: str
+    adapter_version: str
+    request: dict[str, Any]
+    request_hash: str
+    queue_fingerprint: dict[str, Any]
+    state: str
+    handle: dict[str, Any] | None
+    failure_code: str | None
+    created_at: str
+    dispatch_claimed_at: str | None
+    outcome_recorded_at: str | None
+
+
+@dataclass(frozen=True)
+class SubmitTaskRecord:
+    """Atomic submit result and whether the operation was an exact replay."""
+
+    snapshot: TaskSnapshot
+    intent: DispatchIntentSnapshot
+    replayed: bool
+
+
+@dataclass(frozen=True)
 class _Migration:
     version: int
     path: Path
@@ -203,6 +245,59 @@ class TaskStore(Protocol):
         idempotency_key: str,
         request_hash: str,
     ) -> CreateTaskRecord | None:
+        ...
+
+    def lookup_submit_task(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> SubmitTaskRecord | None:
+        ...
+
+    def submit_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        approval_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        admit: Callable[
+            [SubmitGateContext, str],
+            tuple[Mapping[str, Any], Mapping[str, Any]],
+        ],
+        clock: Callable[[], str],
+    ) -> SubmitTaskRecord:
+        ...
+
+    def get_dispatch_intent(self, task_id: str) -> DispatchIntentSnapshot | None:
+        ...
+
+    def record_dispatch_success(
+        self,
+        *,
+        intent_id: str,
+        handle: Mapping[str, Any],
+        now: str,
+    ) -> DispatchIntentSnapshot:
+        ...
+
+    def claim_dispatch(
+        self, *, intent_id: str, now: str
+    ) -> tuple[DispatchIntentSnapshot, bool]:
+        ...
+
+    def record_dispatch_reconciliation(
+        self,
+        *,
+        intent_id: str,
+        failure_code: str,
+        now: str,
+    ) -> DispatchIntentSnapshot:
         ...
 
     def get_task(self, task_id: str) -> TaskSnapshot | None:
@@ -1019,43 +1114,51 @@ class SQLiteTaskStore:
     ) -> ApprovalBudget | None:
         connection = self._connect()
         try:
-            row = connection.execute(
-                """
-                SELECT budget.task_id, budget.approval_id,
-                       budget.max_tasks, budget.tasks_used,
-                       approval.document_json, approval.document_hash
-                FROM approval_budgets AS budget
-                JOIN approvals AS approval
-                  ON approval.task_id = budget.task_id
-                 AND approval.approval_id = budget.approval_id
-                WHERE budget.task_id = ? AND budget.approval_id = ?
-                """,
-                (task_id, approval_id),
-            ).fetchone()
-            if row is None:
-                return None
-            approval = _decode_hashed_document(row, label="approval")
-            scope = approval.get("scope")
-            if (
-                approval.get("approval_id") != row["approval_id"]
-                or not isinstance(scope, dict)
-                or type(row["max_tasks"]) is not int
-                or type(row["tasks_used"]) is not int
-                or scope.get("max_tasks") != row["max_tasks"]
-                or row["tasks_used"] < 0
-                or row["tasks_used"] > row["max_tasks"]
-            ):
-                raise TaskStoreCorruption(
-                    "approval budget does not match its decision"
-                )
-            return ApprovalBudget(
-                task_id=row["task_id"],
-                approval_id=row["approval_id"],
-                max_tasks=row["max_tasks"],
-                tasks_used=row["tasks_used"],
+            return self._load_approval_budget(
+                connection, task_id=task_id, approval_id=approval_id
             )
         finally:
             connection.close()
+
+    @staticmethod
+    def _load_approval_budget(
+        connection: sqlite3.Connection, *, task_id: str, approval_id: str
+    ) -> ApprovalBudget | None:
+        row = connection.execute(
+            """
+            SELECT budget.task_id, budget.approval_id,
+                   budget.max_tasks, budget.tasks_used,
+                   approval.document_json, approval.document_hash
+            FROM approval_budgets AS budget
+            JOIN approvals AS approval
+              ON approval.task_id = budget.task_id
+             AND approval.approval_id = budget.approval_id
+            WHERE budget.task_id = ? AND budget.approval_id = ?
+            """,
+            (task_id, approval_id),
+        ).fetchone()
+        if row is None:
+            return None
+        approval = _decode_hashed_document(row, label="approval")
+        scope = approval.get("scope")
+        if (
+            approval.get("approval_id") != row["approval_id"]
+            or not isinstance(scope, dict)
+            or type(row["max_tasks"]) is not int
+            or type(row["tasks_used"]) is not int
+            or scope.get("max_tasks") != row["max_tasks"]
+            or row["tasks_used"] < 0
+            or row["tasks_used"] > row["max_tasks"]
+        ):
+            raise TaskStoreCorruption(
+                "approval budget does not match its decision"
+            )
+        return ApprovalBudget(
+            task_id=row["task_id"],
+            approval_id=row["approval_id"],
+            max_tasks=row["max_tasks"],
+            tasks_used=row["tasks_used"],
+        )
 
     def create_task(
         self,
@@ -1234,6 +1337,352 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    def _load_submit_replay(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> SubmitTaskRecord | None:
+        row = connection.execute(
+            """
+            SELECT record.request_hash, record.task_id, record.response_json,
+                   record.created_at AS record_created_at,
+                   link.request_hash AS link_request_hash,
+                   link.task_id AS link_task_id, link.intent_id,
+                   link.created_at AS link_created_at
+            FROM idempotency_records AS record
+            LEFT JOIN submit_idempotency_links AS link
+              ON link.project_id = record.project_id
+             AND link.principal_id = record.principal_id
+             AND link.operation = record.operation
+             AND link.idempotency_key = record.idempotency_key
+            WHERE record.project_id = ? AND record.principal_id = ?
+              AND record.operation = 'submit_task'
+              AND record.idempotency_key = ?
+            """,
+            (project_id, principal_id, idempotency_key),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["request_hash"] != request_hash:
+            raise IdempotencyConflict(
+                "idempotency key was already used for another submit request"
+            )
+        if (
+            row["intent_id"] is None
+            or row["link_request_hash"] != row["request_hash"]
+            or row["link_task_id"] != row["task_id"]
+            or row["link_created_at"] != row["record_created_at"]
+        ):
+            raise TaskStoreCorruption(
+                "submit idempotency record is not bound to its dispatch intent"
+            )
+        response = _decode_document(
+            row["response_json"], label="submit idempotency response"
+        )
+        if response != {
+            "intent_id": row["intent_id"],
+            "task_id": row["task_id"],
+        }:
+            raise TaskStoreCorruption(
+                "submit idempotency response differs from its typed link"
+            )
+        snapshot = self._load_snapshot(connection, row["task_id"])
+        intent = self._load_dispatch_intent(connection, task_id=row["task_id"])
+        if snapshot is None or intent is None:
+            raise TaskStoreCorruption(
+                "submit idempotency record references missing durable state"
+            )
+        if intent.intent_id != row["intent_id"]:
+            raise TaskStoreCorruption(
+                "submit idempotency record references another dispatch intent"
+            )
+        if intent.created_at != row["record_created_at"]:
+            raise TaskStoreCorruption(
+                "submit idempotency record time differs from its dispatch intent"
+            )
+        return SubmitTaskRecord(snapshot=snapshot, intent=intent, replayed=True)
+
+    def lookup_submit_task(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> SubmitTaskRecord | None:
+        connection = self._connect()
+        try:
+            return self._load_submit_replay(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+        finally:
+            connection.close()
+
+    def submit_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        approval_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        admit: Callable[
+            [SubmitGateContext, str],
+            tuple[Mapping[str, Any], Mapping[str, Any]],
+        ],
+        clock: Callable[[], str],
+    ) -> SubmitTaskRecord:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            replay = self._load_submit_replay(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if replay is not None:
+                connection.commit()
+                return replay
+
+            snapshot = self._load_snapshot(connection, task_id)
+            if (
+                snapshot is None
+                or snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreConflict("task does not exist in the requested scope")
+            if snapshot.status != "AwaitingApproval":
+                raise TaskStoreConflict("task is not awaiting approval")
+            if snapshot.plan is None or snapshot.approval is None:
+                raise TaskStoreConflict("task has no current plan and approval")
+            if snapshot.approval.get("approval_id") != approval_id:
+                raise TaskStoreConflict("approval is not current for this task")
+            budget = self._load_approval_budget(
+                connection, task_id=task_id, approval_id=approval_id
+            )
+            if budget is None:
+                raise TaskStoreCorruption("current approval has no durable budget")
+            try:
+                dataset_keys = [
+                    (dataset["id"], dataset["version"])
+                    for dataset in snapshot.draft["datasets"]
+                ]
+                algorithm_keys = [
+                    (
+                        snapshot.draft["algorithm"]["id"],
+                        snapshot.draft["algorithm"]["version"],
+                    )
+                ]
+                for node in snapshot.plan["nodes"]:
+                    algorithm_keys.append(
+                        (node["algorithm"]["id"], node["algorithm"]["version"])
+                    )
+                    dataset_keys.extend(
+                        (binding["dataset"]["id"], binding["dataset"]["version"])
+                        for binding in node["inputs"]
+                    )
+            except (KeyError, TypeError) as error:
+                raise TaskStoreCorruption(
+                    "current submit documents cannot identify registry records"
+                ) from error
+            registry = self._load_registry_snapshots(
+                connection,
+                project_id=project_id,
+                dataset_keys=dataset_keys,
+                algorithm_keys=algorithm_keys,
+            )
+            now = clock()
+            intent, queued_event = admit(
+                SubmitGateContext(
+                    snapshot=snapshot,
+                    registry=registry,
+                    budget=budget,
+                ),
+                now,
+            )
+            intent_json, intent_hash = encode_document(intent)
+            queue_fingerprint = intent.get("queue_fingerprint")
+            if not isinstance(queue_fingerprint, Mapping):
+                raise TaskStoreConflict("dispatch intent has no queue fingerprint")
+            _, fingerprint_hash = encode_document(queue_fingerprint)
+            event_json, event_hash = encode_document(queued_event)
+            _, event_fingerprint_hash = encode_document(
+                queued_event.get("fingerprint", {})
+            )
+
+            if len(snapshot.plan.get("nodes", [])) != 1:
+                raise TaskStoreConflict(
+                    "P1 submission requires exactly one plan node"
+                )
+            node = snapshot.plan["nodes"][0]
+            indexed_intent = {
+                "task_id": task_id,
+                "plan_id": snapshot.plan["plan_id"],
+                "plan_hash": snapshot.plan["plan_hash"],
+                "approval_id": approval_id,
+                "node_id": node["node_id"],
+                "node_idempotency_key": node["idempotency_key"],
+                "created_at": now,
+            }
+            adapter = intent.get("adapter")
+            if (
+                intent.get("schema_version") != "1.0.0"
+                or any(intent.get(key) != value for key, value in indexed_intent.items())
+                or not isinstance(intent.get("intent_id"), str)
+                or not isinstance(adapter, Mapping)
+                or set(adapter) != {"id", "version"}
+                or not isinstance(intent.get("request"), Mapping)
+                or queued_event.get("schema_version") != "1.0.0"
+                or queued_event.get("sequence") != 1
+                or queued_event.get("task_id") != task_id
+                or queued_event.get("event_type") != "task_queued"
+                or queued_event.get("task_status") != "Queued"
+                or queued_event.get("occurred_at") != now
+                or queued_event.get("node_id") is not None
+                or queued_event.get("fingerprint") != queue_fingerprint
+                or event_fingerprint_hash != fingerprint_hash
+            ):
+                raise TaskStoreConflict(
+                    "dispatch intent or queued event differs from current state"
+                )
+
+            consumed = connection.execute(
+                """
+                UPDATE approval_budgets
+                SET tasks_used = tasks_used + 1, updated_at = ?
+                WHERE task_id = ? AND approval_id = ?
+                  AND tasks_used < max_tasks
+                """,
+                (now, task_id, approval_id),
+            )
+            if consumed.rowcount != 1:
+                raise TaskStoreConflict("approval task budget is exhausted")
+            connection.execute(
+                """
+                INSERT INTO dispatch_intents(
+                    intent_id, task_id, plan_id, plan_hash, approval_id,
+                    node_id, node_idempotency_key, adapter_id,
+                    adapter_version, request_json, request_hash,
+                    fingerprint_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent["intent_id"],
+                    task_id,
+                    snapshot.plan["plan_id"],
+                    snapshot.plan["plan_hash"],
+                    approval_id,
+                    node["node_id"],
+                    node["idempotency_key"],
+                    adapter["id"],
+                    adapter["version"],
+                    intent_json,
+                    intent_hash,
+                    fingerprint_hash,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO run_events(
+                    task_id, sequence, event_id, event_type, task_status,
+                    node_id, fingerprint_hash, document_json, document_hash,
+                    occurred_at, recorded_at
+                ) VALUES (?, 1, ?, 'task_queued', 'Queued', NULL, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    queued_event["event_id"],
+                    event_fingerprint_hash,
+                    event_json,
+                    event_hash,
+                    queued_event["occurred_at"],
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Queued', updated_at = ? WHERE task_id = ?",
+                (now, task_id),
+            )
+            response_json, _ = encode_document(
+                {"intent_id": intent["intent_id"], "task_id": task_id}
+            )
+            connection.execute(
+                """
+                INSERT INTO idempotency_records(
+                    project_id, principal_id, operation, idempotency_key,
+                    request_hash, task_id, response_json, created_at
+                ) VALUES (?, ?, 'submit_task', ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    principal_id,
+                    idempotency_key,
+                    request_hash,
+                    task_id,
+                    response_json,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO submit_idempotency_links(
+                    project_id, principal_id, operation, idempotency_key,
+                    request_hash, task_id, intent_id, created_at
+                ) VALUES (?, ?, 'submit_task', ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    principal_id,
+                    idempotency_key,
+                    request_hash,
+                    task_id,
+                    intent["intent_id"],
+                    now,
+                ),
+            )
+            queued_snapshot = self._load_snapshot(connection, task_id)
+            stored_intent = self._load_dispatch_intent(
+                connection, task_id=task_id
+            )
+            if queued_snapshot is None or stored_intent is None:
+                raise TaskStoreCorruption("submitted task cannot be read")
+            connection.commit()
+            return SubmitTaskRecord(
+                snapshot=queued_snapshot,
+                intent=stored_intent,
+                replayed=False,
+            )
+        except (IdempotencyConflict, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict("task submission conflicts with durable state") from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def get_task(self, task_id: str) -> TaskSnapshot | None:
         connection = self._connect()
         try:
@@ -1391,7 +1840,29 @@ class SQLiteTaskStore:
         }
         if not runtime_status and event_summary["event_count"] != 0:
             raise TaskStoreCorruption("pre-runtime task unexpectedly has run events")
+        intent_binding = connection.execute(
+            """
+            SELECT plan_id, plan_hash, approval_id
+            FROM dispatch_intents WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if not runtime_status and intent_binding is not None:
+            raise TaskStoreCorruption(
+                "pre-runtime task unexpectedly has a dispatch intent"
+            )
         if runtime_status:
+            if (
+                intent_binding is None
+                or plan is None
+                or approval is None
+                or intent_binding["plan_id"] != plan.get("plan_id")
+                or intent_binding["plan_hash"] != plan.get("plan_hash")
+                or intent_binding["approval_id"] != approval.get("approval_id")
+            ):
+                raise TaskStoreCorruption(
+                    "runtime task lacks its current dispatch intent"
+                )
             if (
                 event_summary["event_count"] == 0
                 or event_summary["first_sequence"] != 1
@@ -1425,6 +1896,10 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption(
                     "task status does not match its latest run event"
                 )
+            if self._load_dispatch_intent(connection, task_id=task_id) is None:
+                raise TaskStoreCorruption(
+                    "runtime task dispatch intent cannot be decoded"
+                )
         return TaskSnapshot(
             task_id=row["task_id"],
             project_id=row["project_id"],
@@ -1436,6 +1911,564 @@ class SQLiteTaskStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def _load_dispatch_intent(
+        self, connection: sqlite3.Connection, *, task_id: str
+    ) -> DispatchIntentSnapshot | None:
+        row = connection.execute(
+            """
+            SELECT intent.intent_id, intent.task_id, intent.plan_id,
+                   intent.plan_hash, intent.approval_id, intent.node_id,
+                   intent.node_idempotency_key, intent.adapter_id,
+                   intent.adapter_version, intent.request_json AS document_json,
+                   intent.request_hash AS document_hash,
+                   intent.fingerprint_hash, intent.created_at,
+                   attempt.claimed_at AS dispatch_claimed_at,
+                   outcome.outcome, outcome.document_json AS outcome_json,
+                   outcome.document_hash AS outcome_hash,
+                   outcome.recorded_at AS outcome_recorded_at
+            FROM dispatch_intents AS intent
+            LEFT JOIN dispatch_attempts AS attempt
+              ON attempt.intent_id = intent.intent_id
+            LEFT JOIN dispatch_outcomes AS outcome
+              ON outcome.intent_id = intent.intent_id
+            WHERE intent.task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        document = _decode_hashed_document(row, label="dispatch intent")
+        required = {
+            "schema_version",
+            "intent_id",
+            "task_id",
+            "plan_id",
+            "plan_hash",
+            "approval_id",
+            "node_id",
+            "node_idempotency_key",
+            "adapter",
+            "request",
+            "queue_fingerprint",
+            "created_at",
+        }
+        if set(document) != required:
+            raise TaskStoreCorruption("dispatch intent fields are inconsistent")
+        adapter = document.get("adapter")
+        request = document.get("request")
+        fingerprint = document.get("queue_fingerprint")
+        indexed = {
+            "intent_id": row["intent_id"],
+            "task_id": row["task_id"],
+            "plan_id": row["plan_id"],
+            "plan_hash": row["plan_hash"],
+            "approval_id": row["approval_id"],
+            "node_id": row["node_id"],
+            "node_idempotency_key": row["node_idempotency_key"],
+            "created_at": row["created_at"],
+        }
+        if (
+            document.get("schema_version") != "1.0.0"
+            or any(document.get(key) != value for key, value in indexed.items())
+            or not isinstance(adapter, dict)
+            or set(adapter) != {"id", "version"}
+            or adapter.get("id") != row["adapter_id"]
+            or adapter.get("version") != row["adapter_version"]
+            or not isinstance(request, dict)
+            or not isinstance(fingerprint, dict)
+        ):
+            raise TaskStoreCorruption("dispatch intent identity is inconsistent")
+        request_fields = {
+            "task_id",
+            "node_id",
+            "plan_hash",
+            "idempotency_key",
+            "project_id",
+            "principal_id",
+            "algorithm",
+            "dataset",
+            "task_type",
+            "parameters",
+            "resources",
+            "normalized_config_hash",
+        }
+        task_identity = connection.execute(
+            """
+            SELECT task.project_id, task.principal_id,
+                   task.current_plan_id, task.current_approval_id,
+                   plan.plan_hash AS durable_plan_hash,
+                   node.idempotency_key AS durable_node_key
+            FROM tasks AS task
+            JOIN plans AS plan
+              ON plan.task_id = task.task_id AND plan.plan_id = ?
+            JOIN plan_node_idempotency AS node
+              ON node.task_id = task.task_id
+             AND node.plan_id = plan.plan_id AND node.node_id = ?
+            WHERE task.task_id = ?
+            """,
+            (row["plan_id"], row["node_id"], row["task_id"]),
+        ).fetchone()
+        if (
+            set(request) != request_fields
+            or task_identity is None
+            or task_identity["current_plan_id"] != row["plan_id"]
+            or task_identity["current_approval_id"] != row["approval_id"]
+            or task_identity["durable_plan_hash"] != row["plan_hash"]
+            or task_identity["durable_node_key"] != row["node_idempotency_key"]
+            or request.get("task_id") != row["task_id"]
+            or request.get("node_id") != row["node_id"]
+            or request.get("plan_hash") != row["plan_hash"]
+            or request.get("idempotency_key") != row["node_idempotency_key"]
+            or request.get("project_id") != task_identity["project_id"]
+            or request.get("principal_id") != task_identity["principal_id"]
+        ):
+            raise TaskStoreCorruption(
+                "dispatch intent request differs from durable task state"
+            )
+        documents = connection.execute(
+            """
+            SELECT draft.document_json AS draft_json,
+                   draft.document_hash AS draft_hash,
+                   plan.document_json AS plan_json,
+                   plan.document_hash AS plan_document_hash,
+                   queued.document_json AS queued_json,
+                   queued.document_hash AS queued_hash,
+                   queued.fingerprint_hash AS queued_fingerprint_hash,
+                   queued.event_type AS queued_type,
+                   queued.task_status AS queued_status,
+                   queued.node_id AS queued_node_id
+            FROM tasks AS task
+            JOIN draft_revisions AS draft
+              ON draft.task_id = task.task_id
+             AND draft.draft_id = task.current_draft_id
+             AND draft.revision = task.current_draft_revision
+            JOIN plans AS plan
+              ON plan.task_id = task.task_id
+             AND plan.plan_id = task.current_plan_id
+            JOIN run_events AS queued
+              ON queued.task_id = task.task_id AND queued.sequence = 1
+            WHERE task.task_id = ?
+            """,
+            (row["task_id"],),
+        ).fetchone()
+        if documents is None:
+            raise TaskStoreCorruption(
+                "dispatch intent lacks its durable draft, plan, or queued event"
+            )
+        draft = _decode_hashed_document(
+            {
+                "document_json": documents["draft_json"],
+                "document_hash": documents["draft_hash"],
+            },
+            label="dispatch draft",
+        )
+        plan = _decode_hashed_document(
+            {
+                "document_json": documents["plan_json"],
+                "document_hash": documents["plan_document_hash"],
+            },
+            label="dispatch plan",
+        )
+        queued_event = _decode_hashed_document(
+            {
+                "document_json": documents["queued_json"],
+                "document_hash": documents["queued_hash"],
+            },
+            label="queued event",
+        )
+        try:
+            if len(plan["nodes"]) != 1:
+                raise TaskStoreCorruption(
+                    "dispatch plan no longer has exactly one node"
+                )
+            durable_node = plan["nodes"][0]
+            if len(durable_node["inputs"]) != 1:
+                raise TaskStoreCorruption(
+                    "dispatch plan no longer has exactly one input"
+                )
+            input_identity = durable_node["inputs"][0]["dataset"]
+            durable_dataset = next(
+                value
+                for value in draft["datasets"]
+                if all(
+                    value[key] == input_identity[key]
+                    for key in ("id", "version", "content_hash", "data_type")
+                )
+            )
+            expected_request = {
+                "task_id": row["task_id"],
+                "node_id": durable_node["node_id"],
+                "plan_hash": plan["plan_hash"],
+                "idempotency_key": durable_node["idempotency_key"],
+                "project_id": task_identity["project_id"],
+                "principal_id": task_identity["principal_id"],
+                "algorithm": durable_node["algorithm"],
+                "dataset": durable_dataset,
+                "task_type": plan["task_type"],
+                "parameters": durable_node["parameters"],
+                "resources": durable_node["resources"],
+            }
+        except (KeyError, StopIteration, TypeError) as error:
+            raise TaskStoreCorruption(
+                "dispatch intent cannot be reconstructed from durable state"
+            ) from error
+        request_without_config_hash = {
+            key: value
+            for key, value in request.items()
+            if key != "normalized_config_hash"
+        }
+        if request_without_config_hash != expected_request:
+            raise TaskStoreCorruption(
+                "dispatch intent request payload differs from current plan"
+            )
+        try:
+            _, fingerprint_hash = encode_document(fingerprint)
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "dispatch intent fingerprint is not finite JSON"
+            ) from error
+        if fingerprint_hash != row["fingerprint_hash"]:
+            raise TaskStoreCorruption(
+                "dispatch intent fingerprint hash does not match"
+            )
+        if (
+            fingerprint.get("algorithm") != request.get("algorithm")
+            or fingerprint.get("seed") != request.get("parameters", {}).get("seed")
+            or fingerprint.get("hardware", {}).get("device")
+            != request.get("resources", {}).get("device")
+            or fingerprint.get("normalized_config_hash")
+            != request.get("normalized_config_hash")
+            or fingerprint.get("input_hashes")
+            != [request.get("dataset", {}).get("content_hash")]
+            or documents["queued_type"] != "task_queued"
+            or documents["queued_status"] != "Queued"
+            or documents["queued_node_id"] is not None
+            or queued_event.get("sequence") != 1
+            or queued_event.get("task_id") != row["task_id"]
+            or queued_event.get("fingerprint") != fingerprint
+            or documents["queued_fingerprint_hash"] != fingerprint_hash
+        ):
+            raise TaskStoreCorruption(
+                "dispatch intent fingerprint differs from its request or queued event"
+            )
+
+        state = "pending"
+        handle: dict[str, Any] | None = None
+        failure_code: str | None = None
+        dispatch_claimed_at: str | None = None
+        outcome_recorded_at: str | None = None
+        if row["dispatch_claimed_at"] is not None:
+            state = "dispatching"
+            dispatch_claimed_at = str(row["dispatch_claimed_at"])
+        if row["outcome"] is not None:
+            outcome_row = {
+                "document_json": row["outcome_json"],
+                "document_hash": row["outcome_hash"],
+            }
+            outcome_document = _decode_hashed_document(
+                outcome_row, label="dispatch outcome"
+            )
+            state = str(row["outcome"])
+            outcome_recorded_at = str(row["outcome_recorded_at"])
+            if (
+                outcome_document.get("status") != state
+                or outcome_document.get("recorded_at") != outcome_recorded_at
+            ):
+                raise TaskStoreCorruption("dispatch outcome identity is inconsistent")
+            if state == "dispatched":
+                if set(outcome_document) != {"status", "handle", "recorded_at"}:
+                    raise TaskStoreCorruption(
+                        "successful dispatch outcome fields are inconsistent"
+                    )
+                value = outcome_document.get("handle")
+                if not isinstance(value, dict):
+                    raise TaskStoreCorruption("dispatch handle must be an object")
+                handle = value
+            elif state == "reconciliation_required":
+                if set(outcome_document) != {
+                    "status",
+                    "failure_code",
+                    "recorded_at",
+                }:
+                    raise TaskStoreCorruption(
+                        "failed dispatch outcome fields are inconsistent"
+                    )
+                value = outcome_document.get("failure_code")
+                if not isinstance(value, str) or not value:
+                    raise TaskStoreCorruption("dispatch failure code is invalid")
+                failure_code = value
+            else:
+                raise TaskStoreCorruption("dispatch outcome state is invalid")
+        result = DispatchIntentSnapshot(
+            intent_id=row["intent_id"],
+            task_id=row["task_id"],
+            plan_id=row["plan_id"],
+            plan_hash=row["plan_hash"],
+            approval_id=row["approval_id"],
+            node_id=row["node_id"],
+            node_idempotency_key=row["node_idempotency_key"],
+            adapter_id=row["adapter_id"],
+            adapter_version=row["adapter_version"],
+            request=request,
+            request_hash=row["document_hash"],
+            queue_fingerprint=fingerprint,
+            state=state,
+            handle=handle,
+            failure_code=failure_code,
+            created_at=row["created_at"],
+            dispatch_claimed_at=dispatch_claimed_at,
+            outcome_recorded_at=outcome_recorded_at,
+        )
+        if handle is not None:
+            try:
+                self._validate_dispatch_handle(result, handle)
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "dispatch handle differs from its immutable intent"
+                ) from error
+        return result
+
+    def get_dispatch_intent(self, task_id: str) -> DispatchIntentSnapshot | None:
+        connection = self._connect()
+        try:
+            return self._load_dispatch_intent(connection, task_id=task_id)
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _task_id_for_intent(
+        connection: sqlite3.Connection, intent_id: str
+    ) -> str | None:
+        row = connection.execute(
+            "SELECT task_id FROM dispatch_intents WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        return None if row is None else str(row["task_id"])
+
+    def claim_dispatch(
+        self, *, intent_id: str, now: str
+    ) -> tuple[DispatchIntentSnapshot, bool]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            if intent.state != "pending":
+                connection.commit()
+                return intent, False
+            connection.execute(
+                "INSERT INTO dispatch_attempts(intent_id, claimed_at) VALUES (?, ?)",
+                (intent_id, now),
+            )
+            claimed = self._load_dispatch_intent(connection, task_id=task_id)
+            if claimed is None or claimed.state != "dispatching":
+                raise TaskStoreCorruption("claimed dispatch intent cannot be read")
+            connection.commit()
+            return claimed, True
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict("dispatch claim conflicts with durable state") from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _validate_dispatch_handle(
+        intent: DispatchIntentSnapshot, handle: Mapping[str, Any]
+    ) -> None:
+        required = {
+            "submission_id",
+            "task_id",
+            "node_id",
+            "job_id",
+            "idempotency_key",
+            "plan_hash",
+            "request_hash",
+            "algorithm",
+            "adapter_version",
+            "fingerprint",
+        }
+        algorithm = handle.get("algorithm")
+        fingerprint = handle.get("fingerprint")
+        request = intent.request
+        if (
+            set(handle) != required
+            or handle.get("task_id") != intent.task_id
+            or handle.get("node_id") != intent.node_id
+            or handle.get("idempotency_key") != intent.node_idempotency_key
+            or handle.get("plan_hash") != intent.plan_hash
+            or handle.get("adapter_version") != intent.adapter_version
+            or algorithm != request.get("algorithm")
+            or not isinstance(fingerprint, Mapping)
+            or fingerprint.get("algorithm") != request.get("algorithm")
+            or fingerprint.get("seed") != request.get("parameters", {}).get("seed")
+            or fingerprint.get("hardware", {}).get("device")
+            != request.get("resources", {}).get("device")
+            or fingerprint.get("normalized_config_hash")
+            != request.get("normalized_config_hash")
+            or fingerprint.get("input_hashes")
+            != [request.get("dataset", {}).get("content_hash")]
+            or not isinstance(handle.get("submission_id"), str)
+            or not isinstance(handle.get("job_id"), str)
+            or not isinstance(handle.get("request_hash"), str)
+        ):
+            raise TaskStoreConflict(
+                "dispatch handle differs from its immutable intent"
+            )
+
+    def record_dispatch_success(
+        self,
+        *,
+        intent_id: str,
+        handle: Mapping[str, Any],
+        now: str,
+    ) -> DispatchIntentSnapshot:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            self._validate_dispatch_handle(intent, handle)
+            if intent.state == "dispatched":
+                if intent.handle != dict(handle):
+                    raise TaskStoreConflict(
+                        "dispatch success differs from the recorded handle"
+                    )
+                connection.commit()
+                return intent
+            if intent.state != "dispatching":
+                raise TaskStoreConflict("dispatch intent is not claimed")
+            document = {
+                "status": "dispatched",
+                "handle": dict(handle),
+                "recorded_at": now,
+            }
+            document_json, document_hash = encode_document(document)
+            connection.execute(
+                """
+                INSERT INTO dispatch_outcomes(
+                    intent_id, outcome, document_json, document_hash, recorded_at
+                ) VALUES (?, 'dispatched', ?, ?, ?)
+                """,
+                (intent_id, document_json, document_hash, now),
+            )
+            stored = self._load_dispatch_intent(connection, task_id=task_id)
+            if stored is None or stored.state != "dispatched":
+                raise TaskStoreCorruption("dispatch success cannot be read")
+            connection.commit()
+            return stored
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict("dispatch outcome conflicts with durable state") from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def record_dispatch_reconciliation(
+        self,
+        *,
+        intent_id: str,
+        failure_code: str,
+        now: str,
+    ) -> DispatchIntentSnapshot:
+        if (
+            not isinstance(failure_code, str)
+            or not failure_code
+            or len(failure_code) > 128
+            or not failure_code.replace("_", "").isalnum()
+            or failure_code.upper() != failure_code
+        ):
+            raise TaskStoreConflict("dispatch failure code is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            if intent.state == "reconciliation_required":
+                if intent.failure_code != failure_code:
+                    raise TaskStoreConflict(
+                        "dispatch reconciliation outcome already differs"
+                    )
+                connection.commit()
+                return intent
+            if intent.state != "dispatching":
+                raise TaskStoreConflict("dispatch intent is not claimed")
+            document = {
+                "status": "reconciliation_required",
+                "failure_code": failure_code,
+                "recorded_at": now,
+            }
+            document_json, document_hash = encode_document(document)
+            connection.execute(
+                """
+                INSERT INTO dispatch_outcomes(
+                    intent_id, outcome, document_json, document_hash, recorded_at
+                ) VALUES (?, 'reconciliation_required', ?, ?, ?)
+                """,
+                (intent_id, document_json, document_hash, now),
+            )
+            stored = self._load_dispatch_intent(connection, task_id=task_id)
+            if stored is None or stored.state != "reconciliation_required":
+                raise TaskStoreCorruption(
+                    "dispatch reconciliation outcome cannot be read"
+                )
+            connection.commit()
+            return stored
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict("dispatch outcome conflicts with durable state") from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def append_draft_revision(
         self,
@@ -1735,9 +2768,9 @@ class SQLiteTaskStore:
         """Atomically update status and append an already validated RunEvent.
 
         This is an internal persistence primitive, not a submission API.
-        AwaitingApproval -> Queued must later be wrapped by the atomic registry,
-        approval-budget, deterministic-gate, and submit-idempotency transaction.
-        This P1.1 primitive therefore rejects every pre-runtime state.
+        AwaitingApproval -> Queued is owned by ``submit_task`` and its atomic
+        registry, approval-budget, Gate, intent, and idempotency transaction.
+        This primitive therefore rejects every pre-runtime state.
         """
 
         document_json, document_hash = encode_document(event)
