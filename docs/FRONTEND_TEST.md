@@ -2,7 +2,7 @@
 
 本文给第一次运行项目的使用者一条可执行的验收路径：配置本地 secret、核对固定模型、一键启动，
 优先走完 P1 Guided 的确认/修改/批准/状态/八项结果闭环，验证对话与任务独立、任务回收站和
-六张标准图片，再可选检查旧 MCP/FWI Result 兼容性，最后一键关闭。
+有界永久删除、六张标准图片，再可选检查旧 MCP/FWI Result 兼容性，最后一键关闭。
 
 只在受信任的本机或受控容器中执行。当前 Web 没有用户认证，不要把 8080 或 5000 端口暴露到公网；不要在终端、截图、聊天、Issue 或日志粘贴内容中输出 API Key。
 
@@ -264,7 +264,18 @@ lease/reconciliation 或 SSE 已实现。
 5. 对 Succeeded/Failed/Cancelled 任务点击“删除”。预期它从 active 视图消失、出现在任务
    回收站，详情、事件和结果仍可读取；点击“恢复”后回到 active，且不会重新运行 Worker；
 6. Queued/Running/Waiting/Retrying 或结果未知任务不得出现可用删除操作；AwaitingApproval 要先
-   “放弃草稿”成为 Cancelled。任务回收站不是 artifact 永久清除功能。
+   “放弃草稿”成为 Cancelled。这里的普通“删除”仍只是可恢复 Trash，不会清理本地结果；
+7. 对一个可丢弃的回收站任务点击红色“永久删除”。确认框必须要求逐字输入完整 `task_id`，
+   并说明本机 Worker 运行目录/结果不可恢复、SQLite 任务审计和对话仍保留；输入不匹配时不得
+   发请求；
+8. 对已运行的终态任务确认后，预期其专属本地目录（config、日志、status、NPY、CSV、PNG）
+   被删除，任务从 active/trash 列表消失，不能 Restore、查看详情或重新读取 artifact；对仅
+   abandon 的 pre-runtime 任务，响应应说明未曾创建本地运行目录（`not_created`）；
+9. 永久删除不得级联删除 conversation/message。所有引用该 task 的对话卡改为“任务已永久
+   删除”，用户可以单独移除失效引用；已下载到浏览器外部的副本不受本功能控制；
+10. 若响应中断、结果未知，回收站行显示“继续永久删除”且“恢复”禁用；再次确认只继续同一
+    purge，不启动 Worker。为避免耗时，不必新跑真实 FWI：可用现有可丢弃终态任务做一次人工
+    删除；自动化已用临时 Worker 树验证实际文件清理、崩溃恢复和符号链接边界。
 
 刷新页面后，对话 task 引用卡应先显示“状态需从 SQLite 刷新”，不能用 `localStorage` 中旧的
 成功/进度缓存冒充事实；打开任务后再显示服务器返回的当前状态。
@@ -284,7 +295,7 @@ python3 -m unittest discover -s web/tests -p 'test_*.py' -v
 node web/tests/ui_message_rendering_test.js
 ```
 
-当前预期为 Web/Workbench Python 29/29 PASS，UI Node 输出
+当前预期为 Web Python 29/29 PASS，UI Node 输出
 `ui message rendering tests passed`。这组测试同时证明执行型文本先进入 Guided、纯理论文本仍
 走聊天、旧结果不会把无合法回执的说明或代码误标成已提交，并覆盖旧 artifact 路径/后缀边界。
 如要人工查看旧 Worker 目录、六张 PNG 或 `metrics.json`，只使用已经由兼容 MCP 或 Worker

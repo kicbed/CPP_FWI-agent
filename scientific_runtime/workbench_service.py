@@ -432,6 +432,7 @@ class GuidedWorkbench:
             "features": {
                 "approval_required": True,
                 "abandon_pre_runtime": True,
+                "permanent_delete_from_trash": True,
                 "running_cancel": False,
                 "automatic_reconciliation": False,
                 "streaming_events": False,
@@ -1421,6 +1422,10 @@ class GuidedWorkbench:
                     "updated_at": snapshot.updated_at,
                     "visibility_revision": snapshot.visibility_revision,
                     "trashed_at": snapshot.trashed_at,
+                    "purge_state": (
+                        "pending" if snapshot.purge_id is not None else None
+                    ),
+                    "purge_requested_at": snapshot.purge_requested_at,
                 }
             )
         return {
@@ -1481,6 +1486,53 @@ class GuidedWorkbench:
             key,
             restore=True,
         )
+
+    def purge_task(
+        self, task_id: str, expected_visibility_revision: int, key: str
+    ) -> dict[str, Any]:
+        if (
+            type(expected_visibility_revision) is not int
+            or not 0 <= expected_visibility_revision <= 2**63 - 1
+        ):
+            raise WorkbenchValidationError(
+                "INVALID_VISIBILITY_REVISION",
+                ["expected_visibility_revision must be a non-negative integer"],
+            )
+        result = self._call(
+            self._tasks.purge_task,
+            task_id=task_id,
+            expected_visibility_revision=expected_visibility_revision,
+            idempotency_key=self._mutation_key("purge", key),
+            **self._scope,
+        )
+        response = {
+            field: _value(result, field)
+            for field in (
+                "task_id",
+                "purge_id",
+                "purge_state",
+                "purged_at",
+                "local_run_state",
+                "audit_retained",
+                "replayed",
+            )
+        }
+        if (
+            response["task_id"] != task_id
+            or not isinstance(response["purge_id"], str)
+            or OPAQUE_ID.fullmatch(response["purge_id"]) is None
+            or response["purge_state"] != "purged"
+            or not isinstance(response["purged_at"], str)
+            or response["local_run_state"] not in {"deleted", "not_created"}
+            or response["audit_retained"] is not True
+            or type(response["replayed"]) is not bool
+        ):
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID",
+                ["task purge service returned an invalid outcome"],
+            )
+        _timestamp(response["purged_at"], field="purged_at")
+        return response
 
     def list_events(
         self, task_id: str, after_sequence: int = 0, limit: int = 100

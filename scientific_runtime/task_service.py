@@ -128,6 +128,19 @@ class TaskVisibilityResult:
 
 
 @dataclass(frozen=True)
+class TaskPurgeResult:
+    """Stable public outcome for one irreversible local task purge."""
+
+    task_id: str
+    purge_id: str
+    purge_state: str
+    purged_at: str
+    local_run_state: str
+    audit_retained: bool
+    replayed: bool
+
+
+@dataclass(frozen=True)
 class TaskRuntimeResult:
     snapshot: TaskSnapshot
     intent: DispatchIntentSnapshot | None
@@ -380,6 +393,14 @@ class TaskService:
             task_id, project_id=project_id, principal_id=principal_id
         )
 
+    @staticmethod
+    def _require_not_purged(snapshot: TaskSnapshot) -> TaskSnapshot:
+        """Keep a purge reservation from being bypassed by stale replays."""
+
+        if snapshot.purge_id is not None:
+            raise TaskNotFound("task has been permanently deleted")
+        return snapshot
+
     def _validate_registered_draft(
         self,
         draft: Mapping[str, Any],
@@ -601,7 +622,9 @@ class TaskService:
         except IdempotencyConflict as error:
             raise TaskIdempotencyConflict(str(error)) from error
         if replay is not None:
-            return CreateTaskResult(snapshot=replay.snapshot, replayed=True)
+            return CreateTaskResult(
+                snapshot=self._require_not_purged(replay.snapshot), replayed=True
+            )
         task_id = self._task_id_factory()
         _validate_opaque_id(task_id, field="generated task_id")
         try:
@@ -618,7 +641,10 @@ class TaskService:
             raise TaskIdempotencyConflict(str(error)) from error
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
-        return CreateTaskResult(snapshot=result.snapshot, replayed=result.replayed)
+        return CreateTaskResult(
+            snapshot=self._require_not_purged(result.snapshot),
+            replayed=result.replayed,
+        )
 
     def lookup_compatible_create_task(
         self,
@@ -689,7 +715,9 @@ class TaskService:
             raise TaskConflict(str(error)) from error
         if replay is None:
             return None
-        return CreateTaskResult(snapshot=replay.snapshot, replayed=True)
+        return CreateTaskResult(
+            snapshot=self._require_not_purged(replay.snapshot), replayed=True
+        )
 
     def get_task(
         self, task_id: str, *, project_id: str, principal_id: str
@@ -704,7 +732,7 @@ class TaskService:
             or snapshot.principal_id != principal_id
         ):
             raise TaskNotFound("task does not exist in the requested scope")
-        return snapshot
+        return self._require_not_purged(snapshot)
 
     def list_tasks(
         self,
@@ -1230,6 +1258,206 @@ class TaskService:
         )
 
     @staticmethod
+    def _validated_purge_outcome(
+        outcome: Mapping[str, Any],
+        *,
+        task_id: str,
+        purge_id: str,
+        replayed: bool,
+    ) -> TaskPurgeResult:
+        expected_fields = {
+            "task_id",
+            "purge_id",
+            "purge_state",
+            "purged_at",
+            "local_run_state",
+            "audit_retained",
+        }
+        purged_at = outcome.get("purged_at")
+        try:
+            parsed = datetime.fromisoformat(
+                purged_at.replace("Z", "+00:00")
+            )
+        except (AttributeError, ValueError) as error:
+            raise TaskDispatchError("TASK_PURGE_OUTCOME_INVALID") from error
+        if (
+            set(outcome) != expected_fields
+            or outcome.get("task_id") != task_id
+            or outcome.get("purge_id") != purge_id
+            or outcome.get("purge_state") != "purged"
+            or parsed.tzinfo is None
+            or outcome.get("local_run_state") not in {"deleted", "not_created"}
+            or outcome.get("audit_retained") is not True
+            or type(replayed) is not bool
+        ):
+            raise TaskDispatchError("TASK_PURGE_OUTCOME_INVALID")
+        return TaskPurgeResult(
+            task_id=task_id,
+            purge_id=purge_id,
+            purge_state="purged",
+            purged_at=purged_at,
+            local_run_state=outcome["local_run_state"],
+            audit_retained=True,
+            replayed=replayed,
+        )
+
+    def purge_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_visibility_revision: int,
+        idempotency_key: str,
+    ) -> TaskPurgeResult:
+        """Irreversibly delete one trashed terminal task's local run data.
+
+        SQLite first reserves an immutable purge tombstone.  That reservation
+        prevents restore, status, and artifact reads while the Adapter removes
+        the Worker-owned directory.  A retry continues the same reservation,
+        so a crash between filesystem cleanup and outcome persistence cannot
+        launch the task again or make it visible.
+        """
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        _validate_idempotency_key(idempotency_key)
+        if (
+            type(expected_visibility_revision) is not int
+            or not 0 <= expected_visibility_revision <= 2**63 - 1
+        ):
+            raise TaskValidationError(
+                "INVALID_VISIBILITY_REVISION",
+                ["expected_visibility_revision must be a non-negative integer"],
+            )
+        scoped_snapshot = self._store.get_task(task_id)
+        if (
+            scoped_snapshot is None
+            or scoped_snapshot.project_id != project_id
+            or scoped_snapshot.principal_id != principal_id
+        ):
+            raise TaskNotFound("task does not exist in the requested scope")
+        _, request_hash = encode_document(
+            {
+                "task_id": task_id,
+                "project_id": project_id,
+                "principal_id": principal_id,
+                "action": "purge_task",
+                "expected_visibility_revision": expected_visibility_revision,
+            }
+        )
+        try:
+            reservation = self._store.reserve_task_purge(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                expected_visibility_revision=expected_visibility_revision,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                now=self._clock(),
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+
+        snapshot = reservation.snapshot
+        if (
+            snapshot.task_id != task_id
+            or snapshot.project_id != project_id
+            or snapshot.principal_id != principal_id
+            or snapshot.visibility_revision != expected_visibility_revision
+            or snapshot.status not in {"Succeeded", "Failed", "Cancelled"}
+            or snapshot.trashed_at is None
+            or snapshot.purge_id != reservation.purge_id
+            or snapshot.purge_requested_at is None
+            or type(reservation.replayed) is not bool
+        ):
+            raise TaskDispatchError("TASK_PURGE_RESERVATION_INVALID")
+        if reservation.outcome is not None:
+            if not isinstance(reservation.outcome, Mapping):
+                raise TaskDispatchError("TASK_PURGE_OUTCOME_INVALID")
+            return self._validated_purge_outcome(
+                reservation.outcome,
+                task_id=task_id,
+                purge_id=reservation.purge_id,
+                replayed=True,
+            )
+
+        intent = self._store.get_dispatch_intent(task_id)
+        adapter_replayed = False
+        if intent is None:
+            abandonment = snapshot.abandonment
+            if (
+                snapshot.status != "Cancelled"
+                or not isinstance(abandonment, Mapping)
+                or abandonment.get("reason") != "user_discarded_draft"
+            ):
+                raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+            local_run_state = "not_created"
+        else:
+            if self._dispatcher is None:
+                raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+            if (
+                intent.task_id != task_id
+                or intent.state != "dispatched"
+                or intent.handle is None
+            ):
+                raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+            try:
+                adapter_result = self._dispatcher.purge(
+                    intent, purge_id=reservation.purge_id
+                )
+            except DispatchError as error:
+                raise TaskDispatchError(error.code) from error
+            except Exception as error:
+                raise TaskDispatchError("ADAPTER_PURGE_UNAVAILABLE") from error
+            if (
+                not isinstance(adapter_result, Mapping)
+                or set(adapter_result)
+                != {"task_id", "purge_id", "local_run_state", "replayed"}
+                or adapter_result.get("task_id") != task_id
+                or adapter_result.get("purge_id") != reservation.purge_id
+                or adapter_result.get("local_run_state") != "deleted"
+                or type(adapter_result.get("replayed")) is not bool
+            ):
+                raise TaskDispatchError("ADAPTER_PURGE_INVALID")
+            local_run_state = "deleted"
+            adapter_replayed = adapter_result["replayed"]
+
+        try:
+            completed = self._store.complete_task_purge(
+                purge_id=reservation.purge_id,
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                local_run_state=local_run_state,
+                now=self._clock(),
+            )
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        if (
+            completed.purge_id != reservation.purge_id
+            or completed.snapshot.task_id != task_id
+            or completed.snapshot.purged_at is None
+            or completed.snapshot.purge_local_run_state != local_run_state
+            or not isinstance(completed.outcome, Mapping)
+            or type(completed.replayed) is not bool
+        ):
+            raise TaskDispatchError("TASK_PURGE_OUTCOME_INVALID")
+        return self._validated_purge_outcome(
+            completed.outcome,
+            task_id=task_id,
+            purge_id=reservation.purge_id,
+            replayed=(
+                reservation.replayed
+                or adapter_replayed
+                or completed.replayed
+            ),
+        )
+
+    @staticmethod
     def _parse_gate_time(value: str) -> datetime:
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -1470,7 +1698,7 @@ class TaskService:
             raise TaskIdempotencyConflict(str(error)) from error
         if replay is not None:
             return SubmitTaskResult(
-                snapshot=replay.snapshot,
+                snapshot=self._require_not_purged(replay.snapshot),
                 intent=replay.intent,
                 replayed=True,
                 dispatch_attempted=False,

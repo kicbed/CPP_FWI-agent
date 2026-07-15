@@ -51,6 +51,7 @@ WORKBENCH_MUTATION_OPERATIONS = frozenset(
 
 TASK_VISIBILITY_OPERATIONS = frozenset({"trash_task", "restore_task"})
 TASK_VISIBILITY_VIEWS = frozenset({"active", "trash"})
+TASK_PURGE_LOCAL_RUN_STATES = frozenset({"deleted", "not_created"})
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "Draft": frozenset({"Draft", "NeedsInput", "AwaitingApproval", "Cancelled"}),
@@ -107,6 +108,10 @@ class TaskSnapshot:
     abandonment: dict[str, Any] | None = None
     visibility_revision: int = 0
     trashed_at: str | None = None
+    purge_id: str | None = None
+    purge_requested_at: str | None = None
+    purged_at: str | None = None
+    purge_local_run_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +212,16 @@ class TaskVisibilityMutationRecord:
     """One exact trash/restore outcome and whether it was replayed."""
 
     snapshot: TaskSnapshot
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class TaskPurgeRecord:
+    """One durable two-phase purge reservation or completion."""
+
+    snapshot: TaskSnapshot
+    purge_id: str
+    outcome: dict[str, Any] | None
     replayed: bool
 
 
@@ -375,6 +390,31 @@ class TaskStore(Protocol):
         request_hash: str,
         now: str,
     ) -> TaskVisibilityMutationRecord:
+        ...
+
+    def reserve_task_purge(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_visibility_revision: int,
+        idempotency_key: str,
+        request_hash: str,
+        now: str,
+    ) -> TaskPurgeRecord:
+        ...
+
+    def complete_task_purge(
+        self,
+        *,
+        purge_id: str,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        local_run_state: str,
+        now: str,
+    ) -> TaskPurgeRecord:
         ...
 
     def lookup_workbench_mutation(
@@ -2172,6 +2212,10 @@ class SQLiteTaskStore:
                       AND tasks.project_id = ?
                       AND tasks.principal_id = ?
                       AND COALESCE(visibility.state, 'active') = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM task_purge_outcomes AS purge_outcome
+                          WHERE purge_outcome.task_id = tasks.task_id
+                      )
                     """,
                     (cursor, project_id, principal_id, visibility_state),
                 ).fetchone()
@@ -2209,6 +2253,10 @@ class SQLiteTaskStore:
                   ON visibility.task_id = tasks.task_id
                 WHERE tasks.project_id = ? AND tasks.principal_id = ?
                   AND COALESCE(visibility.state, 'active') = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_purge_outcomes AS purge_outcome
+                      WHERE purge_outcome.task_id = tasks.task_id
+                  )
                 {boundary}
                 ORDER BY tasks.created_at DESC, tasks.task_id DESC
                 LIMIT ?
@@ -2345,6 +2393,162 @@ class SQLiteTaskStore:
             )
         return int(projection["revision"]), trashed_at
 
+    def _load_task_purge(
+        self,
+        connection: sqlite3.Connection,
+        row: Mapping[str, Any],
+        *,
+        visibility_revision: int,
+        trashed_at: str | None,
+    ) -> tuple[str | None, str | None, str | None, str | None, dict[str, Any] | None]:
+        """Decode one immutable purge request/outcome overlay."""
+
+        task_id = str(row["task_id"])
+        request_row = connection.execute(
+            """
+            SELECT purge_id, task_id, project_id, principal_id,
+                   visibility_revision, request_hash,
+                   document_json, document_hash, requested_at, recorded_at
+            FROM task_purge_requests WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if request_row is None:
+            dangling = connection.execute(
+                """
+                SELECT 1 FROM task_purge_outcomes WHERE task_id = ?
+                UNION ALL
+                SELECT 1 FROM task_purge_idempotency WHERE task_id = ?
+                LIMIT 1
+                """,
+                (task_id, task_id),
+            ).fetchone()
+            if dangling is not None:
+                raise TaskStoreCorruption(
+                    "task purge state lacks its immutable request"
+                )
+            return None, None, None, None, None
+
+        request = _decode_hashed_document(
+            request_row, label="task purge request"
+        )
+        purge_id = request_row["purge_id"]
+        if (
+            not isinstance(purge_id, str)
+            or not purge_id.startswith("purge-")
+            or len(purge_id) != 38
+            or any(character not in "0123456789abcdef" for character in purge_id[6:])
+            or request_row["task_id"] != task_id
+            or request_row["project_id"] != row["project_id"]
+            or request_row["principal_id"] != row["principal_id"]
+            or request_row["visibility_revision"] != visibility_revision
+            or trashed_at is None
+            or not isinstance(request_row["request_hash"], str)
+            or not request_row["request_hash"]
+            or not isinstance(request_row["requested_at"], str)
+            or request_row["recorded_at"] != request_row["requested_at"]
+            or set(request)
+            != {
+                "schema_version",
+                "purge_id",
+                "task_id",
+                "visibility_revision",
+                "purge_state",
+                "actor",
+                "requested_at",
+                "extensions",
+            }
+            or request.get("schema_version") != "1.0.0"
+            or request.get("purge_id") != purge_id
+            or request.get("task_id") != task_id
+            or request.get("visibility_revision") != visibility_revision
+            or request.get("purge_state") != "pending"
+            or request.get("actor")
+            != {"type": "user", "id": row["principal_id"]}
+            or request.get("requested_at") != request_row["requested_at"]
+            or request.get("extensions") != {}
+        ):
+            raise TaskStoreCorruption("task purge request is invalid")
+
+        aliases = connection.execute(
+            """
+            SELECT project_id, principal_id, operation, idempotency_key,
+                   request_hash, purge_id, task_id,
+                   visibility_revision, created_at
+            FROM task_purge_idempotency
+            WHERE purge_id = ? ORDER BY idempotency_key ASC
+            """,
+            (purge_id,),
+        ).fetchall()
+        if not aliases:
+            raise TaskStoreCorruption(
+                "task purge request lacks an idempotency binding"
+            )
+        for alias in aliases:
+            if (
+                alias["project_id"] != row["project_id"]
+                or alias["principal_id"] != row["principal_id"]
+                or alias["operation"] != "purge_task"
+                or not isinstance(alias["idempotency_key"], str)
+                or not alias["idempotency_key"]
+                or alias["request_hash"] != request_row["request_hash"]
+                or alias["purge_id"] != purge_id
+                or alias["task_id"] != task_id
+                or alias["visibility_revision"] != visibility_revision
+                or not isinstance(alias["created_at"], str)
+            ):
+                raise TaskStoreCorruption(
+                    "task purge idempotency binding is invalid"
+                )
+
+        outcome_row = connection.execute(
+            """
+            SELECT purge_id, task_id, project_id, principal_id,
+                   visibility_revision, local_run_state,
+                   document_json, document_hash, purged_at, recorded_at
+            FROM task_purge_outcomes WHERE purge_id = ?
+            """,
+            (purge_id,),
+        ).fetchone()
+        if outcome_row is None:
+            return purge_id, request_row["requested_at"], None, None, None
+
+        outcome = _decode_hashed_document(
+            outcome_row, label="task purge outcome"
+        )
+        if (
+            outcome_row["task_id"] != task_id
+            or outcome_row["project_id"] != row["project_id"]
+            or outcome_row["principal_id"] != row["principal_id"]
+            or outcome_row["visibility_revision"] != visibility_revision
+            or outcome_row["local_run_state"] not in TASK_PURGE_LOCAL_RUN_STATES
+            or not isinstance(outcome_row["purged_at"], str)
+            or outcome_row["recorded_at"] != outcome_row["purged_at"]
+            or set(outcome)
+            != {
+                "task_id",
+                "purge_id",
+                "purge_state",
+                "purged_at",
+                "local_run_state",
+                "audit_retained",
+            }
+            or outcome.get("task_id") != task_id
+            or outcome.get("purge_id") != purge_id
+            or outcome.get("purge_state") != "purged"
+            or outcome.get("purged_at") != outcome_row["purged_at"]
+            or outcome.get("local_run_state") != outcome_row["local_run_state"]
+            or outcome.get("audit_retained") is not True
+        ):
+            raise TaskStoreCorruption("task purge outcome is invalid")
+        return (
+            purge_id,
+            request_row["requested_at"],
+            outcome_row["purged_at"],
+            outcome_row["local_run_state"],
+            outcome,
+        )
+
     def _load_snapshot(
         self, connection: sqlite3.Connection, task_id: str
     ) -> TaskSnapshot | None:
@@ -2355,6 +2559,18 @@ class SQLiteTaskStore:
             return None
         visibility_revision, trashed_at = self._load_task_visibility(
             connection, row
+        )
+        (
+            purge_id,
+            purge_requested_at,
+            purged_at,
+            purge_local_run_state,
+            _,
+        ) = self._load_task_purge(
+            connection,
+            row,
+            visibility_revision=visibility_revision,
+            trashed_at=trashed_at,
         )
         abandonment_row = connection.execute(
             """
@@ -2623,6 +2839,41 @@ class SQLiteTaskStore:
             abandonment=abandonment,
             visibility_revision=visibility_revision,
             trashed_at=trashed_at,
+            purge_id=purge_id,
+            purge_requested_at=purge_requested_at,
+            purged_at=purged_at,
+            purge_local_run_state=purge_local_run_state,
+        )
+
+    def _load_task_purge_record(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        replayed: bool,
+    ) -> TaskPurgeRecord:
+        snapshot = self._load_snapshot(connection, task_id)
+        if snapshot is None or snapshot.purge_id is None:
+            raise TaskStoreCorruption("task purge reservation cannot be read")
+        outcome = None
+        if snapshot.purged_at is not None:
+            outcome_row = connection.execute(
+                """
+                SELECT document_json, document_hash
+                FROM task_purge_outcomes WHERE purge_id = ?
+                """,
+                (snapshot.purge_id,),
+            ).fetchone()
+            if outcome_row is None:
+                raise TaskStoreCorruption("task purge outcome cannot be read")
+            outcome = _decode_hashed_document(
+                outcome_row, label="task purge outcome"
+            )
+        return TaskPurgeRecord(
+            snapshot=snapshot,
+            purge_id=snapshot.purge_id,
+            outcome=outcome,
+            replayed=replayed,
         )
 
     def _load_dispatch_intent(
@@ -3838,6 +4089,18 @@ class SQLiteTaskStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if operation == "restore_task":
+                purge_request = connection.execute(
+                    """
+                    SELECT 1 FROM task_purge_requests
+                    WHERE task_id = ? AND project_id = ? AND principal_id = ?
+                    """,
+                    (task_id, project_id, principal_id),
+                ).fetchone()
+                if purge_request is not None:
+                    raise TaskStoreConflict(
+                        "a task with a purge request cannot be restored"
+                    )
             mutation = connection.execute(
                 """
                 SELECT task_id, request_hash, visibility_revision,
@@ -4118,6 +4381,343 @@ class SQLiteTaskStore:
                 connection.rollback()
             raise TaskStoreConflict(
                 "task visibility mutation conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def reserve_task_purge(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_visibility_revision: int,
+        idempotency_key: str,
+        request_hash: str,
+        now: str,
+    ) -> TaskPurgeRecord:
+        """Reserve an irreversible purge before any filesystem side effect."""
+
+        strings = (
+            task_id,
+            project_id,
+            principal_id,
+            idempotency_key,
+            request_hash,
+            now,
+        )
+        if (
+            any(not isinstance(value, str) or not value for value in strings)
+            or type(expected_visibility_revision) is not int
+            or expected_visibility_revision < 1
+        ):
+            raise TaskStoreConflict("task purge request is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            alias = connection.execute(
+                """
+                SELECT request_hash, purge_id, task_id, visibility_revision
+                FROM task_purge_idempotency
+                WHERE project_id = ? AND principal_id = ?
+                  AND operation = 'purge_task' AND idempotency_key = ?
+                """,
+                (project_id, principal_id, idempotency_key),
+            ).fetchone()
+            if alias is not None:
+                if (
+                    alias["request_hash"] != request_hash
+                    or alias["task_id"] != task_id
+                    or alias["visibility_revision"]
+                    != expected_visibility_revision
+                ):
+                    raise IdempotencyConflict(
+                        "idempotency key was already used for another purge request"
+                    )
+                record = self._load_task_purge_record(
+                    connection, task_id=task_id, replayed=True
+                )
+                if (
+                    record.purge_id != alias["purge_id"]
+                    or record.snapshot.project_id != project_id
+                    or record.snapshot.principal_id != principal_id
+                ):
+                    raise TaskStoreCorruption(
+                        "task purge replay crosses its durable scope"
+                    )
+                connection.commit()
+                return record
+
+            task = connection.execute(
+                "SELECT project_id, principal_id FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreConflict("task does not exist")
+            if (
+                task["project_id"] != project_id
+                or task["principal_id"] != principal_id
+            ):
+                raise TaskStoreConflict("task purge crosses task scope")
+
+            existing = connection.execute(
+                """
+                SELECT request.purge_id, request.request_hash,
+                       request.visibility_revision,
+                       outcome.purge_id AS completed_purge_id
+                FROM task_purge_requests AS request
+                LEFT JOIN task_purge_outcomes AS outcome
+                  ON outcome.purge_id = request.purge_id
+                WHERE request.task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["completed_purge_id"] is not None:
+                    raise TaskStoreConflict("task is already purged")
+                if (
+                    existing["request_hash"] != request_hash
+                    or existing["visibility_revision"]
+                    != expected_visibility_revision
+                ):
+                    raise TaskStoreConflict(
+                        "task already has another purge reservation"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO task_purge_idempotency(
+                        project_id, principal_id, operation, idempotency_key,
+                        request_hash, purge_id, task_id,
+                        visibility_revision, created_at
+                    ) VALUES (?, ?, 'purge_task', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_id,
+                        principal_id,
+                        idempotency_key,
+                        request_hash,
+                        existing["purge_id"],
+                        task_id,
+                        expected_visibility_revision,
+                        now,
+                    ),
+                )
+                record = self._load_task_purge_record(
+                    connection, task_id=task_id, replayed=True
+                )
+                connection.commit()
+                return record
+
+            visibility = connection.execute(
+                """
+                SELECT state, revision FROM task_visibility
+                WHERE task_id = ? AND project_id = ? AND principal_id = ?
+                """,
+                (task_id, project_id, principal_id),
+            ).fetchone()
+            if (
+                visibility is None
+                or visibility["state"] != "trashed"
+                or visibility["revision"] != expected_visibility_revision
+            ):
+                raise TaskStoreConflict(
+                    "task purge revision or trash precondition failed"
+                )
+            identity_text = "\x1f".join(
+                (
+                    project_id,
+                    principal_id,
+                    task_id,
+                    str(expected_visibility_revision),
+                )
+            )
+            purge_id = "purge-" + hashlib.sha256(
+                identity_text.encode("utf-8")
+            ).hexdigest()[:32]
+            request = {
+                "schema_version": "1.0.0",
+                "purge_id": purge_id,
+                "task_id": task_id,
+                "visibility_revision": expected_visibility_revision,
+                "purge_state": "pending",
+                "actor": {"type": "user", "id": principal_id},
+                "requested_at": now,
+                "extensions": {},
+            }
+            document_json, document_hash = encode_document(request)
+            connection.execute(
+                """
+                INSERT INTO task_purge_requests(
+                    purge_id, task_id, project_id, principal_id,
+                    visibility_revision, request_hash,
+                    document_json, document_hash, requested_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    purge_id,
+                    task_id,
+                    project_id,
+                    principal_id,
+                    expected_visibility_revision,
+                    request_hash,
+                    document_json,
+                    document_hash,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_purge_idempotency(
+                    project_id, principal_id, operation, idempotency_key,
+                    request_hash, purge_id, task_id,
+                    visibility_revision, created_at
+                ) VALUES (?, ?, 'purge_task', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    principal_id,
+                    idempotency_key,
+                    request_hash,
+                    purge_id,
+                    task_id,
+                    expected_visibility_revision,
+                    now,
+                ),
+            )
+            record = self._load_task_purge_record(
+                connection, task_id=task_id, replayed=False
+            )
+            connection.commit()
+            return record
+        except (IdempotencyConflict, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "task purge reservation conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def complete_task_purge(
+        self,
+        *,
+        purge_id: str,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        local_run_state: str,
+        now: str,
+    ) -> TaskPurgeRecord:
+        """Finalize a reserved purge after local run cleanup succeeds."""
+
+        strings = (purge_id, task_id, project_id, principal_id, now)
+        if (
+            any(not isinstance(value, str) or not value for value in strings)
+            or local_run_state not in TASK_PURGE_LOCAL_RUN_STATES
+        ):
+            raise TaskStoreConflict("task purge completion is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            request = connection.execute(
+                """
+                SELECT task_id, project_id, principal_id, visibility_revision
+                FROM task_purge_requests WHERE purge_id = ?
+                """,
+                (purge_id,),
+            ).fetchone()
+            if request is None:
+                raise TaskStoreConflict("task purge reservation does not exist")
+            if (
+                request["task_id"] != task_id
+                or request["project_id"] != project_id
+                or request["principal_id"] != principal_id
+            ):
+                raise TaskStoreConflict(
+                    "task purge completion crosses its reservation scope"
+                )
+            existing = connection.execute(
+                """
+                SELECT local_run_state FROM task_purge_outcomes
+                WHERE purge_id = ?
+                """,
+                (purge_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["local_run_state"] != local_run_state:
+                    raise TaskStoreConflict(
+                        "task purge was completed with another local run state"
+                    )
+                record = self._load_task_purge_record(
+                    connection, task_id=task_id, replayed=True
+                )
+                connection.commit()
+                return record
+            outcome = {
+                "task_id": task_id,
+                "purge_id": purge_id,
+                "purge_state": "purged",
+                "purged_at": now,
+                "local_run_state": local_run_state,
+                "audit_retained": True,
+            }
+            document_json, document_hash = encode_document(outcome)
+            connection.execute(
+                """
+                INSERT INTO task_purge_outcomes(
+                    purge_id, task_id, project_id, principal_id,
+                    visibility_revision, local_run_state,
+                    document_json, document_hash, purged_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    purge_id,
+                    task_id,
+                    project_id,
+                    principal_id,
+                    request["visibility_revision"],
+                    local_run_state,
+                    document_json,
+                    document_hash,
+                    now,
+                    now,
+                ),
+            )
+            record = self._load_task_purge_record(
+                connection, task_id=task_id, replayed=False
+            )
+            connection.commit()
+            return record
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "task purge completion conflicts with durable state"
             ) from error
         except Exception:
             if connection.in_transaction:

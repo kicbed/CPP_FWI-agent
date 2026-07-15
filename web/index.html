@@ -629,6 +629,9 @@
           && value.visibilityRevision >= 0 ? value.visibilityRevision : 0,
         trashedAt: retainDisplayCache && typeof value.trashedAt === 'string'
           ? value.trashedAt.slice(0, 80) : '',
+        purgeState: retainDisplayCache && value.purgeState === 'purged' ? 'purged' : '',
+        purgedAt: retainDisplayCache && value.purgeState === 'purged'
+          && typeof value.purgedAt === 'string' ? value.purgedAt.slice(0, 80) : '',
         verifiedAt: retainDisplayCache ? Date.now() : 0,
       };
     }
@@ -970,6 +973,8 @@
         resultReady: task.status === 'Succeeded' || task.resultReady === true,
         visibilityRevision: task.visibilityRevision,
         trashedAt: task.trashedAt,
+        purgeState: task.purgeState,
+        purgedAt: task.purgedAt,
       }, true);
     }
 
@@ -1028,6 +1033,36 @@
       return changed;
     }
 
+    function markTaskRefsPurged(taskId, purgedAt) {
+      if (!isSafeConversationId(taskId, 128) || typeof purgedAt !== 'string') return false;
+      let changed = false;
+      Object.values(state.chats).forEach(chat => {
+        if (!isTaskReferencedByChat(chat, taskId)) return;
+        chat.taskRefs = chat.taskRefs.map(reference => reference.taskId === taskId
+          ? {
+            ...reference,
+            status: '',
+            progressCompleted: null,
+            progressTotal: null,
+            resultReady: false,
+            trashedAt: '',
+            purgeState: 'purged',
+            purgedAt: purgedAt.slice(0, 80),
+            verifiedAt: Date.now(),
+          }
+          : reference);
+        changed = true;
+      });
+      if (changed) {
+        // Storage intentionally keeps only taskId/linkedAt. The verified purge
+        // marker is a same-session display cache; SQLite/API remains truth.
+        persistChatState();
+        renderConversationTaskRefs();
+        renderHistory();
+      }
+      return changed;
+    }
+
     function renderConversationTaskRefs() {
       const container = document.getElementById('conversationTaskRefs');
       if (!container) return;
@@ -1059,14 +1094,20 @@
         const verified = Number.isFinite(reference.verifiedAt) && reference.verifiedAt > 0;
         const progress = verified && reference.progressTotal !== null
           ? ` · ${reference.progressCompleted ?? 0}/${reference.progressTotal}` : '';
-        summary.textContent = verified
-          ? `${reference.status || '状态待刷新'}${progress}${reference.resultReady ? ' · 结果可查看' : ''}${reference.trashedAt ? ' · 已在回收站' : ''}`
-          : '任务状态需从 SQLite 刷新；本地对话只保存引用';
+        const permanentlyDeleted = reference.purgeState === 'purged';
+        summary.textContent = permanentlyDeleted
+          ? '任务已永久删除；对话内容和此引用仍保留'
+          : (verified
+            ? `${reference.status || '状态待刷新'}${progress}${reference.resultReady ? ' · 结果可查看' : ''}${reference.trashedAt ? ' · 已在回收站' : ''}`
+            : '任务状态需从 SQLite 刷新；本地对话只保存引用');
         const open = document.createElement('button');
         open.type = 'button';
         open.className = 'mt-2 text-xs font-medium text-accent hover:underline';
-        open.textContent = '打开独立任务详情';
-        open.addEventListener('click', () => reopenGuidedTask(reference.taskId));
+        open.textContent = permanentlyDeleted ? '移除失效引用' : '打开独立任务详情';
+        open.addEventListener('click', () => {
+          if (permanentlyDeleted) unlinkTaskFromChat(state.chatId, reference.taskId);
+          else reopenGuidedTask(reference.taskId);
+        });
         card.append(label, summary, open);
         container.appendChild(card);
       });
@@ -1934,6 +1975,7 @@
       if (resource === 'abandon') return `${GUIDED_API_PREFIX}/tasks/${task}/abandon`;
       if (resource === 'trash') return `${GUIDED_API_PREFIX}/tasks/${task}/trash`;
       if (resource === 'restore') return `${GUIDED_API_PREFIX}/tasks/${task}/restore`;
+      if (resource === 'purge') return `${GUIDED_API_PREFIX}/tasks/${task}/purge`;
       if (resource === 'task') return `${GUIDED_API_PREFIX}/tasks/${task}`;
       if (resource === 'artifacts') return `${GUIDED_API_PREFIX}/tasks/${task}/artifacts`;
       if (resource === 'artifact' && artifact) {
@@ -2677,6 +2719,9 @@
         if (!item || typeof item !== 'object' || Array.isArray(item)
             || !isSafeGuidedOpaqueId(item.task_id)
             || !allowedStates.has(item.status)) return null;
+        if (item.purge_state !== undefined
+            && item.purge_state !== ''
+            && item.purge_state !== 'pending') return null;
         const algorithm = item.algorithm && typeof item.algorithm === 'object'
           ? item.algorithm : {};
         const adapter = item.adapter_status && typeof item.adapter_status === 'object'
@@ -2702,6 +2747,7 @@
             && item.visibility_revision >= 0 ? item.visibility_revision : 0,
           trashedAt: typeof item.trashed_at === 'string'
             ? boundedGuidedText(item.trashed_at, 80) : '',
+          purgeState: item.purge_state === 'pending' ? 'pending' : '',
           createdAt: boundedGuidedText(item.created_at, 80),
           updatedAt: boundedGuidedText(item.updated_at, 80),
         };
@@ -2733,6 +2779,7 @@
         resultReady: task.status === 'Succeeded',
         visibilityRevision: task.visibilityRevision,
         trashedAt: task.trashedAt,
+        purgeState: task.purgeState === 'pending' ? 'pending' : '',
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
       };
@@ -2833,17 +2880,33 @@
         button.append(header, detail);
         button.addEventListener('click', () => reopenGuidedTask(button.dataset.taskId));
         row.appendChild(button);
-        if (state.guided.taskIndexView === 'trash' || isGuidedTerminalState(item.status)) {
+        if (state.guided.taskIndexView === 'trash') {
           const visibility = document.createElement('button');
           visibility.type = 'button';
           visibility.className = 'shrink-0 px-2 text-[11px] text-slate-400 hover:text-red-600';
-          visibility.textContent = state.guided.taskIndexView === 'trash' ? '恢复' : '删除';
-          visibility.title = state.guided.taskIndexView === 'trash'
-            ? '从任务回收站恢复' : '移入任务回收站（仅终态任务）';
-          visibility.addEventListener('click', () => {
-            if (state.guided.taskIndexView === 'trash') restoreGuidedTask(item.taskId);
-            else trashGuidedTask(item.taskId);
-          });
+          visibility.textContent = '恢复';
+          visibility.title = item.purgeState === 'pending'
+            ? '永久删除已经开始，不能再恢复' : '从任务回收站恢复';
+          visibility.disabled = item.purgeState === 'pending' || Boolean(state.guided.mutation);
+          visibility.addEventListener('click', () => restoreGuidedTask(item.taskId));
+          row.appendChild(visibility);
+          const purge = document.createElement('button');
+          purge.type = 'button';
+          purge.className = 'shrink-0 border-l border-red-100 px-2 text-[11px] font-medium text-red-600 hover:bg-red-50 disabled:opacity-40';
+          purge.textContent = item.purgeState === 'pending' ? '继续永久删除' : '永久删除';
+          purge.title = item.purgeState === 'pending'
+            ? '继续同一任务的永久删除清理' : '永久删除本地运行结果（不可恢复）';
+          purge.disabled = Boolean(state.guided.mutation);
+          purge.addEventListener('click', () => purgeGuidedTask(item.taskId));
+          row.appendChild(purge);
+        } else if (isGuidedTerminalState(item.status)) {
+          const visibility = document.createElement('button');
+          visibility.type = 'button';
+          visibility.className = 'shrink-0 px-2 text-[11px] text-slate-400 hover:text-red-600';
+          visibility.textContent = '删除';
+          visibility.title = '移入任务回收站（仅终态任务）';
+          visibility.disabled = Boolean(state.guided.mutation);
+          visibility.addEventListener('click', () => trashGuidedTask(item.taskId));
           row.appendChild(visibility);
         }
         container.appendChild(row);
@@ -2935,6 +2998,10 @@
         showToast('仅 Succeeded / Failed / Cancelled 终态任务可删除到回收站');
         return false;
       }
+      if (action === 'restore' && summary.purgeState === 'pending') {
+        showToast('永久删除已经开始，任务不能再恢复');
+        return false;
+      }
       if (action === 'trash' && typeof window.confirm === 'function'
           && !window.confirm('将这个终态任务移入回收站？任务结果不会立即物理删除，可在任务回收站恢复。')) {
         return false;
@@ -2985,6 +3052,86 @@
 
     function restoreGuidedTask(taskId) {
       return changeGuidedTaskVisibility(taskId, 'active');
+    }
+
+    async function purgeGuidedTask(taskId) {
+      const summary = state.guided.taskIndex.find(item => item.taskId === taskId)
+        || (state.guided.taskId === taskId && state.guided.task
+          ? guidedTaskSummary(state.guided.task) : null);
+      if (!summary || !isSafeGuidedOpaqueId(taskId) || state.guided.mutation) return false;
+      if (!summary.trashedAt) {
+        showToast('任务必须先移入回收站，才能永久删除');
+        return false;
+      }
+      if (typeof window.prompt !== 'function') {
+        showToast('当前浏览器无法完成永久删除强确认');
+        return false;
+      }
+      const confirmation = window.prompt(
+        `永久删除后，本机 Worker 运行目录和结果文件不可恢复；SQLite 任务审计记录仍保留，对话内容不会删除，已下载文件也无法追回。\n\n请输入完整任务 ID 确认：\n${taskId}`,
+        '',
+      );
+      if (confirmation === null) return false;
+      if (confirmation !== taskId) {
+        showToast('任务 ID 不匹配，未执行永久删除');
+        return false;
+      }
+      const body = {
+        expected_visibility_revision: summary.visibilityRevision,
+        confirmation_task_id: taskId,
+      };
+      const key = guidedMutationKey(`purge:${taskId}`, body);
+      const purgingOpenTask = state.guided.taskId === taskId;
+      state.guided.mutation = 'purge';
+      if (purgingOpenTask) {
+        clearGuidedPoll();
+        state.guided.generation = (state.guided.generation || 0) + 1;
+        revokeGuidedArtifactObjectUrls();
+        state.guided.artifacts = [];
+        renderGuidedFwi();
+      }
+      renderGuidedTaskIndex();
+      try {
+        const data = await guidedApiRequest(guidedApiPath('purge', taskId), {
+          method: 'POST', body, idempotencyKey: key,
+        });
+        if (!data || data.task_id !== taskId
+            || data.purge_state !== 'purged'
+            || typeof data.purged_at !== 'string' || !data.purged_at
+            || !['deleted', 'not_created'].includes(data.local_run_state)
+            || data.audit_retained !== true
+            || typeof data.replayed !== 'boolean') {
+          throw guidedInvalidMutationResponse('永久删除响应无效');
+        }
+        markTaskRefsPurged(taskId, data.purged_at);
+        state.guided.taskIndex = state.guided.taskIndex.filter(item => item.taskId !== taskId);
+        if (purgingOpenTask) {
+          clearGuidedPoll();
+          revokeGuidedArtifactObjectUrls();
+          const generation = (state.guided.generation || 0) + 1;
+          state.guided = createGuidedFwiState(generation, state.guided);
+          renderGuidedFwi();
+        } else {
+          state.guided.mutation = '';
+        }
+        await loadGuidedTaskIndex({ reset: true, supersede: true });
+        showToast(data.local_run_state === 'deleted'
+          ? '本地运行结果已永久删除；SQLite 任务审计记录与对话保留'
+          : '任务已永久移除；未曾创建本地运行结果，SQLite 任务审计记录与对话保留');
+        return true;
+      } catch (error) {
+        state.guided.mutation = '';
+        if (error && error.guidedOutcomeUnknown) {
+          state.guided.taskIndex = state.guided.taskIndex.map(item => item.taskId === taskId
+            ? { ...item, purgeState: 'pending' } : item);
+          showToast('永久删除结果尚未确认；本地预览已释放，请使用“继续永久删除”闭环同一任务');
+        } else {
+          showToast(`永久删除失败：${error && error.message ? error.message : '未知错误'}`);
+        }
+        renderGuidedTaskIndex();
+        if (purgingOpenTask) renderGuidedFwi();
+        return false;
+      }
     }
 
     function guidedInvalidMutationResponse(message) {

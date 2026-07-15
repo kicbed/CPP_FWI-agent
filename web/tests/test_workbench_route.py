@@ -19,6 +19,7 @@ class _Application:
     def __init__(self):
         self.created = []
         self.listed = []
+        self.purged = []
 
     def session_capabilities(self):
         return {
@@ -45,6 +46,17 @@ class _Application:
                 }
             ],
             "next_cursor": None,
+        }
+
+    def purge_task(self, task_id, expected_visibility_revision, key):
+        self.purged.append((task_id, expected_visibility_revision, key))
+        return {
+            "task_id": task_id,
+            "purge_state": "purged",
+            "purged_at": "2026-07-15T12:00:00Z",
+            "local_run_state": "deleted",
+            "audit_retained": True,
+            "replayed": False,
         }
 
 
@@ -147,6 +159,30 @@ class WorkbenchRouteTest(unittest.TestCase):
         self.assertNotIn("access-control-allow-origin", headers)
         self.assertEqual(json.loads(body)["data"]["task_id"], "task-route-test")
         self.assertEqual(self.application.created, [(form, "route-create-1")])
+
+        purge = {
+            "expected_visibility_revision": 1,
+            "confirmation_task_id": "task-route-test",
+        }
+        encoded = json.dumps(purge, separators=(",", ":")).encode("utf-8")
+        status, headers, body = self.request(
+            "POST",
+            "/api/scientific-runtime/v1/tasks/task-route-test/purge",
+            body=encoded,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "X-Workbench-CSRF": self.csrf,
+                "Idempotency-Key": "route-purge-1",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("access-control-allow-origin", headers)
+        self.assertEqual(json.loads(body)["data"]["purge_state"], "purged")
+        self.assertEqual(
+            self.application.purged,
+            [("task-route-test", 1, "route-purge-1")],
+        )
 
     def test_preflight_and_unsupported_methods_fail_closed(self):
         for method in ("OPTIONS", "DELETE", "PATCH"):

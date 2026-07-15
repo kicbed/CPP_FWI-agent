@@ -214,6 +214,10 @@ class AdapterArtifactError(AdapterError):
     """A Worker artifact is unavailable, unsafe, or semantically invalid."""
 
 
+class AdapterPurgeError(AdapterError):
+    """A local Worker run cannot be safely and durably purged."""
+
+
 class AdapterUnavailable(AdapterError):
     """A trusted runtime dependency or launch operation is unavailable."""
 
@@ -345,6 +349,22 @@ class AdapterCancelResult:
             "accepted": self.accepted,
             "code": self.code,
             "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
+class AdapterPurgeResult:
+    task_id: str
+    purge_id: str
+    local_run_state: str
+    replayed: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "purge_id": self.purge_id,
+            "local_run_state": self.local_run_state,
+            "replayed": self.replayed,
         }
 
 
@@ -674,6 +694,43 @@ def _require_private_directory(path: Path, *, parent: Path) -> Path:
         if parent_descriptor >= 0:
             os.close(parent_descriptor)
     return candidate
+
+
+def _unlink_directory_contents(directory_fd: int, *, expected_device: int) -> None:
+    """Remove one already-open tree without following descendant symlinks."""
+
+    for name in sorted(os.listdir(directory_fd)):
+        if (
+            not isinstance(name, str)
+            or name in {"", ".", ".."}
+            or "/" in name
+            or "\x00" in name
+        ):
+            raise OSError("directory contains an invalid entry name")
+        entry_status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(entry_status.st_mode):
+            child_fd = -1
+            try:
+                child_fd = os.open(name, DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+                opened_status = os.fstat(child_fd)
+                if (
+                    not stat.S_ISDIR(opened_status.st_mode)
+                    or opened_status.st_dev != expected_device
+                    or (opened_status.st_dev, opened_status.st_ino)
+                    != (entry_status.st_dev, entry_status.st_ino)
+                ):
+                    raise OSError("directory entry changed or crossed a mount boundary")
+                _unlink_directory_contents(
+                    child_fd, expected_device=expected_device
+                )
+            finally:
+                if child_fd >= 0:
+                    os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            # This unlinks a symlink as an object; it never follows its target.
+            os.unlink(name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
 
 
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -1705,6 +1762,9 @@ class DeepwaveAdapter:
             "launch_state",
             "record_hash",
         }
+        launch_state = value.get("launch_state")
+        if launch_state in {"purging", "purged"}:
+            required.add("purge_id")
         if set(value) != required:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private record fields are inconsistent"
@@ -1720,9 +1780,23 @@ class DeepwaveAdapter:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private record version is unsupported"
             )
-        if value["launch_state"] not in {"preparing", "launching", "launched", "failed"}:
+        if launch_state not in {
+            "preparing",
+            "launching",
+            "launched",
+            "failed",
+            "purging",
+            "purged",
+        }:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: launch state is unknown"
+            )
+        if launch_state in {"purging", "purged"} and (
+            not isinstance(value.get("purge_id"), str)
+            or OPAQUE_ID.fullmatch(value["purge_id"]) is None
+        ):
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: purge identity is invalid"
             )
         if _sha256_document(DeepwaveAdapter._record_request_payload(value)) != value["request_hash"]:
             raise AdapterHandleError(
@@ -1981,7 +2055,12 @@ class DeepwaveAdapter:
             self._write_submission(index_path, record)
             return self._handle_from_record(record)
 
-    def _record_for_handle(self, handle: AdapterHandle) -> dict[str, Any]:
+    def _record_for_handle(
+        self,
+        handle: AdapterHandle,
+        *,
+        allowed_launch_states: frozenset[str] = frozenset({"launched"}),
+    ) -> dict[str, Any]:
         if not isinstance(handle, AdapterHandle):
             raise AdapterHandleError(
                 "ADAPTER_HANDLE_INVALID: expected an AdapterHandle"
@@ -2018,9 +2097,9 @@ class DeepwaveAdapter:
             raise AdapterHandleError(
                 "ADAPTER_HANDLE_INVALID: handle does not match its private record"
             )
-        if record["launch_state"] != "launched":
+        if record["launch_state"] not in allowed_launch_states:
             raise AdapterHandleError(
-                "ADAPTER_HANDLE_INVALID: submission is not in launched state"
+                "ADAPTER_HANDLE_INVALID: submission state does not permit this operation"
             )
         return record
 
@@ -2052,8 +2131,7 @@ class DeepwaveAdapter:
             )
         return unresolved
 
-    def status(self, handle: AdapterHandle) -> AdapterStatus:
-        record = self._record_for_handle(handle)
+    def _status_for_record(self, record: Mapping[str, Any]) -> AdapterStatus:
         job_dir = self._job_directory(record)
         value = _read_json_file(job_dir / "status.json", code="ADAPTER_STATUS_INVALID")
         if value.get("job_id") != record["job_id"]:
@@ -2156,6 +2234,124 @@ class DeepwaveAdapter:
             updated_at=value["updated_at"],
             terminal=status in {"Succeeded", "Failed"},
         )
+
+    def status(self, handle: AdapterHandle) -> AdapterStatus:
+        record = self._record_for_handle(handle)
+        return self._status_for_record(record)
+
+    def _purge_job_directory(self, record: Mapping[str, Any]) -> bool:
+        """Delete the receipt-bound direct child using only held directory FDs."""
+
+        job_id = record.get("job_id")
+        if not isinstance(job_id, str) or JOB_ID.fullmatch(job_id) is None:
+            raise AdapterPurgeError(
+                "PURGE_RECEIPT_INVALID: job identity is malformed"
+            )
+        root = _validate_run_root(self._run_root, create=False)
+        root_fd = -1
+        job_fd = -1
+        try:
+            root_fd = _open_directory_fd(root)
+            root_status = os.fstat(root_fd)
+            if (
+                not stat.S_ISDIR(root_status.st_mode)
+                or root_status.st_uid != os.geteuid()
+                or stat.S_IMODE(root_status.st_mode) & 0o022
+            ):
+                raise OSError("run root ownership or permissions are unsafe")
+            try:
+                job_fd = os.open(job_id, DIRECTORY_OPEN_FLAGS, dir_fd=root_fd)
+            except FileNotFoundError:
+                return False
+            job_status = os.fstat(job_fd)
+            if (
+                not stat.S_ISDIR(job_status.st_mode)
+                or job_status.st_uid != os.geteuid()
+                or stat.S_IMODE(job_status.st_mode) & 0o022
+                or job_status.st_dev != root_status.st_dev
+            ):
+                raise OSError("job directory identity or permissions are unsafe")
+            _unlink_directory_contents(
+                job_fd, expected_device=root_status.st_dev
+            )
+            os.close(job_fd)
+            job_fd = -1
+            os.rmdir(job_id, dir_fd=root_fd)
+            os.fsync(root_fd)
+            return True
+        except AdapterError:
+            raise
+        except OSError as error:
+            raise AdapterPurgeError(
+                "PURGE_LOCAL_RUN_UNAVAILABLE: controlled deletion failed"
+            ) from error
+        finally:
+            if job_fd >= 0:
+                os.close(job_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+
+    def purge(
+        self, handle: AdapterHandle, *, purge_id: str
+    ) -> AdapterPurgeResult:
+        """Permanently remove one receipt-bound terminal local Worker run."""
+
+        if not isinstance(purge_id, str) or OPAQUE_ID.fullmatch(purge_id) is None:
+            raise AdapterPurgeError(
+                "PURGE_ID_INVALID: purge_id must be a v1 opaque identifier"
+            )
+        purge_states = frozenset({"launched", "purging", "purged"})
+        # Validate before deriving a control filename.  The record is re-read
+        # after taking the per-submission lock, which is the authoritative view.
+        self._record_for_handle(
+            handle, allowed_launch_states=purge_states
+        )
+        submissions, locks = self._control_paths()
+        index_name = handle.submission_id.removeprefix("submission-") + ".json"
+        index_path = submissions / index_name
+        lock_path = locks / (index_name + ".lock")
+        with self._lock_submission(lock_path):
+            record = self._record_for_handle(
+                handle, allowed_launch_states=purge_states
+            )
+            launch_state = record["launch_state"]
+            replayed = launch_state != "launched"
+            if launch_state in {"purging", "purged"}:
+                if record.get("purge_id") != purge_id:
+                    raise AdapterIdempotencyConflict(
+                        "PURGE_IDEMPOTENCY_CONFLICT: receipt is bound to another purge"
+                    )
+                if launch_state == "purged":
+                    return AdapterPurgeResult(
+                        task_id=handle.task_id,
+                        purge_id=purge_id,
+                        local_run_state="deleted",
+                        replayed=True,
+                    )
+            else:
+                observed = self._status_for_record(record)
+                if not observed.terminal or observed.status not in {
+                    "Succeeded",
+                    "Failed",
+                }:
+                    raise AdapterPurgeError(
+                        "PURGE_REQUIRES_TERMINAL_STATUS: Worker is not succeeded or failed"
+                    )
+                record["launch_state"] = "purging"
+                record["purge_id"] = purge_id
+                self._write_submission(index_path, record)
+
+            # A missing directory is accepted only after the durable purging
+            # tombstone exists.  This closes the delete-before-receipt crash gap.
+            self._purge_job_directory(record)
+            record["launch_state"] = "purged"
+            self._write_submission(index_path, record)
+            return AdapterPurgeResult(
+                task_id=handle.task_id,
+                purge_id=purge_id,
+                local_run_state="deleted",
+                replayed=replayed,
+            )
 
     def cancel(self, handle: AdapterHandle) -> AdapterCancelResult:
         # P1 intentionally has no process cancellation protocol.  Validate the
@@ -2817,6 +3013,8 @@ __all__ = [
     "AdapterHandle",
     "AdapterHandleError",
     "AdapterIdempotencyConflict",
+    "AdapterPurgeError",
+    "AdapterPurgeResult",
     "AdapterStatus",
     "AdapterStatusError",
     "AdapterUnavailable",

@@ -907,6 +907,7 @@ function testConversationStorageRecoveryIdentityAndClearing() {
         taskRefs: [{
           taskId: 'task-durable-1', linkedAt: 123, status: 'Succeeded',
           resultReady: true, progressCompleted: 500, progressTotal: 500,
+          purgeState: 'purged', purgedAt: '2026-07-15T12:00:00Z',
         }],
       },
     },
@@ -916,6 +917,8 @@ function testConversationStorageRecoveryIdentityAndClearing() {
   assert.equal(migratedRef.linkedAt, 123);
   assert.equal(migratedRef.status, '', 'local status cache must not survive reload as task truth');
   assert.equal(migratedRef.resultReady, false);
+  assert.equal(migratedRef.purgeState, '', 'local purge cache must be reverified after reload');
+  assert.equal(migratedRef.purgedAt, '');
   const serialized = api.serializeChatsForStorage({
     [first.id]: {
       ...first,
@@ -1026,7 +1029,8 @@ function testConversationTaskLinksAreManyToManyAndIndependent() {
     extractFunction('isTaskReferencedByChat'),
     extractFunction('linkTaskToChat'),
     extractFunction('unlinkTaskFromChat'),
-    'module.exports = { linkTaskToChat, unlinkTaskFromChat, isTaskReferencedByChat };',
+    extractFunction('markTaskRefsPurged'),
+    'module.exports = { linkTaskToChat, unlinkTaskFromChat, markTaskRefsPurged, isTaskReferencedByChat };',
   ].join('\n'), sandbox);
   const task = {
     taskId: 'task-shared-1', status: 'Running', visibilityRevision: 2, trashedAt: '',
@@ -1038,6 +1042,15 @@ function testConversationTaskLinksAreManyToManyAndIndependent() {
   assert.equal(api.linkTaskToChat('chat-b', task), true);
   assert.equal(api.isTaskReferencedByChat(sandbox.state.chats['chat-a'], task.taskId), true);
   assert.equal(api.isTaskReferencedByChat(sandbox.state.chats['chat-b'], task.taskId), true);
+  assert.equal(api.markTaskRefsPurged(task.taskId, '2026-07-15T12:00:00Z'), true);
+  assert.equal(sandbox.state.chats['chat-a'].taskRefs[0].purgeState, 'purged');
+  assert.equal(sandbox.state.chats['chat-b'].taskRefs[0].purgeState, 'purged');
+  assert.equal(sandbox.state.chats['chat-a'].taskRefs[0].resultReady, false);
+  assert.equal(
+    api.isTaskReferencedByChat(sandbox.state.chats['chat-a'], task.taskId),
+    true,
+    'permanent task deletion retains the conversation reference as a tombstone',
+  );
   assert.equal(api.unlinkTaskFromChat('chat-a', task.taskId), true);
   assert.equal(api.isTaskReferencedByChat(sandbox.state.chats['chat-a'], task.taskId), false);
   assert.equal(api.isTaskReferencedByChat(sandbox.state.chats['chat-b'], task.taskId), true);
@@ -1432,6 +1445,10 @@ function testGuidedIdentifiersAndRoutesAreConstrained() {
     api.guidedApiPath('restore', 'task-safe:1'),
     '/api/scientific-runtime/v1/tasks/task-safe%3A1/restore',
   );
+  assert.equal(
+    api.guidedApiPath('purge', 'task-safe:1'),
+    '/api/scientific-runtime/v1/tasks/task-safe%3A1/purge',
+  );
   assert.equal(api.guidedApiPath('artifact', 'task-1', "bad'id"), '');
   assert.equal(api.guidedApiPath('unknown', 'task-1'), '');
 
@@ -1719,6 +1736,7 @@ async function testGuidedImageBlobLoadingIsBoundedAndRevoked() {
   assert.match(extractFunction('closeGuidedFwi'), /revokeGuidedArtifactObjectUrls\(\)/);
   assert.match(extractFunction('reopenGuidedTask'), /revokeGuidedArtifactObjectUrls\(\)/);
   assert.match(extractFunction('changeGuidedTaskVisibility'), /revokeGuidedArtifactObjectUrls\(\)/);
+  assert.match(extractFunction('purgeGuidedTask'), /revokeGuidedArtifactObjectUrls\(\)/);
 }
 
 async function testGuidedImageRetriesAreSingleFlightAndStaleSafe() {
@@ -2317,6 +2335,188 @@ async function testGuidedSucceededRefreshRendersArtifactsOnce() {
   assert.equal(renders, 1, 'Succeeded refresh should render once after the non-rendering artifact GET');
 }
 
+async function testGuidedPermanentPurgeIsStrongConfirmedAndStaleSafe() {
+  const taskId = 'task-guided-purge-1';
+  const summary = {
+    taskId,
+    status: 'Succeeded',
+    goal: 'purge completed FWI',
+    visibilityRevision: 7,
+    trashedAt: '2026-07-15T10:00:00Z',
+    purgeState: '',
+  };
+  const makeGuidedState = open => ({
+    phase: open ? 'results' : 'closed',
+    taskId: open ? taskId : '',
+    task: open ? { taskId } : null,
+    artifacts: open ? [{ artifactId: 'artifact-loss' }] : [],
+    artifactObjectUrls: open
+      ? { 'artifact-loss': 'blob:guided/purge-me' }
+      : Object.create(null),
+    mutation: '',
+    mutationKeys: Object.create(null),
+    generation: 4,
+    pollTimer: open ? 99 : null,
+    taskIndex: [{ ...summary }],
+    taskIndexCursor: '',
+    taskIndexPage: 0,
+    taskIndexLoading: false,
+    taskIndexLoaded: true,
+    taskIndexError: '',
+    taskIndexView: 'trash',
+  });
+  const prompts = [];
+  const requests = [];
+  const toasts = [];
+  const marks = [];
+  const loads = [];
+  const revocations = [];
+  let promptValue = null;
+  let responseMode = 'success';
+  let generatedKeys = 0;
+  let guidedRenders = 0;
+  let taskIndexRenders = 0;
+  let pollClears = 0;
+  const successData = {
+    task_id: taskId,
+    purge_state: 'purged',
+    purged_at: '2026-07-15T12:00:00Z',
+    local_run_state: 'deleted',
+    audit_retained: true,
+    replayed: false,
+  };
+  const sandbox = {
+    module: { exports: {} },
+    window: {
+      prompt(message, defaultValue) {
+        prompts.push({ message, defaultValue });
+        return promptValue;
+      },
+      confirm() { throw new Error('purge must use one strong typed confirmation'); },
+    },
+    state: { guided: makeGuidedState(true) },
+    isSafeGuidedOpaqueId: value => value === taskId,
+    guidedTaskSummary: () => summary,
+    createStableId(prefix) {
+      generatedKeys += 1;
+      return `${prefix}-stable-${generatedKeys}`;
+    },
+    guidedApiPath(resource, id) {
+      return resource === 'purge'
+        ? `/api/scientific-runtime/v1/tasks/${id}/purge` : '';
+    },
+    clearGuidedPoll() {
+      pollClears += 1;
+      sandbox.state.guided.pollTimer = null;
+    },
+    revokeGuidedArtifactObjectUrls() {
+      revocations.push(Object.values(sandbox.state.guided.artifactObjectUrls || {}));
+      sandbox.state.guided.artifactObjectUrls = Object.create(null);
+    },
+    renderGuidedFwi() { guidedRenders += 1; },
+    renderGuidedTaskIndex() { taskIndexRenders += 1; },
+    showToast(message) { toasts.push(message); },
+    markTaskRefsPurged(id, purgedAt) {
+      marks.push({ taskId: id, purgedAt });
+      return true;
+    },
+    createGuidedFwiState(generation, retained) {
+      return {
+        ...retained,
+        phase: 'closed',
+        taskId: '',
+        task: null,
+        artifacts: [],
+        artifactObjectUrls: Object.create(null),
+        mutation: '',
+        mutationKeys: Object.create(null),
+        generation,
+        pollTimer: null,
+      };
+    },
+    async loadGuidedTaskIndex(options) {
+      loads.push(options);
+      return true;
+    },
+    async guidedApiRequest(path, options) {
+      requests.push({
+        path,
+        method: options.method,
+        body: JSON.parse(JSON.stringify(options.body)),
+        idempotencyKey: options.idempotencyKey,
+        generation: sandbox.state.guided.generation,
+        artifacts: sandbox.state.guided.artifacts.length,
+        objectUrls: Object.keys(sandbox.state.guided.artifactObjectUrls).length,
+      });
+      if (responseMode === 'malformed') return { ...successData, audit_retained: false };
+      return { ...successData };
+    },
+  };
+  vm.runInNewContext([
+    extractFunction('guidedMutationKey'),
+    extractFunction('guidedInvalidMutationResponse'),
+    `async ${extractFunction('purgeGuidedTask')}`,
+    'module.exports = { purgeGuidedTask };',
+  ].join('\n'), sandbox);
+  const purge = sandbox.module.exports.purgeGuidedTask;
+
+  assert.equal(await purge(taskId), false, 'cancelling typed confirmation must do nothing');
+  assert.equal(requests.length, 0);
+  promptValue = 'task-guided-purge-WRONG';
+  assert.equal(await purge(taskId), false, 'a mismatched task ID must do nothing');
+  assert.equal(requests.length, 0);
+  assert.match(toasts.at(-1), /任务 ID 不匹配/);
+
+  promptValue = taskId;
+  assert.equal(await purge(taskId), true);
+  assert.equal(prompts.length, 3, 'each purge attempt uses exactly one typed prompt');
+  assert.match(prompts.at(-1).message, /本机 Worker 运行目录和结果文件不可恢复/);
+  assert.match(prompts.at(-1).message, /SQLite 任务审计记录仍保留/);
+  assert.match(prompts.at(-1).message, /对话内容不会删除/);
+  assert.match(prompts.at(-1).message, /请输入完整任务 ID/);
+  assert.equal(prompts.at(-1).defaultValue, '');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].path, `/api/scientific-runtime/v1/tasks/${taskId}/purge`);
+  assert.equal(requests[0].method, 'POST');
+  assert.deepEqual(requests[0].body, {
+    expected_visibility_revision: 7,
+    confirmation_task_id: taskId,
+  });
+  assert.match(requests[0].idempotencyKey, /^guided-purge:task-guided-purge-1-stable-1$/);
+  assert.equal(requests[0].generation, 5, 'opening task is invalidated before the purge request');
+  assert.equal(requests[0].artifacts, 0);
+  assert.equal(requests[0].objectUrls, 0);
+  assert.deepEqual(revocations[0], ['blob:guided/purge-me']);
+  assert.equal(revocations.length, 2, 'success closes the task through a second defensive revoke');
+  assert.equal(pollClears, 2);
+  assert.equal(sandbox.state.guided.phase, 'closed');
+  assert.equal(sandbox.state.guided.taskId, '');
+  assert.equal(sandbox.state.guided.generation, 6);
+  assert.equal(sandbox.state.guided.taskIndex.length, 0);
+  assert.deepEqual(marks, [{ taskId, purgedAt: successData.purged_at }]);
+  assert.equal(loads[0].reset, true);
+  assert.equal(loads[0].supersede, true);
+  assert.match(toasts.at(-1), /本地运行结果已永久删除.*SQLite 任务审计记录与对话保留/);
+  assert.equal(guidedRenders >= 2, true);
+  assert.equal(taskIndexRenders >= 1, true);
+
+  sandbox.state.guided = makeGuidedState(false);
+  responseMode = 'malformed';
+  assert.equal(await purge(taskId), false, 'a malformed success body must fail closed');
+  assert.equal(sandbox.state.guided.taskIndex[0].purgeState, 'pending');
+  assert.match(toasts.at(-1), /永久删除结果尚未确认.*继续永久删除/);
+  const pendingKey = requests.at(-1).idempotencyKey;
+  assert.equal(generatedKeys, 2);
+  assert.equal(marks.length, 1, 'an invalid response cannot mark conversation refs purged');
+
+  responseMode = 'success';
+  assert.equal(await purge(taskId), true);
+  assert.equal(requests.at(-1).idempotencyKey, pendingKey);
+  assert.equal(generatedKeys, 2, 'continuation must reuse the original purge idempotency key');
+  assert.equal(sandbox.state.guided.taskIndex.length, 0);
+  assert.equal(marks.length, 2);
+}
+
 function testGuidedTaskIndexUsesSafeNormalizedDomText() {
   const created = [];
   const container = new GuidedFakeElement('div');
@@ -2333,10 +2533,11 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
   };
   const source = [
     "const state = { guided: { taskId: '', taskIndex: [], taskIndexCursor: '', taskIndexPage: 0, taskIndexLoading: false, taskIndexError: '', taskIndexView: 'active' } };",
-    'const reopenCalls = []; const taskIndexLoads = []; const trashCalls = []; const restoreCalls = [];',
+    'const reopenCalls = []; const taskIndexLoads = []; const trashCalls = []; const restoreCalls = []; const purgeCalls = [];',
     'function reopenGuidedTask(taskId) { reopenCalls.push(taskId); }',
     'function loadGuidedTaskIndex(options) { taskIndexLoads.push(options); }',
     'function trashGuidedTask(taskId) { trashCalls.push(taskId); } function restoreGuidedTask(taskId) { restoreCalls.push(taskId); }',
+    'function purgeGuidedTask(taskId) { purgeCalls.push(taskId); }',
     extractFunction('isSafeGuidedOpaqueId'),
     extractFunction('isSafeGuidedIdentifier'),
     extractFunction('isSafeGuidedVersion'),
@@ -2346,7 +2547,7 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
     extractFunction('normalizeGuidedTaskIndexPage'),
     extractFunction('isGuidedTerminalState'),
     extractFunction('renderGuidedTaskIndex'),
-    'module.exports = { state, reopenCalls, taskIndexLoads, trashCalls, restoreCalls, normalizeGuidedTaskIndexPage, renderGuidedTaskIndex };',
+    'module.exports = { state, reopenCalls, taskIndexLoads, trashCalls, restoreCalls, purgeCalls, normalizeGuidedTaskIndexPage, renderGuidedTaskIndex };',
   ].join('\n');
   vm.runInNewContext(source, sandbox);
   const api = sandbox.module.exports;
@@ -2358,10 +2559,15 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
         algorithm: { id: '<script>alert(1)</script>', version: '1.4.0' },
         preset: 'fwi_smoke', device: 'cuda', iterations: 50, seed: 0,
         optimizer: 'adam', learning_rate_milli: 10000,
+        purge_state: '',
         relative_path: '../../../../etc/passwd', artifact_url: 'javascript:alert(1)',
       },
       { task_id: "bad' onclick='alert(1)", status: 'Running', goal: 'skip me' },
       { task_id: 'task-unknown-status', status: '<img>', goal: 'skip me too' },
+      {
+        task_id: 'task-invalid-purge-state', status: 'Succeeded', goal: 'skip purged item',
+        purge_state: 'purged',
+      },
     ],
     next_cursor: '../../unsafe',
   });
@@ -2372,6 +2578,7 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
   assert.equal(page.tasks[0].learningRate, '10');
   assert.equal(Object.hasOwn(page.tasks[0], 'relative_path'), false);
   assert.equal(Object.hasOwn(page.tasks[0], 'artifact_url'), false);
+  assert.equal(page.tasks[0].purgeState, '');
 
   const maxTaskId = 't'.repeat(128);
   for (const viewPrefix of ['a', 't']) {
@@ -2419,9 +2626,20 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
   assert.equal(trashRow.children[1].textContent, '恢复');
   trashRow.children[1].listeners.click();
   assert.deepEqual(Array.from(api.restoreCalls), ['task-safe:1']);
+  assert.equal(trashRow.children[2].textContent, '永久删除');
+  trashRow.children[2].listeners.click();
+  assert.deepEqual(Array.from(api.purgeCalls), ['task-safe:1']);
+  api.state.guided.taskIndex[0].purgeState = 'pending';
+  api.renderGuidedTaskIndex();
+  const pendingPurgeRow = container.children[0];
+  assert.equal(pendingPurgeRow.children[1].disabled, true);
+  assert.equal(pendingPurgeRow.children[2].textContent, '继续永久删除');
+  pendingPurgeRow.children[2].listeners.click();
+  assert.deepEqual(Array.from(api.purgeCalls), ['task-safe:1', 'task-safe:1']);
   const visibilitySource = extractFunction('changeGuidedTaskVisibility');
   assert.match(visibilitySource, /expected_visibility_revision: summary\.visibilityRevision/);
   assert.match(visibilitySource, /isGuidedTerminalState\(summary\.status\)/);
+  assert.match(visibilitySource, /summary\.purgeState === 'pending'/);
   assert.match(extractFunction('loadGuidedTaskIndex'), /\?view=\$\{view\}&limit=20/);
   assert.match(extractFunction('setGuidedTaskIndexView'), /supersede: true/);
 
@@ -2853,6 +3071,7 @@ async function main() {
   testGuidedStateIsNotPersistedWithChats();
   testGuidedPollingPreservesReaderScrollPosition();
   await testGuidedSucceededRefreshRendersArtifactsOnce();
+  await testGuidedPermanentPurgeIsStrongConfirmedAndStaleSafe();
   testGuidedTaskIndexUsesSafeNormalizedDomText();
   await testGuidedTaskIndexDiscardsStaleCrossViewResponses();
   await testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursorAdvance();

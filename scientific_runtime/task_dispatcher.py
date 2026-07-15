@@ -56,6 +56,11 @@ class TaskDispatcher(Protocol):
     ) -> tuple[list[dict[str, Any]], dict[str, Any], bytes]:
         ...
 
+    def purge(
+        self, intent: DispatchIntentSnapshot, *, purge_id: str
+    ) -> dict[str, Any]:
+        ...
+
 
 class DeepwaveTaskDispatcher:
     """Fixed code mapping for ``fwi.deepwave_adapter``; never dynamic import."""
@@ -179,6 +184,14 @@ class DeepwaveTaskDispatcher:
             raise DispatchError("DISPATCH_RECEIPT_INVALID") from error
         if (
             handle.adapter_version != intent.adapter_version
+            or handle.task_id != intent.task_id
+            or handle.node_id != intent.node_id
+            or handle.idempotency_key != intent.node_idempotency_key
+            or handle.plan_hash != intent.plan_hash
+            or (
+                intent.request.get("algorithm") is not None
+                and handle.algorithm != intent.request.get("algorithm")
+            )
             or not is_supported_receipt_binding(
                 handle.algorithm,
                 handle.adapter_version,
@@ -216,3 +229,24 @@ class DeepwaveTaskDispatcher:
             raise DispatchError(error.code) from error
         except Exception as error:
             raise DispatchError("ADAPTER_ARTIFACT_UNAVAILABLE") from error
+
+    def purge(
+        self, intent: DispatchIntentSnapshot, *, purge_id: str
+    ) -> dict[str, Any]:
+        handle = self._handle_from_intent(intent)
+        try:
+            result = self._adapter.purge(handle, purge_id=purge_id).as_dict()
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("ADAPTER_PURGE_UNAVAILABLE") from error
+        expected = {"task_id", "purge_id", "local_run_state", "replayed"}
+        if (
+            set(result) != expected
+            or result["task_id"] != intent.task_id
+            or result["purge_id"] != purge_id
+            or result["local_run_state"] != "deleted"
+            or type(result["replayed"]) is not bool
+        ):
+            raise DispatchError("ADAPTER_PURGE_RESPONSE_INVALID")
+        return result

@@ -828,6 +828,36 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             errors.append((caught.exception.code, caught.exception.errors))
         self.assertEqual(errors[0], errors[1])
 
+    def test_trash_permanent_delete_removes_task_but_retains_audit(self) -> None:
+        created = self.workbench.create_task(
+            guided_form(goal="permanently delete this abandoned task"),
+            "purge-create",
+        )
+        task_id = created["task_id"]
+        self.workbench.abandon_task(task_id, "purge-abandon")
+        trashed = self.workbench.trash_task(task_id, 0, "purge-trash")
+        before = self.workbench.list_tasks(view="trash")["tasks"]
+        self.assertEqual([item["task_id"] for item in before], [task_id])
+        self.assertIsNone(before[0]["purge_state"])
+
+        first = self.workbench.purge_task(
+            task_id, trashed["visibility_revision"], "purge-confirmed"
+        )
+        replay = self.workbench.purge_task(
+            task_id, trashed["visibility_revision"], "purge-confirmed"
+        )
+
+        self.assertEqual(first["task_id"], task_id)
+        self.assertEqual(first["purge_state"], "purged")
+        self.assertEqual(first["local_run_state"], "not_created")
+        self.assertTrue(first["audit_retained"])
+        self.assertFalse(first["replayed"])
+        self.assertEqual(replay["purge_id"], first["purge_id"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(self.workbench.list_tasks(view="trash")["tasks"], [])
+        with self.assertRaises(WorkbenchNotFound):
+            self.workbench.get_task(task_id, refresh=False)
+
     def test_revise_uses_cas_builds_new_plan_and_replays_exactly(self) -> None:
         created = self.workbench.create_task(guided_form(), "create-revise")
         revised_form = guided_form(device="cpu", iterations=3, seed=7)

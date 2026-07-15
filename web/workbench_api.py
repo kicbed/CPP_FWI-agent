@@ -29,7 +29,15 @@ _QUERY = re.compile(r"^[A-Za-z0-9_=&-]+$")
 _TASK_CURSOR = re.compile(r"^v1_[A-Za-z0-9_-]{4,175}$")
 
 _MUTATION_ENDPOINTS = frozenset(
-    {"create_task", "revise_task", "approve", "abandon", "trash", "restore"}
+    {
+        "create_task",
+        "revise_task",
+        "approve",
+        "abandon",
+        "trash",
+        "restore",
+        "purge",
+    }
 )
 _FORM_FIELDS = frozenset(
     {
@@ -340,6 +348,7 @@ def _route(path: str) -> _Route:
             "abandon": ("abandon", ("POST",)),
             "trash": ("trash", ("POST",)),
             "restore": ("restore", ("POST",)),
+            "purge": ("purge", ("POST",)),
             "events": ("events", ("GET",)),
             "artifacts": ("artifacts", ("GET",)),
         }
@@ -794,6 +803,28 @@ class WorkbenchAPI:
                     else self._application.restore_task
                 )
                 return _success_response(function(route.task_id, revision, key))
+            if route.endpoint == "purge":
+                if set(payload) != {
+                    "expected_visibility_revision",
+                    "confirmation_task_id",
+                }:
+                    raise _RequestError(
+                        422, "INVALID_PURGE", "request validation failed"
+                    )
+                revision = payload["expected_visibility_revision"]
+                confirmation_task_id = payload["confirmation_task_id"]
+                if (
+                    type(revision) is not int
+                    or not 0 <= revision <= 2**63 - 1
+                    or not isinstance(confirmation_task_id, str)
+                    or confirmation_task_id != route.task_id
+                ):
+                    raise _RequestError(
+                        422, "INVALID_PURGE", "request validation failed"
+                    )
+                return _success_response(
+                    self._application.purge_task(route.task_id, revision, key)
+                )
             if route.endpoint == "events":
                 events = self._application.list_events(
                     route.task_id,

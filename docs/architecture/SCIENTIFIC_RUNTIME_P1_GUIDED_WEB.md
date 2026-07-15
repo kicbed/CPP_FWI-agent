@@ -9,7 +9,8 @@
 - 前置依赖：P0 contracts、P1.1a Task Store、P1.1b Registry、P1.2a fixed Adapter、
   P1.1c atomic submit 均已 Verified
 - 后续维护：`D-007 / P1-007 / P2-001` **Verified**；`D-008` 的对话/任务分离、
-  标准六图结果和任务回收站已实现，完整 P2 仍 Pending
+  标准六图结果和可恢复任务回收站已验证；`D-009/P2-003` 有界本地结果永久删除已验证，
+  完整 P2 仍 Pending
 
 本切片把已经验证的持久后端接入本机 Web，完成固定 Marmousi/Deepwave 的一条最小纵向
 链路：Catalog → 确定性表单 → TaskDraft/Plan → 人工批准 → SQLite task → Adapter status →

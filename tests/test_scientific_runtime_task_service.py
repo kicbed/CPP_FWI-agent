@@ -90,6 +90,8 @@ class FakeDispatcher:
         self.status_calls = 0
         self.collect_calls = 0
         self.read_calls = 0
+        self.purge_calls = 0
+        self.purge_ids: list[str] = []
         self.adapter_status: dict | None = None
         self.manifests: list[dict] = []
         self.artifact_data: dict[str, bytes] = {}
@@ -176,6 +178,17 @@ class FakeDispatcher:
             copy.deepcopy(manifest),
             self.artifact_data[artifact_id],
         )
+
+    def purge(self, intent, *, purge_id):
+        with self.lock:
+            self.purge_calls += 1
+            self.purge_ids.append(purge_id)
+        return {
+            "task_id": intent.task_id,
+            "purge_id": purge_id,
+            "local_run_state": "deleted",
+            "replayed": False,
+        }
 
 
 class ScientificRuntimeTaskServiceTest(unittest.TestCase):
@@ -268,6 +281,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "task_visibility_events",
                 "task_visibility",
                 "task_visibility_mutations",
+                "task_purge_requests",
+                "task_purge_idempotency",
+                "task_purge_outcomes",
             },
         )
         connection = sqlite3.connect(self.database_path)
@@ -295,7 +311,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 6)
+        self.assertEqual(self.store.migration_version(), 7)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -311,7 +327,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 6)
+        self.assertEqual(reopened.migration_version(), 7)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -398,12 +414,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 6)] * 8)
+        self.assertEqual(results, [("wal", 7)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 7")
+            connection.execute("PRAGMA user_version = 8")
             connection.commit()
         finally:
             connection.close()
@@ -1014,6 +1030,76 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
+    def test_permanent_delete_purges_trashed_abandoned_task_once(self) -> None:
+        created = self.create(key="create-purge-abandoned")
+        task_id = created.snapshot.task_id
+        self.service.abandon_task(
+            task_id=task_id,
+            idempotency_key="abandon-purge-abandoned",
+            **self.scope,
+        )
+        trashed = self.service.trash_task(
+            task_id=task_id,
+            expected_visibility_revision=0,
+            idempotency_key="trash-purge-abandoned",
+            **self.scope,
+        )
+
+        hidden_errors = []
+        for hidden_task_id, hidden_scope in (
+            (
+                task_id,
+                {"project_id": "other-project", "principal_id": PRINCIPAL_ID},
+            ),
+            ("task-purge-missing", self.scope),
+        ):
+            with self.assertRaises(TaskNotFound) as hidden:
+                self.service.purge_task(
+                    task_id=hidden_task_id,
+                    expected_visibility_revision=1,
+                    idempotency_key="purge-scope-hidden",
+                    **hidden_scope,
+                )
+            hidden_errors.append(str(hidden.exception))
+        self.assertEqual(hidden_errors[0], hidden_errors[1])
+
+        first = self.service.purge_task(
+            task_id=task_id,
+            expected_visibility_revision=trashed.snapshot.visibility_revision,
+            idempotency_key="purge-abandoned",
+            **self.scope,
+        )
+        replay = self.service.purge_task(
+            task_id=task_id,
+            expected_visibility_revision=trashed.snapshot.visibility_revision,
+            idempotency_key="purge-abandoned",
+            **self.scope,
+        )
+
+        self.assertEqual(first.task_id, task_id)
+        self.assertEqual(first.purge_state, "purged")
+        self.assertEqual(first.local_run_state, "not_created")
+        self.assertTrue(first.audit_retained)
+        self.assertFalse(first.replayed)
+        self.assertEqual(replay.purge_id, first.purge_id)
+        self.assertTrue(replay.replayed)
+        self.assertEqual(
+            self.service.list_tasks(view="trash", **self.scope).snapshots,
+            (),
+        )
+        with self.assertRaises(TaskNotFound):
+            self.service.get_task(task_id, **self.scope)
+        with self.assertRaises(TaskNotFound):
+            self.service.restore_task(
+                task_id=task_id,
+                expected_visibility_revision=1,
+                idempotency_key="restore-after-purge",
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("task_purge_requests"), 1)
+        self.assertEqual(self.raw_count("task_purge_outcomes"), 1)
+        self.assertEqual(self.raw_count("task_purge_idempotency"), 1)
+
     def test_trash_rejects_terminal_state_without_resolved_execution_evidence(
         self,
     ) -> None:
@@ -1182,7 +1268,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
-    def test_dispatched_terminal_task_can_be_moved_to_trash(self) -> None:
+    def test_dispatched_terminal_task_can_be_trashed_and_purged(self) -> None:
         task_id, _, dispatcher, service = self.submitted_runtime(
             key="visibility-dispatched-success"
         )
@@ -1205,6 +1291,26 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
         self.assertEqual(trashed.snapshot.visibility_revision, 1)
         self.assertEqual(trashed.snapshot.trashed_at, NOW)
+        purged = service.purge_task(
+            task_id=task_id,
+            expected_visibility_revision=1,
+            idempotency_key="purge-dispatched-success",
+            **self.scope,
+        )
+        replay = service.purge_task(
+            task_id=task_id,
+            expected_visibility_revision=1,
+            idempotency_key="purge-dispatched-success",
+            **self.scope,
+        )
+        self.assertEqual(purged.local_run_state, "deleted")
+        self.assertFalse(purged.replayed)
+        self.assertEqual(replay.purge_id, purged.purge_id)
+        self.assertTrue(replay.replayed)
+        self.assertEqual(dispatcher.purge_calls, 1)
+        self.assertEqual(dispatcher.purge_ids, [purged.purge_id])
+        with self.assertRaises(TaskNotFound):
+            service.get_task(task_id, **self.scope)
 
     def test_approved_pre_runtime_task_cannot_be_abandoned(self) -> None:
         created = self.create(key="create-approved-abandon-guard")

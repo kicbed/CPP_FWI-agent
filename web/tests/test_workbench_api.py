@@ -85,6 +85,11 @@ class FakeApplication:
             "restore_task", task_id, expected_visibility_revision, key
         )
 
+    def purge_task(self, task_id, expected_visibility_revision, key):
+        return self._call(
+            "purge_task", task_id, expected_visibility_revision, key
+        )
+
     def list_events(self, task_id, *, after_sequence=0, limit=100):
         self._call("list_events", task_id, after_sequence=after_sequence, limit=limit)
         return [{"sequence": after_sequence + 1}]
@@ -464,6 +469,20 @@ class WorkbenchAPITest(unittest.TestCase):
             ("restore_task", ("task-1", 1, "browser-mutation-0001"), {}),
         )
 
+        response = self.mutation(
+            "POST",
+            f"{task_path}/purge",
+            {
+                "expected_visibility_revision": 1,
+                "confirmation_task_id": "task-1",
+            },
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            self.application.calls[-1],
+            ("purge_task", ("task-1", 1, "browser-mutation-0001"), {}),
+        )
+
         for endpoint, payload in (
             ("trash", {}),
             ("trash", {"expected_visibility_revision": -1}),
@@ -482,6 +501,36 @@ class WorkbenchAPITest(unittest.TestCase):
                     self.decode(response)["error"]["code"],
                     "INVALID_VISIBILITY",
                 )
+
+        for payload in (
+            {},
+            {"expected_visibility_revision": 1},
+            {
+                "expected_visibility_revision": -1,
+                "confirmation_task_id": "task-1",
+            },
+            {
+                "expected_visibility_revision": True,
+                "confirmation_task_id": "task-1",
+            },
+            {
+                "expected_visibility_revision": 1,
+                "confirmation_task_id": "other-task",
+            },
+            {
+                "expected_visibility_revision": 1,
+                "confirmation_task_id": "task-1",
+                "project_id": "other",
+            },
+        ):
+            with self.subTest(purge_payload=payload):
+                previous_calls = len(self.application.calls)
+                response = self.mutation("POST", f"{task_path}/purge", payload)
+                self.assertEqual(response.status, 422)
+                self.assertEqual(
+                    self.decode(response)["error"]["code"], "INVALID_PURGE"
+                )
+                self.assertEqual(len(self.application.calls), previous_calls)
 
         response = self.api.dispatch(
             "GET",
