@@ -20,17 +20,24 @@ require_text() {
 
 required_files=(
     .dockerignore
+    .gitignore
     AGENTS.md
     docs/PROJECT_CONTINUITY.md
     docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md
     docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md
+    docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md
     docs/PROJECT_PROGRESS.md
     docs/GIT_AND_PROMPT_POLICY.md
     scientific_runtime/__init__.py
+    scientific_runtime/fwi_registry.py
+    scientific_runtime/registry_service.py
+    scientific_runtime/registrations/deepwave_acoustic_fwi_v1.json
     scientific_runtime/task_store.py
     scientific_runtime/task_service.py
     scientific_runtime/migrations/0001_task_store.sql
+    scientific_runtime/migrations/0002_catalog_registry.sql
+    tests/test_scientific_runtime_registry.py
     tests/test_scientific_runtime_task_service.py
     contracts/scientific_runtime/v1/common.schema.json
     contracts/scientific_runtime/v1/dataset-ref.schema.json
@@ -56,19 +63,22 @@ require_text docs/PROJECT_CONTINUITY.md '## D-004：'
 require_text docs/PROJECT_CONTINUITY.md '## D-005：'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
-require_text docs/PROJECT_CONTINUITY.md 'P0 contracts + P1.1a SQLite foundation Verified / P1 in progress'
+require_text docs/PROJECT_CONTINUITY.md 'P0 contracts + P1.1a Task Store + P1.1b Registry foundation Verified / P1 in progress'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '<!-- scientific-agent-runtime-plan: v1 -->'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '实现状态：**Pending**'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '<!-- scientific-runtime-p0-contracts: v1 -->'
-require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'P1.1a TaskStore/TaskService 持久基础已验证'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'P1.1a TaskStore 与 P1.1b Registry 持久基础已验证'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '调度和 Adapter 尚未实现'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md '<!-- scientific-runtime-p1-registry: v1 -->'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md 'registered/allowlisted 不等于 executable/ready'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md '`task_queued` 和所有 pre-runtime→runtime store 转换继续'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '<!-- scientific-runtime-p1-task-store: v1 -->'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '父工作项 P1.1 仍为 **Partially implemented**'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '也没有开放 `submit`/`Queued` 入口'
 require_text docs/PROJECT_PROGRESS.md '<!-- project-progress-schema: v1 -->'
 require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1（In progress；P1.1 为 Partially implemented）**'
 require_text docs/PROJECT_PROGRESS.md '| P0 最小 FWI 契约 | Verified |'
-require_text docs/PROJECT_PROGRESS.md '下一可执行切片：P1.1b/P1.2 前置注册'
+require_text docs/PROJECT_PROGRESS.md '下一可执行切片：P1.2a Deepwave Adapter'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'D-005` / **Proposed'
@@ -85,6 +95,13 @@ ignore_source="$(git check-ignore -v -- .local-prompts/example.md 2>/dev/null ||
 [[ "$ignore_source" == .gitignore:* ]] || fail '.local-prompts/ is not ignored by the repository .gitignore'
 ignore_source="$(git check-ignore -v -- scratch.local-prompt.md 2>/dev/null || true)"
 [[ "$ignore_source" == .gitignore:* ]] || fail '*.local-prompt.md is not ignored by the repository .gitignore'
+for runtime_database in \
+    scratch.sqlite scratch.sqlite-wal scratch.sqlite3 scratch.sqlite3-shm \
+    scratch.db scratch.db-wal; do
+    ignore_source="$(git check-ignore -v -- "$runtime_database" 2>/dev/null || true)"
+    [[ "$ignore_source" == .gitignore:* ]] || \
+        fail "$runtime_database is not ignored by the repository .gitignore"
+done
 
 is_forbidden_git_path() {
     local path="$1" base lower_path lower_base wrapped

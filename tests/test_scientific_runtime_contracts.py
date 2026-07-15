@@ -535,6 +535,24 @@ class ScientificRuntimeExecutionGateTest(unittest.TestCase):
             "INPUT_TYPE_MISMATCH",
         )
 
+    def test_plan_ports_must_match_the_registered_manifest_exactly(self) -> None:
+        plan = plan_graph()
+        plan["nodes"][0]["inputs"][0]["port"] = "unknown_model"
+        rehash(plan)
+        self.assert_has_code(self.evaluate(plan=plan), "INPUT_PORT_MISMATCH")
+
+        plan = plan_graph()
+        plan["nodes"][0]["outputs"].pop()
+        rehash(plan)
+        self.assert_has_code(self.evaluate(plan=plan), "OUTPUT_PORT_MISMATCH")
+
+        plan = plan_graph()
+        plan["nodes"][0]["outputs"].append(
+            copy.deepcopy(plan["nodes"][0]["outputs"][0])
+        )
+        rehash(plan)
+        self.assert_has_code(self.evaluate(plan=plan), "OUTPUT_PORT_MISMATCH")
+
     def test_plan_algorithm_and_device_cannot_drift_from_the_draft(self) -> None:
         draft = task_draft()
         draft["algorithm"] = {"id": "deepwave.other", "version": "1.0.0"}

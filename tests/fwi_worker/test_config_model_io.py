@@ -13,6 +13,8 @@ from fwi_worker.model_io import (
     make_initial_model,
     read_and_validate_sidecar,
 )
+from scientific_runtime import verified_marmousi_dataset_ref
+from scientific_runtime_contracts import schema_errors
 
 
 class ConfigAndModelIOTest(unittest.TestCase):
@@ -103,6 +105,19 @@ class ConfigAndModelIOTest(unittest.TestCase):
         self.assertEqual(loaded.velocity.dtype, np.float32)
         self.assertEqual(float(loaded.velocity.min()), 1500.0)
         self.assertEqual(float(loaded.velocity.max()), 5500.0)
+
+    def test_verified_model_maps_to_a_path_free_catalog_snapshot(self) -> None:
+        dataset = verified_marmousi_dataset_ref(
+            project_id="project-1", principals=["user-1"]
+        )
+        self.assertEqual(schema_errors("dataset-ref.schema.json", dataset), [])
+        self.assertEqual(
+            dataset["content_hash"],
+            "sha256:b80918e3a609a679f16a47dd30978812d80e4fab1fcbd5ce692d9ca97022a688",
+        )
+        self.assertNotIn("path", dataset)
+        self.assertNotIn("source_path", dataset)
+        self.assertNotIn("path", dataset["metadata"])
 
     def test_slowness_smoothing_preserves_top_row_and_bounds(self) -> None:
         config = resolve_config({"preset": "forward", "device": "cpu"})

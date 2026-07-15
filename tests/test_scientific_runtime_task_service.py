@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from scientific_runtime import (
+    RegistryService,
     SQLiteTaskStore,
     TaskConflict,
     TaskIdempotencyConflict,
@@ -25,7 +26,9 @@ from scientific_runtime import (
 from scientific_runtime_contracts import compute_plan_hash, schema_errors
 from scientific_runtime.task_store import APPLICATION_ID, encode_document
 from tests.test_scientific_runtime_contracts import (
+    algorithm_manifest,
     approval_decision,
+    dataset_ref,
     plan_graph,
     run_event,
     task_draft,
@@ -42,6 +45,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.database_path = Path(self.temporary.name) / "task.sqlite3"
         self.store = SQLiteTaskStore(self.database_path)
+        self.registry = RegistryService(self.store, clock=lambda: NOW)
+        self.registry.register_dataset(dataset=dataset_ref())
+        self.registry.register_algorithm(manifest=algorithm_manifest())
         self.next_id = 0
 
         def make_task_id() -> str:
@@ -63,6 +69,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             draft=draft or task_draft(),
             idempotency_key=key,
         )
+
+    def register_project_dataset(self, project_id: str) -> dict:
+        dataset = dataset_ref()
+        dataset["access_scope"]["project_id"] = project_id
+        self.registry.register_dataset(dataset=dataset)
+        return dataset
 
     def persist_plan_and_approval(self, task_id: str) -> tuple[dict, dict]:
         plan = plan_graph()
@@ -148,7 +160,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 1)
+        self.assertEqual(self.store.migration_version(), 2)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -164,7 +176,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 1)
+        self.assertEqual(reopened.migration_version(), 2)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -205,12 +217,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 1)] * 8)
+        self.assertEqual(results, [("wal", 2)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 2")
+            connection.execute("PRAGMA user_version = 3")
             connection.commit()
         finally:
             connection.close()
@@ -303,19 +315,22 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(self.raw_count("idempotency_records"), 1)
 
     def test_corrupt_idempotency_scope_fails_closed(self) -> None:
+        foreign_dataset = self.register_project_dataset("project-2")
         foreign_draft = task_draft()
         foreign_draft["draft_id"] = "draft-foreign-scope"
+        foreign_draft["datasets"] = [foreign_dataset]
         foreign = self.service.create_task(
             project_id="project-2",
             principal_id=PRINCIPAL_ID,
             draft=foreign_draft,
             idempotency_key="foreign-create-key",
         )
+        requested_draft = task_draft()
         _, request_hash = encode_document(
             {
                 "project_id": PROJECT_ID,
                 "principal_id": PRINCIPAL_ID,
-                "draft": foreign_draft,
+                "draft": requested_draft,
             }
         )
         response_json, _ = encode_document({"task_id": foreign.snapshot.task_id})
@@ -350,7 +365,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             self.service.create_task(
                 project_id=PROJECT_ID,
                 principal_id=PRINCIPAL_ID,
-                draft=foreign_draft,
+                draft=requested_draft,
                 idempotency_key="corrupt-scope-key",
             )
 
@@ -444,8 +459,10 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 event=started,
             )
 
+        other_dataset = self.register_project_dataset("project-2")
         other_draft = task_draft()
         other_draft["draft_id"] = "draft-other-scope"
+        other_draft["datasets"] = [other_dataset]
         other = self.service.create_task(
             project_id="project-2",
             principal_id=PRINCIPAL_ID,

@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
+from jsonschema import Draft7Validator
+from jsonschema.exceptions import SchemaError
+
 from scientific_runtime_contracts import compute_plan_hash, schema_errors
 
 from .task_store import (
@@ -275,8 +278,9 @@ class TaskService:
     """Create and query durable tasks without submitting numerical work.
 
     P1.1 intentionally has no queue/submit method.  Dataset Catalog snapshots,
-    approval budget consumption, the full deterministic gate, and the Queued
-    event must first be combined in one later SQLite transaction.
+    the current draft/plan/approval, approval budget consumption, the full
+    deterministic gate, submit idempotency, and the Queued event must first be
+    combined in one later SQLite transaction.
     """
 
     def __init__(
@@ -296,6 +300,191 @@ class TaskService:
         if errors:
             raise TaskValidationError("SCHEMA_INVALID", errors)
 
+    def _validate_registered_draft(
+        self,
+        draft: Mapping[str, Any],
+        *,
+        project_id: str,
+        principal_id: str,
+    ) -> dict[str, Any]:
+        dataset = draft["datasets"][0]
+        algorithm = draft["algorithm"]
+        dataset_key = (dataset["id"], dataset["version"])
+        algorithm_key = (algorithm["id"], algorithm["version"])
+        registry = self._store.load_registry_snapshots(
+            project_id=project_id,
+            dataset_keys=[dataset_key],
+            algorithm_keys=[algorithm_key],
+        )
+        registered_dataset = registry.datasets.get(dataset_key)
+        if registered_dataset is None:
+            raise TaskValidationError(
+                "DATASET_NOT_REGISTERED",
+                ["TaskDraft dataset id/version is not registered for this project"],
+            )
+        dataset_errors = schema_errors(
+            "dataset-ref.schema.json", registered_dataset
+        )
+        if dataset_errors:
+            raise TaskValidationError(
+                "REGISTRY_SNAPSHOT_INVALID", dataset_errors
+            )
+        access_scope = registered_dataset["access_scope"]
+        if (
+            access_scope["project_id"] != project_id
+            or principal_id not in access_scope["principals"]
+            or "execute" not in access_scope["permissions"]
+        ):
+            raise TaskValidationError(
+                "DATASET_ACCESS_DENIED",
+                ["principal lacks execute access to the registered dataset"],
+            )
+        if registered_dataset != dataset:
+            raise TaskValidationError(
+                "DATASET_METADATA_MISMATCH",
+                ["TaskDraft DatasetRef differs from the immutable Catalog record"],
+            )
+        manifest = registry.algorithms.get(algorithm_key)
+        if manifest is None:
+            raise TaskValidationError(
+                "ALGORITHM_NOT_REGISTERED",
+                ["TaskDraft algorithm id/version is not registered"],
+            )
+        manifest_errors = schema_errors(
+            "algorithm-manifest.schema.json", manifest
+        )
+        if manifest_errors:
+            raise TaskValidationError(
+                "REGISTRY_SNAPSHOT_INVALID", manifest_errors
+            )
+        try:
+            Draft7Validator.check_schema(manifest["parameter_schema"])
+        except SchemaError as error:
+            raise TaskValidationError(
+                "REGISTRY_SNAPSHOT_INVALID",
+                [f"AlgorithmManifest parameter_schema is invalid: {error.message}"],
+            ) from error
+        for field in ("inputs", "outputs"):
+            ports = [item["port"] for item in manifest[field]]
+            if len(ports) != len(set(ports)):
+                raise TaskValidationError(
+                    "REGISTRY_SNAPSHOT_INVALID",
+                    [f"AlgorithmManifest {field} ports must be unique"],
+                )
+        if not manifest["security"]["allowlisted"]:
+            raise TaskValidationError(
+                "ALGORITHM_NOT_ALLOWLISTED",
+                ["registered algorithm version is not allowlisted"],
+            )
+        if draft["task_type"] not in manifest["task_types"]:
+            raise TaskValidationError(
+                "TASK_TYPE_MISMATCH",
+                ["algorithm does not declare the TaskDraft task type"],
+            )
+        parameter_errors = list(
+            Draft7Validator(manifest["parameter_schema"]).iter_errors(
+                draft["parameters"]
+            )
+        )
+        if parameter_errors:
+            raise TaskValidationError(
+                "PARAMETER_SCHEMA_MISMATCH",
+                ["TaskDraft parameters violate AlgorithmManifest parameter_schema"],
+            )
+        preset = draft["parameters"]["preset"]
+        if (
+            draft["parameters"]["device"] != draft["resources"]["device"]
+            or (
+                draft["task_type"] == "acoustic_forward_2d"
+                and preset != "forward"
+            )
+            or (
+                draft["task_type"] == "acoustic_fwi_2d"
+                and preset == "forward"
+            )
+        ):
+            raise TaskValidationError(
+                "TASK_PARAMETER_MISMATCH",
+                ["task type, preset, and requested device are inconsistent"],
+            )
+        input_types = {item["data_type"] for item in manifest["inputs"]}
+        if registered_dataset["data_type"] not in input_types:
+            raise TaskValidationError(
+                "INPUT_TYPE_MISMATCH",
+                ["dataset type is not accepted by the registered algorithm"],
+            )
+
+        resources = draft["resources"]
+        limits = manifest["resource_limits"]
+        resource_errors: list[str] = []
+        if resources["device"] not in limits["devices"]:
+            resource_errors.append("device")
+        for field, limit_field in (
+            ("gpu_count", "max_gpu_count"),
+            ("cpu_cores", "max_cpu_cores"),
+            ("memory_mb", "max_memory_mb"),
+            ("wall_time_seconds", "max_wall_time_seconds"),
+        ):
+            if resources[field] > limits[limit_field]:
+                resource_errors.append(field)
+        if resource_errors:
+            raise TaskValidationError(
+                "RESOURCE_LIMIT_EXCEEDED",
+                [
+                    "TaskDraft resources exceed AlgorithmManifest limits: "
+                    + ", ".join(resource_errors)
+                ],
+            )
+        return manifest
+
+    @staticmethod
+    def _validate_registered_plan(
+        plan: Mapping[str, Any], manifest: Mapping[str, Any]
+    ) -> None:
+        input_ports = {
+            item["port"]: item["data_type"] for item in manifest["inputs"]
+        }
+        output_ports = {
+            item["port"]: item["data_type"] for item in manifest["outputs"]
+        }
+        declared_effects = set(manifest["security"]["side_effects"])
+        errors: list[str] = []
+        for node in plan["nodes"]:
+            node_id = node["node_id"]
+            planned_input_ports = [binding["port"] for binding in node["inputs"]]
+            if (
+                len(planned_input_ports) != len(set(planned_input_ports))
+                or set(planned_input_ports) != set(input_ports)
+            ):
+                errors.append(
+                    f"node {node_id} input ports differ from AlgorithmManifest"
+                )
+            for binding in node["inputs"]:
+                expected_type = input_ports.get(binding["port"])
+                if expected_type != binding["dataset"]["data_type"]:
+                    errors.append(
+                        f"node {node_id} input does not match AlgorithmManifest"
+                    )
+            planned_output_ports = [output["port"] for output in node["outputs"]]
+            if (
+                len(planned_output_ports) != len(set(planned_output_ports))
+                or set(planned_output_ports) != set(output_ports)
+            ):
+                errors.append(
+                    f"node {node_id} output ports differ from AlgorithmManifest"
+                )
+            for output in node["outputs"]:
+                if output_ports.get(output["port"]) != output["data_type"]:
+                    errors.append(
+                        f"node {node_id} output does not match AlgorithmManifest"
+                    )
+            if not set(node["side_effects"]).issubset(declared_effects):
+                errors.append(
+                    f"node {node_id} requests undeclared side effects"
+                )
+        if errors:
+            raise TaskValidationError("PLAN_REGISTRY_MISMATCH", errors)
+
     def create_task(
         self,
         *,
@@ -312,6 +501,9 @@ class TaskService:
             raise TaskValidationError(
                 "INVALID_INITIAL_REVISION", ["a new task draft must start at revision 1"]
             )
+        self._validate_registered_draft(
+            draft, project_id=project_id, principal_id=principal_id
+        )
         _, request_hash = encode_document(
             {
                 "project_id": project_id,
@@ -389,6 +581,9 @@ class TaskService:
             raise TaskConflict("draft_id is immutable within a task")
         if draft["revision"] != expected_revision + 1:
             raise TaskConflict("draft revision must increase by exactly one")
+        self._validate_registered_draft(
+            draft, project_id=project_id, principal_id=principal_id
+        )
         try:
             return self._store.append_draft_revision(
                 task_id=task_id,
@@ -428,6 +623,12 @@ class TaskService:
         }:
             raise TaskConflict("plan does not target the current draft revision")
         _validate_plan_draft_consistency(plan, current.draft)
+        manifest = self._validate_registered_draft(
+            current.draft,
+            project_id=project_id,
+            principal_id=principal_id,
+        )
+        self._validate_registered_plan(plan, manifest)
         try:
             return self._store.store_plan(
                 task_id=task_id, plan=plan, now=self._clock()

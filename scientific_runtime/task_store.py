@@ -19,8 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 
-MIGRATION_VERSION = 1
-MIGRATION_PATH = Path(__file__).with_name("migrations") / "0001_task_store.sql"
+MIGRATIONS_DIRECTORY = Path(__file__).with_name("migrations")
 APPLICATION_ID = 0x53525431  # ASCII "SRT1"
 SCHEMA_MIGRATIONS_SQL = """
 CREATE TABLE schema_migrations (
@@ -106,8 +105,82 @@ class CreateTaskRecord:
     replayed: bool
 
 
+@dataclass(frozen=True)
+class RegistryWriteRecord:
+    """Immutable registry document and whether the write was a replay."""
+
+    document: dict[str, Any]
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class RegistrySnapshots:
+    """Server-owned registry documents read from one SQLite snapshot."""
+
+    datasets: dict[tuple[str, str], dict[str, Any]]
+    algorithms: dict[tuple[str, str], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ApprovalBudget:
+    """Durable task-count budget bound to one immutable approval."""
+
+    task_id: str
+    approval_id: str
+    max_tasks: int
+    tasks_used: int
+
+
+@dataclass(frozen=True)
+class _Migration:
+    version: int
+    path: Path
+    text: str
+    checksum: str
+
+
 class TaskStore(Protocol):
     """Storage boundary used by the P1 TaskService."""
+
+    def register_dataset(
+        self, *, dataset: Mapping[str, Any], now: str
+    ) -> RegistryWriteRecord:
+        ...
+
+    def register_algorithm(
+        self, *, manifest: Mapping[str, Any], now: str
+    ) -> RegistryWriteRecord:
+        ...
+
+    def get_dataset(
+        self, *, project_id: str, dataset_id: str, version: str
+    ) -> dict[str, Any] | None:
+        ...
+
+    def list_datasets(self, *, project_id: str) -> list[dict[str, Any]]:
+        ...
+
+    def get_algorithm(
+        self, *, algorithm_id: str, version: str
+    ) -> dict[str, Any] | None:
+        ...
+
+    def list_algorithms(self) -> list[dict[str, Any]]:
+        ...
+
+    def get_approval_budget(
+        self, *, task_id: str, approval_id: str
+    ) -> ApprovalBudget | None:
+        ...
+
+    def load_registry_snapshots(
+        self,
+        *,
+        project_id: str,
+        dataset_keys: Sequence[tuple[str, str]],
+        algorithm_keys: Sequence[tuple[str, str]],
+    ) -> RegistrySnapshots:
+        ...
 
     def create_task(
         self,
@@ -229,6 +302,30 @@ def _decode_hashed_document(
     return value
 
 
+def _load_migrations() -> tuple[_Migration, ...]:
+    migrations: list[_Migration] = []
+    for path in sorted(MIGRATIONS_DIRECTORY.glob("[0-9][0-9][0-9][0-9]_*.sql")):
+        prefix = path.name.split("_", 1)[0]
+        version = int(prefix)
+        text = path.read_text(encoding="utf-8")
+        migrations.append(
+            _Migration(
+                version=version,
+                path=path,
+                text=text,
+                checksum=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            )
+        )
+    if not migrations:
+        raise TaskStoreCorruption("no task-store migrations are available")
+    versions = [migration.version for migration in migrations]
+    if versions != list(range(1, len(migrations) + 1)):
+        raise TaskStoreCorruption(
+            "task-store migration versions must be contiguous from one"
+        )
+    return tuple(migrations)
+
+
 def _migration_statements(text: str) -> Sequence[str]:
     """Split SQL with sqlite's parser, preserving trigger bodies atomically."""
 
@@ -266,14 +363,17 @@ def _schema_manifest(connection: sqlite3.Connection) -> tuple[tuple[str, ...], .
     )
 
 
-def _expected_schema_manifest(migration_text: str) -> tuple[tuple[str, ...], ...]:
+def _expected_schema_manifest(
+    migrations: Sequence[_Migration],
+) -> tuple[tuple[str, ...], ...]:
     connection = sqlite3.connect(":memory:", isolation_level=None)
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(SCHEMA_MIGRATIONS_SQL)
-        for statement in _migration_statements(migration_text):
-            connection.execute(statement)
+        for migration in migrations:
+            for statement in _migration_statements(migration.text):
+                connection.execute(statement)
         return _schema_manifest(connection)
     finally:
         connection.close()
@@ -368,11 +468,9 @@ class SQLiteTaskStore:
         return connection
 
     def _initialize_locked(self) -> None:
-        migration_text = MIGRATION_PATH.read_text(encoding="utf-8")
-        migration_checksum = hashlib.sha256(
-            migration_text.encode("utf-8")
-        ).hexdigest()
-        expected_manifest = _expected_schema_manifest(migration_text)
+        migrations = _load_migrations()
+        latest_version = migrations[-1].version
+        expected_manifest = _expected_schema_manifest(migrations)
         connection = self._connect(require_wal=False)
         try:
             preflight_user_version = int(
@@ -436,43 +534,56 @@ class SQLiteTaskStore:
                     raise TaskStoreError(
                         "task database migration metadata is inconsistent"
                     )
-            newer = connection.execute(
-                "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone()[0]
+            applied_rows = connection.execute(
+                """
+                SELECT version, name, checksum
+                FROM schema_migrations ORDER BY version ASC
+                """
+            ).fetchall()
+            applied_versions = [int(row["version"]) for row in applied_rows]
             if (
-                (newer is not None and int(newer) > MIGRATION_VERSION)
-                or user_version > MIGRATION_VERSION
+                any(version > latest_version for version in applied_versions)
+                or user_version > latest_version
             ):
                 raise TaskStoreError(
                     "task database was created by a newer migration version"
                 )
-            existing = connection.execute(
-                "SELECT checksum FROM schema_migrations WHERE version = ?",
-                (MIGRATION_VERSION,),
-            ).fetchone()
-            if existing is None:
-                if not first_install or newer is not None or user_version != 0:
+            expected_applied_versions = list(range(1, user_version + 1))
+            if applied_versions != expected_applied_versions:
+                raise TaskStoreError(
+                    "task database migration metadata is inconsistent"
+                )
+            migrations_by_version = {
+                migration.version: migration for migration in migrations
+            }
+            for row in applied_rows:
+                migration = migrations_by_version[int(row["version"])]
+                if row["name"] != migration.path.name:
                     raise TaskStoreError(
                         "task database migration metadata is inconsistent"
                     )
-                for statement in _migration_statements(migration_text):
+                if row["checksum"] != migration.checksum:
+                    raise TaskStoreError(
+                        "applied task-store migration checksum changed"
+                    )
+
+            for migration in migrations[user_version:]:
+                for statement in _migration_statements(migration.text):
                     connection.execute(statement)
                 connection.execute(
                     """
                     INSERT INTO schema_migrations(version, name, checksum, applied_at)
                     VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                     """,
-                    (MIGRATION_VERSION, MIGRATION_PATH.name, migration_checksum),
+                    (migration.version, migration.path.name, migration.checksum),
                 )
-                connection.execute(f"PRAGMA user_version = {MIGRATION_VERSION}")
+                connection.execute(f"PRAGMA user_version = {migration.version}")
+            if first_install:
                 connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")
-            else:
-                if user_version != MIGRATION_VERSION:
-                    raise TaskStoreError(
-                        "task database migration metadata is inconsistent"
-                    )
-                if existing["checksum"] != migration_checksum:
-                    raise TaskStoreError("applied task-store migration checksum changed")
+            if int(connection.execute("PRAGMA user_version").fetchone()[0]) != latest_version:
+                raise TaskStoreError(
+                    "task database migration metadata is inconsistent"
+                )
             if _schema_manifest(connection) != expected_manifest:
                 raise TaskStoreCorruption(
                     "task database schema does not match the applied migration"
@@ -518,6 +629,431 @@ class SQLiteTaskStore:
         connection = self._connect()
         try:
             return int(connection.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _dataset_core_hash(dataset: Mapping[str, Any]) -> str:
+        core = dict(dataset)
+        core.pop("access_scope", None)
+        _, core_hash = encode_document(core)
+        return core_hash
+
+    def _load_dataset_registration(
+        self, connection: sqlite3.Connection, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        dataset = _decode_hashed_document(row, label="dataset registration")
+        indexed = {
+            "id": row["dataset_id"],
+            "version": row["version"],
+            "content_hash": row["content_hash"],
+            "data_type": row["data_type"],
+        }
+        if any(dataset.get(key) != value for key, value in indexed.items()):
+            raise TaskStoreCorruption(
+                "persisted dataset identity does not match its index"
+            )
+        access_scope = dataset.get("access_scope")
+        if (
+            not isinstance(access_scope, dict)
+            or access_scope.get("project_id") != row["project_id"]
+        ):
+            raise TaskStoreCorruption(
+                "persisted dataset project does not match its index"
+            )
+        version_row = connection.execute(
+            """
+            SELECT content_hash, data_type, core_hash
+            FROM dataset_versions
+            WHERE dataset_id = ? AND version = ?
+            """,
+            (row["dataset_id"], row["version"]),
+        ).fetchone()
+        if version_row is None:
+            raise TaskStoreCorruption(
+                "dataset catalog entry references a missing version"
+            )
+        if (
+            version_row["content_hash"] != row["content_hash"]
+            or version_row["data_type"] != row["data_type"]
+            or version_row["core_hash"] != self._dataset_core_hash(dataset)
+        ):
+            raise TaskStoreCorruption(
+                "persisted dataset version does not match its catalog entry"
+            )
+        return dataset
+
+    def register_dataset(
+        self, *, dataset: Mapping[str, Any], now: str
+    ) -> RegistryWriteRecord:
+        document_json, document_hash = encode_document(dataset)
+        core_hash = self._dataset_core_hash(dataset)
+        project_id = dataset["access_scope"]["project_id"]
+        identity = (
+            dataset["id"],
+            dataset["version"],
+            dataset["content_hash"],
+            dataset["data_type"],
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            version_row = connection.execute(
+                """
+                SELECT content_hash, data_type, core_hash
+                FROM dataset_versions
+                WHERE dataset_id = ? AND version = ?
+                """,
+                identity[:2],
+            ).fetchone()
+            if version_row is None:
+                connection.execute(
+                    """
+                    INSERT INTO dataset_versions(
+                        dataset_id, version, content_hash, data_type,
+                        core_hash, first_registered_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (*identity, core_hash, now),
+                )
+            elif (
+                version_row["content_hash"] != identity[2]
+                or version_row["data_type"] != identity[3]
+                or version_row["core_hash"] != core_hash
+            ):
+                raise TaskStoreConflict(
+                    "dataset id/version already identifies different immutable content"
+                )
+
+            existing = connection.execute(
+                """
+                SELECT project_id, dataset_id, version, content_hash, data_type,
+                       document_json, document_hash
+                FROM dataset_catalog
+                WHERE project_id = ? AND dataset_id = ? AND version = ?
+                """,
+                (project_id, *identity[:2]),
+            ).fetchone()
+            if existing is not None:
+                if existing["document_hash"] != document_hash:
+                    raise TaskStoreConflict(
+                        "dataset project/version already has a different access snapshot"
+                    )
+                document = self._load_dataset_registration(connection, existing)
+                connection.commit()
+                return RegistryWriteRecord(document=document, replayed=True)
+
+            connection.execute(
+                """
+                INSERT INTO dataset_catalog(
+                    project_id, dataset_id, version, content_hash, data_type,
+                    document_json, document_hash, registered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (project_id, *identity, document_json, document_hash, now),
+            )
+            inserted = connection.execute(
+                """
+                SELECT project_id, dataset_id, version, content_hash, data_type,
+                       document_json, document_hash
+                FROM dataset_catalog
+                WHERE project_id = ? AND dataset_id = ? AND version = ?
+                """,
+                (project_id, *identity[:2]),
+            ).fetchone()
+            if inserted is None:
+                raise TaskStoreCorruption(
+                    "newly registered dataset cannot be read"
+                )
+            document = self._load_dataset_registration(connection, inserted)
+            connection.commit()
+            return RegistryWriteRecord(document=document, replayed=False)
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "dataset registration conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def register_algorithm(
+        self, *, manifest: Mapping[str, Any], now: str
+    ) -> RegistryWriteRecord:
+        document_json, document_hash = encode_document(manifest)
+        identity = (manifest["id"], manifest["version"])
+        allowlisted = int(bool(manifest["security"]["allowlisted"]))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT algorithm_id, version, allowlisted,
+                       document_json, document_hash
+                FROM algorithm_registry
+                WHERE algorithm_id = ? AND version = ?
+                """,
+                identity,
+            ).fetchone()
+            if existing is not None:
+                if existing["document_hash"] != document_hash:
+                    raise TaskStoreConflict(
+                        "algorithm id/version already identifies another manifest"
+                    )
+                document = self._load_algorithm_registration(existing)
+                connection.commit()
+                return RegistryWriteRecord(document=document, replayed=True)
+            connection.execute(
+                """
+                INSERT INTO algorithm_registry(
+                    algorithm_id, version, allowlisted,
+                    document_json, document_hash, registered_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (*identity, allowlisted, document_json, document_hash, now),
+            )
+            inserted = connection.execute(
+                """
+                SELECT algorithm_id, version, allowlisted,
+                       document_json, document_hash
+                FROM algorithm_registry
+                WHERE algorithm_id = ? AND version = ?
+                """,
+                identity,
+            ).fetchone()
+            if inserted is None:
+                raise TaskStoreCorruption(
+                    "newly registered algorithm cannot be read"
+                )
+            document = self._load_algorithm_registration(inserted)
+            connection.commit()
+            return RegistryWriteRecord(document=document, replayed=False)
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "algorithm registration conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _load_algorithm_registration(row: Mapping[str, Any]) -> dict[str, Any]:
+        manifest = _decode_hashed_document(row, label="algorithm registration")
+        security = manifest.get("security")
+        if (
+            manifest.get("id") != row["algorithm_id"]
+            or manifest.get("version") != row["version"]
+            or not isinstance(security, dict)
+            or int(bool(security.get("allowlisted"))) != row["allowlisted"]
+        ):
+            raise TaskStoreCorruption(
+                "persisted algorithm identity does not match its index"
+            )
+        return manifest
+
+    def get_dataset(
+        self, *, project_id: str, dataset_id: str, version: str
+    ) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT project_id, dataset_id, version, content_hash, data_type,
+                       document_json, document_hash
+                FROM dataset_catalog
+                WHERE project_id = ? AND dataset_id = ? AND version = ?
+                """,
+                (project_id, dataset_id, version),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._load_dataset_registration(connection, row)
+        finally:
+            connection.close()
+
+    def list_datasets(self, *, project_id: str) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT project_id, dataset_id, version, content_hash, data_type,
+                       document_json, document_hash
+                FROM dataset_catalog
+                WHERE project_id = ?
+                ORDER BY dataset_id ASC, version ASC
+                """,
+                (project_id,),
+            ).fetchall()
+            return [
+                self._load_dataset_registration(connection, row) for row in rows
+            ]
+        finally:
+            connection.close()
+
+    def get_algorithm(
+        self, *, algorithm_id: str, version: str
+    ) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT algorithm_id, version, allowlisted,
+                       document_json, document_hash
+                FROM algorithm_registry
+                WHERE algorithm_id = ? AND version = ?
+                """,
+                (algorithm_id, version),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._load_algorithm_registration(row)
+        finally:
+            connection.close()
+
+    def list_algorithms(self) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT algorithm_id, version, allowlisted,
+                       document_json, document_hash
+                FROM algorithm_registry
+                ORDER BY algorithm_id ASC, version ASC
+                """
+            ).fetchall()
+            return [self._load_algorithm_registration(row) for row in rows]
+        finally:
+            connection.close()
+
+    def _load_registry_snapshots(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        dataset_keys: Sequence[tuple[str, str]],
+        algorithm_keys: Sequence[tuple[str, str]],
+    ) -> RegistrySnapshots:
+        datasets: dict[tuple[str, str], dict[str, Any]] = {}
+        for key in dict.fromkeys(dataset_keys):
+            row = connection.execute(
+                """
+                SELECT project_id, dataset_id, version, content_hash, data_type,
+                       document_json, document_hash
+                FROM dataset_catalog
+                WHERE project_id = ? AND dataset_id = ? AND version = ?
+                """,
+                (project_id, *key),
+            ).fetchone()
+            if row is not None:
+                datasets[key] = self._load_dataset_registration(connection, row)
+        algorithms: dict[tuple[str, str], dict[str, Any]] = {}
+        for key in dict.fromkeys(algorithm_keys):
+            row = connection.execute(
+                """
+                SELECT algorithm_id, version, allowlisted,
+                       document_json, document_hash
+                FROM algorithm_registry
+                WHERE algorithm_id = ? AND version = ?
+                """,
+                key,
+            ).fetchone()
+            if row is not None:
+                algorithms[key] = self._load_algorithm_registration(row)
+        return RegistrySnapshots(datasets=datasets, algorithms=algorithms)
+
+    def load_registry_snapshots(
+        self,
+        *,
+        project_id: str,
+        dataset_keys: Sequence[tuple[str, str]],
+        algorithm_keys: Sequence[tuple[str, str]],
+    ) -> RegistrySnapshots:
+        connection = self._connect()
+        try:
+            # A deferred read transaction pins one consistent WAL snapshot for
+            # all requested records.  Future submit code can call the internal
+            # helper from its BEGIN IMMEDIATE gate/queue transaction.
+            connection.execute("BEGIN")
+            snapshots = self._load_registry_snapshots(
+                connection,
+                project_id=project_id,
+                dataset_keys=dataset_keys,
+                algorithm_keys=algorithm_keys,
+            )
+            connection.commit()
+            return snapshots
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_approval_budget(
+        self, *, task_id: str, approval_id: str
+    ) -> ApprovalBudget | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT budget.task_id, budget.approval_id,
+                       budget.max_tasks, budget.tasks_used,
+                       approval.document_json, approval.document_hash
+                FROM approval_budgets AS budget
+                JOIN approvals AS approval
+                  ON approval.task_id = budget.task_id
+                 AND approval.approval_id = budget.approval_id
+                WHERE budget.task_id = ? AND budget.approval_id = ?
+                """,
+                (task_id, approval_id),
+            ).fetchone()
+            if row is None:
+                return None
+            approval = _decode_hashed_document(row, label="approval")
+            scope = approval.get("scope")
+            if (
+                approval.get("approval_id") != row["approval_id"]
+                or not isinstance(scope, dict)
+                or type(row["max_tasks"]) is not int
+                or type(row["tasks_used"]) is not int
+                or scope.get("max_tasks") != row["max_tasks"]
+                or row["tasks_used"] < 0
+                or row["tasks_used"] > row["max_tasks"]
+            ):
+                raise TaskStoreCorruption(
+                    "approval budget does not match its decision"
+                )
+            return ApprovalBudget(
+                task_id=row["task_id"],
+                approval_id=row["approval_id"],
+                max_tasks=row["max_tasks"],
+                tasks_used=row["tasks_used"],
+            )
         finally:
             connection.close()
 
@@ -806,6 +1342,27 @@ class SQLiteTaskStore:
             ):
                 raise TaskStoreCorruption(
                     "current approval does not bind the current plan"
+                )
+            budget = connection.execute(
+                """
+                SELECT max_tasks, tasks_used
+                FROM approval_budgets
+                WHERE task_id = ? AND approval_id = ?
+                """,
+                (task_id, approval_row["approval_id"]),
+            ).fetchone()
+            approval_scope = approval.get("scope")
+            if (
+                budget is None
+                or not isinstance(approval_scope, dict)
+                or type(budget["max_tasks"]) is not int
+                or type(budget["tasks_used"]) is not int
+                or budget["max_tasks"] != approval_scope.get("max_tasks")
+                or budget["tasks_used"] < 0
+                or budget["tasks_used"] > budget["max_tasks"]
+            ):
+                raise TaskStoreCorruption(
+                    "current approval budget does not match its decision"
                 )
         if row["status"] in {
             "Queued",
@@ -1407,6 +1964,26 @@ class SQLiteTaskStore:
                 ):
                     raise TaskStoreCorruption(
                         "persisted approval identity does not match its index"
+                    )
+                budget = connection.execute(
+                    """
+                    SELECT max_tasks, tasks_used FROM approval_budgets
+                    WHERE task_id = ? AND approval_id = ?
+                    """,
+                    (task_id, row["approval_id"]),
+                ).fetchone()
+                scope = approval.get("scope")
+                if (
+                    budget is None
+                    or not isinstance(scope, dict)
+                    or type(budget["max_tasks"]) is not int
+                    or type(budget["tasks_used"]) is not int
+                    or budget["max_tasks"] != scope.get("max_tasks")
+                    or budget["tasks_used"] < 0
+                    or budget["tasks_used"] > budget["max_tasks"]
+                ):
+                    raise TaskStoreCorruption(
+                        "persisted approval budget does not match its decision"
                     )
                 values.append(approval)
             return values

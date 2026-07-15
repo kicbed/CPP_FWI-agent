@@ -6,8 +6,8 @@
 - 合同版本：`1.0.0`
 - JSON Schema 方言：Draft-07
 - 实现阶段：P0.1
-- 运行时状态：**P0 合同参考实现；P1.1a TaskStore/TaskService 持久基础已验证，submit/API/
-  调度和 Adapter 尚未实现**
+- 运行时状态：**P0 合同参考实现；P1.1a TaskStore 与 P1.1b Registry 持久基础已验证，
+  submit/API/调度和 Adapter 尚未实现**
 
 本文是七类公共对象、规范化、状态转换、确定性执行门、API 草案和 Algorithm Adapter v1
 的 P0 规范。它只覆盖已注册 `marmousi_94_288` 到 Deepwave 二维声学 FWI artifact 的最小
@@ -237,5 +237,7 @@ P0 不能防止尚未实现的 API/TaskService 竞态、进程丢失或取消失
 Web 确认卡、SSE、取消、lease、重试、reconciliation、DAG scheduler 或 Agent Planner。
 
 后续状态：SQLite/task identity/草稿、plan、approval 和 event 持久基础已在 P1.1a 实现；该
-事实不改变本节对历史 P0 切片边界的描述。P1.1a 详情见
-`docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md`。
+事实不改变本节对历史 P0 切片边界的描述。P1.1b 还增加了不可变 Dataset/Algorithm 注册
+快照、批准预算持久行和服务端 registry resolution，并补齐 plan/manifest port 集合一致性；
+仍没有 submit 或 Adapter。详情见 `docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md` 与
+`docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md`。

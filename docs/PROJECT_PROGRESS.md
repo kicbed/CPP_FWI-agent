@@ -6,10 +6,11 @@
 - 活跃决策：`D-003`、`D-004`；`D-005` 仍为 Proposed
 - 活跃分支：`feature/scientific-agent-runtime`
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
-- 总体状态：**P0 已完成并验证；P1 进行中，P1.1a SQLite 持久基础已验证**
+- 总体状态：**P0 已完成并验证；P1 进行中，P1.1a Task Store 与 P1.1b Registry 基础已验证**
 - 当前阶段：**P1（In progress；P1.1 为 Partially implemented）**
-- 下一动作：P1.1b/P1.2 持久化最小 Dataset Catalog/Algorithm Registry 快照，为同事务
-  Gate、批准预算和 submit 幂等建立前置条件；Deepwave Adapter 就绪前不进入 `Queued`
+- 下一动作：P1.2a 实现并验证固定 Deepwave Algorithm Adapter 能力边界；随后再把当前
+  registry/draft/plan/approval/budget、完整 Gate、submit idempotency 与首个 queued event 合并
+  为单 SQLite 事务。Adapter 就绪前不进入 `Queued`
 - 当前阻塞：无
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
 
@@ -22,8 +23,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | 阶段 | 状态 | 已完成内容 | 验证证据 | 下一出口条件 |
 |---|---|---|---|---|
 | 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
-| P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 一致性 | 合同当前 27/27；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 26/26、Web Python 7/7、UI/governance PASS | —（阶段完成） |
-| P1 最小持久垂直切片 | In progress | P1.1a：SQLite WAL Task Store、受项目/主体约束的 TaskService、持久 task/draft/plan/approval/event/create-idempotency；无 submit/queue 入口 | P1.1a 33/33、合同组合 60/60；CTest 39/39、runner 1/1、FWI 26/26、Web 13/13、UI/governance PASS | 完成 Catalog/Registry、同事务 Gate/批准预算/submit 幂等、Deepwave Adapter 和 Guided Web |
+| P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 28/28；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
+| P1 最小持久垂直切片 | In progress | P1.1a Task Store + P1.1b SQLite v2 immutable Catalog/Registry、批准预算持久行、服务端 snapshot 校验与固定 FWI 注册映射；无 submit/queue 入口 | Registry 22/22、TaskService 33/33、contract 28/28（组合 83/83）；CTest 39/39、runner 1/1、FWI 27/27、Web/embedding 13/13、UI/governance PASS | Deepwave Adapter、同事务 Gate/budget/submit 幂等与 Guided Web |
 | P2 持久可靠性加固 | Pending | 无 | 无 | lease、取消、重试、恢复和 SSE 通过 |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
@@ -40,8 +41,9 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 - 当前可运行基线是实验分支上的 Deepwave 二维声学 FWI MVP。
 - 现有 FWI 固定白名单、参数校验、独立 Worker 和 artifact 路由是迁移时必须保护的安全边界。
-- 当前通用 Orchestrator 仍以固定/单跳路由为主；独立 P1.1a 模块已有 SQLite 持久基础，
-  但尚无 submit/queue 入口、审批 API、DAG 调度、服务端取消或运行中断后的恢复。
+- 当前通用 Orchestrator 仍以固定/单跳路由为主；独立 P1.1a/P1.1b 模块已有 SQLite 持久
+  task/registry 基础，但尚无 submit/queue 入口、审批 API、DAG 调度、服务端取消或运行中断后的
+  恢复。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
 - 2026-07-15 用户的风险评估已收紧顺序：最小 FWI Schema 先行，最小 SQLite TaskService
   提前到首个垂直切片，Redis 不作为任务事实源，P4 Agent Planner 后置。
@@ -50,8 +52,9 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 ### 尚未开始或尚未完成
 
-- 没有部署运行数据库、Dataset Catalog/Algorithm Registry 注册、submit 事务或新 Web API；
-- P1.1 的 submit 幂等只预留了 migration 约束，尚无产品代码路径；
+- 没有部署运行数据库、submit 事务或新 Web API；Catalog/Registry 只有持久组件、受信任
+  bootstrap 和测试注册，不等于已部署服务；
+- P1.1 的 submit 幂等只预留了 migration 约束，批准预算也只持久化未消费，尚无产品提交路径；
 - 没有把现有 FWI 改造成通用 Algorithm Adapter。
 - 没有实现 Guided/Agent 新 UI、审批卡、DAG 或子 Agent 调度。
 
@@ -112,15 +115,32 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
   尚未实现；P3 前即使 v1 Schema 可表示 DAG，首个真实 submit 仍必须增加单 FWI 节点能力门；
 - D-005 未获批；本切片未审计、迁移或删除旧 prompt-like 文件，也未改变 `FWI_RUN_ROOT`。
 
-### 下一可执行切片：P1.1b/P1.2 前置注册
+### P1.1b Registry 基础验证（2026-07-15）
 
-1. 增加最小不可变 Dataset Catalog 和 Algorithm Registry 存储，先注册 Marmousi 数据与当前
-   Deepwave FWI 算法/版本/资源/输入输出快照；
-2. 用注册快照替代仅由调用方提供的 Gate 元数据，并明确批准预算的持久字段；
-3. 设计并测试 Gate、plan、approval、预算与 submit idempotency 的单 SQLite 事务，但在
-   Deepwave Adapter 可接管真实 FWI 提交前不暴露 `Queued` 产品入口；
-4. 保持固定 MCP 白名单、结构化校验、私有运行根和单节点能力门，不提前实现 P3 DAG；
-5. D-005 未获批，继续不审计、迁移或删除旧 prompt-like 文件。
+- `0002_catalog_registry.sql` 与有序 migration loader：fresh v2、带 task/approval 的 v1→v2
+  原位/并发升级、每版 name/checksum、失败全回滚和最终 schema/integrity 验证；
+- `dataset_versions`/`dataset_catalog`：跨项目共享不可变 core identity、项目 access snapshot、
+  精确 replay、版本共存、permission-scoped get/list、hash/index/schema 损坏 fail closed；
+- `algorithm_registry`：版本固定 manifest、allowlist 索引、参数 Schema/port 校验和不可变 replay；
+- `approval_budgets`：从既有/新增 approval 固化 max/tasks-used，读取时和 decision 交叉核对；
+  本切片不消费预算；
+- TaskService 从单 WAL read snapshot 解析注册 Dataset/Algorithm，拒绝未注册、metadata/hash/
+  scope/allowlist/task type/parameter/resource/I/O/side-effect 漂移；P0 Gate 同步要求 plan port 集合
+  精确匹配 manifest；
+- 固定 bootstrap 复用 Worker sidecar 与 NPY/MAT 双 hash 检查，生成无服务器路径的
+  `marmousi_94_288@1.0.0` DatasetRef；Deepwave manifest 是已审 metadata，但声明的标准 Adapter
+  尚不存在，不能据此执行；
+- `tests.test_scientific_runtime_registry` 22/22、TaskService 33/33、合同 28/28；完整回归见阶段表。
+
+### 下一可执行切片：P1.2a Deepwave Adapter
+
+1. 按 Algorithm Adapter v1 为固定 `deepwave.acoustic_fwi@1.0.0` 实现 validate/estimate/submit/
+   status/cancel/collect 的真实受控边界，继续复用固定模型、参数上限、私有运行根和安全 spawn；
+2. 先做 conformance/smoke fixture、handle/idempotency 与 artifact 路径/hash 测试，不能把当前
+   MCP 的“每次新 job”行为误报为幂等 Adapter；
+3. Adapter 就绪后，再实现 registry + current draft/plan/approval + budget + Gate + submit key +
+   `task_queued` 的单 SQLite 事务和 P1 单 FWI 节点 capability guard；
+4. 不提前实现 P2 cancel/reconciliation 或 P3 DAG；D-005 未获批，继续不迁移旧 prompt-like 文件。
 
 ## 新会话恢复协议
 
@@ -148,6 +168,7 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
 | 2026-07-15 | PREP-003 | Implemented → Verified | 真实新会话 branch/diff/ancestor/ledger/helper reconciliation | live preflight + governance tests：PASS | 准备阶段完成 |
 | 2026-07-15 | P0-001 | Pending → Verified | 七类 Schema、canonical/hash、Gate、fingerprint、状态/API/Adapter/Proto、威胁与差异审计 | contract 23/23、CTest 39/39、runner 1/1、FWI 26/26、Web 7/7、UI/governance：PASS | P0 阶段完成；P1.1 SQLite Task Store/TaskService |
 | 2026-07-15 | P1-001 / P1.1a | Pending → Verified（foundation）；P1.1 → Partially implemented | SQLite migration/store、受 scope 约束的 TaskService、task/draft/plan/approval/event/create-idempotency、Gate 补强 | contract 27/27、TaskService 33/33、组合 60/60；CTest 39/39、runner 1/1、FWI 26/26、Web 13/13、UI/governance PASS | P1.1b/P1.2 Catalog/Registry；同事务 submit 与 Adapter 仍 pending |
+| 2026-07-15 | P1-002 / P1.1b | Pending → Verified（registry foundation）；P1.1 仍 Partially implemented | SQLite v2 migration、immutable Catalog/Registry、approval budget 行、server-owned snapshot validation、path-free Marmousi/Deepwave registration | Registry 22/22、TaskService 33/33、contract 28/28；CTest 39/39、runner 1/1、FWI 27/27、Web/embedding 13/13、UI/governance PASS | P1.2a Deepwave Adapter；同事务 submit/Queued 仍 pending |
 
 记录规则：
 

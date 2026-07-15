@@ -449,6 +449,18 @@ def evaluate_execution_gate(
                 GateViolation("PARAMETER_SCHEMA_MISMATCH", node_path + "/parameters", "node parameters violate AlgorithmManifest parameter_schema")
             )
         manifest_inputs = {item["port"]: item["data_type"] for item in manifest["inputs"]}
+        planned_input_ports = [item["port"] for item in node["inputs"]]
+        if (
+            len(planned_input_ports) != len(set(planned_input_ports))
+            or set(planned_input_ports) != set(manifest_inputs)
+        ):
+            violations.append(
+                GateViolation(
+                    "INPUT_PORT_MISMATCH",
+                    node_path + "/inputs",
+                    "planned input ports must match AlgorithmManifest exactly",
+                )
+            )
         for input_index, binding in enumerate(node["inputs"]):
             dataset = binding["dataset"]
             input_path = f"{node_path}/inputs/{input_index}"
@@ -500,6 +512,18 @@ def evaluate_execution_gate(
                 )
 
         manifest_outputs = {item["port"]: item["data_type"] for item in manifest["outputs"]}
+        planned_output_ports = [item["port"] for item in node["outputs"]]
+        if (
+            len(planned_output_ports) != len(set(planned_output_ports))
+            or set(planned_output_ports) != set(manifest_outputs)
+        ):
+            violations.append(
+                GateViolation(
+                    "OUTPUT_PORT_MISMATCH",
+                    node_path + "/outputs",
+                    "planned output ports must match AlgorithmManifest exactly",
+                )
+            )
         for output_index, output in enumerate(node["outputs"]):
             if manifest_outputs.get(output["port"]) != output["data_type"]:
                 violations.append(
