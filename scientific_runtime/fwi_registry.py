@@ -20,7 +20,7 @@ from .registry_service import RegistryResult, RegistryService, RegistryValidatio
 
 
 DEEPWAVE_ALGORITHM_ID = "deepwave.acoustic_fwi"
-DEEPWAVE_ALGORITHM_VERSION = "1.3.0"
+DEEPWAVE_ALGORITHM_VERSION = "1.4.0"
 DEEPWAVE_LEGACY_ALGORITHM_VERSION = "1.0.0"
 DEEPWAVE_MANIFEST_PATHS = {
     DEEPWAVE_LEGACY_ALGORITHM_VERSION: (
@@ -32,8 +32,11 @@ DEEPWAVE_MANIFEST_PATHS = {
     "1.2.0": (
         Path(__file__).with_name("registrations") / "deepwave_acoustic_fwi_v1_2.json"
     ),
-    DEEPWAVE_ALGORITHM_VERSION: (
+    "1.3.0": (
         Path(__file__).with_name("registrations") / "deepwave_acoustic_fwi_v1_3.json"
+    ),
+    DEEPWAVE_ALGORITHM_VERSION: (
+        Path(__file__).with_name("registrations") / "deepwave_acoustic_fwi_v1_4.json"
     ),
 }
 

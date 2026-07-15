@@ -138,11 +138,15 @@ function loadGuidedFunctions() {
     'guidedLearningRateFromMilli',
     'validateGuidedFwiForm',
     'makeGuidedForm',
+    'normalizeGuidedPlanOutputs',
+    'expectedGuidedFwiPlanOutputs',
+    'hasExactGuidedFwiPlanOutputs',
     'normalizeGuidedTaskProjection',
     'isGuidedReviewReady',
     'isGuidedApprovedSubmitPending',
     'isGuidedApprovalCompleted',
     'normalizeGuidedArtifacts',
+    'isSafeGuidedBlobUrl',
     'guidedDispatchExplanation',
     'renderGuidedArtifactsHtml',
   ];
@@ -274,9 +278,10 @@ function loadConversationStorageFunctions(withCrypto = true) {
     };
   }
   const source = [
-    'const CHAT_SCHEMA_VERSION = 2;',
+    'const CHAT_SCHEMA_VERSION = 3;',
     'const MAX_STORED_CHATS = 50;',
     'const MAX_STORED_MESSAGES = 200;',
+    'const MAX_STORED_TASK_REFS = 50;',
     'const MAX_MESSAGE_CHARACTERS = 250000;',
     'let fallbackIdCounter = 0;',
     extractFunction('normalizeMode'),
@@ -288,13 +293,15 @@ function loadConversationStorageFunctions(withCrypto = true) {
     extractFunction('safeStorageRemove'),
     extractFunction('normalizeStoredMessage'),
     extractFunction('normalizeStoredFwiJob'),
+    extractFunction('normalizeStoredTaskRef'),
     extractFunction('createChatRecord'),
     extractFunction('normalizeStoredChat'),
     extractFunction('parseStoredChatState'),
     extractFunction('buildClearedChatState'),
+    extractFunction('serializeChatsForStorage'),
     `module.exports = {
       createStableId, createChatRecord, parseStoredChatState, buildClearedChatState,
-      safeStorageRead, safeStorageWrite, safeStorageRemove
+      safeStorageRead, safeStorageWrite, safeStorageRemove, serializeChatsForStorage
     };`,
   ].join('\n');
   vm.runInNewContext(source, sandbox);
@@ -691,7 +698,8 @@ function testFwiExecutionWithoutReceiptIsReportedHonestly() {
   const interceptAt = sendSource.indexOf('isFwiExecutionRequest(text)');
   const legacyDispatchAt = sendSource.indexOf("if (request.mode === 'http')");
   assert.ok(interceptAt >= 0 && interceptAt < legacyDispatchAt);
-  assert.match(sendSource, /openGuidedFwi\(guidedOverridesFromExecutionText\(text\)\)/);
+  assert.match(sendSource, /recordGuidedExecutionIntent\(chat\.id, text\)/);
+  assert.match(sendSource, /openGuidedFwi\(\{ \.\.\.guidedOverridesFromExecutionText\(text\), linkChatId: chat\.id \}\)/);
   assert.match(sendSource, /response\.fwiPayload/);
   assert.match(extractFunction('parseSSE'), /extractFwiPayload\(event\)/);
   assert.match(extractFunction('sendGrpc'), /fwiPayload:\s*extractFwiPayload\(data\)/);
@@ -750,10 +758,52 @@ function testFwiMissingImageFallback() {
   assert.deepEqual(removedClasses, ['hidden']);
 }
 
+function testLegacyFwiReceiptSectionOnlyAppearsForCompatibilityState() {
+  const section = new GuidedFakeElement('section');
+  section.classList.add('hidden');
+  const container = new GuidedFakeElement('div');
+  const sandbox = {
+    module: { exports: {} },
+    state: { fwiReceiptMissing: false, fwiJob: null },
+    document: {
+      getElementById(id) {
+        if (id === 'legacyFwiReceiptSection') return section;
+        if (id === 'experimentHistory') return container;
+        return null;
+      },
+    },
+    escapeHtml(value) { return String(value); },
+  };
+  vm.runInNewContext([
+    extractFunction('normalizeFwiJobId'),
+    extractFunction('renderExperimentHistory'),
+    'module.exports = { renderExperimentHistory };',
+  ].join('\n'), sandbox);
+  const render = sandbox.module.exports.renderExperimentHistory;
+
+  render();
+  assert.equal(section.classList.contains('hidden'), true);
+  assert.equal(container.innerHTML, '');
+
+  sandbox.state.fwiJob = { job_id: 'fwi-legacy-1', status: 'succeeded' };
+  render();
+  assert.equal(section.classList.contains('hidden'), false);
+  assert.match(container.innerHTML, /fwi-legacy-1/);
+
+  sandbox.state.fwiJob = null;
+  sandbox.state.fwiReceiptMissing = true;
+  render();
+  assert.equal(section.classList.contains('hidden'), false);
+  assert.match(container.innerHTML, /未创建任务/);
+  assert.doesNotMatch(extractFunction('renderExperimentHistory'), /尚未提交任务/);
+  assert.match(html, /旧版 FWI 会话回执（兼容）/);
+}
+
 function testHonestFwiControlsAndNoPlaceholderFeatures() {
   assert.match(html, /id="fwiQuickActions"/);
   assert.match(html, /Deepwave 2D Acoustic FWI/);
-  assert.match(html, /最近 FWI 任务/);
+  assert.match(html, /旧版 FWI 会话回执（兼容）/);
+  assert.match(html, /id="legacyFwiReceiptSection" class="hidden/);
   assert.match(html, /marmousi_94_288/);
   assert.match(html, /id="guidedFwiPanel"/);
   assert.match(html, /openGuidedFwi\(\{ preset: 'fwi_smoke', device: 'cuda', iterations: 2 \}\)/);
@@ -841,10 +891,45 @@ function testConversationStorageRecoveryIdentityAndClearing() {
     },
   });
   const restored = api.parseStoredChatState(envelope, '', 'http');
+  assert.equal(restored.schemaVersion, 3, 'v2 envelopes migrate to schema v3');
   assert.equal(restored.activeChatId, first.id);
   assert.equal(restored.mode, 'grpc');
   assert.equal(restored.chats[first.id].title, 'restored chat');
   assert.equal(restored.chats[first.id].fwiJob.job_id, 'fwi-safe-1');
+
+  const withStaleCache = api.parseStoredChatState(JSON.stringify({
+    schemaVersion: 3,
+    activeChatId: first.id,
+    mode: 'http',
+    chats: {
+      [first.id]: {
+        ...first,
+        taskRefs: [{
+          taskId: 'task-durable-1', linkedAt: 123, status: 'Succeeded',
+          resultReady: true, progressCompleted: 500, progressTotal: 500,
+        }],
+      },
+    },
+  }), '', 'http');
+  const migratedRef = withStaleCache.chats[first.id].taskRefs[0];
+  assert.equal(migratedRef.taskId, 'task-durable-1');
+  assert.equal(migratedRef.linkedAt, 123);
+  assert.equal(migratedRef.status, '', 'local status cache must not survive reload as task truth');
+  assert.equal(migratedRef.resultReady, false);
+  const serialized = api.serializeChatsForStorage({
+    [first.id]: {
+      ...first,
+      taskRefs: [{
+        taskId: 'task-durable-1', linkedAt: 123, status: 'Succeeded',
+        resultReady: true, progressCompleted: 500, progressTotal: 500,
+      }],
+    },
+  });
+  assert.deepEqual(
+    Object.keys(serialized[first.id].taskRefs[0]).sort(),
+    ['linkedAt', 'taskId'],
+    'localStorage payload keeps relationship identity only',
+  );
 
   const cleared = api.buildClearedChatState(restored.chats, first.id, 'grpc', false);
   assert.equal(cleared.chats[first.id], undefined);
@@ -885,6 +970,114 @@ function testHistoryUsesSafeDomAndDataAttributes() {
   assert.doesNotMatch(historySource, /onclick=.*loadChat/);
   assert.match(historySource, /dataset\.chatId/);
   assert.match(historySource, /addEventListener/);
+}
+
+function testExecutionIntentIsStoredBeforeIndependentDraft() {
+  const stored = [];
+  const rendered = [];
+  const elements = {
+    welcomeMsg: new GuidedFakeElement('div'),
+    messages: new GuidedFakeElement('div'),
+    chatTitle: new GuidedFakeElement('h2'),
+  };
+  const sandbox = {
+    module: { exports: {} },
+    state: { chats: { 'chat-1': { id: 'chat-1', title: 'FWI request' } } },
+    document: { getElementById(id) { return elements[id]; } },
+    appendStoredMessage(chatId, role, content) { stored.push({ chatId, role, content }); },
+    appendMessage(role, content) { rendered.push({ role, content }); },
+    renderHistory() {},
+  };
+  vm.runInNewContext([
+    extractFunction('recordGuidedExecutionIntent'),
+    'module.exports = { recordGuidedExecutionIntent };',
+  ].join('\n'), sandbox);
+  assert.equal(sandbox.module.exports.recordGuidedExecutionIntent('chat-1', '运行 500 次 FWI'), true);
+  assert.deepEqual(stored.map(item => item.role), ['user', 'system']);
+  assert.equal(stored[0].content, '运行 500 次 FWI');
+  assert.match(stored[1].content, /只打开独立任务草稿、尚未创建\/运行任务/);
+  assert.deepEqual(rendered.map(item => item.role), ['user', 'system']);
+  const submitSource = extractFunction('submitGuidedDraft');
+  assert.match(submitSource, /if \(!editing && state\.guided\.pendingLinkChatId\)/);
+  assert.match(submitSource, /linkTaskToChat\(state\.guided\.pendingLinkChatId, task\)/);
+  assert.doesNotMatch(html, /openGuidedFwi\(\{[^}]*linkChatId[^}]*\}\)[^<]*Demo CPU/);
+}
+
+function testConversationTaskLinksAreManyToManyAndIndependent() {
+  const sandbox = {
+    module: { exports: {} },
+    Date,
+    state: {
+      chatId: 'chat-a',
+      chats: {
+        'chat-a': { id: 'chat-a', taskRefs: [], time: 1 },
+        'chat-b': { id: 'chat-b', taskRefs: [], time: 2 },
+      },
+    },
+    persistChatState: () => true,
+    renderConversationTaskRefs() {},
+    renderHistory() {},
+  };
+  vm.runInNewContext([
+    'const MAX_STORED_TASK_REFS = 50;',
+    extractFunction('isSafeConversationId'),
+    extractFunction('normalizeStoredTaskRef'),
+    extractFunction('taskRefFromGuidedTask'),
+    extractFunction('isTaskReferencedByChat'),
+    extractFunction('linkTaskToChat'),
+    extractFunction('unlinkTaskFromChat'),
+    'module.exports = { linkTaskToChat, unlinkTaskFromChat, isTaskReferencedByChat };',
+  ].join('\n'), sandbox);
+  const task = {
+    taskId: 'task-shared-1', status: 'Running', visibilityRevision: 2, trashedAt: '',
+    draft: { goal: 'shared task', device: 'cuda', iterations: 500, optimizer: 'adam', learningRate: '10' },
+    adapter: { completed: 12, total: 500 },
+  };
+  const api = sandbox.module.exports;
+  assert.equal(api.linkTaskToChat('chat-a', task), true);
+  assert.equal(api.linkTaskToChat('chat-b', task), true);
+  assert.equal(api.isTaskReferencedByChat(sandbox.state.chats['chat-a'], task.taskId), true);
+  assert.equal(api.isTaskReferencedByChat(sandbox.state.chats['chat-b'], task.taskId), true);
+  assert.equal(api.unlinkTaskFromChat('chat-a', task.taskId), true);
+  assert.equal(api.isTaskReferencedByChat(sandbox.state.chats['chat-a'], task.taskId), false);
+  assert.equal(api.isTaskReferencedByChat(sandbox.state.chats['chat-b'], task.taskId), true);
+  assert.equal(task.status, 'Running', 'unlinking a conversation reference cannot mutate the task');
+}
+
+function testChatDeleteConfirmsAndRollsBackWhenStorageFails() {
+  const toasts = [];
+  const originalChats = {
+    'chat-a': { id: 'chat-a', title: 'active', taskRefs: [] },
+    'chat-b': { id: 'chat-b', title: 'delete me', taskRefs: [{ taskId: 'task-1', linkedAt: 1 }] },
+  };
+  const sandbox = {
+    module: { exports: {} },
+    window: { confirm: () => true },
+    state: {
+      chats: originalChats, chatId: 'chat-a', contextId: 'ctx-a', fwiJob: null,
+      preferredMode: 'http', mode: 'http',
+    },
+    persistChatState: () => false,
+    showToast(message) { toasts.push(message); },
+    renderHistory() { throw new Error('failed deletion must not rerender as success'); },
+    abortActiveRequest() {},
+    createChatRecord() { throw new Error('replacement not expected'); },
+    loadChat() { throw new Error('load not expected'); },
+  };
+  vm.runInNewContext([
+    extractFunction('isSafeConversationId'),
+    extractFunction('deleteChat'),
+    'module.exports = { deleteChat };',
+  ].join('\n'), sandbox);
+  assert.equal(sandbox.module.exports.deleteChat('chat-b'), false);
+  assert.equal(sandbox.state.chats, originalChats, 'storage failure restores the in-memory conversation set');
+  assert.ok(sandbox.state.chats['chat-b']);
+  assert.match(toasts[0], /未删除.*独立任务未受影响/);
+  for (const name of ['deleteChat', 'clearChat', 'clearAllChats']) {
+    const source = extractFunction(name);
+    assert.match(source, /window\.confirm/);
+    assert.doesNotMatch(source, /guidedApiRequest|trashGuidedTask|abandonGuidedFwi/);
+  }
 }
 
 function testRequestsAreBoundAndStreamFailuresAreNotReplayed() {
@@ -1030,7 +1223,7 @@ function makeGuidedTask(overrides = {}) {
       goal: '<img src=x onerror=alert(1)>',
       task_type: 'acoustic_fwi_2d',
       dataset: { id: 'marmousi_94_288', version: '1.0.0' },
-      algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
+      algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
       parameters: {
         preset: 'fwi_smoke', device: 'cpu', iterations: overrides.iterations ?? 2, seed: 0,
         optimizer: overrides.optimizer || 'adam',
@@ -1044,7 +1237,17 @@ function makeGuidedTask(overrides = {}) {
       task_type: 'acoustic_fwi_2d',
       nodes: [{
         node_id: 'invert',
-        algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
+        algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
+        outputs: [
+          { port: 'inverted_model', data_type: 'inverted_velocity_model_2d' },
+          { port: 'loss', data_type: 'loss_curve' },
+          { port: 'true_model_figure', data_type: 'figure' },
+          { port: 'initial_model_figure', data_type: 'figure' },
+          { port: 'inverted_model_figure', data_type: 'figure' },
+          { port: 'model_error_figure', data_type: 'figure' },
+          { port: 'shot_gathers_figure', data_type: 'figure' },
+          { port: 'loss_curve_figure', data_type: 'figure' },
+        ],
       }],
     },
     approval,
@@ -1221,6 +1424,14 @@ function testGuidedIdentifiersAndRoutesAreConstrained() {
     '/api/scientific-runtime/v1/tasks/task-safe%3A1/artifacts/artifact-loss-1',
   );
   assert.equal(api.guidedApiPath('task', '../escape'), '');
+  assert.equal(
+    api.guidedApiPath('trash', 'task-safe:1'),
+    '/api/scientific-runtime/v1/tasks/task-safe%3A1/trash',
+  );
+  assert.equal(
+    api.guidedApiPath('restore', 'task-safe:1'),
+    '/api/scientific-runtime/v1/tasks/task-safe%3A1/restore',
+  );
   assert.equal(api.guidedApiPath('artifact', 'task-1', "bad'id"), '');
   assert.equal(api.guidedApiPath('unknown', 'task-1'), '');
 
@@ -1234,7 +1445,7 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   const api = loadGuidedFunctions();
   const catalog = {
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
   };
   const reviewTask = api.normalizeGuidedTaskProjection(makeGuidedTask());
   assert.equal(api.isGuidedReviewReady(reviewTask, catalog), true);
@@ -1290,12 +1501,24 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   });
   legacyProjection.draft.algorithm.version = '1.1.0';
   legacyProjection.plan.nodes[0].algorithm.version = '1.1.0';
+  legacyProjection.plan.nodes[0].outputs = legacyProjection.plan.nodes[0].outputs.slice(0, 2);
   delete legacyProjection.draft.parameters.optimizer;
   delete legacyProjection.draft.parameters.learning_rate_milli;
   const normalizedLegacy = api.normalizeGuidedTaskProjection(legacyProjection);
   assert.ok(normalizedLegacy, 'complete 1.0/1.1 projections remain readable');
   assert.equal(normalizedLegacy.draft.optimizer, '');
   assert.equal(normalizedLegacy.draft.learningRate, null);
+  const currentMissingFigures = makeGuidedTask();
+  currentMissingFigures.plan.nodes[0].outputs = currentMissingFigures.plan.nodes[0].outputs.slice(0, 2);
+  assert.equal(
+    api.normalizeGuidedTaskProjection(currentMissingFigures),
+    null,
+    'Algorithm 1.4 cannot silently fall back to the historical two-output contract',
+  );
+  const currentWrongFigurePort = makeGuidedTask();
+  currentWrongFigurePort.plan.nodes[0].outputs[2].port = 'unexpected_figure';
+  assert.equal(api.normalizeGuidedTaskProjection(currentWrongFigurePort), null);
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask()).plan.outputs.length, 8);
   const planHash = `sha256:${'a'.repeat(64)}`;
   for (const malformed of [
     { task_id: 'task-guided-1' },
@@ -1337,9 +1560,9 @@ function testGuidedArtifactManifestsUseControlledDownloads() {
       makeGuidedManifest('loss_curve', 'artifact-other-task', { task_id: 'other-task' }),
     ],
   };
-  const artifacts = api.normalizeGuidedArtifacts(raw, 'task-guided-1');
+  assert.equal(api.normalizeGuidedArtifacts(raw, 'task-guided-1').length, 0);
+  const artifacts = api.normalizeGuidedArtifacts(raw.artifacts.slice(0, 2), 'task-guided-1');
   assert.equal(artifacts.length, 2);
-  assert.equal(api.normalizeGuidedArtifacts(raw.artifacts.slice(0, 2), 'task-guided-1').length, 2);
   const rendered = api.renderGuidedArtifactsHtml('task-guided-1', artifacts);
   assert.equal((rendered.match(/data-guided-artifact=/g) || []).length, 2);
   assert.match(rendered, /ArtifactManifest/);
@@ -1352,6 +1575,236 @@ function testGuidedArtifactManifestsUseControlledDownloads() {
   assert.match(incomplete, /onclick="loadGuidedArtifacts\(\)"/);
   assert.match(incomplete, /重新获取 artifacts（GET）/);
   assert.match(incomplete, /不会重试 Worker 或创建新任务/);
+}
+
+function makeCurrentGuidedArtifacts() {
+  const outputs = [
+    { port: 'inverted_model', dataType: 'inverted_velocity_model_2d' },
+    { port: 'loss', dataType: 'loss_curve' },
+    { port: 'true_model_figure', dataType: 'figure' },
+    { port: 'initial_model_figure', dataType: 'figure' },
+    { port: 'inverted_model_figure', dataType: 'figure' },
+    { port: 'model_error_figure', dataType: 'figure' },
+    { port: 'shot_gathers_figure', dataType: 'figure' },
+    { port: 'loss_curve_figure', dataType: 'figure' },
+  ];
+  const artifacts = outputs.map((output, index) => {
+    const isFigure = output.dataType === 'figure';
+    return makeGuidedManifest(output.dataType, `artifact-${output.port}`, {
+      artifact_type: output.dataType,
+      media_type: isFigure ? 'image/png'
+        : (output.dataType === 'loss_curve' ? 'text/csv' : 'application/x-npy'),
+      size_bytes: isFigure ? 4 : 42,
+      display: {
+        component: isFigure ? 'image'
+          : (output.dataType === 'loss_curve' ? 'line_chart' : 'download'),
+        title: `result ${index}`,
+        order: index,
+      },
+      extensions: {
+        'org.agent_rpc.adapter': { output_port: output.port },
+        ...(isFigure ? {
+          'org.agent_rpc.figure': { width_px: 1440, height_px: 608 },
+        } : {}),
+      },
+    });
+  });
+  return { outputs, artifacts };
+}
+
+function testCurrentEightAndHistoricalTwoArtifactContracts() {
+  const api = loadGuidedFunctions();
+  const current = makeCurrentGuidedArtifacts();
+  const normalized = api.normalizeGuidedArtifacts(
+    { artifacts: current.artifacts }, 'task-guided-1', current.outputs,
+  );
+  assert.equal(normalized.length, 8);
+  assert.equal(normalized.filter(item => item.mediaType === 'image/png').length, 6);
+  const objectUrls = Object.fromEntries(
+    normalized.filter(item => item.mediaType === 'image/png')
+      .map(item => [item.artifactId, `blob:guided/${item.artifactId}`]),
+  );
+  const rendered = api.renderGuidedArtifactsHtml(
+    'task-guided-1', normalized, current.outputs, objectUrls, {},
+  );
+  assert.equal((rendered.match(/<img src="blob:/g) || []).length, 6);
+  assert.equal((rendered.match(/data-guided-artifact=/g) || []).length, 8);
+  assert.doesNotMatch(rendered, /\/fwi-artifacts|worker_job_id|relative_path/);
+
+  const historicalOutputs = current.outputs.slice(0, 2);
+  const historical = api.normalizeGuidedArtifacts(
+    { artifacts: current.artifacts.slice(0, 2) }, 'task-guided-1', historicalOutputs,
+  );
+  assert.equal(historical.length, 2, 'historical exact two-output plans remain readable');
+
+  const duplicatePort = structuredClone(current.artifacts);
+  duplicatePort[7].extensions['org.agent_rpc.adapter'].output_port = 'true_model_figure';
+  assert.equal(api.normalizeGuidedArtifacts(
+    { artifacts: duplicatePort }, 'task-guided-1', current.outputs,
+  ).length, 0, 'duplicate output_port fails closed');
+  const wrongComponent = structuredClone(current.artifacts);
+  wrongComponent[2].display.component = 'download';
+  assert.equal(api.normalizeGuidedArtifacts(
+    { artifacts: wrongComponent }, 'task-guided-1', current.outputs,
+  ).length, 0, 'PNG outputs must use the image component');
+}
+
+async function testGuidedImageBlobLoadingIsBoundedAndRevoked() {
+  const current = makeCurrentGuidedArtifacts();
+  const images = current.artifacts.slice(2).map(item => ({
+    artifactId: item.artifact_id,
+    taskId: item.task_id,
+    mediaType: 'image/png',
+    sizeBytes: item.size_bytes,
+  }));
+  const requests = [];
+  const revoked = [];
+  let counter = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const sandbox = {
+    module: { exports: {} },
+    state: {
+      guided: {
+        taskId: 'task-guided-1', generation: 4, csrfToken: 'csrf-token-1234567890',
+        artifacts: images, artifactObjectUrls: Object.create(null),
+        artifactImageErrors: Object.create(null),
+      },
+    },
+    URL: {
+      createObjectURL() { counter += 1; return `blob:guided/image-${counter}`; },
+      revokeObjectURL(value) { revoked.push(value); },
+    },
+    guidedApiPath(_resource, taskId, artifactId) {
+      return `/api/scientific-runtime/v1/tasks/${taskId}/artifacts/${artifactId}`;
+    },
+    async fetch(path, options) {
+      requests.push({ path, options });
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      const mismatch = path.endsWith(images[2].artifactId);
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'image/png' },
+        async blob() {
+          inFlight -= 1;
+          return { size: mismatch ? 5 : 4 };
+        },
+      };
+    },
+    renderGuidedFwi() {},
+  };
+  vm.runInNewContext([
+    extractFunction('isSafeGuidedOpaqueId'),
+    extractFunction('isSafeGuidedBlobUrl'),
+    extractFunction('revokeGuidedArtifactObjectUrls'),
+    `async ${extractFunction('loadGuidedArtifactImages')}`,
+    'module.exports = { loadGuidedArtifactImages, revokeGuidedArtifactObjectUrls };',
+  ].join('\n'), sandbox);
+  const api = sandbox.module.exports;
+  assert.equal(await api.loadGuidedArtifactImages({ render: false }), false);
+  assert.equal(requests.length, 6);
+  assert.equal(maxInFlight, 1, 'image loading stays sequential and memory-bounded');
+  assert.equal(Object.keys(sandbox.state.guided.artifactObjectUrls).length, 5);
+  assert.equal(sandbox.state.guided.artifactImageErrors[images[2].artifactId], true);
+  requests.forEach(({ path, options }) => {
+    assert.match(path, /^\/api\/scientific-runtime\/v1\/tasks\/task-guided-1\/artifacts\//);
+    assert.doesNotMatch(path, /fwi-artifacts/);
+    assert.equal(options.headers['X-Workbench-CSRF'], 'csrf-token-1234567890');
+  });
+  api.revokeGuidedArtifactObjectUrls();
+  assert.equal(revoked.length, 5);
+  assert.equal(Object.keys(sandbox.state.guided.artifactObjectUrls).length, 0);
+  assert.match(extractFunction('closeGuidedFwi'), /revokeGuidedArtifactObjectUrls\(\)/);
+  assert.match(extractFunction('reopenGuidedTask'), /revokeGuidedArtifactObjectUrls\(\)/);
+  assert.match(extractFunction('changeGuidedTaskVisibility'), /revokeGuidedArtifactObjectUrls\(\)/);
+}
+
+async function testGuidedImageRetriesAreSingleFlightAndStaleSafe() {
+  const imageArtifact = {
+    taskId: 'task-guided-1', artifactId: 'artifact-figure-1',
+    mediaType: 'image/png', sizeBytes: 4,
+  };
+  const requests = [];
+  const revoked = [];
+  let created = 0;
+  let gate = null;
+  const makeGate = () => {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  const sandbox = {
+    module: { exports: {} },
+    state: {
+      guided: {
+        taskId: 'task-guided-1', generation: 4, csrfToken: 'csrf-token-1234567890',
+        artifacts: [imageArtifact], artifactObjectUrls: Object.create(null),
+        artifactImageErrors: Object.create(null), artifactImageLoadInFlight: false,
+        artifactImageGeneration: 0,
+      },
+    },
+    URL: {
+      createObjectURL() { created += 1; return `blob:guided/single-flight-${created}`; },
+      revokeObjectURL(value) { revoked.push(value); },
+    },
+    guidedApiPath(_resource, taskId, artifactId) {
+      return `/api/scientific-runtime/v1/tasks/${taskId}/artifacts/${artifactId}`;
+    },
+    async fetch(path) {
+      requests.push(path);
+      const currentGate = gate;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'image/png' },
+        async blob() {
+          await currentGate.promise;
+          return { size: 4 };
+        },
+      };
+    },
+    renderGuidedFwi() {},
+  };
+  vm.runInNewContext([
+    extractFunction('isSafeGuidedOpaqueId'),
+    extractFunction('isSafeGuidedBlobUrl'),
+    extractFunction('revokeGuidedArtifactObjectUrls'),
+    `async ${extractFunction('loadGuidedArtifactImages')}`,
+    'module.exports = { loadGuidedArtifactImages, revokeGuidedArtifactObjectUrls };',
+  ].join('\n'), sandbox);
+  const api = sandbox.module.exports;
+
+  gate = makeGate();
+  const first = api.loadGuidedArtifactImages({ render: false });
+  await Promise.resolve();
+  assert.equal(requests.length, 1);
+  assert.equal(
+    await api.loadGuidedArtifactImages({ render: false }),
+    false,
+    'a repeated retry must join/reject the existing global image load instead of fetching again',
+  );
+  assert.equal(requests.length, 1);
+  sandbox.state.guided.artifactObjectUrls[imageArtifact.artifactId] = 'blob:guided/older-url';
+  gate.resolve();
+  assert.equal(await first, true);
+  assert.ok(revoked.includes('blob:guided/older-url'), 'a replaced Blob URL is revoked');
+  assert.equal(
+    sandbox.state.guided.artifactObjectUrls[imageArtifact.artifactId],
+    'blob:guided/single-flight-1',
+  );
+
+  api.revokeGuidedArtifactObjectUrls();
+  gate = makeGate();
+  const stale = api.loadGuidedArtifactImages({ render: false });
+  await Promise.resolve();
+  const createdBeforeInvalidation = created;
+  api.revokeGuidedArtifactObjectUrls();
+  gate.resolve();
+  assert.equal(await stale, false);
+  assert.equal(created, createdBeforeInvalidation, 'an invalidated response cannot create a Blob URL');
+  assert.equal(Object.keys(sandbox.state.guided.artifactObjectUrls).length, 0);
 }
 
 function testGuidedCatalogProjectionDoesNotExposePaths() {
@@ -1398,7 +1851,7 @@ function testGuidedApprovalCannotBeBypassedOrReplayedAutomatically() {
 
   const sendSource = extractFunction('sendMessage');
   assert.ok(sendSource.indexOf('isFwiExecutionRequest(text)') < sendSource.indexOf('state.activeRequest = request'));
-  assert.match(sendSource, /openGuidedFwi\(guidedOverridesFromExecutionText\(text\)\)/);
+  assert.match(sendSource, /openGuidedFwi\(\{ \.\.\.guidedOverridesFromExecutionText\(text\), linkChatId: chat\.id \}\)/);
   assert.equal(loadUiFunctions().api.isFwiExecutionRequest('什么是 FWI？请解释原理'), false);
 
   const approveSource = extractFunction('approveGuidedFwi');
@@ -1525,7 +1978,7 @@ async function testGuidedApproveFourXxRetainsOriginalKeyThroughGetRecovery() {
   const planHash = `sha256:${'b'.repeat(64)}`;
   const catalog = {
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
   };
   const noApprovalProjection = makeGuidedTask({ task_id: taskId, plan_hash: planHash });
   const approvedSubmitPendingProjection = makeGuidedTask({
@@ -1651,6 +2104,9 @@ async function testGuidedApproveFourXxRetainsOriginalKeyThroughGetRecovery() {
     extractFunction('guidedLearningRateValue'),
     extractFunction('guidedLearningRateFromMilli'),
     extractFunction('validateGuidedFwiForm'),
+    extractFunction('normalizeGuidedPlanOutputs'),
+    extractFunction('expectedGuidedFwiPlanOutputs'),
+    extractFunction('hasExactGuidedFwiPlanOutputs'),
     extractFunction('normalizeGuidedTaskProjection'),
     extractFunction('isGuidedReviewReady'),
     extractFunction('isGuidedApprovedSubmitPending'),
@@ -1839,6 +2295,8 @@ async function testGuidedSucceededRefreshRendersArtifactsOnce() {
       { taskId: expectedTaskId, artifactId: 'artifact-model' },
       { taskId: expectedTaskId, artifactId: 'artifact-loss' },
     ],
+    revokeGuidedArtifactObjectUrls() {},
+    async loadGuidedArtifactImages() { return true; },
     isGuidedApprovedSubmitPending: () => false,
     upsertGuidedTaskIndex() {},
     scheduleGuidedPoll() {},
@@ -1874,10 +2332,11 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
     },
   };
   const source = [
-    "const state = { guided: { taskId: '', taskIndex: [], taskIndexCursor: '', taskIndexPage: 0, taskIndexLoading: false, taskIndexError: '' } };",
-    'const reopenCalls = []; const taskIndexLoads = [];',
+    "const state = { guided: { taskId: '', taskIndex: [], taskIndexCursor: '', taskIndexPage: 0, taskIndexLoading: false, taskIndexError: '', taskIndexView: 'active' } };",
+    'const reopenCalls = []; const taskIndexLoads = []; const trashCalls = []; const restoreCalls = [];',
     'function reopenGuidedTask(taskId) { reopenCalls.push(taskId); }',
     'function loadGuidedTaskIndex(options) { taskIndexLoads.push(options); }',
+    'function trashGuidedTask(taskId) { trashCalls.push(taskId); } function restoreGuidedTask(taskId) { restoreCalls.push(taskId); }',
     extractFunction('isSafeGuidedOpaqueId'),
     extractFunction('isSafeGuidedIdentifier'),
     extractFunction('isSafeGuidedVersion'),
@@ -1885,8 +2344,9 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
     extractFunction('guidedIntegerValue'),
     extractFunction('guidedLearningRateFromMilli'),
     extractFunction('normalizeGuidedTaskIndexPage'),
+    extractFunction('isGuidedTerminalState'),
     extractFunction('renderGuidedTaskIndex'),
-    'module.exports = { state, reopenCalls, taskIndexLoads, normalizeGuidedTaskIndexPage, renderGuidedTaskIndex };',
+    'module.exports = { state, reopenCalls, taskIndexLoads, trashCalls, restoreCalls, normalizeGuidedTaskIndexPage, renderGuidedTaskIndex };',
   ].join('\n');
   vm.runInNewContext(source, sandbox);
   const api = sandbox.module.exports;
@@ -1895,7 +2355,7 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
     tasks: [
       {
         task_id: 'task-safe:1', status: 'Running', goal: maliciousGoal,
-        algorithm: { id: '<script>alert(1)</script>', version: '1.3.0' },
+        algorithm: { id: '<script>alert(1)</script>', version: '1.4.0' },
         preset: 'fwi_smoke', device: 'cuda', iterations: 50, seed: 0,
         optimizer: 'adam', learning_rate_milli: 10000,
         relative_path: '../../../../etc/passwd', artifact_url: 'javascript:alert(1)',
@@ -1913,10 +2373,31 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
   assert.equal(Object.hasOwn(page.tasks[0], 'relative_path'), false);
   assert.equal(Object.hasOwn(page.tasks[0], 'artifact_url'), false);
 
+  const maxTaskId = 't'.repeat(128);
+  for (const viewPrefix of ['a', 't']) {
+    const encoded = Buffer.from(`${viewPrefix}:${maxTaskId}`, 'ascii')
+      .toString('base64url');
+    const maxCursor = `v1_${encoded}`;
+    assert.equal(encoded.length, 174);
+    assert.equal(
+      api.normalizeGuidedTaskIndexPage({ tasks: [], next_cursor: maxCursor }).nextCursor,
+      maxCursor,
+      'the frontend must retain a maximum-length active/trash view-bound cursor',
+    );
+  }
+  assert.equal(
+    api.normalizeGuidedTaskIndexPage({
+      tasks: [], next_cursor: `v1_${'A'.repeat(176)}`,
+    }).nextCursor,
+    '',
+  );
+
   api.state.guided.taskIndex = page.tasks;
   api.renderGuidedTaskIndex();
   assert.equal(container.children.length, 1);
-  const button = container.children[0];
+  const row = container.children[0];
+  const button = row.children[0];
+  assert.equal(row.children.length, 1, 'a Running task cannot be moved to trash');
   const header = button.children[0];
   const label = header.children[0];
   assert.equal(label.textContent, maliciousGoal);
@@ -1926,6 +2407,25 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
   button.listeners.click();
   assert.deepEqual(Array.from(api.reopenCalls), ['task-safe:1']);
 
+  api.state.guided.taskIndex[0].status = 'Succeeded';
+  api.renderGuidedTaskIndex();
+  const terminalRow = container.children[0];
+  assert.equal(terminalRow.children[1].textContent, '删除');
+  terminalRow.children[1].listeners.click();
+  assert.deepEqual(Array.from(api.trashCalls), ['task-safe:1']);
+  api.state.guided.taskIndexView = 'trash';
+  api.renderGuidedTaskIndex();
+  const trashRow = container.children[0];
+  assert.equal(trashRow.children[1].textContent, '恢复');
+  trashRow.children[1].listeners.click();
+  assert.deepEqual(Array.from(api.restoreCalls), ['task-safe:1']);
+  const visibilitySource = extractFunction('changeGuidedTaskVisibility');
+  assert.match(visibilitySource, /expected_visibility_revision: summary\.visibilityRevision/);
+  assert.match(visibilitySource, /isGuidedTerminalState\(summary\.status\)/);
+  assert.match(extractFunction('loadGuidedTaskIndex'), /\?view=\$\{view\}&limit=20/);
+  assert.match(extractFunction('setGuidedTaskIndexView'), /supersede: true/);
+
+  api.state.guided.taskIndexView = 'active';
   api.state.guided.taskIndexPage = 5;
   api.state.guided.taskIndexCursor = 'v1_ab';
   api.renderGuidedTaskIndex();
@@ -1938,12 +2438,74 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
   assert.equal(api.taskIndexLoads[0].reset, true);
 }
 
+async function testGuidedTaskIndexDiscardsStaleCrossViewResponses() {
+  const pending = Object.create(null);
+  const requests = [];
+  const refUpdates = [];
+  const makeDeferred = () => {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  pending.active = makeDeferred();
+  pending.trash = makeDeferred();
+  const sandbox = {
+    module: { exports: {} },
+    state: {
+      guided: {
+        csrfToken: 'csrf-token-abcdefghijkl', session: {}, taskIndex: [],
+        taskIndexCursor: '', taskIndexPage: 0, taskIndexLoading: false,
+        taskIndexLoaded: false, taskIndexError: '', taskIndexView: 'active',
+        taskIndexRequestGeneration: 0,
+      },
+    },
+    isSafeGuidedCsrfToken: () => true,
+    guidedApiPath: () => '/api/scientific-runtime/v1/tasks',
+    renderGuidedTaskIndex() {},
+    renderConversationTaskRefs() {},
+    updateTaskRefCaches(task) { refUpdates.push(task.taskId); },
+    normalizeGuidedTaskIndexPage(value) { return value; },
+    async guidedApiRequest(path) {
+      requests.push(path);
+      return path.includes('view=trash') ? pending.trash.promise : pending.active.promise;
+    },
+  };
+  vm.runInNewContext([
+    `async ${extractFunction('loadGuidedTaskIndex')}`,
+    'module.exports = { loadGuidedTaskIndex };',
+  ].join('\n'), sandbox);
+  const load = sandbox.module.exports.loadGuidedTaskIndex;
+
+  const activeRequest = load({ reset: true });
+  sandbox.state.guided.taskIndexView = 'trash';
+  const trashRequest = load({ reset: true, supersede: true });
+  assert.deepEqual(requests, [
+    '/api/scientific-runtime/v1/tasks?view=active&limit=20',
+    '/api/scientific-runtime/v1/tasks?view=trash&limit=20',
+  ]);
+  pending.trash.resolve({ tasks: [{ taskId: 'task-trash' }], nextCursor: '' });
+  assert.equal(await trashRequest, true);
+  assert.deepEqual(
+    sandbox.state.guided.taskIndex.map(item => item.taskId),
+    ['task-trash'],
+  );
+  pending.active.resolve({ tasks: [{ taskId: 'task-active-stale' }], nextCursor: '' });
+  assert.equal(await activeRequest, false);
+  assert.deepEqual(
+    sandbox.state.guided.taskIndex.map(item => item.taskId),
+    ['task-trash'],
+    'the superseded active response cannot land in the trash tab',
+  );
+  assert.deepEqual(refUpdates, ['task-trash'], 'stale list data cannot refresh conversation caches');
+  assert.equal(sandbox.state.guided.taskIndexLoading, false);
+}
+
 async function testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursorAdvance() {
   const allTasks = Array.from({ length: 125 }, (_, index) => ({
     task_id: `task-page-${String(index).padStart(3, '0')}`,
     status: index % 2 === 0 ? 'Succeeded' : 'Running',
     goal: `durable task ${index}`,
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
     preset: 'fwi_smoke',
     device: 'cuda',
     iterations: 2,
@@ -1986,9 +2548,12 @@ async function testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursor
         taskIndexLoading: false,
         taskIndexLoaded: false,
         taskIndexError: '',
+        taskIndexView: 'active',
       },
     },
     renderGuidedTaskIndex() { renders += 1; },
+    updateTaskRefCaches() {},
+    renderConversationTaskRefs() {},
     async guidedApiRequest(path) {
       requests.push(path);
       const match = /[?&]cursor=([^&]+)/.exec(path);
@@ -2084,7 +2649,7 @@ function createGuidedRecoveryHarness(task, approvedSubmitPending = false) {
         phase: 'monitoring',
         csrfToken: 'csrf-token-1234567890',
         session: { mode: 'guided' },
-        catalog: { algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' } },
+        catalog: { algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' } },
         form: null,
         task,
         taskId: task.taskId,
@@ -2104,9 +2669,14 @@ function createGuidedRecoveryHarness(task, approvedSubmitPending = false) {
         taskIndexLoading: false,
         taskIndexLoaded: true,
         taskIndexError: '',
+        taskIndexView: 'active',
+        artifactObjectUrls: Object.create(null),
+        artifactImageErrors: Object.create(null),
       },
     },
     clearGuidedPoll() {},
+    revokeGuidedArtifactObjectUrls() {},
+    updateTaskRefCaches() {},
     renderGuidedFwi() { guidedRenders += 1; },
     renderGuidedTaskIndex() { taskIndexRenders += 1; },
     showToast(message) { toasts.push(message); },
@@ -2118,7 +2688,7 @@ function createGuidedRecoveryHarness(task, approvedSubmitPending = false) {
       throw new Error(`unexpected path ${path}`);
     },
     normalizeGuidedSession: () => ({ csrfToken: 'csrf-token-abcdefghijkl', mode: 'guided' }),
-    normalizeGuidedCatalog: () => ({ algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' } }),
+    normalizeGuidedCatalog: () => ({ algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' } }),
     normalizeGuidedTaskProjection: (_data, expectedTaskId) => (
       expectedTaskId === task.taskId ? task : null
     ),
@@ -2202,7 +2772,7 @@ async function testGuidedCloseRetainsIndexAndReopensThroughGets() {
   ]);
   assert.equal(harness.sandbox.state.guided.taskId, task.taskId);
   assert.equal(harness.sandbox.state.guided.task, task);
-  assert.equal(harness.sandbox.state.guided.catalog.algorithm.version, '1.3.0');
+  assert.equal(harness.sandbox.state.guided.catalog.algorithm.version, '1.4.0');
   assert.equal(
     harness.sandbox.state.guided.task.draft.algorithmVersion,
     '1.2.0',
@@ -2255,10 +2825,14 @@ async function main() {
   testFwiExecutionWithoutReceiptIsReportedHonestly();
   testFwiResultMetricsImagesAndEscaping();
   testFwiMissingImageFallback();
+  testLegacyFwiReceiptSectionOnlyAppearsForCompatibilityState();
   testHonestFwiControlsAndNoPlaceholderFeatures();
   testGrpcModeIsHealthGatedAndFallsBack();
   testConversationStorageRecoveryIdentityAndClearing();
   testHistoryUsesSafeDomAndDataAttributes();
+  testExecutionIntentIsStoredBeforeIndependentDraft();
+  testConversationTaskLinksAreManyToManyAndIndependent();
+  testChatDeleteConfirmsAndRollsBackWhenStorageFails();
   testRequestsAreBoundAndStreamFailuresAreNotReplayed();
   await testHttpFailureIsNotAutomaticallyReplayed();
   await testLegacyFwiSubmitIsDeniedByEveryChatTransport();
@@ -2269,6 +2843,9 @@ async function main() {
   testGuidedIdentifiersAndRoutesAreConstrained();
   testGuidedTaskAndCrashStatesAreHonest();
   testGuidedArtifactManifestsUseControlledDownloads();
+  testCurrentEightAndHistoricalTwoArtifactContracts();
+  await testGuidedImageBlobLoadingIsBoundedAndRevoked();
+  await testGuidedImageRetriesAreSingleFlightAndStaleSafe();
   testGuidedCatalogProjectionDoesNotExposePaths();
   testGuidedApprovalCannotBeBypassedOrReplayedAutomatically();
   await testGuidedApprovedSubmitPendingStopsPolling();
@@ -2277,6 +2854,7 @@ async function main() {
   testGuidedPollingPreservesReaderScrollPosition();
   await testGuidedSucceededRefreshRendersArtifactsOnce();
   testGuidedTaskIndexUsesSafeNormalizedDomText();
+  await testGuidedTaskIndexDiscardsStaleCrossViewResponses();
   await testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursorAdvance();
   await testGuidedCloseRetainsIndexAndReopensThroughGets();
   await testRecoveredApprovedPendingTaskIsFailClosed();

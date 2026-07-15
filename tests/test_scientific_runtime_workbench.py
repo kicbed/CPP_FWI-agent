@@ -60,8 +60,8 @@ def legacy_guided_form(**changes):
 
 def development_fingerprint() -> dict:
     value = fingerprint()
-    value["algorithm"]["version"] = "1.3.0"
-    value["adapter_version"] = "1.3.0"
+    value["algorithm"]["version"] = "1.4.0"
+    value["adapter_version"] = "1.4.0"
     value["provenance_mode"] = "development"
     value["source"] = {"identity_complete": False, "dirty": None}
     return value
@@ -84,7 +84,7 @@ class FakeDispatcher:
         ]
         return DispatchPreparation(
             adapter_id="fwi.deepwave_adapter",
-            adapter_version="1.3.0",
+            adapter_version="1.4.0",
             request=request,
             queue_fingerprint=queue_fingerprint,
         )
@@ -131,7 +131,7 @@ class FakeDispatcher:
         values = self.collect(intent)
         if artifact_id != values[0]["artifact_id"]:
             raise AssertionError("unexpected artifact id")
-        return values[0], b"artifact-test-bytes"
+        return values, values[0], b"artifact-test-bytes"
 
 
 class ScientificRuntimeWorkbenchTest(unittest.TestCase):
@@ -224,6 +224,28 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             "extensions": {},
         }
 
+    def historical_optimizer_draft(
+        self,
+        *,
+        version: str,
+        form: dict,
+        draft_id: str,
+        revision: int,
+    ) -> tuple[dict, dict]:
+        manifest = load_deepwave_manifest(version)
+        self.registry.register_algorithm(manifest=manifest)
+        normalized, dataset, _, _ = self.workbench._validated_form(form)
+        return (
+            self.workbench._draft(
+                form=normalized,
+                dataset=dataset,
+                manifest=manifest,
+                draft_id=draft_id,
+                revision=revision,
+            ),
+            manifest,
+        )
+
     def test_capabilities_and_catalog_are_fixed_scoped_and_path_free(self) -> None:
         capabilities = self.workbench.session_capabilities()
         self.assertEqual(capabilities["mode"], "guided")
@@ -262,7 +284,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertEqual(
             capabilities["algorithm"],
-            {"id": "deepwave.acoustic_fwi", "version": "1.3.0"},
+            {"id": "deepwave.acoustic_fwi", "version": "1.4.0"},
         )
         self.assertEqual(
             capabilities["capabilities"],
@@ -280,7 +302,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(catalog["datasets"][0]["id"], "marmousi_94_288")
         self.assertNotIn("access_scope", catalog["datasets"][0])
         self.assertEqual(len(catalog["algorithms"]), 1)
-        self.assertEqual(catalog["algorithms"][0]["version"], "1.3.0")
+        self.assertEqual(catalog["algorithms"][0]["version"], "1.4.0")
         serialized = repr(catalog)
         self.assertNotIn("entrypoint_ref", serialized)
         self.assertNotIn("/root/", serialized)
@@ -295,6 +317,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(len(snapshot.plan["nodes"]), 1)
         self.assertEqual(snapshot.plan["nodes"][0]["node_id"], "invert")
         self.assertEqual(snapshot.plan["nodes"][0]["dependencies"], [])
+        self.assertEqual(len(snapshot.plan["nodes"][0]["outputs"]), 8)
         self.assertEqual(snapshot.draft["resources"]["gpu_count"], 1)
         self.assertEqual(snapshot.draft["schema_version"], "1.1.0")
         self.assertEqual(snapshot.plan["schema_version"], "1.1.0")
@@ -364,7 +387,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         current = self.workbench.create_task(legacy_guided_form(), new_key)
         current_snapshot = self.store.get_task(current["task_id"])
         self.assertFalse(current["replayed"])
-        self.assertEqual(current_snapshot.draft["algorithm"]["version"], "1.3.0")
+        self.assertEqual(current_snapshot.draft["algorithm"]["version"], "1.4.0")
         self.assertEqual(current_snapshot.draft["parameters"]["optimizer"], "adam")
         self.assertEqual(current_snapshot.draft["parameters"]["learning_rate_milli"], 10_000)
         current_replay = self.workbench.create_task(legacy_guided_form(), new_key)
@@ -446,7 +469,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertFalse(current["replayed"])
         self.assertEqual(current["draft"]["revision"], 3)
-        self.assertEqual(current["draft"]["algorithm"]["version"], "1.3.0")
+        self.assertEqual(current["draft"]["algorithm"]["version"], "1.4.0")
         self.assertEqual(current["draft"]["parameters"]["optimizer"], "adam")
         current_replay = self.workbench.revise_task(
             created.snapshot.task_id,
@@ -456,6 +479,111 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertTrue(current_replay["replayed"])
         self.assertEqual(current_replay["draft"]["revision"], 3)
+
+    def test_optimizer_form_replays_v1_2_v1_3_create_and_revise_ledgers(self) -> None:
+        for version in ("1.2.0", "1.3.0"):
+            for input_style in ("nine-field", "expanded-seven-field"):
+                with self.subTest(version=version, input_style=input_style):
+                    form_factory = (
+                        guided_form
+                        if input_style == "nine-field"
+                        else legacy_guided_form
+                    )
+                    suffix = f"{version}-{input_style}"
+                    create_key = f"optimizer-history-create-{suffix}"
+                    create_form = form_factory()
+                    draft_id = _stable_id(
+                        "draft", PROJECT_ID, PRINCIPAL_ID, 1, create_key
+                    )
+                    old_draft, old_manifest = self.historical_optimizer_draft(
+                        version=version,
+                        form=create_form,
+                        draft_id=draft_id,
+                        revision=1,
+                    )
+                    seeded = self.tasks.create_task(
+                        draft=old_draft,
+                        idempotency_key=self.workbench._mutation_key(
+                            "create", create_key
+                        ),
+                        project_id=PROJECT_ID,
+                        principal_id=PRINCIPAL_ID,
+                    )
+                    self.assertIsNone(seeded.snapshot.plan)
+
+                    create_replay = self.workbench.create_task(
+                        create_form, create_key
+                    )
+                    create_snapshot = self.store.get_task(
+                        seeded.snapshot.task_id
+                    )
+                    self.assertTrue(create_replay["replayed"])
+                    self.assertEqual(create_snapshot.draft, old_draft)
+                    self.assertEqual(
+                        create_snapshot.plan["nodes"][0]["outputs"],
+                        old_manifest["outputs"],
+                    )
+                    self.assertEqual(
+                        len(create_snapshot.plan["nodes"][0]["outputs"]), 2
+                    )
+                    with self.assertRaises(WorkbenchConflict) as caught:
+                        self.workbench.create_task(
+                            form_factory(goal="different durable request"),
+                            create_key,
+                        )
+                    self.assertEqual(
+                        caught.exception.code, "IDEMPOTENCY_CONFLICT"
+                    )
+
+                    revise_key = f"optimizer-history-revise-{suffix}"
+                    revise_form = form_factory(
+                        device="cpu", iterations=3, seed=7
+                    )
+                    old_revision, _ = self.historical_optimizer_draft(
+                        version=version,
+                        form=revise_form,
+                        draft_id=draft_id,
+                        revision=2,
+                    )
+                    self.tasks.revise_draft(
+                        task_id=seeded.snapshot.task_id,
+                        expected_revision=1,
+                        draft=old_revision,
+                        idempotency_key=self.workbench._mutation_key(
+                            "revise", revise_key
+                        ),
+                        project_id=PROJECT_ID,
+                        principal_id=PRINCIPAL_ID,
+                    )
+
+                    revise_replay = self.workbench.revise_task(
+                        seeded.snapshot.task_id,
+                        1,
+                        revise_form,
+                        revise_key,
+                    )
+                    revise_snapshot = self.store.get_task(
+                        seeded.snapshot.task_id
+                    )
+                    self.assertTrue(revise_replay["replayed"])
+                    self.assertEqual(revise_snapshot.draft, old_revision)
+                    self.assertEqual(
+                        revise_snapshot.plan["nodes"][0]["outputs"],
+                        old_manifest["outputs"],
+                    )
+                    self.assertEqual(
+                        len(revise_snapshot.plan["nodes"][0]["outputs"]), 2
+                    )
+                    with self.assertRaises(WorkbenchConflict) as caught:
+                        self.workbench.revise_task(
+                            seeded.snapshot.task_id,
+                            1,
+                            form_factory(device="cpu", iterations=4, seed=7),
+                            revise_key,
+                        )
+                    self.assertEqual(
+                        caught.exception.code, "IDEMPOTENCY_CONFLICT"
+                    )
 
     def test_form_rejects_browser_execution_controls_and_boolean_integers(self) -> None:
         for forbidden in ("path", "shell", "handle", "job_id", "extra_args"):
@@ -606,6 +734,99 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                 with self.assertRaises(WorkbenchValidationError) as caught:
                     self.workbench.list_tasks(limit=limit)
                 self.assertEqual(caught.exception.code, "INVALID_TASK_LIST_LIMIT")
+
+    def test_task_trash_restore_projection_views_replay_and_cursor_binding(self) -> None:
+        created = [
+            self.workbench.create_task(
+                guided_form(goal=f"visibility task {index}"), f"visibility-{index}"
+            )
+            for index in range(3)
+        ]
+        for index, task in enumerate(created):
+            abandoned = self.workbench.abandon_task(
+                task["task_id"], f"visibility-abandon-{index}"
+            )
+            self.assertEqual(abandoned["status"], "Cancelled")
+            self.assertEqual(abandoned["visibility_revision"], 0)
+            self.assertIsNone(abandoned["trashed_at"])
+
+        first = self.workbench.trash_task(
+            created[1]["task_id"], 0, "visibility-trash-one"
+        )
+        replay = self.workbench.trash_task(
+            created[1]["task_id"], 0, "visibility-trash-one"
+        )
+        self.assertFalse(first["replayed"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(first["visibility_revision"], 1)
+        self.assertIsInstance(first["trashed_at"], str)
+        detail = self.workbench.get_task(created[1]["task_id"])
+        self.assertEqual(detail["visibility_revision"], 1)
+        self.assertEqual(detail["trashed_at"], first["trashed_at"])
+        self.assertEqual(self.workbench.list_events(created[1]["task_id"]), [])
+
+        active = self.workbench.list_tasks(view="active")
+        self.assertNotIn(
+            created[1]["task_id"], [item["task_id"] for item in active["tasks"]]
+        )
+        self.assertTrue(
+            all(
+                item["visibility_revision"] == 0 and item["trashed_at"] is None
+                for item in active["tasks"]
+            )
+        )
+        trashed = self.workbench.list_tasks(view="trash")
+        self.assertEqual(
+            [item["task_id"] for item in trashed["tasks"]],
+            [created[1]["task_id"]],
+        )
+        self.assertEqual(trashed["tasks"][0]["visibility_revision"], 1)
+
+        self.workbench.trash_task(
+            created[0]["task_id"], 0, "visibility-trash-zero"
+        )
+        first_page = self.workbench.list_tasks(limit=1, view="trash")
+        self.assertIsNotNone(first_page["next_cursor"])
+        with self.assertRaises(WorkbenchValidationError) as caught:
+            self.workbench.list_tasks(
+                cursor=first_page["next_cursor"], limit=1, view="active"
+            )
+        self.assertEqual(caught.exception.code, "INVALID_TASK_CURSOR")
+        second_page = self.workbench.list_tasks(
+            cursor=first_page["next_cursor"], limit=1, view="trash"
+        )
+        self.assertEqual(len(second_page["tasks"]), 1)
+
+        with self.assertRaises(WorkbenchConflict) as caught:
+            self.workbench.trash_task(
+                created[2]["task_id"], 0, "visibility-trash-one"
+            )
+        self.assertEqual(caught.exception.code, "IDEMPOTENCY_CONFLICT")
+
+        restored = self.workbench.restore_task(
+            created[1]["task_id"], 1, "visibility-restore-one"
+        )
+        self.assertEqual(restored["status"], "Cancelled")
+        self.assertEqual(restored["visibility_revision"], 2)
+        self.assertIsNone(restored["trashed_at"])
+        self.assertIn(
+            created[1]["task_id"],
+            [item["task_id"] for item in self.workbench.list_tasks()["tasks"]],
+        )
+
+        foreign = GuidedWorkbench(
+            self.tasks,
+            self.registry,
+            project_id="other-project",
+            principal_id=PRINCIPAL_ID,
+            clock=lambda: NOW,
+        )
+        errors = []
+        for task_id in (created[1]["task_id"], "task-does-not-exist"):
+            with self.assertRaises(WorkbenchNotFound) as caught:
+                foreign.trash_task(task_id, 2, "visibility-hidden")
+            errors.append((caught.exception.code, caught.exception.errors))
+        self.assertEqual(errors[0], errors[1])
 
     def test_revise_uses_cas_builds_new_plan_and_replays_exactly(self) -> None:
         created = self.workbench.create_task(guided_form(), "create-revise")

@@ -225,6 +225,10 @@
         <p class="text-xs text-slate-400 uppercase tracking-wider font-medium">持久 FWI 任务</p>
         <button type="button" onclick="loadGuidedTaskIndex({ reset: true })" class="text-[11px] text-slate-400 hover:text-accent transition-colors" title="从 SQLite 刷新任务列表">刷新</button>
       </div>
+      <div class="grid grid-cols-2 gap-1 mb-2" role="group" aria-label="任务可见性">
+        <button id="guidedActiveTasksBtn" type="button" onclick="setGuidedTaskIndexView('active')" class="rounded-md border px-2 py-1 text-[11px]">进行中 / 已完成</button>
+        <button id="guidedTrashTasksBtn" type="button" onclick="setGuidedTaskIndexView('trash')" class="rounded-md border px-2 py-1 text-[11px]">任务回收站</button>
+      </div>
       <div id="guidedTaskHistory" class="space-y-1 max-h-52 overflow-y-auto" aria-live="polite"></div>
     </div>
 
@@ -237,9 +241,9 @@
       <div id="chatHistory" class="space-y-1"></div>
     </div>
 
-    <!-- Current FWI job -->
-    <div class="px-4 pt-3 pb-3 border-t border-slate-100">
-      <p class="text-xs text-slate-400 uppercase tracking-wider mb-2 font-medium">最近 FWI 任务</p>
+    <!-- Read-only compatibility for browser-local legacy FWI receipts. -->
+    <div id="legacyFwiReceiptSection" class="hidden px-4 pt-3 pb-3 border-t border-slate-100">
+      <p class="text-xs text-slate-400 uppercase tracking-wider mb-2 font-medium" title="原“最近 FWI 任务”仅用于历史兼容，不属于 SQLite 科研任务">旧版 FWI 会话回执（兼容）</p>
       <div id="experimentHistory" class="space-y-2"></div>
     </div>
 
@@ -359,6 +363,9 @@
       <!-- Messages container -->
       <div id="messages" class="max-w-3xl mx-auto space-y-4 hidden"></div>
 
+      <!-- A conversation can reference zero or more independent tasks. -->
+      <section id="conversationTaskRefs" aria-live="polite" class="max-w-3xl mx-auto mt-4 hidden"></section>
+
       <!-- Active Guided view; durable task discovery is restored from SQLite. -->
       <section id="guidedFwiPanel" aria-live="polite" class="max-w-5xl mx-auto mb-4 hidden"></section>
 
@@ -476,9 +483,10 @@
     const CHAT_STORAGE_KEY = 'agent-chats';
     const CHAT_ACTIVE_KEY = 'agent-active-chat';
     const CHAT_MODE_KEY = 'agent-mode';
-    const CHAT_SCHEMA_VERSION = 2;
+    const CHAT_SCHEMA_VERSION = 3;
     const MAX_STORED_CHATS = 50;
     const MAX_STORED_MESSAGES = 200;
+    const MAX_STORED_TASK_REFS = 50;
     const MAX_MESSAGE_CHARACTERS = 250000;
     const GUIDED_API_PREFIX = '/api/scientific-runtime/v1';
     const GUIDED_POLL_INTERVAL_MS = 1500;
@@ -589,6 +597,42 @@
       };
     }
 
+    function normalizeStoredTaskRef(value, retainDisplayCache = false) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)
+          || !isSafeConversationId(value.taskId, 128)) return null;
+      const allowedStates = new Set([
+        'Draft', 'NeedsInput', 'AwaitingApproval', 'Queued', 'Running', 'Waiting',
+        'Retrying', 'Succeeded', 'Failed', 'Cancelled',
+      ]);
+      const completed = Number.isInteger(value.progressCompleted) && value.progressCompleted >= 0
+        ? Math.min(value.progressCompleted, 10000) : null;
+      const total = Number.isInteger(value.progressTotal) && value.progressTotal >= 0
+        ? Math.min(value.progressTotal, 10000) : null;
+      return {
+        taskId: value.taskId,
+        linkedAt: Number.isFinite(value.linkedAt) && value.linkedAt > 0 ? value.linkedAt : Date.now(),
+        // taskId + linkedAt are the durable relationship. Everything below is
+        // a bounded, same-session display cache and is discarded on reload;
+        // SQLite/API remains the task truth source.
+        status: retainDisplayCache && allowedStates.has(value.status) ? value.status : '',
+        goal: retainDisplayCache && typeof value.goal === 'string' ? value.goal.slice(0, 2000) : '',
+        device: retainDisplayCache && ['cpu', 'cuda'].includes(value.device) ? value.device : '',
+        iterations: retainDisplayCache && Number.isInteger(value.iterations) && value.iterations >= 1
+          && value.iterations <= 10000 ? value.iterations : null,
+        optimizer: retainDisplayCache && ['adam', 'sgd'].includes(value.optimizer) ? value.optimizer : '',
+        learningRate: retainDisplayCache && typeof value.learningRate === 'string'
+          ? value.learningRate.slice(0, 32) : '',
+        progressCompleted: retainDisplayCache ? completed : null,
+        progressTotal: retainDisplayCache ? total : null,
+        resultReady: retainDisplayCache && (value.resultReady === true || value.status === 'Succeeded'),
+        visibilityRevision: retainDisplayCache && Number.isInteger(value.visibilityRevision)
+          && value.visibilityRevision >= 0 ? value.visibilityRevision : 0,
+        trashedAt: retainDisplayCache && typeof value.trashedAt === 'string'
+          ? value.trashedAt.slice(0, 80) : '',
+        verifiedAt: retainDisplayCache ? Date.now() : 0,
+      };
+    }
+
     function createChatRecord(mode = 'http') {
       const now = Date.now();
       return {
@@ -596,6 +640,7 @@
         contextId: createStableId('web'),
         title: '新对话',
         messages: [],
+        taskRefs: [],
         fwiJob: null,
         mode: normalizeMode(mode),
         createdAt: now,
@@ -612,6 +657,10 @@
       const messages = Array.isArray(value.messages)
         ? value.messages.map(normalizeStoredMessage).filter(Boolean).slice(-MAX_STORED_MESSAGES)
         : [];
+      const taskRefMap = new Map();
+      (Array.isArray(value.taskRefs) ? value.taskRefs : [])
+        .map(reference => normalizeStoredTaskRef(reference)).filter(Boolean).slice(-MAX_STORED_TASK_REFS)
+        .forEach(reference => taskRefMap.set(reference.taskId, reference));
       const createdAt = Number.isFinite(value.createdAt) && value.createdAt > 0
         ? value.createdAt
         : (Number.isFinite(value.time) && value.time > 0 ? value.time : Date.now());
@@ -626,6 +675,7 @@
           ? value.title.trim().slice(0, 120)
           : '新对话',
         messages,
+        taskRefs: Array.from(taskRefMap.values()).slice(-MAX_STORED_TASK_REFS),
         fwiJob: normalizeStoredFwiJob(value.fwiJob),
         mode: normalizeMode(value.mode),
         createdAt,
@@ -642,7 +692,7 @@
       }
 
       const isEnvelope = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        && parsed.schemaVersion === CHAT_SCHEMA_VERSION && parsed.chats
+        && [2, CHAT_SCHEMA_VERSION].includes(parsed.schemaVersion) && parsed.chats
         && typeof parsed.chats === 'object' && !Array.isArray(parsed.chats);
       const rawChats = isEnvelope
         ? parsed.chats
@@ -721,6 +771,13 @@
         taskIndexLoading: false,
         taskIndexLoaded: false,
         taskIndexError: '',
+        taskIndexView: 'active',
+        taskIndexRequestGeneration: 0,
+        pendingLinkChatId: '',
+        artifactObjectUrls: Object.create(null),
+        artifactImageErrors: Object.create(null),
+        artifactImageLoadInFlight: false,
+        artifactImageGeneration: 0,
       },
     };
 
@@ -820,6 +877,23 @@
     }
 
     // ===== Chat =====
+    function serializeChatsForStorage(chats) {
+      const serialized = Object.create(null);
+      Object.entries(chats || {}).forEach(([id, chat]) => {
+        if (!chat || !isSafeConversationId(id, 128)) return;
+        serialized[id] = {
+          ...chat,
+          // Persist relationship identity only. Status/progress/result caches
+          // are session-local observations and must never masquerade as SQLite.
+          taskRefs: (Array.isArray(chat.taskRefs) ? chat.taskRefs : [])
+            .filter(reference => reference && isSafeConversationId(reference.taskId, 128))
+            .slice(-MAX_STORED_TASK_REFS)
+            .map(reference => ({ taskId: reference.taskId, linkedAt: reference.linkedAt })),
+        };
+      });
+      return serialized;
+    }
+
     function persistChatState() {
       let entries = Object.values(state.chats)
         .filter(chat => chat && isSafeConversationId(chat.id, 128))
@@ -838,12 +912,13 @@
         schemaVersion: CHAT_SCHEMA_VERSION,
         activeChatId: state.chatId,
         mode: normalizeMode(state.preferredMode || state.mode),
-        chats: state.chats,
+        chats: serializeChatsForStorage(state.chats),
       });
       const saved = safeStorageWrite(storage, CHAT_STORAGE_KEY, payload);
+      if (!saved) return false;
       safeStorageWrite(storage, CHAT_ACTIVE_KEY, state.chatId);
       safeStorageWrite(storage, CHAT_MODE_KEY, normalizeMode(state.preferredMode || state.mode));
-      return saved;
+      return true;
     }
 
     function createStoredMessage(role, content, status = 'complete', requestId = '') {
@@ -875,6 +950,143 @@
       chat.time = Date.now();
       persistChatState();
       return message;
+    }
+
+    function taskRefFromGuidedTask(task) {
+      if (!task || !isSafeConversationId(task.taskId, 128)) return null;
+      const draft = task.draft && typeof task.draft === 'object' ? task.draft : task;
+      const adapter = task.adapter && typeof task.adapter === 'object' ? task.adapter : {};
+      return normalizeStoredTaskRef({
+        taskId: task.taskId,
+        linkedAt: Date.now(),
+        status: task.status,
+        goal: draft.goal || task.goal,
+        device: draft.device || task.device,
+        iterations: draft.iterations ?? task.iterations,
+        optimizer: draft.optimizer || task.optimizer,
+        learningRate: draft.learningRate || task.learningRate,
+        progressCompleted: adapter.completed ?? task.progressCompleted,
+        progressTotal: adapter.total ?? task.progressTotal,
+        resultReady: task.status === 'Succeeded' || task.resultReady === true,
+        visibilityRevision: task.visibilityRevision,
+        trashedAt: task.trashedAt,
+      }, true);
+    }
+
+    function isTaskReferencedByChat(chat, taskId) {
+      return Boolean(chat && Array.isArray(chat.taskRefs)
+        && chat.taskRefs.some(reference => reference.taskId === taskId));
+    }
+
+    function linkTaskToChat(chatId, task) {
+      const chat = state.chats[chatId];
+      const reference = taskRefFromGuidedTask(task);
+      if (!chat || !reference) return false;
+      const previous = Array.isArray(chat.taskRefs) ? chat.taskRefs : [];
+      const existing = previous.find(item => item.taskId === reference.taskId);
+      reference.linkedAt = existing?.linkedAt || reference.linkedAt;
+      chat.taskRefs = [...previous.filter(item => item.taskId !== reference.taskId), reference]
+        .slice(-MAX_STORED_TASK_REFS);
+      chat.time = Date.now();
+      if (!persistChatState()) {
+        chat.taskRefs = previous;
+        return false;
+      }
+      if (chatId === state.chatId) renderConversationTaskRefs();
+      renderHistory();
+      return true;
+    }
+
+    function unlinkTaskFromChat(chatId, taskId) {
+      const chat = state.chats[chatId];
+      if (!chat || !isSafeConversationId(taskId, 128)
+          || !isTaskReferencedByChat(chat, taskId)) return false;
+      const previous = chat.taskRefs;
+      chat.taskRefs = previous.filter(reference => reference.taskId !== taskId);
+      chat.time = Date.now();
+      if (!persistChatState()) {
+        chat.taskRefs = previous;
+        return false;
+      }
+      if (chatId === state.chatId) renderConversationTaskRefs();
+      renderHistory();
+      return true;
+    }
+
+    function updateTaskRefCaches(task, options) {
+      options = options && typeof options === 'object' ? options : {};
+      const fresh = taskRefFromGuidedTask(task);
+      if (!fresh) return false;
+      let changed = false;
+      Object.values(state.chats).forEach(chat => {
+        if (!isTaskReferencedByChat(chat, fresh.taskId)) return;
+        chat.taskRefs = chat.taskRefs.map(reference => reference.taskId === fresh.taskId
+          ? { ...fresh, linkedAt: reference.linkedAt } : reference);
+        changed = true;
+      });
+      if (options.render !== false) renderConversationTaskRefs();
+      return changed;
+    }
+
+    function renderConversationTaskRefs() {
+      const container = document.getElementById('conversationTaskRefs');
+      if (!container) return;
+      const chat = state.chats[state.chatId];
+      const refs = chat && Array.isArray(chat.taskRefs) ? chat.taskRefs : [];
+      container.replaceChildren();
+      if (refs.length === 0) {
+        container.classList.add('hidden');
+        return;
+      }
+      const heading = document.createElement('div');
+      heading.className = 'mb-2 flex items-center justify-between gap-3';
+      const title = document.createElement('h3');
+      title.className = 'text-xs font-semibold uppercase tracking-wider text-slate-500';
+      title.textContent = '此对话引用的独立任务';
+      const note = document.createElement('span');
+      note.className = 'text-[11px] text-slate-400';
+      note.textContent = '切换或删除对话不会改变任务';
+      heading.append(title, note);
+      container.appendChild(heading);
+      refs.forEach(reference => {
+        const card = document.createElement('article');
+        card.className = 'mb-2 rounded-lg border border-slate-200 bg-white p-3 shadow-sm';
+        const label = document.createElement('strong');
+        label.className = 'block truncate text-sm text-slate-800';
+        label.textContent = reference.goal || reference.taskId;
+        const summary = document.createElement('p');
+        summary.className = 'mt-1 text-xs text-slate-500';
+        const verified = Number.isFinite(reference.verifiedAt) && reference.verifiedAt > 0;
+        const progress = verified && reference.progressTotal !== null
+          ? ` · ${reference.progressCompleted ?? 0}/${reference.progressTotal}` : '';
+        summary.textContent = verified
+          ? `${reference.status || '状态待刷新'}${progress}${reference.resultReady ? ' · 结果可查看' : ''}${reference.trashedAt ? ' · 已在回收站' : ''}`
+          : '任务状态需从 SQLite 刷新；本地对话只保存引用';
+        const open = document.createElement('button');
+        open.type = 'button';
+        open.className = 'mt-2 text-xs font-medium text-accent hover:underline';
+        open.textContent = '打开独立任务详情';
+        open.addEventListener('click', () => reopenGuidedTask(reference.taskId));
+        card.append(label, summary, open);
+        container.appendChild(card);
+      });
+      container.classList.remove('hidden');
+    }
+
+    function linkCurrentConversationToGuidedTask() {
+      if (!state.guided.task) return false;
+      const linked = linkTaskToChat(state.chatId, state.guided.task);
+      showToast(linked ? '已在当前对话中添加任务引用' : '未能保存任务引用');
+      renderGuidedFwi();
+      return linked;
+    }
+
+    function unlinkCurrentConversationFromGuidedTask() {
+      const taskId = state.guided.taskId;
+      const removed = unlinkTaskFromChat(state.chatId, taskId);
+      showToast(removed ? '已从当前对话移除引用；任务仍然保留' : '未能保存引用变更');
+      renderGuidedFwi();
+      return removed;
     }
 
     function buildClearedChatState(chats, currentChatId, mode, clearAll = false) {
@@ -918,7 +1130,10 @@
       abortActiveRequest('new_chat');
       resetFwiPanel();
       const current = state.chats[state.chatId];
-      if (current && current.messages.length === 0 && !current.fwiJob) delete state.chats[state.chatId];
+      if (current && current.messages.length === 0 && !current.fwiJob
+          && (!Array.isArray(current.taskRefs) || current.taskRefs.length === 0)) {
+        delete state.chats[state.chatId];
+      }
       const chat = createChatRecord(state.preferredMode || state.mode);
       state.chats[chat.id] = chat;
       state.chatId = chat.id;
@@ -928,53 +1143,76 @@
         showToast('浏览器未允许保存更改；刷新后旧对话可能重新出现');
       }
       showEmptyChat();
+      renderConversationTaskRefs();
       renderHistory();
       renderExperimentHistory();
     }
 
     function clearChat() {
+      if (typeof window.confirm === 'function'
+          && !window.confirm('仅删除本浏览器中的当前对话；独立科研任务及其结果不受影响。继续吗？')) return false;
       abortActiveRequest('clear_chat');
       resetFwiPanel();
+      const previous = {
+        chats: state.chats, chatId: state.chatId, contextId: state.contextId, fwiJob: state.fwiJob,
+      };
       const cleared = buildClearedChatState(state.chats, state.chatId, state.preferredMode || state.mode, false);
       state.chats = cleared.chats;
       state.chatId = cleared.chatId;
       state.contextId = cleared.contextId;
       state.fwiJob = null;
       if (!persistChatState()) {
-        showToast('浏览器拒绝保存清除结果；刷新后旧对话可能重新出现');
+        Object.assign(state, previous);
+        showToast('浏览器拒绝保存；当前对话未删除，独立任务未受影响');
+        return false;
       }
       showEmptyChat();
+      renderConversationTaskRefs();
       renderHistory();
       renderExperimentHistory();
+      return true;
     }
 
     function clearAllChats() {
-      if (typeof window.confirm === 'function' && !window.confirm('确定清空全部本地对话历史吗？此操作不可撤销。')) return;
+      if (typeof window.confirm === 'function'
+          && !window.confirm('仅清空本浏览器中的全部对话；独立科研任务及其结果不受影响。继续吗？')) return false;
       abortActiveRequest('clear_all_chats');
       resetFwiPanel();
-      const storage = getBrowserStorage();
-      safeStorageRemove(storage, CHAT_STORAGE_KEY);
-      safeStorageRemove(storage, CHAT_ACTIVE_KEY);
+      const previous = {
+        chats: state.chats, chatId: state.chatId, contextId: state.contextId, fwiJob: state.fwiJob,
+      };
       const cleared = buildClearedChatState(state.chats, state.chatId, state.preferredMode || state.mode, true);
       state.chats = cleared.chats;
       state.chatId = cleared.chatId;
       state.contextId = cleared.contextId;
       state.fwiJob = null;
       if (!persistChatState()) {
-        showToast('浏览器拒绝清除持久化历史；请在站点数据设置中手动删除');
+        Object.assign(state, previous);
+        showToast('浏览器拒绝保存；对话历史未清空，独立任务未受影响');
+        return false;
       }
       showEmptyChat();
+      renderConversationTaskRefs();
       renderHistory();
       renderExperimentHistory();
+      return true;
     }
 
     function deleteChat(chatId) {
       if (!isSafeConversationId(chatId, 128) || !state.chats[chatId]) return false;
+      if (typeof window.confirm === 'function'
+          && !window.confirm('仅删除本浏览器中的这条对话；独立科研任务及其结果不受影响。继续吗？')) return false;
       if (chatId === state.chatId) abortActiveRequest('delete_chat');
+      const previous = {
+        chats: state.chats, chatId: state.chatId, contextId: state.contextId, fwiJob: state.fwiJob,
+      };
+      state.chats = Object.assign(Object.create(null), state.chats);
       delete state.chats[chatId];
       if (chatId !== state.chatId) {
         if (!persistChatState()) {
-          showToast('浏览器拒绝保存删除结果；刷新后该对话可能重新出现');
+          Object.assign(state, previous);
+          showToast('浏览器拒绝保存；这条对话未删除，独立任务未受影响');
+          return false;
         }
         renderHistory();
         return true;
@@ -989,7 +1227,9 @@
         state.chatId = remaining[0].id;
       }
       if (!persistChatState()) {
-        showToast('浏览器拒绝保存删除结果；刷新后历史可能重新出现');
+        Object.assign(state, previous);
+        showToast('浏览器拒绝保存；这条对话未删除，独立任务未受影响');
+        return false;
       }
       loadChat(state.chatId, { initial: true });
       return true;
@@ -1039,6 +1279,7 @@
         document.getElementById('chatTitle').textContent = chat.title || '对话';
       }
       renderHistory();
+      renderConversationTaskRefs();
       restoreFwiPanelForChat(chat);
       scrollToBottom();
       if (!options.initial && window.innerWidth < 768) toggleSidebar();
@@ -1145,19 +1386,36 @@
       return true;
     }
 
+    function recordGuidedExecutionIntent(chatId, text) {
+      const chat = state.chats[chatId];
+      if (!chat || typeof text !== 'string' || !text.trim()) return false;
+      const notice = '只打开独立任务草稿、尚未创建/运行任务。请检查参数并显式提交、批准。';
+      document.getElementById('welcomeMsg').classList.add('hidden');
+      document.getElementById('messages').classList.remove('hidden');
+      appendStoredMessage(chatId, 'user', text.trim());
+      appendStoredMessage(chatId, 'system', notice);
+      appendMessage('user', text.trim());
+      appendMessage('system', notice);
+      document.getElementById('chatTitle').textContent = chat.title;
+      renderHistory();
+      return true;
+    }
+
     async function sendMessage() {
       const input = document.getElementById('userInput');
       const text = input.value.trim();
       if (!text) return;
+      if (state.streaming) return;
       // Execution-shaped FWI text must enter the explicit Draft/Plan approval
       // workflow. Theory questions continue through the existing chat transport.
       if (isFwiExecutionRequest(text)) {
+        const chat = state.chats[state.chatId];
+        if (!chat || !recordGuidedExecutionIntent(chat.id, text)) return;
         input.value = '';
         input.style.height = 'auto';
-        openGuidedFwi(guidedOverridesFromExecutionText(text));
+        openGuidedFwi({ ...guidedOverridesFromExecutionText(text), linkChatId: chat.id });
         return;
       }
-      if (state.streaming) return;
 
       const chat = state.chats[state.chatId];
       if (!chat) return;
@@ -1674,6 +1932,8 @@
       if (resource === 'draft') return `${GUIDED_API_PREFIX}/tasks/${task}/draft`;
       if (resource === 'approve') return `${GUIDED_API_PREFIX}/tasks/${task}/approve`;
       if (resource === 'abandon') return `${GUIDED_API_PREFIX}/tasks/${task}/abandon`;
+      if (resource === 'trash') return `${GUIDED_API_PREFIX}/tasks/${task}/trash`;
+      if (resource === 'restore') return `${GUIDED_API_PREFIX}/tasks/${task}/restore`;
       if (resource === 'task') return `${GUIDED_API_PREFIX}/tasks/${task}`;
       if (resource === 'artifacts') return `${GUIDED_API_PREFIX}/tasks/${task}/artifacts`;
       if (resource === 'artifact' && artifact) {
@@ -1710,6 +1970,16 @@
         taskIndexLoading: previous.taskIndexLoading === true,
         taskIndexLoaded: previous.taskIndexLoaded === true,
         taskIndexError: boundedGuidedText(previous.taskIndexError, 500),
+        taskIndexView: previous.taskIndexView === 'trash' ? 'trash' : 'active',
+        taskIndexRequestGeneration: Number.isInteger(previous.taskIndexRequestGeneration)
+          && previous.taskIndexRequestGeneration >= 0
+          ? previous.taskIndexRequestGeneration : 0,
+        pendingLinkChatId: '',
+        artifactObjectUrls: Object.create(null),
+        artifactImageErrors: Object.create(null),
+        artifactImageLoadInFlight: false,
+        artifactImageGeneration: Number.isInteger(previous.artifactImageGeneration)
+          && previous.artifactImageGeneration >= 0 ? previous.artifactImageGeneration : 0,
       };
     }
 
@@ -1972,6 +2242,49 @@
       };
     }
 
+    function normalizeGuidedPlanOutputs(value) {
+      const list = Array.isArray(value) ? value : [];
+      const outputs = list.map(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)
+            || !isSafeGuidedIdentifier(item.port)
+            || !isSafeGuidedIdentifier(item.data_type)) return null;
+        return { port: item.port, dataType: item.data_type };
+      }).filter(Boolean);
+      if (outputs.length !== list.length || outputs.length > 16
+          || new Set(outputs.map(item => item.port)).size !== outputs.length) return [];
+      return outputs;
+    }
+
+    function expectedGuidedFwiPlanOutputs(algorithmVersion) {
+      const primary = [
+        { port: 'inverted_model', dataType: 'inverted_velocity_model_2d' },
+        { port: 'loss', dataType: 'loss_curve' },
+      ];
+      if (algorithmVersion === '1.4.0') {
+        return [
+          ...primary,
+          { port: 'true_model_figure', dataType: 'figure' },
+          { port: 'initial_model_figure', dataType: 'figure' },
+          { port: 'inverted_model_figure', dataType: 'figure' },
+          { port: 'model_error_figure', dataType: 'figure' },
+          { port: 'shot_gathers_figure', dataType: 'figure' },
+          { port: 'loss_curve_figure', dataType: 'figure' },
+        ];
+      }
+      return ['1.0.0', '1.1.0', '1.2.0', '1.3.0'].includes(algorithmVersion)
+        ? primary : [];
+    }
+
+    function hasExactGuidedFwiPlanOutputs(algorithmVersion, outputs) {
+      const expected = expectedGuidedFwiPlanOutputs(algorithmVersion);
+      return expected.length > 0
+        && Array.isArray(outputs)
+        && outputs.length === expected.length
+        && expected.every((item, index) => (
+          outputs[index].port === item.port && outputs[index].dataType === item.dataType
+        ));
+    }
+
     function normalizeGuidedTaskProjection(value, expectedTaskId = '') {
       const outer = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
       const source = outer.task && typeof outer.task === 'object' ? outer.task : outer;
@@ -2008,6 +2321,9 @@
       const dispatchState = dispatchSource.state || dispatchSource.status || '';
       const adapterStatus = ['Queued', 'Running', 'Succeeded', 'Failed'].includes(adapterSource.status)
         ? adapterSource.status : '';
+      const planNodeSource = Array.isArray(planSource.nodes) && planSource.nodes.length === 1
+        && planSource.nodes[0] && typeof planSource.nodes[0] === 'object'
+        ? planSource.nodes[0] : {};
       const normalized = {
         projectionValid: true,
         taskId,
@@ -2040,6 +2356,7 @@
           id: isSafeGuidedOpaqueId(planSource.plan_id) ? planSource.plan_id : '',
           hash: isSafeGuidedPlanHash(planSource.plan_hash) ? planSource.plan_hash : '',
           nodeCount: Array.isArray(planSource.nodes) ? planSource.nodes.length : 0,
+          outputs: normalizeGuidedPlanOutputs(planNodeSource.outputs),
         },
         approval: {
           id: isSafeGuidedOpaqueId(approvalSource.approval_id) ? approvalSource.approval_id : '',
@@ -2063,6 +2380,10 @@
         },
         createdAt: boundedGuidedText(source.created_at, 80),
         updatedAt: boundedGuidedText(source.updated_at, 80),
+        visibilityRevision: Number.isInteger(source.visibility_revision)
+          && source.visibility_revision >= 0 ? source.visibility_revision : 0,
+        trashedAt: typeof source.trashed_at === 'string'
+          ? boundedGuidedText(source.trashed_at, 80) : '',
       };
       const draftComplete = normalized.draft.id
         && normalized.draft.revision >= 1
@@ -2105,7 +2426,13 @@
             || planDraft.revision !== normalized.draft.revision
             || !isSafeGuidedOpaqueId(node.node_id)
             || node.algorithm?.id !== normalized.draft.algorithmId
-            || node.algorithm?.version !== normalized.draft.algorithmVersion) {
+            || node.algorithm?.version !== normalized.draft.algorithmVersion
+            || !Object.hasOwn(node, 'outputs')
+            || !Array.isArray(node.outputs)
+            || node.outputs.length !== normalized.plan.outputs.length
+            || !hasExactGuidedFwiPlanOutputs(
+              normalized.draft.algorithmVersion, normalized.plan.outputs,
+            )) {
           return null;
         }
       } else if (normalized.plan.id || normalized.plan.hash || normalized.plan.nodeCount !== 0) {
@@ -2202,10 +2529,12 @@
           .includes(task.status));
     }
 
-    function normalizeGuidedArtifacts(value, expectedTaskId) {
+    function normalizeGuidedArtifacts(value, expectedTaskId, expectedOutputs) {
       const source = value && typeof value === 'object' ? value : {};
       const list = Array.isArray(value) ? value : (Array.isArray(source.artifacts) ? source.artifacts : []);
-      return list.map(item => {
+      const planned = Array.isArray(expectedOutputs) ? expectedOutputs : [];
+      if (list.length > 16 || (planned.length > 0 && list.length !== planned.length)) return [];
+      const normalized = list.map(item => {
         const manifest = item && item.manifest && typeof item.manifest === 'object'
           ? item.manifest : item;
         if (!manifest || typeof manifest !== 'object') return null;
@@ -2213,23 +2542,69 @@
             || manifest.task_id !== expectedTaskId
             || !isSafeGuidedIdentifier(manifest.artifact_type)) return null;
         const display = manifest.display && typeof manifest.display === 'object' ? manifest.display : {};
-        const allowedMedia = new Set(['application/x-npy', 'text/csv']);
+        const extensions = manifest.extensions && typeof manifest.extensions === 'object'
+          ? manifest.extensions : {};
+        const adapterExtension = extensions['org.agent_rpc.adapter']
+          && typeof extensions['org.agent_rpc.adapter'] === 'object'
+          ? extensions['org.agent_rpc.adapter'] : {};
+        const figureExtension = extensions['org.agent_rpc.figure']
+          && typeof extensions['org.agent_rpc.figure'] === 'object'
+          ? extensions['org.agent_rpc.figure'] : {};
+        const outputPort = isSafeGuidedIdentifier(manifest.output_port)
+          ? manifest.output_port
+          : (isSafeGuidedIdentifier(adapterExtension.output_port)
+            ? adapterExtension.output_port : '');
+        const allowedMedia = new Set(['application/x-npy', 'text/csv', 'image/png']);
         if (!allowedMedia.has(manifest.media_type)) return null;
+        const expectedComponent = {
+          'application/x-npy': 'download',
+          'text/csv': 'line_chart',
+          'image/png': 'image',
+        }[manifest.media_type];
+        if (display.component !== expectedComponent) return null;
+        const width = guidedIntegerValue(
+          display.width_px ?? manifest.width_px ?? figureExtension.width_px, 1, 8192,
+        );
+        const height = guidedIntegerValue(
+          display.height_px ?? manifest.height_px ?? figureExtension.height_px, 1, 8192,
+        );
+        if (manifest.media_type === 'image/png' && (width === null || height === null)) return null;
         return {
           artifactId: manifest.artifact_id,
           taskId: manifest.task_id,
           type: manifest.artifact_type,
           mediaType: manifest.media_type,
+          outputPort,
           contentHash: /^sha256:[0-9a-f]{64}$/.test(manifest.content_hash || '')
             ? manifest.content_hash : '',
           sizeBytes: Number.isInteger(manifest.size_bytes) && manifest.size_bytes >= 0
             ? manifest.size_bytes : null,
           title: boundedGuidedText(display.title, 200) || manifest.artifact_type,
-          component: ['download', 'line_chart'].includes(display.component)
+          component: ['download', 'line_chart', 'image'].includes(display.component)
             ? display.component : 'download',
           order: Number.isInteger(display.order) && display.order >= 0 ? display.order : 999,
+          width,
+          height,
         };
-      }).filter(Boolean).sort((left, right) => left.order - right.order).slice(0, 2);
+      }).filter(Boolean).sort((left, right) => left.order - right.order);
+      if (normalized.length !== list.length
+          || new Set(normalized.map(item => item.artifactId)).size !== normalized.length
+          || (normalized.some(item => item.outputPort)
+            && new Set(normalized.map(item => item.outputPort)).size !== normalized.length)) return [];
+      if (planned.length > 0) {
+        const mediaForType = {
+          inverted_velocity_model_2d: 'application/x-npy',
+          loss_curve: 'text/csv',
+          figure: 'image/png',
+        };
+        const expected = new Map(planned.map(output => [output.port, output.dataType]));
+        if (expected.size !== planned.length || normalized.some(artifact => (
+          !expected.has(artifact.outputPort)
+          || artifact.mediaType !== mediaForType[expected.get(artifact.outputPort)]
+          || artifact.type !== expected.get(artifact.outputPort)
+        ))) return [];
+      }
+      return normalized;
     }
 
     async function guidedApiRequest(path, options) {
@@ -2304,6 +2679,8 @@
             || !allowedStates.has(item.status)) return null;
         const algorithm = item.algorithm && typeof item.algorithm === 'object'
           ? item.algorithm : {};
+        const adapter = item.adapter_status && typeof item.adapter_status === 'object'
+          ? item.adapter_status : {};
         const learningRate = guidedLearningRateFromMilli(item.learning_rate_milli);
         return {
           taskId: item.task_id,
@@ -2318,18 +2695,26 @@
           optimizer: ['adam', 'sgd'].includes(item.optimizer) ? item.optimizer : '',
           learningRate,
           learningRateMilli: learningRate ? item.learning_rate_milli : null,
+          progressCompleted: guidedIntegerValue(adapter.completed, 0, 10000),
+          progressTotal: guidedIntegerValue(adapter.total, 0, 10000),
+          resultReady: item.status === 'Succeeded',
+          visibilityRevision: Number.isInteger(item.visibility_revision)
+            && item.visibility_revision >= 0 ? item.visibility_revision : 0,
+          trashedAt: typeof item.trashed_at === 'string'
+            ? boundedGuidedText(item.trashed_at, 80) : '',
           createdAt: boundedGuidedText(item.created_at, 80),
           updatedAt: boundedGuidedText(item.updated_at, 80),
         };
       }).filter(Boolean).slice(0, 50);
       const nextCursor = typeof source.next_cursor === 'string'
-        && /^v1_[A-Za-z0-9_-]{2,171}$/.test(source.next_cursor)
+        && /^v1_[A-Za-z0-9_-]{4,175}$/.test(source.next_cursor)
         ? source.next_cursor : '';
       return { tasks, nextCursor };
     }
 
     function guidedTaskSummary(task) {
       if (!task || !isSafeGuidedOpaqueId(task.taskId)) return null;
+      const adapter = task.adapter && typeof task.adapter === 'object' ? task.adapter : {};
       return {
         taskId: task.taskId,
         status: task.status,
@@ -2343,6 +2728,11 @@
         optimizer: task.draft.optimizer,
         learningRate: task.draft.learningRate,
         learningRateMilli: task.draft.learningRateMilli,
+        progressCompleted: adapter.completed ?? null,
+        progressTotal: adapter.total ?? null,
+        resultReady: task.status === 'Succeeded',
+        visibilityRevision: task.visibilityRevision,
+        trashedAt: task.trashedAt,
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
       };
@@ -2352,14 +2742,42 @@
       const summary = task && task.draft ? guidedTaskSummary(task) : task;
       if (!summary || !isSafeGuidedOpaqueId(summary.taskId)) return false;
       const existing = state.guided.taskIndex.filter(item => item.taskId !== summary.taskId);
-      state.guided.taskIndex = [summary, ...existing].slice(0, 100);
+      const belongsInView = state.guided.taskIndexView === 'trash'
+        ? Boolean(summary.trashedAt) : !summary.trashedAt;
+      state.guided.taskIndex = (belongsInView ? [summary, ...existing] : existing).slice(0, 100);
+      updateTaskRefCaches(summary);
       renderGuidedTaskIndex();
+      return true;
+    }
+
+    function isGuidedTerminalState(status) {
+      return ['Succeeded', 'Failed', 'Cancelled'].includes(status);
+    }
+
+    function setGuidedTaskIndexView(view) {
+      const next = view === 'trash' ? 'trash' : 'active';
+      if (state.guided.taskIndexView === next && state.guided.taskIndexLoaded) return false;
+      state.guided.taskIndexView = next;
+      state.guided.taskIndex = [];
+      state.guided.taskIndexCursor = '';
+      state.guided.taskIndexPage = 0;
+      state.guided.taskIndexLoaded = false;
+      // A tab switch supersedes any older request. The older response keeps
+      // running at the network layer but its captured generation/view cannot
+      // update this tab or its conversation task-reference cache.
+      loadGuidedTaskIndex({ reset: true, supersede: true });
       return true;
     }
 
     function renderGuidedTaskIndex() {
       const container = document.getElementById('guidedTaskHistory');
       if (!container) return;
+      const activeButton = document.getElementById('guidedActiveTasksBtn');
+      const trashButton = document.getElementById('guidedTrashTasksBtn');
+      if (activeButton && trashButton) {
+        activeButton.className = `rounded-md border px-2 py-1 text-[11px] ${state.guided.taskIndexView === 'active' ? 'border-accent/40 bg-accent/5 text-accent' : 'border-slate-200 text-slate-500'}`;
+        trashButton.className = `rounded-md border px-2 py-1 text-[11px] ${state.guided.taskIndexView === 'trash' ? 'border-accent/40 bg-accent/5 text-accent' : 'border-slate-200 text-slate-500'}`;
+      }
       container.replaceChildren();
       if (state.guided.taskIndexPage > 0) {
         const navigation = document.createElement('div');
@@ -2386,15 +2804,18 @@
       if (state.guided.taskIndex.length === 0) {
         const empty = document.createElement('p');
         empty.className = `text-xs py-2 ${state.guided.taskIndexError ? 'text-red-600' : 'text-slate-400'}`;
-        empty.textContent = state.guided.taskIndexError || '暂无持久任务';
+        empty.textContent = state.guided.taskIndexError
+          || (state.guided.taskIndexView === 'trash' ? '任务回收站为空' : '暂无持久任务');
         container.appendChild(empty);
         return;
       }
       state.guided.taskIndex.forEach(item => {
+        const row = document.createElement('div');
+        row.className = `flex items-stretch gap-1 rounded-lg border ${item.taskId === state.guided.taskId ? 'border-accent/40 bg-accent/5' : 'border-slate-200'}`;
         const button = document.createElement('button');
         button.type = 'button';
         button.dataset.taskId = item.taskId;
-        button.className = `w-full rounded-lg border p-2 text-left text-xs transition-colors ${item.taskId === state.guided.taskId ? 'border-accent/40 bg-accent/5' : 'border-slate-200 hover:border-accent/30'}`;
+        button.className = 'min-w-0 flex-1 rounded-lg p-2 text-left text-xs transition-colors hover:bg-slate-50';
         const header = document.createElement('span');
         header.className = 'flex items-center justify-between gap-2';
         const label = document.createElement('strong');
@@ -2411,7 +2832,21 @@
         detail.textContent = `${item.preset || 'FWI'} · ${item.device || '—'} · ${item.iterations ?? '—'} iter${optimization}`;
         button.append(header, detail);
         button.addEventListener('click', () => reopenGuidedTask(button.dataset.taskId));
-        container.appendChild(button);
+        row.appendChild(button);
+        if (state.guided.taskIndexView === 'trash' || isGuidedTerminalState(item.status)) {
+          const visibility = document.createElement('button');
+          visibility.type = 'button';
+          visibility.className = 'shrink-0 px-2 text-[11px] text-slate-400 hover:text-red-600';
+          visibility.textContent = state.guided.taskIndexView === 'trash' ? '恢复' : '删除';
+          visibility.title = state.guided.taskIndexView === 'trash'
+            ? '从任务回收站恢复' : '移入任务回收站（仅终态任务）';
+          visibility.addEventListener('click', () => {
+            if (state.guided.taskIndexView === 'trash') restoreGuidedTask(item.taskId);
+            else trashGuidedTask(item.taskId);
+          });
+          row.appendChild(visibility);
+        }
+        container.appendChild(row);
       });
       if (state.guided.taskIndexCursor) {
         const more = document.createElement('button');
@@ -2426,9 +2861,19 @@
 
     async function loadGuidedTaskIndex(options) {
       options = options || {};
-      if (state.guided.taskIndexLoading) return false;
+      if (state.guided.taskIndexLoading && options.supersede !== true) return false;
       const reset = options.reset !== false;
       if (!reset && !state.guided.taskIndexCursor) return false;
+      const view = state.guided.taskIndexView === 'trash' ? 'trash' : 'active';
+      const requestGeneration = (
+        Number.isInteger(state.guided.taskIndexRequestGeneration)
+          ? state.guided.taskIndexRequestGeneration : 0
+      ) + 1;
+      state.guided.taskIndexRequestGeneration = requestGeneration;
+      const requestIsCurrent = () => (
+        state.guided.taskIndexRequestGeneration === requestGeneration
+        && state.guided.taskIndexView === view
+      );
       state.guided.taskIndexLoading = true;
       state.guided.taskIndexError = '';
       renderGuidedTaskIndex();
@@ -2441,33 +2886,105 @@
           state.guided.session = session;
         }
         const cursor = reset ? '' : state.guided.taskIndexCursor;
-        const query = cursor ? `?limit=20&cursor=${encodeURIComponent(cursor)}` : '?limit=20';
+        const query = cursor
+          ? `?view=${view}&limit=20&cursor=${encodeURIComponent(cursor)}`
+          : `?view=${view}&limit=20`;
         const page = normalizeGuidedTaskIndexPage(
           await guidedApiRequest(`${guidedApiPath('tasks')}${query}`),
         );
+        if (!requestIsCurrent()) return false;
         // Keep one bounded, fully visible server page. Advancing the cursor
         // replaces the window instead of silently dropping the newly fetched
         // tail after an arbitrary client-side cap. The user can always return
         // to the newest page and traverse the same durable cursor chain again.
         state.guided.taskIndex = page.tasks;
+        page.tasks.forEach(task => updateTaskRefCaches(task, { render: false }));
+        renderConversationTaskRefs();
         state.guided.taskIndexCursor = page.nextCursor;
         state.guided.taskIndexPage = reset ? 0 : state.guided.taskIndexPage + 1;
         state.guided.taskIndexLoaded = true;
         return true;
       } catch (error) {
+        if (!requestIsCurrent()) return false;
         if (error && error.guidedCode === 'CSRF_FORBIDDEN' && !options.sessionRetry) {
           state.guided.csrfToken = '';
           state.guided.session = null;
           state.guided.taskIndexLoading = false;
-          return await loadGuidedTaskIndex({ ...options, sessionRetry: true });
+          return await loadGuidedTaskIndex({
+            ...options, sessionRetry: true, supersede: true,
+          });
         }
         state.guided.taskIndexError = error && error.message
           ? `任务列表不可用：${error.message}` : '任务列表不可用';
         return false;
       } finally {
-        state.guided.taskIndexLoading = false;
-        renderGuidedTaskIndex();
+        if (requestIsCurrent()) {
+          state.guided.taskIndexLoading = false;
+          renderGuidedTaskIndex();
+        }
       }
+    }
+
+    async function changeGuidedTaskVisibility(taskId, targetView) {
+      const summary = state.guided.taskIndex.find(item => item.taskId === taskId)
+        || (state.guided.taskId === taskId && state.guided.task
+          ? guidedTaskSummary(state.guided.task) : null);
+      const action = targetView === 'trash' ? 'trash' : 'restore';
+      if (!summary || !isSafeGuidedOpaqueId(taskId) || state.guided.mutation) return false;
+      if (action === 'trash' && !isGuidedTerminalState(summary.status)) {
+        showToast('仅 Succeeded / Failed / Cancelled 终态任务可删除到回收站');
+        return false;
+      }
+      if (action === 'trash' && typeof window.confirm === 'function'
+          && !window.confirm('将这个终态任务移入回收站？任务结果不会立即物理删除，可在任务回收站恢复。')) {
+        return false;
+      }
+      const body = { expected_visibility_revision: summary.visibilityRevision };
+      const key = guidedMutationKey(`${action}:${taskId}`, body);
+      state.guided.mutation = action;
+      renderGuidedTaskIndex();
+      try {
+        const data = await guidedApiRequest(guidedApiPath(action, taskId), {
+          method: 'POST', body, idempotencyKey: key,
+        });
+        if (!data || data.task_id !== taskId
+            || !Number.isInteger(data.visibility_revision) || data.visibility_revision < 0
+            || (action === 'trash' && typeof data.trashed_at !== 'string')
+            || (action === 'restore' && data.trashed_at !== null)) {
+          throw guidedInvalidMutationResponse('任务可见性响应无效');
+        }
+        const updated = {
+          ...summary,
+          visibilityRevision: data.visibility_revision,
+          trashedAt: typeof data.trashed_at === 'string' ? data.trashed_at : '',
+        };
+        updateTaskRefCaches(updated);
+        if (state.guided.taskId === taskId) {
+          clearGuidedPoll();
+          revokeGuidedArtifactObjectUrls();
+          const generation = (state.guided.generation || 0) + 1;
+          state.guided = createGuidedFwiState(generation, state.guided);
+          renderGuidedFwi();
+        } else {
+          state.guided.mutation = '';
+        }
+        await loadGuidedTaskIndex({ reset: true });
+        showToast(action === 'trash' ? '任务已移入回收站' : '任务已恢复');
+        return true;
+      } catch (error) {
+        state.guided.mutation = '';
+        showToast(`${action === 'trash' ? '删除' : '恢复'}任务失败：${error && error.message ? error.message : '未知错误'}`);
+        renderGuidedTaskIndex();
+        return false;
+      }
+    }
+
+    function trashGuidedTask(taskId) {
+      return changeGuidedTaskVisibility(taskId, 'trash');
+    }
+
+    function restoreGuidedTask(taskId) {
+      return changeGuidedTaskVisibility(taskId, 'active');
     }
 
     function guidedInvalidMutationResponse(message) {
@@ -2704,26 +3221,45 @@
       const completed = adapter.completed === null ? '—' : adapter.completed;
       const total = adapter.total === null ? '—' : adapter.total;
       const isCrashState = ['pending', 'dispatching', 'reconciliation_required'].includes(task.dispatch.state);
+      const linkedToCurrent = isTaskReferencedByChat(state.chats[state.chatId], task.taskId);
       const error = state.guided.error
         ? `<p class="mt-3 text-sm text-red-700" role="alert">${escapeHtml(state.guided.error)}</p>` : '';
       return `<section class="rounded-lg border ${isCrashState ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-white'} p-4" data-guided-view="task">
         <div class="flex flex-wrap items-start justify-between gap-3"><div><h4 class="font-heading font-semibold text-slate-900">Scientific Runtime task</h4><p class="text-xs text-slate-500 mt-1">SQLite 是任务状态真源；轮询只执行 GET</p></div><span class="data-pill ${task.status === 'Succeeded' ? '' : 'warning'}">${escapeHtml(task.status)}</span></div>
         <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd><dt>optimizer / LR</dt><dd class="font-mono">${escapeHtml(`${(task.draft.optimizer || 'legacy').toUpperCase()} / ${task.draft.learningRate || 'preset default'}`)}</dd><dt>dispatch</dt><dd>${escapeHtml(task.dispatch.state || 'not recorded')}</dd><dt>dispatch evidence</dt><dd>${escapeHtml(guidedDispatchExplanation(task.dispatch.state))}</dd><dt>Adapter status</dt><dd>${escapeHtml(adapter.status || 'not available')}</dd><dt>stage</dt><dd>${escapeHtml(adapter.stage || '—')}</dd><dt>progress</dt><dd>${escapeHtml(`${completed} / ${total}`)}</dd><dt>message</dt><dd>${escapeHtml(adapter.message || task.dispatch.failureCode || '等待状态更新')}</dd></dl>
-        ${task.status === 'Succeeded' ? '' : '<button type="button" onclick="refreshGuidedTask()" class="mt-3 px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">刷新状态（GET）</button>'}${error}
+        <div class="mt-3 flex flex-wrap gap-2">${task.status === 'Succeeded' ? '' : '<button type="button" onclick="refreshGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">刷新状态（GET）</button>'}${linkedToCurrent ? '<button type="button" onclick="unlinkCurrentConversationFromGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">从当前对话移除引用</button>' : '<button type="button" onclick="linkCurrentConversationToGuidedTask()" class="px-3 py-2 rounded-lg border border-accent/40 bg-accent/5 text-sm text-accent">关联当前对话</button>'}</div>${error}
       </section>`;
     }
 
-    function renderGuidedArtifactsHtml(taskId, artifacts) {
+    function isSafeGuidedBlobUrl(value) {
+      return typeof value === 'string' && /^blob:[^\s"'<>]{1,2048}$/.test(value);
+    }
+
+    function renderGuidedArtifactsHtml(taskId, artifacts, expectedOutputs, objectUrls, imageErrors) {
       if (!isSafeGuidedOpaqueId(taskId)) return '';
       const safeArtifacts = Array.isArray(artifacts) ? artifacts : [];
-      if (safeArtifacts.length !== 2) {
-        return `<section class="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4" data-guided-view="artifacts"><h4 class="font-semibold text-amber-800">ArtifactManifest 尚未就绪</h4><p class="text-sm text-amber-700 mt-1">成功任务应返回反演模型与损失曲线两个标准 manifest；当前收到 ${escapeHtml(String(safeArtifacts.length))} 个。</p><button type="button" onclick="loadGuidedArtifacts()" class="mt-3 px-3 py-2 rounded-lg border border-amber-300 bg-white text-sm text-amber-900">重新获取 artifacts（GET）</button><p class="mt-2 text-xs text-amber-700">只重新读取 manifest，不会重试 Worker 或创建新任务。</p></section>`;
+      const planned = Array.isArray(expectedOutputs) ? expectedOutputs : [];
+      const expectedCount = planned.length || 2;
+      const urls = objectUrls && typeof objectUrls === 'object' ? objectUrls : {};
+      const errors = imageErrors && typeof imageErrors === 'object' ? imageErrors : {};
+      if (safeArtifacts.length !== expectedCount) {
+        return `<section class="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4" data-guided-view="artifacts"><h4 class="font-semibold text-amber-800">ArtifactManifest 尚未就绪</h4><p class="text-sm text-amber-700 mt-1">当前 Plan 精确声明 ${escapeHtml(String(expectedCount))} 个输出；当前收到 ${escapeHtml(String(safeArtifacts.length))} 个合法 manifest。</p><button type="button" onclick="loadGuidedArtifacts()" class="mt-3 px-3 py-2 rounded-lg border border-amber-300 bg-white text-sm text-amber-900">重新获取 artifacts（GET）</button><p class="mt-2 text-xs text-amber-700">只重新读取 task-scoped manifest，不会重试 Worker 或创建新任务。</p></section>`;
       }
       const cards = safeArtifacts.map(artifact => {
         if (!artifact || artifact.taskId !== taskId || !isSafeGuidedOpaqueId(artifact.artifactId)) return '';
-        return `<article class="rounded-lg border border-slate-200 bg-white p-4" data-guided-artifact="${escapeHtml(artifact.artifactId)}"><div class="flex items-start justify-between gap-3"><div><h5 class="font-semibold text-slate-900">${escapeHtml(artifact.title)}</h5><p class="text-xs text-slate-500 mt-1">${escapeHtml(artifact.type)} · ${escapeHtml(artifact.mediaType)}</p></div><span class="data-pill">ArtifactManifest</span></div><dl class="kv-grid mt-3"><dt>artifact_id</dt><dd class="font-mono">${escapeHtml(artifact.artifactId)}</dd><dt>size</dt><dd>${escapeHtml(artifact.sizeBytes === null ? '—' : `${artifact.sizeBytes} bytes`)}</dd><dt>content hash</dt><dd class="font-mono">${escapeHtml(artifact.contentHash || '—')}</dd></dl><button type="button" onclick="downloadGuidedArtifact('${escapeHtml(taskId)}','${escapeHtml(artifact.artifactId)}')" class="mt-3 px-3 py-2 rounded-lg bg-accent text-white text-sm">通过受控 endpoint 下载</button></article>`;
+        const blobUrl = isSafeGuidedBlobUrl(urls[artifact.artifactId])
+          ? urls[artifact.artifactId] : '';
+        let preview = '';
+        if (artifact.mediaType === 'image/png') {
+          preview = errors[artifact.artifactId]
+            ? `<div class="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-700">此图加载失败；其他结果仍可查看。<button type="button" onclick="loadGuidedArtifactImages()" class="ml-2 underline">重试图片</button></div>`
+            : (blobUrl
+              ? `<img src="${escapeHtml(blobUrl)}" width="${escapeHtml(String(artifact.width))}" height="${escapeHtml(String(artifact.height))}" alt="${escapeHtml(artifact.title)}" loading="lazy" onerror="handleGuidedArtifactImageError('${escapeHtml(taskId)}','${escapeHtml(artifact.artifactId)}')" class="mt-3 h-auto w-full rounded-lg border border-slate-200 bg-slate-50 object-contain">`
+              : '<div class="mt-3 rounded-lg bg-slate-50 p-4 text-center text-xs text-slate-500">正在通过任务作用域 endpoint 加载图片…</div>');
+        }
+        return `<article class="rounded-lg border border-slate-200 bg-white p-4" data-guided-artifact="${escapeHtml(artifact.artifactId)}"><div class="flex items-start justify-between gap-3"><div><h5 class="font-semibold text-slate-900">${escapeHtml(artifact.title)}</h5><p class="text-xs text-slate-500 mt-1">${escapeHtml(artifact.outputPort || artifact.type)} · ${escapeHtml(artifact.mediaType)}</p></div><span class="data-pill">ArtifactManifest</span></div>${preview}<dl class="kv-grid mt-3"><dt>artifact_id</dt><dd class="font-mono">${escapeHtml(artifact.artifactId)}</dd><dt>size</dt><dd>${escapeHtml(artifact.sizeBytes === null ? '—' : `${artifact.sizeBytes} bytes`)}</dd><dt>content hash</dt><dd class="font-mono">${escapeHtml(artifact.contentHash || '—')}</dd></dl><button type="button" onclick="downloadGuidedArtifact('${escapeHtml(taskId)}','${escapeHtml(artifact.artifactId)}')" class="mt-3 px-3 py-2 rounded-lg bg-accent text-white text-sm">通过受控 endpoint 下载</button></article>`;
       }).join('');
-      return `<section class="mt-4" data-guided-view="artifacts"><h4 class="font-heading font-semibold text-slate-900 mb-3">标准 ArtifactManifest</h4><div class="grid grid-cols-1 md:grid-cols-2 gap-3">${cards}</div></section>`;
+      return `<section class="mt-4" data-guided-view="artifacts"><h4 class="font-heading font-semibold text-slate-900 mb-1">任务结果与图像</h4><p class="mb-3 text-xs text-slate-500">结果严格对应当前 Plan 的 ${escapeHtml(String(expectedCount))} 个输出；图片以受控 Blob URL 展示。</p><div class="grid grid-cols-1 md:grid-cols-2 gap-3">${cards}</div></section>`;
     }
 
     function renderGuidedFwi(options) {
@@ -2760,10 +3296,16 @@
       } else {
         content = renderGuidedTaskHtml();
         if (state.guided.task && state.guided.task.status === 'Succeeded') {
-          content += renderGuidedArtifactsHtml(state.guided.taskId, state.guided.artifacts);
+          content += renderGuidedArtifactsHtml(
+            state.guided.taskId,
+            state.guided.artifacts,
+            state.guided.task.plan.outputs,
+            state.guided.artifactObjectUrls,
+            state.guided.artifactImageErrors,
+          );
         }
       }
-      panel.innerHTML = `<div class="workbench-card p-4 shadow-sm" data-guided-fwi="true"><div class="flex items-start justify-between gap-3 mb-4"><div><h3 class="font-heading font-semibold text-slate-900">Guided FWI</h3><p class="text-xs text-slate-500 mt-1">Catalog → Draft / Plan → explicit approval → SQLite task → artifacts</p></div><button type="button" onclick="closeGuidedFwi()" title="关闭任务视图（不取消任务）" aria-label="关闭任务视图（不取消任务）" class="text-slate-400 hover:text-slate-700">×</button></div>${content}</div>`;
+      panel.innerHTML = `<div class="workbench-card p-4 shadow-sm" data-guided-fwi="true"><div class="flex items-start justify-between gap-3 mb-4"><div><h3 class="font-heading font-semibold text-slate-900">独立任务详情 · Guided FWI</h3><p class="text-xs text-slate-500 mt-1">任务独立于对话：Catalog → Draft / Plan → explicit approval → SQLite task → artifacts</p></div><button type="button" onclick="closeGuidedFwi()" title="关闭任务视图（不取消任务）" aria-label="关闭任务视图（不取消任务）" class="text-slate-400 hover:text-slate-700">×</button></div>${content}</div>`;
       panel.classList.remove('hidden');
       if (options.reveal === true && typeof panel.scrollIntoView === 'function') {
         panel.scrollIntoView({ block: 'start' });
@@ -2787,8 +3329,11 @@
         return false;
       }
       clearGuidedPoll();
+      revokeGuidedArtifactObjectUrls();
       const generation = (state.guided.generation || 0) + 1;
       state.guided = createGuidedFwiState(generation, state.guided);
+      state.guided.pendingLinkChatId = isSafeConversationId(overrides.linkChatId, 128)
+        && state.chats[overrides.linkChatId] ? overrides.linkChatId : '';
       document.getElementById('welcomeMsg').classList.add('hidden');
       if (overrides.unsupported_operation === 'forward'
           || hasGuidedUnsupportedForwardIntent(overrides.goal)) {
@@ -2836,6 +3381,7 @@
         return false;
       }
       clearGuidedPoll();
+      revokeGuidedArtifactObjectUrls();
       const generation = (state.guided.generation || 0) + 1;
       state.guided = createGuidedFwiState(generation, state.guided);
       state.guided.taskId = taskId;
@@ -2919,6 +3465,7 @@
         return false;
       }
       clearGuidedPoll();
+      revokeGuidedArtifactObjectUrls();
       const generation = (state.guided.generation || 0) + 1;
       state.guided = createGuidedFwiState(generation, state.guided);
       renderGuidedFwi();
@@ -2982,6 +3529,11 @@
         state.guided.task = task;
         state.guided.taskId = task.taskId;
         upsertGuidedTaskIndex(task);
+        if (!editing && state.guided.pendingLinkChatId) {
+          const linked = linkTaskToChat(state.guided.pendingLinkChatId, task);
+          if (!linked) showToast('任务已创建，但浏览器未能保存对话引用；可在任务详情中重新关联');
+          state.guided.pendingLinkChatId = '';
+        }
         state.guided.form = {
           goal: task.draft.goal,
           dataset_id: task.draft.datasetId,
@@ -3219,6 +3771,101 @@
       }
     }
 
+    function revokeGuidedArtifactObjectUrls() {
+      const urls = state.guided && state.guided.artifactObjectUrls;
+      if (urls && typeof urls === 'object' && typeof URL !== 'undefined') {
+        Object.values(urls).forEach(value => {
+          if (isSafeGuidedBlobUrl(value)) URL.revokeObjectURL(value);
+        });
+      }
+      if (state.guided) {
+        state.guided.artifactImageGeneration = (
+          Number.isInteger(state.guided.artifactImageGeneration)
+            ? state.guided.artifactImageGeneration : 0
+        ) + 1;
+        state.guided.artifactImageLoadInFlight = false;
+        state.guided.artifactObjectUrls = Object.create(null);
+        state.guided.artifactImageErrors = Object.create(null);
+      }
+    }
+
+    function handleGuidedArtifactImageError(taskId, artifactId) {
+      if (taskId !== state.guided.taskId || !isSafeGuidedOpaqueId(artifactId)) return false;
+      const url = state.guided.artifactObjectUrls[artifactId];
+      if (isSafeGuidedBlobUrl(url)) URL.revokeObjectURL(url);
+      delete state.guided.artifactObjectUrls[artifactId];
+      state.guided.artifactImageErrors[artifactId] = true;
+      renderGuidedFwi();
+      return true;
+    }
+
+    async function loadGuidedArtifactImages(options) {
+      options = options || {};
+      const taskId = state.guided.taskId;
+      const generation = state.guided.generation;
+      const images = state.guided.artifacts.filter(artifact => artifact.mediaType === 'image/png');
+      if (!isSafeGuidedOpaqueId(taskId) || images.length === 0) return true;
+      if (state.guided.artifactImageLoadInFlight) return false;
+      const imageGeneration = Number.isInteger(state.guided.artifactImageGeneration)
+        ? state.guided.artifactImageGeneration : 0;
+      state.guided.artifactImageGeneration = imageGeneration;
+      const imageLoadIsCurrent = () => (
+        state.guided.generation === generation
+        && state.guided.taskId === taskId
+        && state.guided.artifactImageGeneration === imageGeneration
+      );
+      state.guided.artifactImageLoadInFlight = true;
+      // Six PNG figures can be large. Load them sequentially to keep peak
+      // fetch/decode memory bounded and isolate a failure to one card.
+      try {
+        for (const artifact of images) {
+          if (!imageLoadIsCurrent()) return false;
+          if (isSafeGuidedBlobUrl(state.guided.artifactObjectUrls[artifact.artifactId])) continue;
+          try {
+            const response = await fetch(guidedApiPath('artifact', taskId, artifact.artifactId), {
+              method: 'GET',
+              headers: { 'X-Workbench-CSRF': state.guided.csrfToken },
+              credentials: 'same-origin',
+              cache: 'no-store',
+            });
+            if (!response.ok) throw new Error(`image HTTP ${response.status}`);
+            const contentType = response.headers?.get('content-type') || '';
+            if (!contentType.toLowerCase().startsWith('image/png')) throw new Error('image media type mismatch');
+            const blob = await response.blob();
+            if (artifact.sizeBytes !== null && blob.size !== artifact.sizeBytes) {
+              throw new Error('image byte length mismatch');
+            }
+            if (!imageLoadIsCurrent()) return false;
+            const objectUrl = URL.createObjectURL(blob);
+            if (!isSafeGuidedBlobUrl(objectUrl)) {
+              URL.revokeObjectURL(objectUrl);
+              throw new Error('invalid Blob URL');
+            }
+            if (!imageLoadIsCurrent()) {
+              URL.revokeObjectURL(objectUrl);
+              return false;
+            }
+            const previousUrl = state.guided.artifactObjectUrls[artifact.artifactId];
+            if (isSafeGuidedBlobUrl(previousUrl) && previousUrl !== objectUrl) {
+              URL.revokeObjectURL(previousUrl);
+            }
+            state.guided.artifactObjectUrls[artifact.artifactId] = objectUrl;
+            delete state.guided.artifactImageErrors[artifact.artifactId];
+          } catch (error) {
+            if (imageLoadIsCurrent()) {
+              state.guided.artifactImageErrors[artifact.artifactId] = true;
+            }
+          }
+        }
+        if (options.render !== false && imageLoadIsCurrent()) renderGuidedFwi();
+        return imageLoadIsCurrent() && images.every(artifact => isSafeGuidedBlobUrl(
+          state.guided.artifactObjectUrls[artifact.artifactId],
+        ));
+      } finally {
+        if (imageLoadIsCurrent()) state.guided.artifactImageLoadInFlight = false;
+      }
+    }
+
     async function loadGuidedArtifacts(options) {
       options = options || {};
       const taskId = state.guided.taskId;
@@ -3228,14 +3875,18 @@
       try {
         const data = await guidedApiRequest(guidedApiPath('artifacts', taskId));
         if (state.guided.generation !== generation) return false;
-        state.guided.artifacts = normalizeGuidedArtifacts(data, taskId);
-        if (state.guided.artifacts.length !== 2) {
-          state.guided.error = 'Artifact collection 尚未返回两个标准 manifest';
+        revokeGuidedArtifactObjectUrls();
+        const expectedOutputs = state.guided.task?.plan?.outputs || [];
+        state.guided.artifacts = normalizeGuidedArtifacts(data, taskId, expectedOutputs);
+        const expectedCount = expectedOutputs.length || 2;
+        if (state.guided.artifacts.length !== expectedCount) {
+          state.guided.error = `Artifact collection 未精确匹配 Plan 的 ${expectedCount} 个输出`;
         } else {
           state.guided.error = '';
+          await loadGuidedArtifactImages({ render: false });
         }
         if (options.render !== false) renderGuidedFwi();
-        return state.guided.artifacts.length === 2;
+        return state.guided.artifacts.length === expectedCount;
       } catch (error) {
         if (state.guided.generation !== generation) return false;
         state.guided.error = error && error.message ? `Artifact 查询失败：${error.message}` : 'Artifact 查询失败';
@@ -3265,7 +3916,8 @@
         if (!response.ok) throw new Error(`artifact HTTP ${response.status}`);
         const blob = await response.blob();
         const artifact = state.guided.artifacts.find(item => item.artifactId === artifactId);
-        const extension = artifact.mediaType === 'text/csv' ? '.csv' : '.npy';
+        const extension = artifact.mediaType === 'text/csv'
+          ? '.csv' : (artifact.mediaType === 'image/png' ? '.png' : '.npy');
         const objectUrl = URL.createObjectURL(blob);
         const anchor = document.createElement('a');
         anchor.href = objectUrl;
@@ -3736,6 +4388,16 @@
     function renderExperimentHistory() {
       const container = document.getElementById('experimentHistory');
       if (!container) return;
+      const section = document.getElementById('legacyFwiReceiptSection');
+      const hasLegacyReceipt = Boolean(state.fwiReceiptMissing || state.fwiJob);
+      if (section) {
+        if (hasLegacyReceipt) section.classList.remove('hidden');
+        else section.classList.add('hidden');
+      }
+      if (!hasLegacyReceipt) {
+        container.innerHTML = '';
+        return;
+      }
       if (state.fwiReceiptMissing) {
         container.innerHTML = `<div class="workbench-card border-red-200 bg-red-50 w-full p-2" data-fwi-sidebar="missing-receipt" role="alert">
           <div class="flex items-center justify-between gap-2">
@@ -3747,10 +4409,7 @@
         return;
       }
       const job = state.fwiJob;
-      if (!job) {
-        container.innerHTML = '<p class="text-xs text-slate-400 py-2">尚未提交任务</p>';
-        return;
-      }
+      if (!job) return;
       const jobId = normalizeFwiJobId(job.job_id) || 'invalid';
       const status = String(job.status || 'queued');
       const clickable = jobId !== 'invalid';

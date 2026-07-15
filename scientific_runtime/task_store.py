@@ -14,7 +14,7 @@ import os
 import sqlite3
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -48,6 +48,9 @@ TASK_STATUSES = frozenset(
 WORKBENCH_MUTATION_OPERATIONS = frozenset(
     {"revise_draft", "persist_plan", "persist_approval", "abandon_task"}
 )
+
+TASK_VISIBILITY_OPERATIONS = frozenset({"trash_task", "restore_task"})
+TASK_VISIBILITY_VIEWS = frozenset({"active", "trash"})
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "Draft": frozenset({"Draft", "NeedsInput", "AwaitingApproval", "Cancelled"}),
@@ -102,6 +105,8 @@ class TaskSnapshot:
     created_at: str
     updated_at: str
     abandonment: dict[str, Any] | None = None
+    visibility_revision: int = 0
+    trashed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +200,14 @@ class WorkbenchMutationRecord:
     task_id: str
     operation: str
     outcome: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TaskVisibilityMutationRecord:
+    """One exact trash/restore outcome and whether it was replayed."""
+
+    snapshot: TaskSnapshot
+    replayed: bool
 
 
 @dataclass(frozen=True)
@@ -346,7 +359,22 @@ class TaskStore(Protocol):
         principal_id: str,
         cursor: str | None = None,
         limit: int = 20,
+        view: str = "active",
     ) -> TaskSnapshotPage:
+        ...
+
+    def change_task_visibility(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        operation: str,
+        expected_visibility_revision: int,
+        idempotency_key: str,
+        request_hash: str,
+        now: str,
+    ) -> TaskVisibilityMutationRecord:
         ...
 
     def lookup_workbench_mutation(
@@ -2099,6 +2127,7 @@ class SQLiteTaskStore:
         principal_id: str,
         cursor: str | None = None,
         limit: int = 20,
+        view: str = "active",
     ) -> TaskSnapshotPage:
         """List one immutable-creation-order page inside an exact task scope.
 
@@ -2119,6 +2148,8 @@ class SQLiteTaskStore:
             raise TaskStoreConflict("task list cursor is invalid")
         if type(limit) is not int or not 1 <= limit <= 50:
             raise TaskStoreConflict("task list limit is invalid")
+        if view not in TASK_VISIBILITY_VIEWS:
+            raise TaskStoreConflict("task list view is invalid")
 
         connection = self._connect()
         try:
@@ -2127,15 +2158,22 @@ class SQLiteTaskStore:
             # updated_at, so progress events cannot move a task between pages.
             connection.execute("BEGIN")
             parameters: list[Any] = [project_id, principal_id]
+            visibility_state = "active" if view == "active" else "trashed"
+            parameters.append(visibility_state)
             boundary = ""
             if cursor is not None:
                 cursor_row = connection.execute(
                     """
-                    SELECT task_id, created_at
+                    SELECT tasks.task_id, tasks.created_at
                     FROM tasks
-                    WHERE task_id = ? AND project_id = ? AND principal_id = ?
+                    LEFT JOIN task_visibility AS visibility
+                      ON visibility.task_id = tasks.task_id
+                    WHERE tasks.task_id = ?
+                      AND tasks.project_id = ?
+                      AND tasks.principal_id = ?
+                      AND COALESCE(visibility.state, 'active') = ?
                     """,
-                    (cursor, project_id, principal_id),
+                    (cursor, project_id, principal_id, visibility_state),
                 ).fetchone()
                 if cursor_row is None:
                     raise TaskStoreConflict("task list cursor is invalid")
@@ -2151,8 +2189,8 @@ class SQLiteTaskStore:
                     )
                 boundary = """
                   AND (
-                        created_at < ?
-                        OR (created_at = ? AND task_id < ?)
+                        tasks.created_at < ?
+                        OR (tasks.created_at = ? AND tasks.task_id < ?)
                   )
                 """
                 parameters.extend(
@@ -2165,11 +2203,14 @@ class SQLiteTaskStore:
             parameters.append(limit + 1)
             rows = connection.execute(
                 f"""
-                SELECT task_id
+                SELECT tasks.task_id
                 FROM tasks
-                WHERE project_id = ? AND principal_id = ?
+                LEFT JOIN task_visibility AS visibility
+                  ON visibility.task_id = tasks.task_id
+                WHERE tasks.project_id = ? AND tasks.principal_id = ?
+                  AND COALESCE(visibility.state, 'active') = ?
                 {boundary}
-                ORDER BY created_at DESC, task_id DESC
+                ORDER BY tasks.created_at DESC, tasks.task_id DESC
                 LIMIT ?
                 """,
                 parameters,
@@ -2202,6 +2243,108 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    def _load_task_visibility(
+        self, connection: sqlite3.Connection, row: Mapping[str, Any]
+    ) -> tuple[int, str | None]:
+        task_id = str(row["task_id"])
+        projection = connection.execute(
+            """
+            SELECT project_id, principal_id, state, revision,
+                   trashed_at, updated_at
+            FROM task_visibility WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        events = connection.execute(
+            """
+            SELECT project_id, principal_id, revision, event_id, action,
+                   previous_state, state, trashed_at, document_json,
+                   document_hash, occurred_at, recorded_at
+            FROM task_visibility_events
+            WHERE task_id = ? ORDER BY revision ASC
+            """,
+            (task_id,),
+        ).fetchall()
+        if projection is None:
+            mutation = connection.execute(
+                "SELECT 1 FROM task_visibility_mutations WHERE task_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if events or mutation is not None:
+                raise TaskStoreCorruption(
+                    "task visibility history lacks its current projection"
+                )
+            return 0, None
+
+        if (
+            projection["project_id"] != row["project_id"]
+            or projection["principal_id"] != row["principal_id"]
+            or type(projection["revision"]) is not int
+            or projection["revision"] < 1
+            or len(events) != projection["revision"]
+        ):
+            raise TaskStoreCorruption("task visibility projection is invalid")
+
+        previous_state = "active"
+        trashed_at: str | None = None
+        for expected_revision, event_row in enumerate(events, start=1):
+            document = _decode_hashed_document(
+                event_row, label="task visibility event"
+            )
+            expected_action = "trashed" if previous_state == "active" else "restored"
+            next_state = "trashed" if expected_action == "trashed" else "active"
+            next_trashed_at = (
+                event_row["occurred_at"] if next_state == "trashed" else None
+            )
+            if (
+                event_row["project_id"] != row["project_id"]
+                or event_row["principal_id"] != row["principal_id"]
+                or event_row["revision"] != expected_revision
+                or event_row["action"] != expected_action
+                or event_row["previous_state"] != previous_state
+                or event_row["state"] != next_state
+                or event_row["trashed_at"] != next_trashed_at
+                or set(document)
+                != {
+                    "schema_version",
+                    "event_id",
+                    "task_id",
+                    "revision",
+                    "action",
+                    "previous_state",
+                    "state",
+                    "trashed_at",
+                    "actor",
+                    "occurred_at",
+                    "extensions",
+                }
+                or document.get("schema_version") != "1.0.0"
+                or document.get("event_id") != event_row["event_id"]
+                or document.get("task_id") != task_id
+                or document.get("revision") != expected_revision
+                or document.get("action") != expected_action
+                or document.get("previous_state") != previous_state
+                or document.get("state") != next_state
+                or document.get("trashed_at") != next_trashed_at
+                or document.get("actor")
+                != {"type": "user", "id": row["principal_id"]}
+                or document.get("occurred_at") != event_row["occurred_at"]
+                or document.get("extensions") != {}
+            ):
+                raise TaskStoreCorruption("task visibility event is invalid")
+            previous_state = next_state
+            trashed_at = next_trashed_at
+
+        if (
+            projection["state"] != previous_state
+            or projection["trashed_at"] != trashed_at
+            or projection["updated_at"] != events[-1]["occurred_at"]
+        ):
+            raise TaskStoreCorruption(
+                "task visibility projection differs from its event history"
+            )
+        return int(projection["revision"]), trashed_at
+
     def _load_snapshot(
         self, connection: sqlite3.Connection, task_id: str
     ) -> TaskSnapshot | None:
@@ -2210,6 +2353,9 @@ class SQLiteTaskStore:
         ).fetchone()
         if row is None:
             return None
+        visibility_revision, trashed_at = self._load_task_visibility(
+            connection, row
+        )
         abandonment_row = connection.execute(
             """
             SELECT task_id, project_id, principal_id,
@@ -2475,6 +2621,8 @@ class SQLiteTaskStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             abandonment=abandonment,
+            visibility_revision=visibility_revision,
+            trashed_at=trashed_at,
         )
 
     def _load_dispatch_intent(
@@ -3583,6 +3731,17 @@ class SQLiteTaskStore:
                 raise TaskStoreConflict(
                     "only a pre-runtime task can be abandoned"
                 )
+            if connection.execute(
+                """
+                SELECT 1 FROM approvals
+                WHERE task_id = ? AND decision = 'approved'
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict(
+                    "an approved task cannot be abandoned before submit reconciliation"
+                )
             if "Cancelled" not in ALLOWED_TRANSITIONS[task["status"]]:
                 raise TaskStoreConflict("pre-runtime abandonment transition is invalid")
             if connection.execute(
@@ -3643,6 +3802,322 @@ class SQLiteTaskStore:
                 connection.rollback()
             raise TaskStoreConflict(
                 "task abandonment conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def change_task_visibility(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        operation: str,
+        expected_visibility_revision: int,
+        idempotency_key: str,
+        request_hash: str,
+        now: str,
+    ) -> TaskVisibilityMutationRecord:
+        """Atomically append one scope-bound trash/restore visibility event."""
+
+        if operation not in TASK_VISIBILITY_OPERATIONS:
+            raise TaskStoreConflict("task visibility operation is invalid")
+        if (
+            type(expected_visibility_revision) is not int
+            or expected_visibility_revision < 0
+        ):
+            raise TaskStoreConflict("task visibility revision is invalid")
+        target_action = "trashed" if operation == "trash_task" else "restored"
+        expected_state = "active" if operation == "trash_task" else "trashed"
+        target_state = "trashed" if operation == "trash_task" else "active"
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            mutation = connection.execute(
+                """
+                SELECT task_id, request_hash, visibility_revision,
+                       outcome_json AS document_json,
+                       outcome_hash AS document_hash
+                FROM task_visibility_mutations
+                WHERE project_id = ? AND principal_id = ?
+                  AND operation = ? AND idempotency_key = ?
+                """,
+                (project_id, principal_id, operation, idempotency_key),
+            ).fetchone()
+            if mutation is not None:
+                if mutation["request_hash"] != request_hash:
+                    raise IdempotencyConflict(
+                        "idempotency key was already used for another visibility request"
+                    )
+                outcome = _decode_hashed_document(
+                    mutation, label="task visibility mutation outcome"
+                )
+                if (
+                    mutation["task_id"] != task_id
+                    or set(outcome)
+                    != {"task_id", "visibility_revision", "trashed_at"}
+                    or outcome.get("task_id") != task_id
+                    or type(outcome.get("visibility_revision")) is not int
+                    or outcome["visibility_revision"] < 1
+                    or outcome["visibility_revision"]
+                    != mutation["visibility_revision"]
+                    or (
+                        operation == "trash_task"
+                        and not isinstance(outcome.get("trashed_at"), str)
+                    )
+                    or (
+                        operation == "restore_task"
+                        and outcome.get("trashed_at") is not None
+                    )
+                ):
+                    raise TaskStoreCorruption(
+                        "task visibility mutation outcome is invalid"
+                    )
+                snapshot = self._load_snapshot(connection, task_id)
+                if (
+                    snapshot is None
+                    or snapshot.project_id != project_id
+                    or snapshot.principal_id != principal_id
+                ):
+                    raise TaskStoreCorruption(
+                        "task visibility replay references a missing task"
+                    )
+                replay_snapshot = replace(
+                    snapshot,
+                    visibility_revision=outcome["visibility_revision"],
+                    trashed_at=outcome["trashed_at"],
+                )
+                connection.commit()
+                return TaskVisibilityMutationRecord(replay_snapshot, True)
+
+            task = connection.execute(
+                """
+                SELECT task_id, project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreConflict("task does not exist")
+            if (
+                task["project_id"] != project_id
+                or task["principal_id"] != principal_id
+            ):
+                raise TaskStoreConflict("task visibility mutation crosses task scope")
+
+            visibility = connection.execute(
+                """
+                SELECT state, revision, trashed_at
+                FROM task_visibility WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            current_state = "active" if visibility is None else visibility["state"]
+            current_revision = 0 if visibility is None else visibility["revision"]
+            if (
+                current_revision != expected_visibility_revision
+                or current_state != expected_state
+            ):
+                raise TaskStoreConflict(
+                    "task visibility revision or state precondition failed"
+                )
+
+            if operation == "trash_task":
+                if task["status"] not in {"Succeeded", "Failed", "Cancelled"}:
+                    raise TaskStoreConflict(
+                        "only a terminal task can be moved to trash"
+                    )
+                evidence = connection.execute(
+                    """
+                    SELECT
+                        EXISTS(
+                            SELECT 1 FROM task_abandonments
+                            WHERE task_id = ?
+                        ) AS abandoned,
+                        EXISTS(
+                            SELECT 1 FROM approvals
+                            WHERE task_id = ? AND decision = 'approved'
+                        ) AS approved,
+                        (
+                            SELECT intent.intent_id
+                            FROM dispatch_intents AS intent
+                            WHERE intent.task_id = ?
+                        ) AS intent_id,
+                        (
+                            SELECT outcome.outcome
+                            FROM dispatch_intents AS intent
+                            LEFT JOIN dispatch_outcomes AS outcome
+                              ON outcome.intent_id = intent.intent_id
+                            WHERE intent.task_id = ?
+                        ) AS dispatch_outcome
+                    """,
+                    (task_id, task_id, task_id, task_id),
+                ).fetchone()
+                pre_runtime_abandonment = (
+                    task["status"] == "Cancelled"
+                    and evidence["abandoned"] == 1
+                    and evidence["approved"] == 0
+                    and evidence["intent_id"] is None
+                )
+                resolved_runtime = (
+                    evidence["intent_id"] is not None
+                    and evidence["dispatch_outcome"] == "dispatched"
+                )
+                if not (pre_runtime_abandonment or resolved_runtime):
+                    raise TaskStoreConflict(
+                        "an unresolved task cannot be moved to trash"
+                    )
+
+            next_revision = current_revision + 1
+            trashed_at = now if target_state == "trashed" else None
+            identity_text = "\x1f".join(
+                (
+                    project_id,
+                    principal_id,
+                    operation,
+                    idempotency_key,
+                    request_hash,
+                    task_id,
+                    str(next_revision),
+                )
+            )
+            event_id = "visibility-" + hashlib.sha256(
+                identity_text.encode("utf-8")
+            ).hexdigest()[:32]
+            event = {
+                "schema_version": "1.0.0",
+                "event_id": event_id,
+                "task_id": task_id,
+                "revision": next_revision,
+                "action": target_action,
+                "previous_state": current_state,
+                "state": target_state,
+                "trashed_at": trashed_at,
+                "actor": {"type": "user", "id": principal_id},
+                "occurred_at": now,
+                "extensions": {},
+            }
+            event_json, event_hash = encode_document(event)
+            connection.execute(
+                """
+                INSERT INTO task_visibility_events(
+                    task_id, project_id, principal_id, revision, event_id,
+                    action, previous_state, state, trashed_at,
+                    document_json, document_hash, occurred_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    project_id,
+                    principal_id,
+                    next_revision,
+                    event_id,
+                    target_action,
+                    current_state,
+                    target_state,
+                    trashed_at,
+                    event_json,
+                    event_hash,
+                    now,
+                    now,
+                ),
+            )
+            if visibility is None:
+                connection.execute(
+                    """
+                    INSERT INTO task_visibility(
+                        task_id, project_id, principal_id, state,
+                        revision, trashed_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        project_id,
+                        principal_id,
+                        target_state,
+                        next_revision,
+                        trashed_at,
+                        now,
+                    ),
+                )
+            else:
+                updated = connection.execute(
+                    """
+                    UPDATE task_visibility
+                    SET state = ?, revision = ?, trashed_at = ?, updated_at = ?
+                    WHERE task_id = ? AND revision = ? AND state = ?
+                    """,
+                    (
+                        target_state,
+                        next_revision,
+                        trashed_at,
+                        now,
+                        task_id,
+                        current_revision,
+                        current_state,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise TaskStoreConflict(
+                        "task visibility changed concurrently"
+                    )
+
+            outcome = {
+                "task_id": task_id,
+                "visibility_revision": next_revision,
+                "trashed_at": trashed_at,
+            }
+            outcome_json, outcome_hash = encode_document(outcome)
+            connection.execute(
+                """
+                INSERT INTO task_visibility_mutations(
+                    project_id, principal_id, operation, idempotency_key,
+                    request_hash, task_id, visibility_revision,
+                    outcome_json, outcome_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    principal_id,
+                    operation,
+                    idempotency_key,
+                    request_hash,
+                    task_id,
+                    next_revision,
+                    outcome_json,
+                    outcome_hash,
+                    now,
+                ),
+            )
+            snapshot = self._load_snapshot(connection, task_id)
+            if (
+                snapshot is None
+                or snapshot.visibility_revision != next_revision
+                or snapshot.trashed_at != trashed_at
+            ):
+                raise TaskStoreCorruption(
+                    "task visibility mutation cannot be read"
+                )
+            connection.commit()
+            return TaskVisibilityMutationRecord(snapshot, False)
+        except (IdempotencyConflict, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "task visibility mutation conflicts with durable state"
             ) from error
         except Exception:
             if connection.in_transaction:

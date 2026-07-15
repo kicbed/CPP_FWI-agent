@@ -4,7 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import matplotlib
 import numpy as np
+from PIL import Image
 
 from fwi_worker.acquisition import build_acquisition
 from fwi_worker.config import resolve_config
@@ -61,9 +63,29 @@ class PlotsAndMetricsTest(unittest.TestCase):
             self.assertEqual(details["interpolation"], "nearest")
             self.assertEqual(details["model_extent_km"], [0.0, 0.2, 0.12, 0.0])
             self.assertEqual(details["shot_gather_clipping"]["percentile"], 99.0)
+            expected_images = {
+                "true_model": (1440, 608),
+                "initial_model": (1440, 608),
+                "inverted_model": (1440, 608),
+                "model_error": (1440, 608),
+                "shot_gathers": (2160, 800),
+                "loss_curve": (1120, 720),
+            }
             for figure in figures:
                 path = run_dir / figure["relative_path"]
                 self.assertGreater(path.stat().st_size, 0)
+                with Image.open(path) as image:
+                    self.assertEqual(image.format, "PNG")
+                    self.assertEqual(image.mode, "RGBA")
+                    self.assertEqual(image.size, expected_images[figure["id"]])
+
+    def test_user_tight_bbox_setting_cannot_change_figure_contract(self) -> None:
+        previous = matplotlib.rcParams["savefig.bbox"]
+        matplotlib.rcParams["savefig.bbox"] = "tight"
+        try:
+            self.test_all_plots_decode_and_use_common_model_limits()
+        finally:
+            matplotlib.rcParams["savefig.bbox"] = previous
 
     def test_marmousi_cell_extent_is_exact(self) -> None:
         config = resolve_config({"preset": "forward", "device": "cpu"})

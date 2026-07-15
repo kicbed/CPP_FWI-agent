@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import copy
 import dataclasses
 import hashlib
@@ -20,6 +19,7 @@ from unittest.mock import patch
 
 import numpy as np
 import scientific_runtime.fwi_adapter as fwi_adapter_module
+from PIL import Image
 
 from scientific_runtime import (
     DeepwaveTaskDispatcher,
@@ -42,7 +42,7 @@ PLAN_HASH = "sha256:" + "d" * 64
 
 
 def algorithm_identity() -> dict[str, Any]:
-    return {"id": "deepwave.acoustic_fwi", "version": "1.3.0"}
+    return {"id": "deepwave.acoustic_fwi", "version": "1.4.0"}
 
 
 def dataset_ref(*, content_hash: str = HASH_DATASET) -> dict[str, Any]:
@@ -98,7 +98,7 @@ def development_fingerprint() -> dict[str, Any]:
     return {
         "provenance_mode": "development",
         "algorithm": algorithm_identity(),
-        "adapter_version": "1.3.0",
+        "adapter_version": "1.4.0",
         "source": {"identity_complete": False, "dirty": None},
         "environment": {"environment_lock_hash": HASH_ENVIRONMENT},
         "runtime": {
@@ -481,13 +481,23 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             json.dumps(metrics), encoding="utf-8"
         )
 
-        png_path = figures / "true_model.png"
-        png_path.write_bytes(
-            base64.b64decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0l"
-                "EQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-            )
+        figure_specs = (
+            ("true_model_figure", "true_model", (1440, 608)),
+            ("initial_model_figure", "initial_model", (1440, 608)),
+            ("inverted_model_figure", "inverted_model", (1440, 608)),
+            ("model_error_figure", "model_error", (1440, 608)),
+            ("shot_gathers_figure", "shot_gathers", (2160, 800)),
+            ("loss_curve_figure", "loss_curve", (1120, 720)),
         )
+        figure_paths: dict[str, Path] = {}
+        for index, (port, figure_id, size) in enumerate(figure_specs, start=1):
+            path = figures / f"{figure_id}.png"
+            Image.new(
+                "RGBA",
+                size,
+                (20 * index, 255 - 20 * index, 80 + 10 * index, 255),
+            ).save(path, format="PNG")
+            figure_paths[port] = path
         legacy_manifest = {
             "type": "fwi_result",
             "schema_version": "1",
@@ -505,18 +515,20 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             "disclaimer": "test-only synthetic result",
             "metrics": metrics,
             "plot_details": {},
+            # Every path/title/url below is deliberately untrusted.  Adapter
+            # 1.4 must use only its fixed figure specification and real bytes.
             "figures": [
                 {
-                    "id": "true_model",
-                    "title": "True model",
-                    # This is the unsafe legacy field collect must ignore.
-                    "path": "/private/untrusted/true_model.png",
+                    "id": figure_id,
+                    "title": f"untrusted {figure_id}",
+                    "path": f"/private/untrusted/{figure_id}.png",
                     "url": (
                         f"/fwi-artifacts/{config['job_id']}"
-                        "/figures/true_model.png"
+                        f"/untrusted/{figure_id}.png"
                     ),
                     "mime_type": "image/png",
                 }
+                for _, figure_id, _ in figure_specs
             ],
         }
         (run_dir / "manifest.json").write_text(
@@ -524,8 +536,9 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         )
         self.write_status(run_dir, "succeeded")
         return {
-            "inverted_velocity_model_2d": inverted_path,
-            "loss_curve": loss_path,
+            "inverted_model": inverted_path,
+            "loss": loss_path,
+            **figure_paths,
         }
 
     def test_validate_and_estimate_are_strict_and_side_effect_free(self) -> None:
@@ -1121,18 +1134,19 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                     ("1.1.0", "1.1.0"),
                     ("1.2.0", "1.2.0"),
                     ("1.3.0", "1.3.0"),
+                    ("1.4.0", "1.4.0"),
                 }
             ),
         )
 
-    def test_current_dispatcher_reads_true_v1_0_v1_1_and_v1_2_receipts(self) -> None:
+    def test_current_dispatcher_reads_true_v1_0_through_v1_3_receipts(self) -> None:
         dispatcher = DeepwaveTaskDispatcher(self.adapter)
         last_intent: DispatchIntentSnapshot | None = None
         last_record: dict[str, Any] | None = None
         last_record_path: Path | None = None
 
         for index, legacy_version in enumerate(
-            ("1.0.0", "1.1.0", "1.2.0"), start=1
+            ("1.0.0", "1.1.0", "1.2.0", "1.3.0"), start=1
         ):
             with self.subTest(legacy_version=legacy_version):
                 handle, run_dir = self.submit_and_run_dir(
@@ -1206,9 +1220,14 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 self.assertEqual(
                     artifacts[0]["metrics"]["gradient_clip_quantile"], 0.98
                 )
-                artifact, data = dispatcher.read_artifact(
-                    intent, artifacts[0]["artifact_id"]
-                )
+                with patch.object(
+                    self.adapter, "collect", wraps=self.adapter.collect
+                ) as collect_once:
+                    collected, artifact, data = dispatcher.read_artifact(
+                        intent, artifacts[0]["artifact_id"]
+                    )
+                self.assertEqual(collect_once.call_count, 1)
+                self.assertEqual(collected, artifacts)
                 self.assertEqual(
                     artifact["fingerprint"]["adapter_version"], legacy_version
                 )
@@ -1217,7 +1236,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 )
                 self.assertEqual(len(data), artifact["size_bytes"])
 
-                mismatched_version = "1.3.0"
+                mismatched_version = "1.4.0"
                 mismatched_intent = dataclasses.replace(
                     intent, adapter_version=mismatched_version
                 )
@@ -1372,23 +1391,29 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ADAPTER_ARTIFACT_INVALID"):
             self.adapter.collect(handle)
 
-    def test_collect_recomputes_safe_schema_valid_primary_artifacts(self) -> None:
+    def test_collect_recomputes_eight_safe_schema_valid_standard_artifacts(self) -> None:
         handle, run_dir = self.submit_and_run_dir()
         expected_paths = self.write_success_artifacts(run_dir)
         first = _plain(self.adapter.collect(handle))
         second = _plain(self.adapter.collect(handle))
         self.assertEqual(first, second)
         manifests = _artifacts(first)
+        self.assertEqual(len(manifests), 8)
+        self.assertEqual([value["display"]["order"] for value in manifests], list(range(8)))
 
-        by_type: dict[str, list[dict[str, Any]]] = {}
+        by_port: dict[str, dict[str, Any]] = {}
         for manifest in manifests:
             self.assertEqual(
                 schema_errors("artifact-manifest.schema.json", manifest), [], manifest
             )
-            by_type.setdefault(manifest["artifact_type"], []).append(manifest)
+            port = manifest["extensions"]["org.agent_rpc.adapter"]["output_port"]
+            self.assertNotIn(port, by_port)
+            by_port[port] = manifest
             encoded = json.dumps(manifest, sort_keys=True)
             self.assertNotIn(str(self.run_root), encoded)
             self.assertNotIn("/private/untrusted", encoded)
+            self.assertNotIn("/untrusted/", encoded)
+            self.assertNotIn("untrusted ", encoded)
             location = manifest["location"]
             location_value = location.get("relative_path", location.get("url"))
             self.assertIsInstance(location_value, str)
@@ -1404,19 +1429,78 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             )
             self.assertNotIn("gradient_clip_values", manifest["metrics"])
 
-        for artifact_type, path in expected_paths.items():
-            with self.subTest(artifact_type=artifact_type):
-                self.assertEqual(len(by_type.get(artifact_type, [])), 1)
-                manifest = by_type[artifact_type][0]
+        self.assertEqual(set(by_port), set(expected_paths))
+        figure_sizes = {
+            "true_model_figure": (1440, 608),
+            "initial_model_figure": (1440, 608),
+            "inverted_model_figure": (1440, 608),
+            "model_error_figure": (1440, 608),
+            "shot_gathers_figure": (2160, 800),
+            "loss_curve_figure": (1120, 720),
+        }
+        for port, path in expected_paths.items():
+            with self.subTest(port=port):
+                manifest = by_port[port]
                 self.assertEqual(
                     manifest["content_hash"],
                     "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
                 )
                 self.assertEqual(manifest["size_bytes"], path.stat().st_size)
+                if port in figure_sizes:
+                    self.assertEqual(manifest["artifact_type"], "figure")
+                    self.assertEqual(manifest["media_type"], "image/png")
+                    self.assertEqual(manifest["display"]["component"], "image")
+                    width_px, height_px = figure_sizes[port]
+                    figure = manifest["extensions"]["org.agent_rpc.figure"]
+                    self.assertEqual(
+                        (figure["width_px"], figure["height_px"]),
+                        (width_px, height_px),
+                    )
+                    self.assertRegex(figure["figure_id"], r"^[a-z][a-z0-9_]+$")
+                returned, data = self.adapter.read_artifact(
+                    handle, manifest["artifact_id"]
+                )
+                self.assertEqual(returned, manifest)
+                self.assertEqual(data, path.read_bytes())
 
-    def test_collect_rejects_primary_artifact_symlinks(self) -> None:
+    def test_collect_rejects_invalid_or_unbounded_png_outputs(self) -> None:
+        cases = ("missing", "truncated", "wrong_dimensions", "wrong_mode", "oversized")
+        for index, corruption in enumerate(cases, start=1):
+            with self.subTest(corruption=corruption):
+                handle, run_dir = self.submit_and_run_dir(
+                    task_id=f"task-png-{index}",
+                    idempotency_key=f"task-png-{index}:invert:0001",
+                )
+                self.write_success_artifacts(run_dir)
+                target = run_dir / "figures" / "true_model.png"
+                if corruption == "missing":
+                    target.unlink()
+                elif corruption == "truncated":
+                    target.write_bytes(target.read_bytes()[:64])
+                elif corruption == "wrong_dimensions":
+                    Image.new("RGBA", (1, 1), (0, 0, 0, 255)).save(
+                        target, format="PNG"
+                    )
+                elif corruption == "wrong_mode":
+                    Image.new("RGB", (1440, 608), (0, 0, 0)).save(
+                        target, format="PNG"
+                    )
+                else:
+                    target.write_bytes(
+                        b"\x89PNG\r\n\x1a\n"
+                        + b"x" * (fwi_adapter_module.MAX_PNG_BYTES + 1)
+                    )
+                with self.assertRaisesRegex(RuntimeError, "ADAPTER_ARTIFACT_INVALID"):
+                    self.adapter.collect(handle)
+
+    def test_collect_rejects_primary_and_png_artifact_symlinks(self) -> None:
         for index, relative_path in enumerate(
-            (Path("models/inverted.npy"), Path("loss.csv")), start=1
+            (
+                Path("models/inverted.npy"),
+                Path("loss.csv"),
+                Path("figures/true_model.png"),
+            ),
+            start=1,
         ):
             with self.subTest(relative_path=str(relative_path)):
                 handle, run_dir = self.submit_and_run_dir(
@@ -1438,6 +1522,19 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         )
         self.write_success_artifacts(run_dir)
         fifo = run_dir / "models" / "inverted.npy"
+        fifo.unlink()
+        os.mkfifo(fifo, mode=0o600)
+        started = time.monotonic()
+        with self.assertRaises((ValueError, RuntimeError, OSError)):
+            self.adapter.collect(handle)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-png-fifo",
+            idempotency_key="task-png-fifo:invert:0001",
+        )
+        self.write_success_artifacts(run_dir)
+        fifo = run_dir / "figures" / "true_model.png"
         fifo.unlink()
         os.mkfifo(fifo, mode=0o600)
         started = time.monotonic()

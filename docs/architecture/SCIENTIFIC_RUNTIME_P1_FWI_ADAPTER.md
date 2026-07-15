@@ -8,7 +8,8 @@
 - 原始 P1.2a 绑定算法/Adapter：`deepwave.acoustic_fwi@1.0.0` / `1.0.0`
 - D-006 checkpoint 绑定算法/Adapter：`deepwave.acoustic_fwi@1.1.0` / `1.1.0`
 - D-007 六参数历史快照：`deepwave.acoustic_fwi@1.2.0` / `1.2.0`（不可变、严格读兼容）
-- D-007 当前新提交绑定：`deepwave.acoustic_fwi@1.3.0` / Adapter `1.3.0`
+- D-007 FWI-only 历史绑定：`deepwave.acoustic_fwi@1.3.0` / Adapter `1.3.0`
+- D-008 当前新提交绑定：`deepwave.acoustic_fwi@1.4.0` / Adapter `1.4.0`
 - 绑定数据：`marmousi_94_288@1.0.0`
 
 本切片把既有 Deepwave 反演 Worker 包装为 Algorithm Adapter v1 的六方法边界，但没有把
@@ -19,7 +20,8 @@ Adapter 接入 TaskService、HTTP、MCP 或 `Queued` 状态转换。它是可供
 TaskService admission，P1-005 已接入并验证 HTTP/Guided Web。`validate` 现在返回无启动
 preflight fingerprint，成功 handle 返回实际 dispatch fingerprint，供 SQLite 首个 node event
 绑定。D-007 先增加 `1.2.0` 六参数快照，随后为保持已注册快照不可变，以 `1.3.0`
-承载最终一致的新提交 manifest；这不改变本页原始 P1.2a checkpoint 的范围。
+承载参数策略一致的新提交 manifest。D-008 再以 `1.4.0` 声明六张标准图片输出；这些维护
+不改变本页原始 P1.2a checkpoint 的范围。
 
 ## 1. 文件与责任
 
@@ -36,10 +38,10 @@ Adapter v1 精确绑定打包的 AlgorithmManifest canonical hash。manifest 字
 D-006/P1-006 因参数接受集合从 100 扩大到 10000，同时升级 Algorithm 与 Adapter minor version；
 旧 `1.0.0` manifest 不变。D-006 的 `1.1.0` Adapter 仍可读取已有 `1.0.0` dispatched handle 的
 status/artifact，而当时的新提交必须使用 `1.1.0`。D-007 的 `1.2.0` 是不可变六参数历史
-快照；当前新提交必须使用 `1.3.0`，并继续严格读取 `1.0↔1.0`、`1.1↔1.1` 和
-`1.2↔1.2` 旧收据，避免 provenance 中同一版本出现两套参数或 manifest 策略。当前
-`1.3.0` manifest 将 FWI-only task/preset、iterations `1..10000`、seed
-`0..2147483647` 与 Adam/SGD 条件学习率边界固定在同一新版本身份中。
+快照；D-007 的 `1.3.0` 将 FWI-only task/preset、iterations `1..10000`、seed
+`0..2147483647` 与 Adam/SGD 条件学习率边界固定在同一身份中。当前新提交必须使用
+`1.4.0`，并继续严格读取 `1.0↔1.0`、`1.1↔1.1`、`1.2↔1.2` 和 `1.3↔1.3`
+旧收据，避免 provenance 中同一版本出现两套输出策略。
 
 ## 2. 六方法边界
 
@@ -50,7 +52,7 @@ status/artifact，而当时的新提交必须使用 `1.1.0`。D-007 的 `1.2.0` 
 | `submit` | 以 task + plan hash + node idempotency key 生成受控 handle，首次请求才做 live readiness 并固定启动 Worker | 不接受 shell、路径、command 或 extra args；尚未由 SQLite Gate/approval 调用 |
 | `status` | 只映射 queued/running/succeeded/failed，校验身份、进度和时间；返回受控消息 | 原始 Worker 异常只留在私有日志，不向公共状态泄露路径 |
 | `cancel` | 对合法 handle 稳定返回 `CANCEL_NOT_SUPPORTED_IN_P1`，不依赖 status、不发信号、不改状态 | Worker 取消、lease 和进程身份属于 P2 |
-| `collect` | 成功后从固定输出重新验证并生成两个 ArtifactManifest | 不发布旧 manifest 的绝对路径，不接受未知输出或 forward 伪装 |
+| `collect` | 成功后从固定输出重新验证；历史 1.0–1.3 生成两个 manifest，当前 1.4 生成两个数值 manifest + 六张 PNG | 不发布旧 manifest 的绝对路径，不接受未知输出或 forward 伪装 |
 
 标准 Adapter 当前只支持 `acoustic_fwi_2d` 的 `fwi_smoke|fwi_demo`。旧 `forward` 会把初始模型
 写到名为 `models/inverted.npy` 的位置；在输出合同重新版本化前，把它发布为 inverted model 会
@@ -93,6 +95,9 @@ status/artifact，而当时的新提交必须使用 `1.1.0`。D-007 的 `1.2.0` 
 - loss CSV 必须有精确行数、连续 iteration、finite 正频率和非负 loss；初/末 loss 与 reduction
   从 CSV 交叉验证。iterations、nan/inf、device、runtime versions 和 device name 必须与请求及
   fingerprint 一致。
+- 1.4 六张 PNG 只从固定 allowlist 相对路径读取，禁止 symlink/非普通文件/超过 8 MiB；完整
+  PNG decode 后核对 RGBA 和固定像素尺寸，再以实际字节计算 hash。Worker 显式覆盖
+  `savefig.bbox` 等配置，避免用户 Matplotlib 配置改变版本化尺寸合同。
 
 ## 5. Provenance 诚实边界
 

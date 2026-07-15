@@ -122,6 +122,12 @@ class AbandonTaskResult:
 
 
 @dataclass(frozen=True)
+class TaskVisibilityResult:
+    snapshot: TaskSnapshot
+    replayed: bool
+
+
+@dataclass(frozen=True)
 class TaskRuntimeResult:
     snapshot: TaskSnapshot
     intent: DispatchIntentSnapshot | None
@@ -707,6 +713,7 @@ class TaskService:
         principal_id: str,
         cursor: str | None = None,
         limit: int = 20,
+        view: str = "active",
     ) -> TaskSnapshotPage:
         """Return a strict, scope-bound page without refreshing runtime state."""
 
@@ -724,12 +731,18 @@ class TaskService:
                 "INVALID_TASK_LIST_LIMIT",
                 ["limit must be an integer from 1 to 50"],
             )
+        if view not in {"active", "trash"}:
+            raise TaskValidationError(
+                "INVALID_TASK_LIST_VIEW",
+                ["view must be active or trash"],
+            )
         try:
             return self._store.list_tasks(
                 project_id=project_id,
                 principal_id=principal_id,
                 cursor=cursor,
                 limit=limit,
+                view=view,
             )
         except TaskStoreConflict as error:
             # A missing and a cross-scope cursor are deliberately
@@ -1087,6 +1100,13 @@ class TaskService:
         )
         if current.status not in {"Draft", "NeedsInput", "AwaitingApproval"}:
             raise TaskConflict("only a pre-runtime task can be abandoned")
+        if (
+            current.approval is not None
+            and current.approval.get("decision") == "approved"
+        ):
+            raise TaskConflict(
+                "an approved task cannot be abandoned before submit reconciliation"
+            )
         now = self._clock()
         abandonment = {
             "schema_version": "1.0.0",
@@ -1113,6 +1133,101 @@ class TaskService:
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
         return AbandonTaskResult(snapshot=snapshot, replayed=replayed)
+
+    def _change_task_visibility(
+        self,
+        *,
+        operation: str,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_visibility_revision: int,
+        idempotency_key: str,
+    ) -> TaskVisibilityResult:
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        _validate_idempotency_key(idempotency_key)
+        if (
+            type(expected_visibility_revision) is not int
+            or not 0 <= expected_visibility_revision <= 2**63 - 1
+        ):
+            raise TaskValidationError(
+                "INVALID_VISIBILITY_REVISION",
+                ["expected_visibility_revision must be a non-negative integer"],
+            )
+        current = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if operation == "trash_task" and current.status not in {
+            "Succeeded",
+            "Failed",
+            "Cancelled",
+        }:
+            raise TaskConflict("only a terminal task can be moved to trash")
+        _, request_hash = encode_document(
+            {
+                "task_id": task_id,
+                "project_id": project_id,
+                "principal_id": principal_id,
+                "action": operation,
+                "expected_visibility_revision": expected_visibility_revision,
+            }
+        )
+        try:
+            result = self._store.change_task_visibility(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                operation=operation,
+                expected_visibility_revision=expected_visibility_revision,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                now=self._clock(),
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        return TaskVisibilityResult(
+            snapshot=result.snapshot, replayed=result.replayed
+        )
+
+    def trash_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_visibility_revision: int,
+        idempotency_key: str,
+    ) -> TaskVisibilityResult:
+        return self._change_task_visibility(
+            operation="trash_task",
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            expected_visibility_revision=expected_visibility_revision,
+            idempotency_key=idempotency_key,
+        )
+
+    def restore_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_visibility_revision: int,
+        idempotency_key: str,
+    ) -> TaskVisibilityResult:
+        return self._change_task_visibility(
+            operation="restore_task",
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            expected_visibility_revision=expected_visibility_revision,
+            idempotency_key=idempotency_key,
+        )
 
     @staticmethod
     def _parse_gate_time(value: str) -> datetime:
@@ -1853,12 +1968,56 @@ class TaskService:
 
     @staticmethod
     def _validate_collected_artifacts(
-        intent: DispatchIntentSnapshot, manifests: list[dict[str, Any]]
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        manifests: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         if intent.handle is None:
             raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+        if not isinstance(snapshot.plan, Mapping):
+            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+        nodes = snapshot.plan.get("nodes")
+        matching_nodes = (
+            [node for node in nodes if isinstance(node, Mapping)
+             and node.get("node_id") == intent.node_id]
+            if isinstance(nodes, list)
+            else []
+        )
+        if len(matching_nodes) != 1:
+            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+        planned_outputs = matching_nodes[0].get("outputs")
+        if not isinstance(planned_outputs, list) or not planned_outputs:
+            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+        presentation_for_type = {
+            "inverted_velocity_model_2d": ("application/x-npy", "download"),
+            "loss_curve": ("text/csv", "line_chart"),
+            "figure": ("image/png", "image"),
+        }
+        figure_contract = {
+            "true_model_figure": ("true_model", 1440, 608),
+            "initial_model_figure": ("initial_model", 1440, 608),
+            "inverted_model_figure": ("inverted_model", 1440, 608),
+            "model_error_figure": ("model_error", 1440, 608),
+            "shot_gathers_figure": ("shot_gathers", 2160, 800),
+            "loss_curve_figure": ("loss_curve", 1120, 720),
+        }
+        expected_outputs: set[tuple[str, str, str, str]] = set()
+        for output in planned_outputs:
+            if not isinstance(output, Mapping):
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            port = output.get("port")
+            data_type = output.get("data_type")
+            if not isinstance(port, str) or not isinstance(data_type, str):
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            presentation = presentation_for_type.get(data_type)
+            if presentation is None:
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            expected_outputs.add((port, data_type, *presentation))
+        if len(expected_outputs) != len(planned_outputs):
+            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
         identifiers: set[str] = set()
-        observed_outputs: set[tuple[str, str, str]] = set()
+        observed_outputs: set[tuple[str, str, str, str]] = set()
+        display_orders: set[int] = set()
         validated: list[dict[str, Any]] = []
         expected_input = {
             key: intent.request["dataset"][key]
@@ -1878,6 +2037,18 @@ class TaskService:
                 if isinstance(adapter_extension, Mapping)
                 else None
             )
+            display = manifest.get("display")
+            component = (
+                display.get("component") if isinstance(display, Mapping) else None
+            )
+            display_order = (
+                display.get("order") if isinstance(display, Mapping) else None
+            )
+            figure_extension = (
+                extensions.get("org.agent_rpc.figure")
+                if isinstance(extensions, Mapping)
+                else None
+            )
             if errors:
                 raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
             if (
@@ -1890,25 +2061,56 @@ class TaskService:
                 != intent.request.get("algorithm")
                 or manifest.get("lineage", {}).get("inputs") != [expected_input]
                 or not isinstance(output_port, str)
+                or not isinstance(component, str)
+                or type(display_order) is not int
+                or display_order < 0
+                or display_order in display_orders
             ):
                 raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            if manifest.get("artifact_type") == "figure":
+                figure_id = (
+                    figure_extension.get("figure_id")
+                    if isinstance(figure_extension, Mapping)
+                    else None
+                )
+                width_px = (
+                    figure_extension.get("width_px")
+                    if isinstance(figure_extension, Mapping)
+                    else None
+                )
+                height_px = (
+                    figure_extension.get("height_px")
+                    if isinstance(figure_extension, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(figure_id, str)
+                    or OPAQUE_ID.fullmatch(figure_id) is None
+                    or type(width_px) is not int
+                    or not 1 <= width_px <= 8192
+                    or type(height_px) is not int
+                    or not 1 <= height_px <= 8192
+                    or figure_contract.get(output_port)
+                    != (figure_id, width_px, height_px)
+                ):
+                    raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
             identifiers.add(artifact_id)
+            display_orders.add(display_order)
             observed_outputs.add(
                 (
                     output_port,
                     manifest["artifact_type"],
                     manifest["media_type"],
+                    component,
                 )
             )
             validated.append(copy.deepcopy(manifest))
-        if len(validated) != 2 or observed_outputs != {
-            (
-                "inverted_model",
-                "inverted_velocity_model_2d",
-                "application/x-npy",
-            ),
-            ("loss", "loss_curve", "text/csv"),
-        }:
+        if (
+            len(validated) != len(expected_outputs)
+            or len(observed_outputs) != len(validated)
+            or observed_outputs != expected_outputs
+            or display_orders != set(range(len(expected_outputs)))
+        ):
             raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
         return sorted(validated, key=lambda item: item["display"]["order"])
 
@@ -1932,7 +2134,9 @@ class TaskService:
             isinstance(value, dict) for value in manifests
         ):
             raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
-        return self._validate_collected_artifacts(runtime.intent, manifests)
+        return self._validate_collected_artifacts(
+            runtime.snapshot, runtime.intent, manifests
+        )
 
     def read_artifact(
         self,
@@ -1943,22 +2147,17 @@ class TaskService:
         principal_id: str,
     ) -> tuple[dict[str, Any], bytes]:
         _validate_opaque_id(artifact_id, field="artifact_id")
-        manifests = self.collect_artifacts(
+        runtime = self.refresh_runtime_status(
             task_id, project_id=project_id, principal_id=principal_id
         )
-        expected = next(
-            (value for value in manifests if value["artifact_id"] == artifact_id),
-            None,
-        )
-        if expected is None:
-            raise TaskNotFound("artifact does not exist in the requested task")
-        intent = self.get_dispatch_intent(
-            task_id, project_id=project_id, principal_id=principal_id
-        )
-        if intent is None or self._dispatcher is None:
+        if runtime.snapshot.status != "Succeeded" or runtime.intent is None:
+            raise TaskDispatchError("RESULT_NOT_READY")
+        if self._dispatcher is None:
             raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
         try:
-            manifest, data = self._dispatcher.read_artifact(intent, artifact_id)
+            manifests, manifest, data = self._dispatcher.read_artifact(
+                runtime.intent, artifact_id
+            )
         except DispatchError as error:
             if error.code == "ARTIFACT_NOT_FOUND":
                 raise TaskNotFound(
@@ -1967,6 +2166,21 @@ class TaskService:
             raise TaskDispatchError(error.code) from error
         except Exception as error:
             raise TaskDispatchError("ADAPTER_ARTIFACT_UNAVAILABLE") from error
+        if (
+            not isinstance(manifests, list)
+            or not all(isinstance(value, dict) for value in manifests)
+            or not isinstance(manifest, dict)
+        ):
+            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+        validated = self._validate_collected_artifacts(
+            runtime.snapshot, runtime.intent, manifests
+        )
+        expected = next(
+            (value for value in validated if value["artifact_id"] == artifact_id),
+            None,
+        )
+        if expected is None:
+            raise TaskNotFound("artifact does not exist in the requested task")
         if (
             manifest != expected
             or not isinstance(data, bytes)

@@ -34,7 +34,18 @@ def _save_figure_atomic(fig: plt.Figure, path: Path) -> None:
     )
     os.close(fd)
     try:
-        fig.savefig(temp_name, dpi=PLOT_DPI, format="png")
+        # Keep the Algorithm 1.4 figure contract independent of a developer's
+        # ~/.config/matplotlib/matplotlibrc.  In particular, savefig.bbox=tight
+        # would otherwise change the declared pixel dimensions.
+        with matplotlib.rc_context(
+            {
+                "savefig.bbox": None,
+                "savefig.transparent": False,
+                "savefig.facecolor": "white",
+                "savefig.edgecolor": "white",
+            }
+        ):
+            fig.savefig(temp_name, dpi=PLOT_DPI, format="png")
         with open(temp_name, "rb") as stream:
             os.fsync(stream.fileno())
         os.replace(temp_name, path)

@@ -21,7 +21,7 @@ HASH_B = "sha256:" + "b" * 64
 HASH_C = "sha256:" + "c" * 64
 HASH_D = "sha256:" + "d" * 64
 ALGORITHM_VERSION = "1.1.0"
-CURRENT_OPTIMIZER_ALGORITHM_VERSION = "1.3.0"
+CURRENT_OPTIMIZER_ALGORITHM_VERSION = "1.4.0"
 LEGACY_OPTIMIZER_ALGORITHM_VERSION = "1.2.0"
 
 
@@ -230,6 +230,10 @@ def optimizer_plan_graph(
     plan["nodes"][0]["parameters"].update(
         optimizer=optimizer, learning_rate_milli=learning_rate_milli
     )
+    if algorithm_version == CURRENT_OPTIMIZER_ALGORITHM_VERSION:
+        plan["nodes"][0]["outputs"] = copy.deepcopy(
+            load_deepwave_manifest(algorithm_version)["outputs"]
+        )
     plan["plan_hash"] = compute_plan_hash(plan)
     return plan
 

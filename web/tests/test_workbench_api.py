@@ -59,8 +59,8 @@ class FakeApplication:
     def create_task(self, form, key):
         return self._call("create_task", form, key) | {"task_id": "task-1"}
 
-    def list_tasks(self, *, cursor=None, limit=20):
-        self._call("list_tasks", cursor=cursor, limit=limit)
+    def list_tasks(self, *, cursor=None, limit=20, view="active"):
+        self._call("list_tasks", cursor=cursor, limit=limit, view=view)
         return {"tasks": [], "next_cursor": None}
 
     def get_task(self, task_id, *, refresh=True):
@@ -74,6 +74,16 @@ class FakeApplication:
 
     def abandon_task(self, task_id, key):
         return self._call("abandon_task", task_id, key)
+
+    def trash_task(self, task_id, expected_visibility_revision, key):
+        return self._call(
+            "trash_task", task_id, expected_visibility_revision, key
+        )
+
+    def restore_task(self, task_id, expected_visibility_revision, key):
+        return self._call(
+            "restore_task", task_id, expected_visibility_revision, key
+        )
 
     def list_events(self, task_id, *, after_sequence=0, limit=100):
         self._call("list_events", task_id, after_sequence=after_sequence, limit=limit)
@@ -341,7 +351,27 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertEqual(self.decode(response)["data"], {"tasks": [], "next_cursor": None})
         self.assertEqual(
             self.application.calls[-1],
-            ("list_tasks", (), {"cursor": cursor, "limit": 2}),
+            (
+                "list_tasks",
+                (),
+                {"cursor": cursor, "limit": 2, "view": "active"},
+            ),
+        )
+
+        response = self.api.dispatch(
+            "GET",
+            f"{API_PREFIX}/tasks?limit=2&view=trash",
+            self.get_headers(),
+            b"",
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            self.application.calls[-1],
+            (
+                "list_tasks",
+                (),
+                {"cursor": None, "limit": 2, "view": "trash"},
+            ),
         )
 
         response = self.api.dispatch(
@@ -380,6 +410,8 @@ class WorkbenchAPITest(unittest.TestCase):
             f"{API_PREFIX}/tasks?limit=01",
             f"{API_PREFIX}/tasks?after_sequence=1",
             f"{API_PREFIX}/tasks?project_id=other",
+            f"{API_PREFIX}/tasks?view=deleted",
+            f"{API_PREFIX}/tasks?view=active&view=trash",
         )
         for target in invalid_targets:
             with self.subTest(target=target):
@@ -413,6 +445,43 @@ class WorkbenchAPITest(unittest.TestCase):
             self.application.calls[-1],
             ("abandon_task", ("task-1", "browser-mutation-0001"), {}),
         )
+
+        response = self.mutation(
+            "POST", f"{task_path}/trash", {"expected_visibility_revision": 0}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            self.application.calls[-1],
+            ("trash_task", ("task-1", 0, "browser-mutation-0001"), {}),
+        )
+
+        response = self.mutation(
+            "POST", f"{task_path}/restore", {"expected_visibility_revision": 1}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            self.application.calls[-1],
+            ("restore_task", ("task-1", 1, "browser-mutation-0001"), {}),
+        )
+
+        for endpoint, payload in (
+            ("trash", {}),
+            ("trash", {"expected_visibility_revision": -1}),
+            ("restore", {"expected_visibility_revision": True}),
+            (
+                "restore",
+                {"expected_visibility_revision": 1, "project_id": "other"},
+            ),
+        ):
+            with self.subTest(endpoint=endpoint, payload=payload):
+                response = self.mutation(
+                    "POST", f"{task_path}/{endpoint}", payload
+                )
+                self.assertEqual(response.status, 422)
+                self.assertEqual(
+                    self.decode(response)["error"]["code"],
+                    "INVALID_VISIBILITY",
+                )
 
         response = self.api.dispatch(
             "GET",
@@ -585,6 +654,18 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertEqual(
             response.headers["Content-Disposition"],
             'attachment; filename="model.npy"',
+        )
+
+        self.application.artifact_media_type = "image/png"
+        self.application.artifact_content = b"\x89PNG\r\n\x1a\ncontrolled-image"
+        png_path = f"{API_PREFIX}/tasks/task-1/artifacts/true-model"
+        response = self.api.dispatch("GET", png_path, self.get_headers(), b"")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body, self.application.artifact_content)
+        self.assertEqual(response.headers["Content-Type"], "image/png")
+        self.assertEqual(
+            response.headers["Content-Disposition"],
+            'attachment; filename="true-model.png"',
         )
 
         self.application.artifact_media_type = "text/html"

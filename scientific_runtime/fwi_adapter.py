@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from jsonschema import Draft7Validator
+from PIL import Image
 
 from scientific_runtime_contracts import schema_errors
 
@@ -48,12 +49,13 @@ from .fwi_registry import (
 
 ALGORITHM_ID = DEEPWAVE_ALGORITHM_ID
 ALGORITHM_VERSION = DEEPWAVE_ALGORITHM_VERSION
-ADAPTER_VERSION = "1.3.0"
+ADAPTER_VERSION = "1.4.0"
 SUPPORTED_RECEIPT_BINDINGS = frozenset(
     {
         ("1.0.0", "1.0.0"),
         ("1.1.0", "1.1.0"),
         ("1.2.0", "1.2.0"),
+        ("1.3.0", "1.3.0"),
         (ALGORITHM_VERSION, ADAPTER_VERSION),
     }
 )
@@ -63,7 +65,7 @@ SUPPORTED_ADAPTER_VERSIONS = frozenset(
 LOGICAL_ENTRYPOINT = "fwi.deepwave_adapter"
 MODEL_ID = "marmousi_94_288"
 BOUND_MANIFEST_HASH = (
-    "sha256:6424a8d70f8e962460484e085ed0ab216fb4706bd156b111bf31baa592f72d81"
+    "sha256:d3d53be7e0697832e92f59c2efd56dd776456ad9ca81d4abd2932b55d0f4d81e"
 )
 GRADIENT_CLIP_QUANTILE = 0.98
 ADAM_LEARNING_RATE_MILLI_RANGE = (100, 100_000)
@@ -75,6 +77,7 @@ MAX_JSON_BYTES = 8 * 1024 * 1024
 # declaration to turn collection into a large-memory operation.
 MAX_NPY_BYTES = 128 * 1024
 MAX_CSV_BYTES = 8 * 1024 * 1024
+MAX_PNG_BYTES = 8 * 1024 * 1024
 MAX_PROBE_OUTPUT_BYTES = 1024 * 1024
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WORKER_PYTHON = Path("/root/.venvs/cpp-fwi-agent/bin/python")
@@ -87,6 +90,68 @@ NODE_IDEMPOTENCY_KEY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
 )
 JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+
+# These plots are fixed Algorithm 1.4 outputs, not paths copied from the
+# legacy Worker manifest.  Dimensions follow the version-bound Matplotlib
+# figure sizes and 160 DPI used by ``fwi_worker.plots``.  A plot layout change
+# therefore requires another Algorithm/Adapter version instead of silently
+# changing an immutable result contract.
+FIGURE_ARTIFACT_SPECS = (
+    {
+        "port": "true_model_figure",
+        "figure_id": "true_model",
+        "title": "True Velocity Model",
+        "relative_path": "figures/true_model.png",
+        "width_px": 1440,
+        "height_px": 608,
+        "order": 2,
+    },
+    {
+        "port": "initial_model_figure",
+        "figure_id": "initial_model",
+        "title": "Smoothed Initial Velocity Model",
+        "relative_path": "figures/initial_model.png",
+        "width_px": 1440,
+        "height_px": 608,
+        "order": 3,
+    },
+    {
+        "port": "inverted_model_figure",
+        "figure_id": "inverted_model",
+        "title": "Inverted Velocity Model",
+        "relative_path": "figures/inverted_model.png",
+        "width_px": 1440,
+        "height_px": 608,
+        "order": 4,
+    },
+    {
+        "port": "model_error_figure",
+        "figure_id": "model_error",
+        "title": "Velocity Model Error",
+        "relative_path": "figures/model_error.png",
+        "width_px": 1440,
+        "height_px": 608,
+        "order": 5,
+    },
+    {
+        "port": "shot_gathers_figure",
+        "figure_id": "shot_gathers",
+        "title": "Observed, Predicted, and Residual Shot Gathers",
+        "relative_path": "figures/shot_gathers.png",
+        "width_px": 2160,
+        "height_px": 800,
+        "order": 6,
+    },
+    {
+        "port": "loss_curve_figure",
+        "figure_id": "loss_curve",
+        "title": "L2 Waveform Residual Loss",
+        "relative_path": "figures/loss_curve.png",
+        "width_px": 1120,
+        "height_px": 720,
+        "order": 7,
+    },
+)
 
 
 def is_supported_receipt_binding(
@@ -2225,6 +2290,48 @@ class DeepwaveAdapter:
         return minimum, maximum
 
     @staticmethod
+    def _validate_png(
+        data: bytes, *, width_px: int, height_px: int
+    ) -> None:
+        """Fully decode one fixed Matplotlib PNG without trusting metadata."""
+
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise AdapterArtifactError(
+                "ADAPTER_ARTIFACT_INVALID: figure is not a PNG"
+            )
+        expected_size = (width_px, height_px)
+        try:
+            # ``verify`` checks the complete PNG structure and chunk checksums
+            # without decoding pixels.  Reopening and loading then proves that
+            # the bounded image payload itself is decodable.
+            with Image.open(io.BytesIO(data)) as image:
+                if (
+                    image.format != "PNG"
+                    or image.size != expected_size
+                    or image.mode != "RGBA"
+                ):
+                    raise AdapterArtifactError(
+                        "ADAPTER_ARTIFACT_INVALID: figure format, dimensions, or mode are wrong"
+                    )
+                image.verify()
+            with Image.open(io.BytesIO(data)) as image:
+                if (
+                    image.format != "PNG"
+                    or image.size != expected_size
+                    or image.mode != "RGBA"
+                ):
+                    raise AdapterArtifactError(
+                        "ADAPTER_ARTIFACT_INVALID: decoded figure identity changed"
+                    )
+                image.load()
+        except AdapterArtifactError:
+            raise
+        except Exception as error:
+            raise AdapterArtifactError(
+                "ADAPTER_ARTIFACT_INVALID: figure is not a fully decodable bounded PNG"
+            ) from error
+
+    @staticmethod
     def _validate_loss_csv(
         data: bytes, *, iterations: int, expected_frequency_hz: float
     ) -> list[float]:
@@ -2434,6 +2541,7 @@ class DeepwaveAdapter:
         component: str,
         title: str,
         order: int,
+        public_extensions: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         content_hash = "sha256:" + hashlib.sha256(data).hexdigest()
         artifact_identity = _sha256_document(
@@ -2444,6 +2552,21 @@ class DeepwaveAdapter:
                 "content_hash": content_hash,
             }
         ).removeprefix("sha256:")
+        extensions: dict[str, Any] = {
+            "org.agent_rpc.adapter": {
+                "output_port": port,
+                "worker_job_id": record["job_id"],
+            }
+        }
+        if public_extensions is not None:
+            for namespace, detail in public_extensions.items():
+                if namespace == "org.agent_rpc.adapter" or not isinstance(
+                    detail, Mapping
+                ):
+                    raise AdapterArtifactError(
+                        "ADAPTER_ARTIFACT_INVALID: generated artifact extensions are invalid"
+                    )
+                extensions[namespace] = copy.deepcopy(dict(detail))
         value = {
             "schema_version": "1.0.0",
             "artifact_id": f"artifact-{artifact_identity[:32]}",
@@ -2465,12 +2588,7 @@ class DeepwaveAdapter:
                 "algorithm": copy.deepcopy(record["algorithm"]),
                 "inputs": [copy.deepcopy(record["dataset"])],
             },
-            "extensions": {
-                "org.agent_rpc.adapter": {
-                    "output_port": port,
-                    "worker_job_id": record["job_id"],
-                }
-            },
+            "extensions": extensions,
         }
         errors = schema_errors("artifact-manifest.schema.json", value)
         if errors:
@@ -2554,7 +2672,7 @@ class DeepwaveAdapter:
             losses=losses,
             fingerprint=record["fingerprint"],
         )
-        return [
+        artifacts = [
             self._artifact_manifest(
                 record=record,
                 port="inverted_model",
@@ -2582,11 +2700,55 @@ class DeepwaveAdapter:
                 order=1,
             ),
         ]
+        # Algorithm/Adapter 1.0--1.3 promised only the two primary numerical
+        # outputs.  Their immutable receipts remain readable as that exact
+        # pair even though the legacy Worker happened to write PNG files too.
+        if record["algorithm"]["version"] != ALGORITHM_VERSION:
+            return artifacts
 
-    def read_artifact(
+        # Algorithm 1.4 promotes the six fixed Worker plots to declared,
+        # hash-bound standard outputs.  Never consume legacy_manifest.figure
+        # path/url fields: all paths, identities, titles, dimensions, and
+        # ordering come from the Adapter's immutable allowlist above.
+        for spec in FIGURE_ARTIFACT_SPECS:
+            data = self._read_artifact_bytes(
+                job_dir,
+                spec["relative_path"],
+                max_bytes=MAX_PNG_BYTES,
+            )
+            self._validate_png(
+                data,
+                width_px=spec["width_px"],
+                height_px=spec["height_px"],
+            )
+            artifacts.append(
+                self._artifact_manifest(
+                    record=record,
+                    port=spec["port"],
+                    artifact_type="figure",
+                    media_type="image/png",
+                    relative_path=spec["relative_path"],
+                    data=data,
+                    created_at=current.updated_at,
+                    metrics=metrics,
+                    component="image",
+                    title=spec["title"],
+                    order=spec["order"],
+                    public_extensions={
+                        "org.agent_rpc.figure": {
+                            "figure_id": spec["figure_id"],
+                            "width_px": spec["width_px"],
+                            "height_px": spec["height_px"],
+                        }
+                    },
+                )
+            )
+        return artifacts
+
+    def collect_and_read_artifact(
         self, handle: AdapterHandle, artifact_id: str
-    ) -> tuple[dict[str, Any], bytes]:
-        """Return one revalidated standard artifact without trusting a path."""
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], bytes]:
+        """Collect once, then return one hash-revalidated artifact payload."""
 
         if (
             not isinstance(artifact_id, str)
@@ -2619,6 +2781,7 @@ class DeepwaveAdapter:
         maximum = {
             "application/x-npy": MAX_NPY_BYTES,
             "text/csv": MAX_CSV_BYTES,
+            "image/png": MAX_PNG_BYTES,
         }.get(media_type)
         if maximum is None:
             raise AdapterArtifactError(
@@ -2635,7 +2798,15 @@ class DeepwaveAdapter:
             raise AdapterArtifactError(
                 "ADAPTER_ARTIFACT_INVALID: artifact changed during validated access"
             )
-        return copy.deepcopy(manifest), data
+        return copy.deepcopy(manifests), copy.deepcopy(manifest), data
+
+    def read_artifact(
+        self, handle: AdapterHandle, artifact_id: str
+    ) -> tuple[dict[str, Any], bytes]:
+        """Return one revalidated standard artifact without trusting a path."""
+
+        _, manifest, data = self.collect_and_read_artifact(handle, artifact_id)
+        return manifest, data
 
 
 __all__ = [

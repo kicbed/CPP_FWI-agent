@@ -22,7 +22,8 @@
 | `scientific_runtime/registrations/deepwave_acoustic_fwi_v1.json` | 原始 `1.0.0` / iterations≤100 AlgorithmManifest 的不可变副本 |
 | `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_1.json` | D-006 checkpoint 的 `1.1.0` / iterations≤10000 AlgorithmManifest 版本固定副本 |
 | `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_2.json` | D-007 `1.2.0` / 六参数历史 AlgorithmManifest；不可变且仅供严格读兼容 |
-| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_3.json` | D-007 当前 `1.3.0` / 最终一致的六参数 FWI-only AlgorithmManifest 版本固定副本 |
+| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_3.json` | D-007 `1.3.0` / 六参数 FWI-only 历史快照；不可变且严格读兼容 |
+| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_4.json` | D-008 当前 `1.4.0` / 两个数值输出加六个固定 figure 输出的版本固定副本 |
 | `tests/test_scientific_runtime_registry.py` | migration、并发、不可变性、权限、损坏、TaskService/Gate 和预算测试 |
 
 普通 TaskService 和未来 Web 只读注册结果，不获得 registry mutation。当前 mutation 方法是内部
@@ -88,10 +89,11 @@ parameters、I/O、policy resource caps、安全声明和 Adapter v1 metadata。
 接受 Schema/hash/索引一致性验证。D-006 checkpoint 的新 Guided 任务只选 `1.1.0`；D-007
 随后新增 `deepwave.acoustic_fwi@1.2.0` / Adapter `1.2.0` 六参数快照；该已注册
 身份保持不可变并与 `1.0.0`/`1.1.0` 一起用于已有任务和收据的严格读兼容，不供
-新的 Guided dispatch 选择。D-007 当前新提交改用 `deepwave.acoustic_fwi@1.3.0` /
+新的 Guided dispatch 选择。D-007 新提交曾使用 `deepwave.acoustic_fwi@1.3.0` /
 Adapter `1.3.0`：其 manifest 只声明 `acoustic_fwi_2d` 与 `fwi_smoke|fwi_demo`，将
 iterations 固定为 `1..10000`、seed 固定为 `0..2147483647`，并以条件 Schema 对
-Adam/SGD 分别约束 `learning_rate_milli`；legacy Worker/MCP `forward` 不在其中。
+Adam/SGD 分别约束 `learning_rate_milli`。D-008 当前新提交使用 `1.4.0`，保持上述参数
+策略并声明原 NPY/CSV 与六个 `figure` 输出；legacy Worker/MCP `forward` 不在其中。
 
 在本 P1.1b checkpoint 中，`fwi.deepwave_adapter` 尚未实现；后续 P1.2a 已为固定
 `acoustic_fwi_2d` 反演补齐六方法、幂等的标准 Adapter。**registered/allowlisted 不等于 executable/ready**

@@ -53,7 +53,7 @@ class TaskDispatcher(Protocol):
 
     def read_artifact(
         self, intent: DispatchIntentSnapshot, artifact_id: str
-    ) -> tuple[dict[str, Any], bytes]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], bytes]:
         ...
 
 
@@ -208,10 +208,10 @@ class DeepwaveTaskDispatcher:
 
     def read_artifact(
         self, intent: DispatchIntentSnapshot, artifact_id: str
-    ) -> tuple[dict[str, Any], bytes]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], bytes]:
         handle = self._handle_from_intent(intent)
         try:
-            return self._adapter.read_artifact(handle, artifact_id)
+            return self._adapter.collect_and_read_artifact(handle, artifact_id)
         except AdapterError as error:
             raise DispatchError(error.code) from error
         except Exception as error:

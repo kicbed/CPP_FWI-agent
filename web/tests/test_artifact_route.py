@@ -89,6 +89,7 @@ class ArtifactRouteTest(unittest.TestCase):
         policy = headers["content-security-policy"]
         self.assertIn("default-src 'self'", policy)
         self.assertIn("script-src 'self' 'unsafe-inline'", policy)
+        self.assertIn("img-src 'self' data: blob:", policy)
         self.assertIn("style-src 'self' 'unsafe-inline'", policy)
         self.assertIn("https://cdn.jsdelivr.net", policy)
         self.assertNotIn("localhost:6000", policy)

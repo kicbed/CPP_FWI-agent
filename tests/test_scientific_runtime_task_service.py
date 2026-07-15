@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 from scientific_runtime import (
@@ -48,8 +49,8 @@ from tests.test_scientific_runtime_contracts import (
 NOW = "2026-07-15T03:00:00Z"
 PROJECT_ID = "project-1"
 PRINCIPAL_ID = "user-1"
-CURRENT_ALGORITHM_VERSION = "1.3.0"
-CURRENT_ADAPTER_VERSION = "1.3.0"
+CURRENT_ALGORITHM_VERSION = "1.4.0"
+CURRENT_ADAPTER_VERSION = "1.4.0"
 
 
 def executable_approval_decision(plan: dict) -> dict:
@@ -170,7 +171,11 @@ class FakeDispatcher:
         manifest = next(
             value for value in self.manifests if value["artifact_id"] == artifact_id
         )
-        return copy.deepcopy(manifest), self.artifact_data[artifact_id]
+        return (
+            copy.deepcopy(self.manifests),
+            copy.deepcopy(manifest),
+            self.artifact_data[artifact_id],
+        )
 
 
 class ScientificRuntimeTaskServiceTest(unittest.TestCase):
@@ -260,6 +265,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "submit_idempotency_links",
                 "workbench_mutations",
                 "task_abandonments",
+                "task_visibility_events",
+                "task_visibility",
+                "task_visibility_mutations",
             },
         )
         connection = sqlite3.connect(self.database_path)
@@ -287,7 +295,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 5)
+        self.assertEqual(self.store.migration_version(), 6)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -303,7 +311,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 5)
+        self.assertEqual(reopened.migration_version(), 6)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -390,12 +398,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 5)] * 8)
+        self.assertEqual(results, [("wal", 6)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 6")
+            connection.execute("PRAGMA user_version = 7")
             connection.commit()
         finally:
             connection.close()
@@ -893,6 +901,326 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 with self.assertRaises(TaskStoreConflict):
                     self.store.list_tasks(limit=limit, **self.scope)
 
+    def test_terminal_task_visibility_is_scoped_append_only_cas_and_reversible(
+        self,
+    ) -> None:
+        created = self.create(key="create-visibility")
+        task_id = created.snapshot.task_id
+        self.assertEqual(created.snapshot.visibility_revision, 0)
+        self.assertIsNone(created.snapshot.trashed_at)
+
+        with self.assertRaises(TaskConflict):
+            self.service.trash_task(
+                task_id=task_id,
+                expected_visibility_revision=0,
+                idempotency_key="trash-before-terminal",
+                **self.scope,
+            )
+
+        abandoned = self.service.abandon_task(
+            task_id=task_id,
+            idempotency_key="abandon-before-trash",
+            **self.scope,
+        )
+        self.assertEqual(abandoned.snapshot.status, "Cancelled")
+        first = self.service.trash_task(
+            task_id=task_id,
+            expected_visibility_revision=0,
+            idempotency_key="trash-terminal",
+            **self.scope,
+        )
+        self.assertFalse(first.replayed)
+        self.assertEqual(first.snapshot.visibility_revision, 1)
+        self.assertEqual(first.snapshot.trashed_at, NOW)
+        replay = self.service.trash_task(
+            task_id=task_id,
+            expected_visibility_revision=0,
+            idempotency_key="trash-terminal",
+            **self.scope,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.snapshot.visibility_revision, 1)
+        self.assertEqual(self.raw_count("task_visibility_events"), 1)
+        self.assertEqual(self.raw_count("task_visibility_mutations"), 1)
+
+        self.assertEqual(
+            [item.task_id for item in self.service.list_tasks(**self.scope).snapshots],
+            [],
+        )
+        trashed = self.service.list_tasks(view="trash", **self.scope)
+        self.assertEqual([item.task_id for item in trashed.snapshots], [task_id])
+        self.assertEqual(trashed.snapshots[0].visibility_revision, 1)
+        self.assertEqual(
+            self.service.get_task(task_id, **self.scope).trashed_at,
+            NOW,
+        )
+
+        with self.assertRaises(TaskConflict):
+            self.service.restore_task(
+                task_id=task_id,
+                expected_visibility_revision=0,
+                idempotency_key="restore-stale",
+                **self.scope,
+            )
+        restored = self.service.restore_task(
+            task_id=task_id,
+            expected_visibility_revision=1,
+            idempotency_key="restore-terminal",
+            **self.scope,
+        )
+        self.assertFalse(restored.replayed)
+        self.assertEqual(restored.snapshot.status, "Cancelled")
+        self.assertEqual(restored.snapshot.visibility_revision, 2)
+        self.assertIsNone(restored.snapshot.trashed_at)
+        self.assertEqual(
+            [item.task_id for item in self.service.list_tasks(**self.scope).snapshots],
+            [task_id],
+        )
+        self.assertEqual(
+            self.service.list_tasks(view="trash", **self.scope).snapshots,
+            (),
+        )
+
+        foreign = TaskService(self.store, clock=lambda: NOW)
+        for missing in (task_id, "task-does-not-exist"):
+            scope = (
+                {"project_id": "other-project", "principal_id": PRINCIPAL_ID}
+                if missing == task_id
+                else self.scope
+            )
+            with self.subTest(missing=missing):
+                with self.assertRaises(TaskNotFound) as caught:
+                    foreign.trash_task(
+                        task_id=missing,
+                        expected_visibility_revision=2,
+                        idempotency_key="scope-hidden",
+                        **scope,
+                    )
+                self.assertEqual(
+                    str(caught.exception),
+                    "task does not exist in the requested scope",
+                )
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE task_visibility_events SET action = 'restored'"
+                )
+            connection.rollback()
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("DELETE FROM task_visibility_events")
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_trash_rejects_terminal_state_without_resolved_execution_evidence(
+        self,
+    ) -> None:
+        created = self.create(key="create-unresolved-visibility")
+        task_id = created.snapshot.task_id
+        connection = sqlite3.connect(self.database_path)
+        try:
+            # Construct an otherwise unreachable legacy/corrupt terminal row
+            # to prove both Store and migration fail closed. Normal task APIs
+            # cannot create Cancelled without abandonment or runtime evidence.
+            connection.execute("DROP TRIGGER runtime_status_requires_latest_event")
+            connection.execute(
+                "UPDATE tasks SET status = 'Cancelled' WHERE task_id = ?",
+                (task_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        _, request_hash = encode_document(
+            {
+                "task_id": task_id,
+                "project_id": PROJECT_ID,
+                "principal_id": PRINCIPAL_ID,
+                "action": "trash_task",
+                "expected_visibility_revision": 0,
+            }
+        )
+        with self.assertRaisesRegex(TaskStoreConflict, "unresolved"):
+            self.store.change_task_visibility(
+                task_id=task_id,
+                project_id=PROJECT_ID,
+                principal_id=PRINCIPAL_ID,
+                operation="trash_task",
+                expected_visibility_revision=0,
+                idempotency_key="trash-unresolved-terminal",
+                request_hash=request_hash,
+                now=NOW,
+            )
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "resolved terminal"
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO task_visibility_events(
+                        task_id, project_id, principal_id, revision, event_id,
+                        action, previous_state, state, trashed_at,
+                        document_json, document_hash, occurred_at, recorded_at
+                    ) VALUES (?, ?, ?, 1, ?, 'trashed', 'active', 'trashed', ?,
+                              '{}', ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        PROJECT_ID,
+                        PRINCIPAL_ID,
+                        "visibility-unresolved-direct",
+                        NOW,
+                        "sha256:" + "a" * 64,
+                        NOW,
+                        NOW,
+                    ),
+                )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_trash_rejects_legacy_approved_abandonment_without_dispatch(
+        self,
+    ) -> None:
+        created = self.create(key="create-legacy-approved-abandonment")
+        task_id = created.snapshot.task_id
+        self.persist_plan_and_approval(task_id)
+        abandonment = {
+            "schema_version": "1.0.0",
+            "task_id": task_id,
+            "previous_status": "AwaitingApproval",
+            "status": "Cancelled",
+            "reason": "user_discarded_draft",
+            "actor": {"type": "user", "id": PRINCIPAL_ID},
+            "abandoned_at": NOW,
+            "extensions": {},
+        }
+        abandonment_json, abandonment_hash = encode_document(abandonment)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            # Recreate the state that v4/v5 allowed before v6 added the
+            # approved-abandon guard.  Immutable legacy evidence is retained,
+            # but it must not become eligible for Trash after upgrade.
+            connection.execute("DROP TRIGGER task_abandonments_require_pre_runtime_task")
+            connection.execute("DROP TRIGGER runtime_status_requires_latest_event")
+            connection.execute(
+                """
+                INSERT INTO task_abandonments(
+                    task_id, project_id, principal_id, document_json,
+                    document_hash, abandoned_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    PROJECT_ID,
+                    PRINCIPAL_ID,
+                    abandonment_json,
+                    abandonment_hash,
+                    NOW,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Cancelled' WHERE task_id = ?",
+                (task_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        _, request_hash = encode_document(
+            {
+                "task_id": task_id,
+                "project_id": PROJECT_ID,
+                "principal_id": PRINCIPAL_ID,
+                "action": "trash_task",
+                "expected_visibility_revision": 0,
+            }
+        )
+        with self.assertRaisesRegex(TaskStoreConflict, "unresolved"):
+            self.store.change_task_visibility(
+                task_id=task_id,
+                project_id=PROJECT_ID,
+                principal_id=PRINCIPAL_ID,
+                operation="trash_task",
+                expected_visibility_revision=0,
+                idempotency_key="trash-legacy-approved-abandonment",
+                request_hash=request_hash,
+                now=NOW,
+            )
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "resolved terminal"
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO task_visibility_events(
+                        task_id, project_id, principal_id, revision, event_id,
+                        action, previous_state, state, trashed_at,
+                        document_json, document_hash, occurred_at, recorded_at
+                    ) VALUES (?, ?, ?, 1, ?, 'trashed', 'active', 'trashed', ?,
+                              '{}', ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        PROJECT_ID,
+                        PRINCIPAL_ID,
+                        "visibility-legacy-approved-direct",
+                        NOW,
+                        "sha256:" + "b" * 64,
+                        NOW,
+                        NOW,
+                    ),
+                )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_dispatched_terminal_task_can_be_moved_to_trash(self) -> None:
+        task_id, _, dispatcher, service = self.submitted_runtime(
+            key="visibility-dispatched-success"
+        )
+        dispatcher.adapter_status = {
+            "status": "Succeeded",
+            "stage": "complete",
+            "completed": 2,
+            "total": 2,
+            "message": "complete",
+            "updated_at": "2026-07-15T03:08:00Z",
+            "terminal": True,
+        }
+        terminal = service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(terminal.snapshot.status, "Succeeded")
+        trashed = service.trash_task(
+            task_id=task_id,
+            expected_visibility_revision=0,
+            idempotency_key="trash-dispatched-success",
+            **self.scope,
+        )
+        self.assertEqual(trashed.snapshot.visibility_revision, 1)
+        self.assertEqual(trashed.snapshot.trashed_at, NOW)
+
+    def test_approved_pre_runtime_task_cannot_be_abandoned(self) -> None:
+        created = self.create(key="create-approved-abandon-guard")
+        self.persist_plan_and_approval(created.snapshot.task_id)
+        with self.assertRaises(TaskConflict):
+            self.service.abandon_task(
+                task_id=created.snapshot.task_id,
+                idempotency_key="approved-abandon-blocked",
+                **self.scope,
+            )
+        self.assertEqual(
+            self.store.get_task(created.snapshot.task_id).status,
+            "AwaitingApproval",
+        )
+        self.assertEqual(self.raw_count("task_abandonments"), 0)
+
     def test_draft_revisions_append_and_invalidate_current_plan(self) -> None:
         created = self.create()
         task_id = created.snapshot.task_id
@@ -1086,6 +1414,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
         approval = approval_decision(plan)
         approval["approval_id"] = "approval-outcome-schema"
+        approval["decision"] = "rejected"
         self.service.persist_approval(
             task_id=task_id,
             approval=approval,
@@ -1818,7 +2147,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(result.intent.state, "dispatched")
         return task_id, plan, dispatcher, service
 
-    def artifact_pair(
+    def artifact_manifests(
         self, task_id: str
     ) -> tuple[list[dict], dict[str, bytes]]:
         intent = self.store.get_dispatch_intent(task_id)
@@ -1831,6 +2160,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         payloads = {
             "artifact-inverted-model": b"\x93NUMPY-test-inverted-model",
             "artifact-loss-curve": b"iteration,loss\n1,1.0\n2,0.5\n",
+            "artifact-true-model-figure": b"\x89PNG\r\n\x1a\ntrue-model",
+            "artifact-initial-model-figure": b"\x89PNG\r\n\x1a\ninitial-model",
+            "artifact-inverted-model-figure": b"\x89PNG\r\n\x1a\ninverted-model",
+            "artifact-model-error-figure": b"\x89PNG\r\n\x1a\nmodel-error",
+            "artifact-shot-gathers-figure": b"\x89PNG\r\n\x1a\nshot-gathers",
+            "artifact-loss-curve-figure": b"\x89PNG\r\n\x1a\nloss-curve",
         }
 
         def manifest(
@@ -1842,9 +2177,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             relative_path: str,
             component: str,
             order: int,
+            figure_id: str = "",
+            width_px: int = 0,
+            height_px: int = 0,
         ) -> dict:
             data = payloads[artifact_id]
-            return {
+            value = {
                 "schema_version": "1.0.0",
                 "artifact_id": artifact_id,
                 "task_id": task_id,
@@ -1876,6 +2214,13 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                     }
                 },
             }
+            if figure_id:
+                value["extensions"]["org.agent_rpc.figure"] = {
+                    "figure_id": figure_id,
+                    "width_px": width_px,
+                    "height_px": height_px,
+                }
+            return value
 
         manifests = [
             manifest(
@@ -1897,6 +2242,73 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 order=1,
             ),
         ]
+        for order, (artifact_id, port, figure_id, path, width, height) in enumerate(
+            (
+                (
+                    "artifact-true-model-figure",
+                    "true_model_figure",
+                    "true_model",
+                    "figures/true_model.png",
+                    1440,
+                    608,
+                ),
+                (
+                    "artifact-initial-model-figure",
+                    "initial_model_figure",
+                    "initial_model",
+                    "figures/initial_model.png",
+                    1440,
+                    608,
+                ),
+                (
+                    "artifact-inverted-model-figure",
+                    "inverted_model_figure",
+                    "inverted_model",
+                    "figures/inverted_model.png",
+                    1440,
+                    608,
+                ),
+                (
+                    "artifact-model-error-figure",
+                    "model_error_figure",
+                    "model_error",
+                    "figures/model_error.png",
+                    1440,
+                    608,
+                ),
+                (
+                    "artifact-shot-gathers-figure",
+                    "shot_gathers_figure",
+                    "shot_gathers",
+                    "figures/shot_gathers.png",
+                    2160,
+                    800,
+                ),
+                (
+                    "artifact-loss-curve-figure",
+                    "loss_curve_figure",
+                    "loss_curve",
+                    "figures/loss_curve.png",
+                    1120,
+                    720,
+                ),
+            ),
+            start=2,
+        ):
+            manifests.append(
+                manifest(
+                    artifact_id=artifact_id,
+                    port=port,
+                    artifact_type="figure",
+                    media_type="image/png",
+                    relative_path=path,
+                    component="image",
+                    order=order,
+                    figure_id=figure_id,
+                    width_px=width,
+                    height_px=height,
+                )
+            )
         return manifests, payloads
 
     def test_atomic_submit_consumes_budget_queues_and_dispatches_after_commit(
@@ -2647,7 +3059,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             len(failed_service.list_run_events(failed_id, **self.scope)), 2
         )
 
-    def test_terminal_artifacts_are_exact_pair_and_bound_to_runtime(self) -> None:
+    def test_terminal_artifacts_match_declared_outputs_and_runtime(self) -> None:
         task_id, plan, dispatcher, service = self.submitted_runtime(
             key="terminal-artifacts"
         )
@@ -2661,7 +3073,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             "terminal": True,
         }
         service.refresh_runtime_status(task_id, **self.scope)
-        manifests, payloads = self.artifact_pair(task_id)
+        manifests, payloads = self.artifact_manifests(task_id)
         dispatcher.manifests = manifests
         dispatcher.artifact_data = payloads
 
@@ -2671,6 +3083,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             [
                 ("inverted_velocity_model_2d", "application/x-npy"),
                 ("loss_curve", "text/csv"),
+                *(("figure", "image/png") for _ in range(6)),
             ],
         )
         self.assertTrue(
@@ -2686,16 +3099,71 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 manifest["content_hash"],
             )
 
-        wrong_pair = copy.deepcopy(manifests)
-        wrong_pair[1]["artifact_type"] = "inverted_velocity_model_2d"
-        wrong_pair[1]["media_type"] = "application/x-npy"
-        wrong_pair[1]["extensions"]["org.agent_rpc.adapter"][
+        wrong_set = copy.deepcopy(manifests)
+        wrong_set[1]["artifact_type"] = "inverted_velocity_model_2d"
+        wrong_set[1]["media_type"] = "application/x-npy"
+        wrong_set[1]["display"]["component"] = "download"
+        wrong_set[1]["extensions"]["org.agent_rpc.adapter"][
             "output_port"
         ] = "inverted_model"
-        dispatcher.manifests = wrong_pair
+        dispatcher.manifests = wrong_set
         with self.assertRaises(TaskDispatchError) as raised:
             service.collect_artifacts(task_id, **self.scope)
         self.assertEqual(raised.exception.code, "ADAPTER_ARTIFACT_INVALID")
+
+        for label, mutate in (
+            (
+                "component",
+                lambda value: value[2]["display"].__setitem__(
+                    "component", "download"
+                ),
+            ),
+            (
+                "display-order",
+                lambda value: value[2]["display"].__setitem__("order", 1),
+            ),
+            (
+                "figure-id",
+                lambda value: value[2]["extensions"][
+                    "org.agent_rpc.figure"
+                ].__setitem__("figure_id", "initial_model"),
+            ),
+            (
+                "figure-dimensions",
+                lambda value: value[2]["extensions"][
+                    "org.agent_rpc.figure"
+                ].__setitem__("width_px", 1439),
+            ),
+        ):
+            with self.subTest(artifact_contract=label):
+                tampered = copy.deepcopy(manifests)
+                mutate(tampered)
+                dispatcher.manifests = tampered
+                with self.assertRaises(TaskDispatchError) as raised:
+                    service.collect_artifacts(task_id, **self.scope)
+                self.assertEqual(
+                    raised.exception.code, "ADAPTER_ARTIFACT_INVALID"
+                )
+
+        intent = self.store.get_dispatch_intent(task_id)
+        self.assertIsNotNone(intent)
+        persisted_two_output_plan = copy.deepcopy(
+            service.get_task(task_id, **self.scope).plan
+        )
+        persisted_two_output_plan["nodes"][0]["outputs"] = persisted_two_output_plan[
+            "nodes"
+        ][0]["outputs"][:2]
+        historical_snapshot = replace(
+            service.get_task(task_id, **self.scope), plan=persisted_two_output_plan
+        )
+        self.assertEqual(
+            len(
+                TaskService._validate_collected_artifacts(
+                    historical_snapshot, intent, copy.deepcopy(manifests[:2])
+                )
+            ),
+            2,
+        )
 
         for label, mutate in (
             ("task", lambda value: value.__setitem__("task_id", "task-other")),

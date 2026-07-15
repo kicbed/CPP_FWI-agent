@@ -66,6 +66,7 @@ FORM_FIELDS = frozenset(
 )
 LEGACY_FORM_FIELDS = FORM_FIELDS - {"optimizer", "learning_rate"}
 LEGACY_ALGORITHM_VERSIONS = ("1.0.0", "1.1.0")
+HISTORICAL_OPTIMIZER_ALGORITHM_VERSIONS = ("1.2.0", "1.3.0")
 PRESETS = frozenset({"fwi_smoke", "fwi_demo"})
 DEVICES = frozenset({"cpu", "cuda"})
 OPTIMIZERS = frozenset({"adam", "sgd"})
@@ -104,7 +105,8 @@ OPTIMIZATION_PROFILES = (
 )
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-TASK_CURSOR = re.compile(r"^v1_[A-Za-z0-9_-]{2,171}$")
+TASK_CURSOR = re.compile(r"^v1_[A-Za-z0-9_-]{4,175}$")
+TASK_LIST_VIEWS = frozenset({"active", "trash"})
 
 
 class WorkbenchError(RuntimeError):
@@ -161,12 +163,23 @@ def _identity(document: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _encode_task_cursor(task_id: str) -> str:
-    encoded = base64.urlsafe_b64encode(task_id.encode("ascii")).decode("ascii")
+def _encode_task_cursor(task_id: str, view: str) -> str:
+    if view not in TASK_LIST_VIEWS:
+        raise WorkbenchValidationError(
+            "INVALID_TASK_LIST_VIEW", ["view must be active or trash"]
+        )
+    prefix = "a" if view == "active" else "t"
+    encoded = base64.urlsafe_b64encode(
+        f"{prefix}:{task_id}".encode("ascii")
+    ).decode("ascii")
     return "v1_" + encoded.rstrip("=")
 
 
-def _decode_task_cursor(cursor: str) -> str:
+def _decode_task_cursor(cursor: str, view: str) -> str:
+    if view not in TASK_LIST_VIEWS:
+        raise WorkbenchValidationError(
+            "INVALID_TASK_LIST_VIEW", ["view must be active or trash"]
+        )
     if not isinstance(cursor, str) or TASK_CURSOR.fullmatch(cursor) is None:
         raise WorkbenchValidationError(
             "INVALID_TASK_CURSOR", ["task cursor is invalid"]
@@ -181,14 +194,18 @@ def _decode_task_cursor(cursor: str) -> str:
         raise WorkbenchValidationError(
             "INVALID_TASK_CURSOR", ["task cursor is invalid"]
         ) from error
+    prefix = "a" if view == "active" else "t"
+    expected_prefix = prefix + ":"
+    task_id = decoded.removeprefix(expected_prefix)
     if (
-        OPAQUE_ID.fullmatch(decoded) is None
-        or _encode_task_cursor(decoded) != cursor
+        not decoded.startswith(expected_prefix)
+        or OPAQUE_ID.fullmatch(task_id) is None
+        or _encode_task_cursor(task_id, view) != cursor
     ):
         raise WorkbenchValidationError(
             "INVALID_TASK_CURSOR", ["task cursor is invalid"]
         )
-    return decoded
+    return task_id
 
 
 def _value(value: Any, field: str, default: Any = None) -> Any:
@@ -747,6 +764,65 @@ class GuidedWorkbench:
             candidates.append((draft, manifest))
         return candidates
 
+    def _historical_optimizer_draft_candidates(
+        self,
+        *,
+        form: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        draft_id: str,
+        revision: int,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Rebuild exact immutable six-parameter Workbench drafts for replay.
+
+        Algorithm 1.2 and 1.3 accepted the optimizer-aware form now used by
+        the browser.  Their mutation-ledger hashes remain valid after a 1.4
+        upgrade, so both nine-field requests and expanded seven-field requests
+        need read-only candidates.  A new mutation still always uses 1.4.
+        """
+
+        registered = self._call(
+            self._registry.list_algorithms, allowlisted_only=True
+        )
+        manifests = {
+            manifest.get("version"): manifest
+            for manifest in registered
+            if manifest.get("id") == ALGORITHM_ID
+            and manifest.get("version")
+            in HISTORICAL_OPTIMIZER_ALGORITHM_VERSIONS
+            and TASK_TYPE in manifest.get("task_types", [])
+            and manifest.get("security", {}).get("allowlisted") is True
+        }
+        parameters = {
+            "preset": form["preset"],
+            "device": form["device"],
+            "iterations": form["iterations"],
+            "seed": form["seed"],
+            "optimizer": form["optimizer"],
+            "learning_rate_milli": form["learning_rate_milli"],
+        }
+        candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for version in HISTORICAL_OPTIMIZER_ALGORITHM_VERSIONS:
+            manifest = manifests.get(version)
+            if manifest is None:
+                continue
+            # Old immutable bounds remain authoritative for determining
+            # whether this request could have produced that historical hash.
+            if not Draft7Validator(manifest["parameter_schema"]).is_valid(parameters):
+                continue
+            candidates.append(
+                (
+                    self._draft(
+                        form=form,
+                        dataset=dataset,
+                        manifest=manifest,
+                        draft_id=draft_id,
+                        revision=revision,
+                    ),
+                    manifest,
+                )
+            )
+        return candidates
+
     def _plan(
         self,
         *,
@@ -884,6 +960,13 @@ class GuidedWorkbench:
             revision=1,
         )
         compatible_manifests = {manifest["version"]: manifest}
+        historical_candidates = self._historical_optimizer_draft_candidates(
+            form=normalized,
+            dataset=dataset,
+            draft_id=draft_id,
+            revision=1,
+        )
+        compatible_candidates = historical_candidates
         if legacy_form:
             legacy_candidates = self._legacy_draft_candidates(
                 form=normalized,
@@ -891,43 +974,46 @@ class GuidedWorkbench:
                 draft_id=draft_id,
                 revision=1,
             )
-            compatible_manifests.update(
-                {candidate_manifest["version"]: candidate_manifest
-                 for _, candidate_manifest in legacy_candidates}
+            compatible_candidates = legacy_candidates + compatible_candidates
+        compatible_manifests.update(
+            {
+                candidate_manifest["version"]: candidate_manifest
+                for _, candidate_manifest in compatible_candidates
+            }
+        )
+        replay = self._call(
+            self._tasks.lookup_compatible_create_task,
+            drafts=[candidate for candidate, _ in compatible_candidates] + [draft],
+            idempotency_key=create_key,
+            **self._scope,
+        )
+        if replay is not None:
+            snapshot = _value(replay, "snapshot", replay)
+            original_revision = (
+                snapshot.draft.get("draft_id") == draft_id
+                and snapshot.draft.get("revision") == 1
             )
-            replay = self._call(
-                self._tasks.lookup_compatible_create_task,
-                drafts=[candidate for candidate, _ in legacy_candidates] + [draft],
-                idempotency_key=create_key,
-                **self._scope,
-            )
-            if replay is not None:
-                snapshot = _value(replay, "snapshot", replay)
-                original_revision = (
-                    snapshot.draft.get("draft_id") == draft_id
-                    and snapshot.draft.get("revision") == 1
-                )
-                if (
-                    original_revision
-                    and snapshot.status == "AwaitingApproval"
-                    and snapshot.plan is None
-                ):
-                    replay_version = snapshot.draft.get("algorithm", {}).get("version")
-                    replay_manifest = compatible_manifests.get(replay_version)
-                    if replay_manifest is None:
-                        raise WorkbenchRuntimeError(
-                            "SERVICE_RESPONSE_INVALID",
-                            ["replayed draft has no compatible immutable manifest"],
-                        )
-                    snapshot = self._persist_plan(
-                        snapshot=snapshot,
-                        manifest=replay_manifest,
-                        request_key=key,
-                        mutation_key=self._mutation_key("create-plan", key),
+            if (
+                original_revision
+                and snapshot.status == "AwaitingApproval"
+                and snapshot.plan is None
+            ):
+                replay_version = snapshot.draft.get("algorithm", {}).get("version")
+                replay_manifest = compatible_manifests.get(replay_version)
+                if replay_manifest is None:
+                    raise WorkbenchRuntimeError(
+                        "SERVICE_RESPONSE_INVALID",
+                        ["replayed draft has no compatible immutable manifest"],
                     )
-                result = self._project(snapshot)
-                result["replayed"] = True
-                return result
+                snapshot = self._persist_plan(
+                    snapshot=snapshot,
+                    manifest=replay_manifest,
+                    request_key=key,
+                    mutation_key=self._mutation_key("create-plan", key),
+                )
+            result = self._project(snapshot)
+            result["replayed"] = True
+            return result
         created = self._call(
             self._tasks.create_task,
             draft=draft,
@@ -981,6 +1067,13 @@ class GuidedWorkbench:
         revised = None
         compatible_replayed = False
         compatible_manifests = {manifest["version"]: manifest}
+        historical_candidates = self._historical_optimizer_draft_candidates(
+            form=normalized,
+            dataset=dataset,
+            draft_id=current.draft["draft_id"],
+            revision=target_revision,
+        )
+        compatible_candidates = historical_candidates
         if legacy_form:
             legacy_candidates = self._legacy_draft_candidates(
                 form=normalized,
@@ -988,19 +1081,22 @@ class GuidedWorkbench:
                 draft_id=current.draft["draft_id"],
                 revision=target_revision,
             )
-            compatible_manifests.update(
-                {candidate_manifest["version"]: candidate_manifest
-                 for _, candidate_manifest in legacy_candidates}
-            )
-            revised = self._call(
-                self._tasks.lookup_compatible_draft_revision,
-                task_id=task_id,
-                expected_revision=expected_revision,
-                drafts=[candidate for candidate, _ in legacy_candidates] + [draft],
-                idempotency_key=self._mutation_key("revise", key),
-                **self._scope,
-            )
-            compatible_replayed = revised is not None
+            compatible_candidates = legacy_candidates + compatible_candidates
+        compatible_manifests.update(
+            {
+                candidate_manifest["version"]: candidate_manifest
+                for _, candidate_manifest in compatible_candidates
+            }
+        )
+        revised = self._call(
+            self._tasks.lookup_compatible_draft_revision,
+            task_id=task_id,
+            expected_revision=expected_revision,
+            drafts=[candidate for candidate, _ in compatible_candidates] + [draft],
+            idempotency_key=self._mutation_key("revise", key),
+            **self._scope,
+        )
+        compatible_replayed = revised is not None
         if revised is None:
             revised = self._call(
                 self._tasks.revise_draft,
@@ -1243,6 +1339,8 @@ class GuidedWorkbench:
             "runtime_status": status,
             "created_at": snapshot.created_at,
             "updated_at": snapshot.updated_at,
+            "visibility_revision": snapshot.visibility_revision,
+            "trashed_at": snapshot.trashed_at,
         }
 
     def get_task(self, task_id: str, refresh: bool = True) -> dict[str, Any]:
@@ -1266,7 +1364,7 @@ class GuidedWorkbench:
         return self._project(snapshot, intent=intent)
 
     def list_tasks(
-        self, cursor: str | None = None, limit: int = 20
+        self, cursor: str | None = None, limit: int = 20, view: str = "active"
     ) -> dict[str, Any]:
         """Return a bounded discovery page without touching runtime adapters."""
 
@@ -1274,11 +1372,16 @@ class GuidedWorkbench:
             raise WorkbenchValidationError(
                 "INVALID_TASK_LIST_LIMIT", ["limit must be an integer from 1 to 50"]
             )
-        raw_cursor = None if cursor is None else _decode_task_cursor(cursor)
+        if view not in TASK_LIST_VIEWS:
+            raise WorkbenchValidationError(
+                "INVALID_TASK_LIST_VIEW", ["view must be active or trash"]
+            )
+        raw_cursor = None if cursor is None else _decode_task_cursor(cursor, view)
         page = self._call(
             self._tasks.list_tasks,
             cursor=raw_cursor,
             limit=limit,
+            view=view,
             **self._scope,
         )
         snapshots = _value(page, "snapshots")
@@ -1316,14 +1419,68 @@ class GuidedWorkbench:
                     "learning_rate_milli": parameters.get("learning_rate_milli"),
                     "created_at": snapshot.created_at,
                     "updated_at": snapshot.updated_at,
+                    "visibility_revision": snapshot.visibility_revision,
+                    "trashed_at": snapshot.trashed_at,
                 }
             )
         return {
             "tasks": tasks,
             "next_cursor": (
-                None if next_cursor is None else _encode_task_cursor(next_cursor)
+                None
+                if next_cursor is None
+                else _encode_task_cursor(next_cursor, view)
             ),
         }
+
+    def _change_task_visibility(
+        self,
+        task_id: str,
+        expected_visibility_revision: int,
+        key: str,
+        *,
+        restore: bool,
+    ) -> dict[str, Any]:
+        if (
+            type(expected_visibility_revision) is not int
+            or not 0 <= expected_visibility_revision <= 2**63 - 1
+        ):
+            raise WorkbenchValidationError(
+                "INVALID_VISIBILITY_REVISION",
+                ["expected_visibility_revision must be a non-negative integer"],
+            )
+        stage = "restore" if restore else "trash"
+        function = self._tasks.restore_task if restore else self._tasks.trash_task
+        result = self._call(
+            function,
+            task_id=task_id,
+            expected_visibility_revision=expected_visibility_revision,
+            idempotency_key=self._mutation_key(stage, key),
+            **self._scope,
+        )
+        snapshot = _value(result, "snapshot", result)
+        response = self._project(snapshot)
+        response["replayed"] = bool(_value(result, "replayed", False))
+        return response
+
+    def trash_task(
+        self, task_id: str, expected_visibility_revision: int, key: str
+    ) -> dict[str, Any]:
+        return self._change_task_visibility(
+            task_id,
+            expected_visibility_revision,
+            key,
+            restore=False,
+        )
+
+    def restore_task(
+        self, task_id: str, expected_visibility_revision: int, key: str
+    ) -> dict[str, Any]:
+        return self._change_task_visibility(
+            task_id,
+            expected_visibility_revision,
+            key,
+            restore=True,
+        )
 
     def list_events(
         self, task_id: str, after_sequence: int = 0, limit: int = 100

@@ -34,8 +34,8 @@ class _Application:
         self.created.append((form, key))
         return {"task_id": "task-route-test", "status": "AwaitingApproval"}
 
-    def list_tasks(self, *, cursor=None, limit=20):
-        self.listed.append((cursor, limit))
+    def list_tasks(self, *, cursor=None, limit=20, view="active"):
+        self.listed.append((cursor, limit, view))
         return {
             "tasks": [
                 {
@@ -118,7 +118,7 @@ class WorkbenchRouteTest(unittest.TestCase):
         self.assertNotIn("access-control-allow-origin", headers)
         task_page = json.loads(body)["data"]
         self.assertEqual(task_page["tasks"][0]["task_id"], "task-route-test")
-        self.assertEqual(self.application.listed[-1], (None, 7))
+        self.assertEqual(self.application.listed[-1], (None, 7, "active"))
 
         form = {
             "goal": "route integration",

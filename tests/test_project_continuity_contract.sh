@@ -40,6 +40,7 @@ required_files=(
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1_1.json
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1_2.json
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1_3.json
+    scientific_runtime/registrations/deepwave_acoustic_fwi_v1_4.json
     scientific_runtime/task_store.py
     scientific_runtime/task_service.py
     scientific_runtime/task_dispatcher.py
@@ -49,6 +50,7 @@ required_files=(
     scientific_runtime/migrations/0003_submit_dispatch.sql
     scientific_runtime/migrations/0004_workbench_runtime.sql
     scientific_runtime/migrations/0005_task_discovery.sql
+    scientific_runtime/migrations/0006_task_visibility.sql
     tests/test_scientific_runtime_registry.py
     tests/test_scientific_runtime_fwi_adapter.py
     tests/test_scientific_runtime_task_service.py
@@ -81,11 +83,13 @@ require_text docs/PROJECT_CONTINUITY.md '## D-004：'
 require_text docs/PROJECT_CONTINUITY.md '## D-005：'
 require_text docs/PROJECT_CONTINUITY.md '## D-006：'
 require_text docs/PROJECT_CONTINUITY.md '## D-007：'
+require_text docs/PROJECT_CONTINUITY.md '## D-008：'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
 require_text docs/PROJECT_CONTINUITY.md 'P2.1 有界切片'
 require_text docs/PROJECT_CONTINUITY.md '完整 P2 Pending'
 require_text docs/PROJECT_CONTINUITY.md '精确历史七个 form 字段'
+require_text docs/PROJECT_CONTINUITY.md '当前 Algorithm/Adapter `deepwave.acoustic_fwi@1.4.0`/`1.4.0`'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '<!-- scientific-agent-runtime-plan: v1 -->'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '完整 P2 仍 Pending'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '<!-- scientific-runtime-p0-contracts: v1 -->'
@@ -115,6 +119,8 @@ require_text docs/PROJECT_PROGRESS.md '完整 P2 Pending'
 require_text docs/PROJECT_PROGRESS.md '| P0 最小 FWI 契约 | Verified |'
 require_text docs/PROJECT_PROGRESS.md '| P1 最小持久垂直切片 | Verified |'
 require_text docs/PROJECT_PROGRESS.md '当前新 Guided 任务使用 contract minor `1.1.0`'
+require_text docs/PROJECT_PROGRESS.md 'P1-008 / D-008'
+require_text docs/PROJECT_PROGRESS.md 'P2-002 / D-008'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'D-005` / **Proposed'

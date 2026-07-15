@@ -57,8 +57,9 @@ P1.1c/D-006 checkpoint 的 capability 精确限制为：单节点、无依赖、
 `fwi.deepwave_adapter@1.1.0`。原始 P1.1c checkpoint 使用的 Algorithm/Adapter `1.0.0` 快照
 保持不可变；D-006/P1-006 通过 minor version 扩展显式迭代上限。D-007 的 `1.2.0`
 Algorithm/Adapter 是不可变的六参数历史快照，和 `1.0.0`/`1.1.0` 一起仅保留既有
-收据的严格读取。当前新 dispatch 精确使用 Algorithm/Adapter `1.3.0` 与六参数 FWI
-plan；其 manifest 只允许 `acoustic_fwi_2d`、`fwi_smoke|fwi_demo`、iterations
+收据的严格读取。D-008 后当前新 dispatch 精确使用 Algorithm/Adapter `1.4.0` 与六参数 FWI
+plan；它保留 1.3 的参数策略，并把六张固定 PNG 加入声明输出。其 manifest 只允许
+`acoustic_fwi_2d`、`fwi_smoke|fwi_demo`、iterations
 `1..10000`、seed `0..2147483647` 及 Adam/SGD 各自的条件学习率边界，不广告 legacy
 `forward`。多节点即使通过通用 Gate 也被拒绝，留给 P3。
 

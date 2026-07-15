@@ -4,7 +4,8 @@
 
 - 决策编号：`D-003`
 - 决策状态：**Accepted**
-- Runtime 实现状态：**P0 + P1 Verified；P2.1 有界任务发现/重开 Verified；完整 P2 仍 Pending**
+- Runtime 实现状态：**P0 + P1 Verified；P2.1 有界任务发现/重开 Verified；P2.2 有界任务
+  回收站 Verified；完整 P2 仍 Pending**
 - 用户确认日期：2026-07-15
 - 实现分支：`feature/scientific-agent-runtime`
 - 基线分支：`feature/fwi-deepwave-2d-acoustic`
@@ -71,6 +72,8 @@
 - Conversation 保存对话和滚动摘要。
 - Project Memory 保存经批准的长期偏好和决定。
 - Task Store 保存草稿、计划、审批、事件、节点状态和 artifact。
+- Conversation 与 Task 通过可选引用关联：对话可以没有任务、引用多个任务；同一任务也可被
+  多个对话引用。删除对话或移除引用不能级联取消、隐藏或删除任务。
 - 不能通过重新解析聊天文本猜测任务是否已提交或完成。
 
 ### A-006：MCP/A2A 是适配与互操作边界，不是全部运行时
@@ -248,7 +251,9 @@ checkpoint 恢复仍属于 P2，P1 不伪装已具备这些能力。
 `docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md`；P1 已达到上述完成标准，P2 仍为
 Pending，未因 Guided Web 状态轮询而提前实现恢复语义。后续 D-007 维护
 切片为当前 FWI 补充 Adam/SGD 与受校验学习率，并保持人工批准和单节点
-执行边界；该配置维护不等于 P2 可靠性完成。
+执行边界；D-008 后续结果维护将当前 Algorithm/Adapter 推进至 `1.4.0`，由持久 Plan 精确声明
+两个数值输出和六张固定 PNG，并保持 `1.0.0`–`1.3.0` 历史计划的两个标准输出不可变。
+这些配置/结果维护不等于 P2 可靠性完成。
 
 ### P2：持久任务可靠性加固
 
@@ -259,7 +264,9 @@ Pending，未因 Guided Web 状态轮询而提前实现恢复语义。后续 D-0
 - SSE 任务事件和浏览器刷新恢复；
 - 多任务列表，不再每个对话只保留一个 FWI job。
 
-当前只启动了一个经用户确认的有界先行切片 **P2.1 任务发现/重开**：
+当前有两个经用户确认的有界先行切片；它们不改变完整 P2 的出口条件。
+
+**P2.1 任务发现/重开**：
 
 - 从 SQLite Task Store 按 `project_id`/`principal_id` 精确限域、定界分页读取持久任务摘要；
 - 页面加载时恢复左栏发现索引，用户可重开单个任务卡；关闭卡片只关闭
@@ -272,6 +279,16 @@ P2.1 当前为 **Verified**。它不包含自动重建运行意图、
 pending/dispatching reconciliation、取消、超时、lease/heartbeat、retry 或 SSE，
 也不会在恢复页面后为已批准但未确认 submit 的任务生成新幂等键。因此完整
 P2 仍为 **Pending**。
+
+用户后续明确批准的有界 **P2.2 任务可见性回收站** 只为具有 resolved terminal provenance
+的终态任务增加 scope-bound、
+append-only、CAS/idempotent 的 Trash/Restore。它不物理删除 Draft/Plan/Approval/Event/artifact，
+restore 不重跑；未确认 dispatch、reconciliation 和运行中任务拒绝进入回收站。该切片和
+Conversation/Task 可选引用、浏览器本地对话删除、1.4 六图结果维护一起记录于 D-008；仍不
+代表 cancel、lease、retry、reconciliation 或 SSE 已完成。P2.2 已通过完整自动化与 fresh v6
+真实 CUDA 任务的 Trash/Restore、拒绝边界、artifact 可读和同库重启验收，因此为
+**Verified**。当前实现每次图片 GET 会完整 collect/解码以执行严格安全复核，visibility 历史
+读取也随事件数线性增长；这是后续性能加固边界，不代表完整 P2 已完成。
 
 完成标准：重复请求不重复建任务；控制面重启后恢复或明确终结任务；取消能到达 Worker；
 已提交任务不依赖浏览器连接存活。
@@ -372,3 +389,4 @@ P2 仍为 **Pending**。
 |---|---|---|
 | 2026-07-15 | 收紧 P0 为最小 FWI 契约；把最小 TaskService/幂等/状态查询提前到 P1；明确 SQLite/Redis 责任、执行环境指纹、确定性 Gate 和 P4 后置 | 用户提供的六项风险评估 |
 | 2026-07-15 | 增加 D-007 配置/交互维护与 P2.1 有界任务发现；不扩大到取消、重试、reconciliation 或 SSE | 用户明确报告优化器、轮询滚动和任务卡恢复三项问题并要求修复 |
+| 2026-07-15 | 增加 D-008 Conversation/Task 可选引用、浏览器本地无级联删除、当前 1.4 六图结果维护与 P2.2 有界可恢复任务回收站；永久 purge 和完整 P2 继续延期 | 用户明确要求理清对话与任务、保留删除场景并恢复 FWI 图片展示 |

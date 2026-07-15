@@ -26,9 +26,11 @@ _CONTENT_LENGTH = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _BAD_ENCODED_PATH = re.compile(r"%(?:00|25|2e|2f|5c)", re.IGNORECASE)
 _PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _QUERY = re.compile(r"^[A-Za-z0-9_=&-]+$")
-_TASK_CURSOR = re.compile(r"^v1_[A-Za-z0-9_-]{2,171}$")
+_TASK_CURSOR = re.compile(r"^v1_[A-Za-z0-9_-]{4,175}$")
 
-_MUTATION_ENDPOINTS = frozenset({"create_task", "revise_task", "approve", "abandon"})
+_MUTATION_ENDPOINTS = frozenset(
+    {"create_task", "revise_task", "approve", "abandon", "trash", "restore"}
+)
 _FORM_FIELDS = frozenset(
     {
         "goal",
@@ -45,6 +47,7 @@ _FORM_FIELDS = frozenset(
 _ALLOWED_ARTIFACT_TYPES = {
     "application/x-npy": ".npy",
     "text/csv": ".csv",
+    "image/png": ".png",
 }
 
 
@@ -335,6 +338,8 @@ def _route(path: str) -> _Route:
             "draft": ("revise_task", ("PUT",)),
             "approve": ("approve", ("POST",)),
             "abandon": ("abandon", ("POST",)),
+            "trash": ("trash", ("POST",)),
+            "restore": ("restore", ("POST",)),
             "events": ("events", ("GET",)),
             "artifacts": ("artifacts", ("GET",)),
         }
@@ -363,7 +368,7 @@ def _query_values(route: _Route, raw_query: str | None) -> dict[str, int | str]:
     allowed = (
         {"after_sequence", "limit"}
         if route.endpoint == "events"
-        else {"cursor", "limit"}
+        else {"cursor", "limit", "view"}
     )
     for item in raw_query.split("&"):
         if item.count("=") != 1:
@@ -373,6 +378,11 @@ def _query_values(route: _Route, raw_query: str | None) -> dict[str, int | str]:
             raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
         if key == "cursor":
             if _TASK_CURSOR.fullmatch(raw_value) is None:
+                raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
+            values[key] = raw_value
+            continue
+        if key == "view":
+            if raw_value not in {"active", "trash"}:
                 raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
             values[key] = raw_value
             continue
@@ -735,6 +745,7 @@ class WorkbenchAPI:
                 result = self._application.list_tasks(
                     cursor=query.get("cursor"),
                     limit=query.get("limit", 20),
+                    view=query.get("view", "active"),
                 )
                 if not isinstance(result, Mapping):
                     raise _ApplicationInvariantError("invalid task list result")
@@ -764,6 +775,25 @@ class WorkbenchAPI:
                 if payload:
                     raise _RequestError(422, "INVALID_ABANDON", "request validation failed")
                 return _success_response(self._application.abandon_task(route.task_id, key))
+            if route.endpoint in {"trash", "restore"}:
+                if set(payload) != {"expected_visibility_revision"}:
+                    raise _RequestError(
+                        422, "INVALID_VISIBILITY", "request validation failed"
+                    )
+                revision = payload["expected_visibility_revision"]
+                if (
+                    type(revision) is not int
+                    or not 0 <= revision <= 2**63 - 1
+                ):
+                    raise _RequestError(
+                        422, "INVALID_VISIBILITY", "request validation failed"
+                    )
+                function = (
+                    self._application.trash_task
+                    if route.endpoint == "trash"
+                    else self._application.restore_task
+                )
+                return _success_response(function(route.task_id, revision, key))
             if route.endpoint == "events":
                 events = self._application.list_events(
                     route.task_id,

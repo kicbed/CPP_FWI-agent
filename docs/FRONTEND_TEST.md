@@ -1,6 +1,8 @@
 # Web 前端端到端测试
 
-本文给第一次运行项目的使用者一条可执行的验收路径：配置本地 secret、核对固定模型、一键启动，优先走完 P1 Guided 的确认/修改/批准/状态/NPY+CSV 闭环，再可选检查旧 MCP/FWI Result 的六张图兼容性，最后一键关闭。
+本文给第一次运行项目的使用者一条可执行的验收路径：配置本地 secret、核对固定模型、一键启动，
+优先走完 P1 Guided 的确认/修改/批准/状态/八项结果闭环，验证对话与任务独立、任务回收站和
+六张标准图片，再可选检查旧 MCP/FWI Result 兼容性，最后一键关闭。
 
 只在受信任的本机或受控容器中执行。当前 Web 没有用户认证，不要把 8080 或 5000 端口暴露到公网；不要在终端、截图、聊天、Issue 或日志粘贴内容中输出 API Key。
 
@@ -148,7 +150,7 @@ curl --fail --silent http://127.0.0.1:50052/health
 预期出现 Guided FWI 表单，而不是旧 `fwi_job_submitted` 结果或一段示例代码。表单应显示：
 
 - session scope 与 P1 capability；
-- 固定 `marmousi_94_288@1.0.0` 数据和当前 `deepwave.acoustic_fwi@1.3.0` 算法；
+- 固定 `marmousi_94_288@1.0.0` 数据和当前 `deepwave.acoustic_fwi@1.4.0` 算法；
 - 只有实验目标、注册数据、preset、device、iterations、seed、optimizer 和 learning rate
   等受控字段，没有服务器
   路径、shell 或 Worker job ID 输入。
@@ -161,7 +163,7 @@ curl --fail --silent http://127.0.0.1:50052/health
 浏览器始终发送完整九个 form 字段，revise 另带 `expected_revision`。`/v1` API 仅为既有
 loopback 客户端保留精确历史七个 form 字段（revise 仍要求 `expected_revision`）：同 key
 升级重放会用旧 1.0/1.1 composer 重建并精确匹配 durable request hash；未命中历史记录才补为
-Adam/LR 10 后按当前 `1.3.0` 处理。只提供 optimizer/learning rate 之一或其他部分 form
+Adam/LR 10 后按当前 `1.4.0` 处理。只提供 optimizer/learning rate 之一或其他部分 form
 shape 必须返回 422，同 key 不同 payload 必须冲突。
 
 纯理论问句“什么是 FWI？只解释，不要运行任务。”仍应走聊天，不打开执行卡。
@@ -202,11 +204,11 @@ pre-runtime 草稿，没有发送运行中 cancel。放弃后重新打开 Smoke 
 把 iterations 改为 `10000`，只点击 **生成 Draft / Plan 确认卡**，不要批准。预期：
 
 - 表单接受整数 10000，Draft/Plan 保留该值并停在 `AwaitingApproval`；
-- 当前算法版本为 `deepwave.acoustic_fwi@1.3.0`；旧 `1.0.0` 快照仍保持上限 100，
-  `1.1.0` 保留 10000 上限，`1.2.0` 保留不可变六参数历史快照；三者均只供
+- 当前算法版本为 `deepwave.acoustic_fwi@1.4.0`；旧 `1.0.0` 快照仍保持上限 100，
+  `1.1.0` 保留 10000 上限，`1.2.0`/`1.3.0` 保留不可变六参数历史快照；旧版均只供
   严格读兼容，不供新 Guided 任务选择；
-- 当前 `1.3.0` manifest 必须同时体现 FWI-only、iterations `1..10000`、seed
-  `0..2147483647` 和 Adam/SGD 各自的条件学习率边界；
+- 当前 `1.4.0` manifest 必须同时体现 FWI-only、iterations `1..10000`、seed
+  `0..2147483647`、Adam/SGD 条件学习率边界，以及两个数值输出和六个 figure 输出；
 - 页面显示长任务警告，且创建确认卡不会新增 Worker job；
 - 点击 **放弃草稿** 后变为 `Cancelled`。
 
@@ -221,16 +223,17 @@ retry 或完成时间保证。
 1. dispatch 进入 `dispatched`，task 为 `Queued`、`Running`、`Succeeded` 之一；任务较快时
    页面可能看不到每个中间帧，但终态不会被伪造；
 2. 状态来自 SQLite task + Adapter GET 查询，页面不显示 Adapter handle 或 Worker job ID；
-3. `Succeeded` 后恰好显示两张 ArtifactManifest 卡：
-   `inverted_velocity_model_2d` NPY 和 `loss_curve` CSV；
-4. 两张卡都显示 size 与 SHA-256，**通过受控 endpoint 下载** 返回 attachment，不使用
-   `/fwi-artifacts/<job_id>/...` 路径。
+3. `Succeeded` 后恰好显示八张 ArtifactManifest 卡：反演模型 NPY、损失 CSV，以及真实模型、
+   初始模型、反演模型、模型误差、炮集和损失曲线六张 PNG；
+4. 每项都显示 size 与 SHA-256；图片应直接形成两列结果画廊，所有读取/下载只走
+   task-scoped 受控 endpoint，不使用 `/fwi-artifacts/<job_id>/...` 路径，也不显示 Worker job ID；
+5. 单张图片加载失败时只在该卡显示错误，其余结果仍可查看；关闭或切换任务后 Blob URL 被释放。
 
 如 approval 已持久化但 submit 预检失败，页面应停止自动轮询，显示
 **继续已批准提交（复用原 Idempotency-Key）**。这是由用户显式重放同一 approve/submit
 mutation，不是 P2 task retry。approve 即使返回结构化 4xx，只要没有合法成功 projection，
 页面也必须先保留原 key 并进入 GET 审计态，期间不能关闭/重开来清掉该 key。Artifact GET
-临时失败或不足两个时，应显示
+临时失败或数量不符合当前 Plan 时，应显示
 **重新获取 artifacts（GET）**，不重跑 Worker。
 
 ### 5.5 轮询不抢占滚动位置
@@ -248,6 +251,23 @@ SQLite 发现 task，而不是从聊天记录或 `localStorage` 猜测。
 `./stop.sh` 后用 `./start.sh --no-build` 重启，左栏仍应发现原 task；重开后 SQLite 终态、
 事件和 artifact 仍可查询。这一 P2-001 切片只是发现/重开，不代表 cancel、retry、
 lease/reconciliation 或 SSE 已实现。
+
+### 5.7 验证对话、任务引用与删除边界
+
+1. 输入纯理论问题并获得回答。预期不会创建 task，说明“对话”不是任务容器；
+2. 输入执行型 FWI 请求。预期原文字先保留在对话中，并出现“仅打开独立草稿，尚未创建/运行”
+   的说明；生成 Draft/Plan 后当前对话才出现 task 引用卡；
+3. 新建另一对话，从左栏打开同一 task 并选择关联。预期两个对话都可引用它；从任一对话
+   “移除引用”不会删除或取消 task；
+4. 删除一个对话。确认框必须明确这只删除本浏览器副本且不影响独立任务；刷新后 task 仍在
+   SQLite 左栏。服务器 transcript 仍按既有 TTL 管理，当前页面不承诺服务器永久删除；
+5. 对 Succeeded/Failed/Cancelled 任务点击“删除”。预期它从 active 视图消失、出现在任务
+   回收站，详情、事件和结果仍可读取；点击“恢复”后回到 active，且不会重新运行 Worker；
+6. Queued/Running/Waiting/Retrying 或结果未知任务不得出现可用删除操作；AwaitingApproval 要先
+   “放弃草稿”成为 Cancelled。任务回收站不是 artifact 永久清除功能。
+
+刷新页面后，对话 task 引用卡应先显示“状态需从 SQLite 刷新”，不能用 `localStorage` 中旧的
+成功/进度缓存冒充事实；打开任务后再显示服务器返回的当前状态。
 
 ## 6. 验收 legacy MCP/FWI Result 兼容性（自动化）
 
@@ -268,7 +288,8 @@ node web/tests/ui_message_rendering_test.js
 `ui message rendering tests passed`。这组测试同时证明执行型文本先进入 Guided、纯理论文本仍
 走聊天、旧结果不会把无合法回执的说明或代码误标成已提交，并覆盖旧 artifact 路径/后缀边界。
 如要人工查看旧 Worker 目录、六张 PNG 或 `metrics.json`，只使用已经由兼容 MCP 或 Worker
-CLI 创建的已知 `job_id`；这不是 P1 Guided 的验收结果，Guided 页面只展示标准 NPY/CSV。
+CLI 创建的已知 `job_id`；这不是 P1 Guided 的验收结果。当前 Guided 页面通过任务作用域
+ArtifactManifest 展示标准 NPY/CSV 和六张 PNG，不复用 legacy URL。
 
 ## 7. 验收本地知识库、公式与“不启动任务”
 
