@@ -1,5 +1,21 @@
 """Durable scientific task runtime components introduced by D-003 P1."""
 
+from .fwi_adapter import (
+    AdapterArtifactError,
+    AdapterCancelResult,
+    AdapterError,
+    AdapterEstimate,
+    AdapterHandle,
+    AdapterHandleError,
+    AdapterIdempotencyConflict,
+    AdapterStatus,
+    AdapterStatusError,
+    AdapterUnavailable,
+    AdapterValidation,
+    AdapterValidationError,
+    DeepwaveAdapter,
+    SafeSubprocessWorkerLauncher,
+)
 from .fwi_registry import (
     FWIBaselineRegistration,
     load_deepwave_manifest,
@@ -39,8 +55,21 @@ from .task_store import (
 )
 
 __all__ = [
+    "AdapterArtifactError",
+    "AdapterCancelResult",
+    "AdapterError",
+    "AdapterEstimate",
+    "AdapterHandle",
+    "AdapterHandleError",
+    "AdapterIdempotencyConflict",
+    "AdapterStatus",
+    "AdapterStatusError",
+    "AdapterUnavailable",
+    "AdapterValidation",
+    "AdapterValidationError",
     "ApprovalBudget",
     "CreateTaskResult",
+    "DeepwaveAdapter",
     "FWIBaselineRegistration",
     "RegistryConflict",
     "RegistryCorruption",
@@ -51,6 +80,7 @@ __all__ = [
     "RegistrySnapshots",
     "RegistryValidationError",
     "RegistryWriteRecord",
+    "SafeSubprocessWorkerLauncher",
     "SQLiteTaskStore",
     "TaskConflict",
     "TaskIdempotencyConflict",

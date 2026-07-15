@@ -26,11 +26,13 @@ required_files=(
     docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md
     docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md
+    docs/architecture/SCIENTIFIC_RUNTIME_P1_FWI_ADAPTER.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md
     docs/PROJECT_PROGRESS.md
     docs/GIT_AND_PROMPT_POLICY.md
     scientific_runtime/__init__.py
     scientific_runtime/fwi_registry.py
+    scientific_runtime/fwi_adapter.py
     scientific_runtime/registry_service.py
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1.json
     scientific_runtime/task_store.py
@@ -38,6 +40,7 @@ required_files=(
     scientific_runtime/migrations/0001_task_store.sql
     scientific_runtime/migrations/0002_catalog_registry.sql
     tests/test_scientific_runtime_registry.py
+    tests/test_scientific_runtime_fwi_adapter.py
     tests/test_scientific_runtime_task_service.py
     contracts/scientific_runtime/v1/common.schema.json
     contracts/scientific_runtime/v1/dataset-ref.schema.json
@@ -47,6 +50,7 @@ required_files=(
     contracts/scientific_runtime/v1/approval-decision.schema.json
     contracts/scientific_runtime/v1/run-event.schema.json
     contracts/scientific_runtime/v1/artifact-manifest.schema.json
+    fwi_worker/adapter_probe.py
 )
 
 for file in "${required_files[@]}"; do
@@ -63,22 +67,25 @@ require_text docs/PROJECT_CONTINUITY.md '## D-004：'
 require_text docs/PROJECT_CONTINUITY.md '## D-005：'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
-require_text docs/PROJECT_CONTINUITY.md 'P0 contracts + P1.1a Task Store + P1.1b Registry foundation Verified / P1 in progress'
+require_text docs/PROJECT_CONTINUITY.md 'P0 contracts + P1.1a Task Store + P1.1b Registry + P1.2a fixed Deepwave Adapter Verified / P1 in progress'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '<!-- scientific-agent-runtime-plan: v1 -->'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '实现状态：**Pending**'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '<!-- scientific-runtime-p0-contracts: v1 -->'
-require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'P1.1a TaskStore 与 P1.1b Registry 持久基础已验证'
-require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '调度和 Adapter 尚未实现'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'P1.1a TaskStore、P1.1b Registry 与 P1.2a 固定 Deepwave'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'submit/API/调度仍未实现'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md '<!-- scientific-runtime-p1-registry: v1 -->'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md 'registered/allowlisted 不等于 executable/ready'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md '`task_queued` 和所有 pre-runtime→runtime store 转换继续'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_FWI_ADAPTER.md '<!-- scientific-runtime-p1-fwi-adapter: v1 -->'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_FWI_ADAPTER.md 'CANCEL_NOT_SUPPORTED_IN_P1'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_FWI_ADAPTER.md 'registry_snapshot_provider'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '<!-- scientific-runtime-p1-task-store: v1 -->'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '父工作项 P1.1 仍为 **Partially implemented**'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '也没有开放 `submit`/`Queued` 入口'
 require_text docs/PROJECT_PROGRESS.md '<!-- project-progress-schema: v1 -->'
 require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1（In progress；P1.1 为 Partially implemented）**'
 require_text docs/PROJECT_PROGRESS.md '| P0 最小 FWI 契约 | Verified |'
-require_text docs/PROJECT_PROGRESS.md '下一可执行切片：P1.2a Deepwave Adapter'
+require_text docs/PROJECT_PROGRESS.md '下一可执行切片：P1.1c 原子 submit intent 与 Queued'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'D-005` / **Proposed'

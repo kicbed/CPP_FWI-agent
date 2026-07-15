@@ -81,9 +81,11 @@ P0 side-effect-free Gate 同步收紧为 plan 输入/输出 port 集合必须与
 Deepwave manifest 固定为 `deepwave.acoustic_fwi@1.0.0`，保留 P0 的 typed parameters、I/O、
 policy resource caps、安全声明和 Adapter v1 metadata。
 
-这里的 `fwi.deepwave_adapter` 尚未实现；现有 MCP runner 也不是六方法、幂等的标准 Adapter。
-因此 **registered/allowlisted 不等于 executable/ready**。CPU/memory/wall-time 数值当前是 Gate
-policy caps，不代表旧 Worker 已有 OS 级资源隔离。
+在本 P1.1b checkpoint 中，`fwi.deepwave_adapter` 尚未实现；后续 P1.2a 已为固定
+`acoustic_fwi_2d` 反演补齐六方法、幂等的标准 Adapter。**registered/allowlisted 不等于 executable/ready**
+仍是一般规则：RegistryService 不自行证明 Adapter 代码/运行环境健康，且
+旧 forward 仍未进入标准 Adapter。CPU/memory/wall-time 数值是 Gate policy caps，不代表旧
+Worker 已有 OS 级资源隔离。
 
 ## 5. 已验证边界与待实现
 
@@ -92,7 +94,7 @@ policy caps，不代表旧 Worker 已有 OS 级资源隔离。
 index/schema 损坏、TaskService server-owned snapshot、P0 Gate、批准预算和路径脱敏。真实 FWI
 模型测试还验证 sidecar/hash 到无路径 DatasetRef 的映射。
 
-仍未实现：部署数据库/API、独立 ACL/allowlist 撤销、批准预算消费、submit idempotency 事务、
-单 FWI 节点 capability gate、Deepwave Adapter/Worker handle、artifact 收集、Web 确认卡和 P2
-取消/lease/retry/reconciliation。当前 `task_queued` 和所有 pre-runtime→runtime store 转换继续
-被拒绝。
+P1.2a 后已有固定 Deepwave Adapter/Worker handle 与两个主 artifact 的严格收集。仍未实现：
+部署数据库/API、独立 ACL/allowlist 撤销、批准预算消费、submit idempotency/dispatch intent
+事务、单 FWI 节点 capability gate、Web 确认卡和 P2 取消/lease/retry/reconciliation。当前
+`task_queued` 和所有 pre-runtime→runtime store 转换继续被拒绝。
