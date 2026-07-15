@@ -18,6 +18,7 @@ from web.workbench_api import WorkbenchAPI
 class _Application:
     def __init__(self):
         self.created = []
+        self.listed = []
 
     def session_capabilities(self):
         return {
@@ -32,6 +33,19 @@ class _Application:
     def create_task(self, form, key):
         self.created.append((form, key))
         return {"task_id": "task-route-test", "status": "AwaitingApproval"}
+
+    def list_tasks(self, *, cursor=None, limit=20):
+        self.listed.append((cursor, limit))
+        return {
+            "tasks": [
+                {
+                    "task_id": "task-route-test",
+                    "status": "Running",
+                    "goal": "route integration",
+                }
+            ],
+            "next_cursor": None,
+        }
 
 
 class WorkbenchRouteTest(unittest.TestCase):
@@ -95,6 +109,17 @@ class WorkbenchRouteTest(unittest.TestCase):
         session = json.loads(body)
         self.assertEqual(session["data"]["csrf_token"], self.csrf)
 
+        status, headers, body = self.request(
+            "GET",
+            "/api/scientific-runtime/v1/tasks?limit=7",
+            headers={"X-Workbench-CSRF": self.csrf},
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("access-control-allow-origin", headers)
+        task_page = json.loads(body)["data"]
+        self.assertEqual(task_page["tasks"][0]["task_id"], "task-route-test")
+        self.assertEqual(self.application.listed[-1], (None, 7))
+
         form = {
             "goal": "route integration",
             "dataset_id": "marmousi_94_288",
@@ -103,6 +128,8 @@ class WorkbenchRouteTest(unittest.TestCase):
             "device": "cpu",
             "iterations": 1,
             "seed": 2026,
+            "optimizer": "adam",
+            "learning_rate": "10",
         }
         encoded = json.dumps(form, separators=(",", ":")).encode("utf-8")
         status, headers, body = self.request(

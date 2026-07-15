@@ -6,7 +6,9 @@
 - 实现切片：`P1.2a`（P1 阶段仍未完成）
 - 实现状态：**Implemented / Verified — fixed single-node adapter only**
 - 原始 P1.2a 绑定算法/Adapter：`deepwave.acoustic_fwi@1.0.0` / `1.0.0`
-- 当前 D-006 绑定算法/Adapter：`deepwave.acoustic_fwi@1.1.0` / `1.1.0`
+- D-006 checkpoint 绑定算法/Adapter：`deepwave.acoustic_fwi@1.1.0` / `1.1.0`
+- D-007 六参数历史快照：`deepwave.acoustic_fwi@1.2.0` / `1.2.0`（不可变、严格读兼容）
+- D-007 当前新提交绑定：`deepwave.acoustic_fwi@1.3.0` / Adapter `1.3.0`
 - 绑定数据：`marmousi_94_288@1.0.0`
 
 本切片把既有 Deepwave 反演 Worker 包装为 Algorithm Adapter v1 的六方法边界，但没有把
@@ -14,8 +16,10 @@ Adapter 接入 TaskService、HTTP、MCP 或 `Queued` 状态转换。它是可供
 受控组件，不是已经开放的产品执行入口，也不是通用 scheduler。
 
 后续状态：P1.1c 已通过 `scientific_runtime/task_dispatcher.py` 把该固定 Adapter 接到原子
-TaskService admission；HTTP/Guided Web 仍未接入。`validate` 现在返回无启动 preflight
-fingerprint，成功 handle 返回实际 dispatch fingerprint，供 SQLite 首个 node event 绑定。
+TaskService admission，P1-005 已接入并验证 HTTP/Guided Web。`validate` 现在返回无启动
+preflight fingerprint，成功 handle 返回实际 dispatch fingerprint，供 SQLite 首个 node event
+绑定。D-007 先增加 `1.2.0` 六参数快照，随后为保持已注册快照不可变，以 `1.3.0`
+承载最终一致的新提交 manifest；这不改变本页原始 P1.2a checkpoint 的范围。
 
 ## 1. 文件与责任
 
@@ -30,8 +34,12 @@ Adapter v1 精确绑定打包的 AlgorithmManifest canonical hash。manifest 字
 不能只保留相同 algorithm ID/version 后静默继续。
 
 D-006/P1-006 因参数接受集合从 100 扩大到 10000，同时升级 Algorithm 与 Adapter minor version；
-旧 `1.0.0` manifest 不变。新 Adapter 仍可读取已有 `1.0.0` dispatched handle 的 status/artifact，
-但新提交必须使用当前 `1.1.0` 身份，避免 provenance 中同一版本出现两套参数策略。
+旧 `1.0.0` manifest 不变。D-006 的 `1.1.0` Adapter 仍可读取已有 `1.0.0` dispatched handle 的
+status/artifact，而当时的新提交必须使用 `1.1.0`。D-007 的 `1.2.0` 是不可变六参数历史
+快照；当前新提交必须使用 `1.3.0`，并继续严格读取 `1.0↔1.0`、`1.1↔1.1` 和
+`1.2↔1.2` 旧收据，避免 provenance 中同一版本出现两套参数或 manifest 策略。当前
+`1.3.0` manifest 将 FWI-only task/preset、iterations `1..10000`、seed
+`0..2147483647` 与 Adam/SGD 条件学习率边界固定在同一新版本身份中。
 
 ## 2. 六方法边界
 
@@ -112,5 +120,6 @@ seed，但明确声明：
 
 后续 P1.1c 已完成 SQLite 中 Gate + current draft/plan/approval/registry + budget consumption +
 submit idempotency + durable intent + 首个 `task_queued` 的原子状态变化，以及事务后 one-shot
-dispatch/receipt 边界。仍 Pending：HTTP/Guided Web；P2 cancel/lease/retry/自动 reconciliation；
-P3 DAG。两个 crash window 以 pending/dispatching 明确暴露，不在 P1 猜测性恢复。
+dispatch/receipt 边界；P1-005 已验证 HTTP/Guided Web。当前仍 Pending：完整 P2
+cancel/lease/retry/自动 reconciliation 与 P3 DAG。两个 crash window 以
+pending/dispatching 明确暴露，不在 P1 猜测性恢复。

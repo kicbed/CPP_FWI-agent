@@ -13,6 +13,7 @@ from scientific_runtime_contracts import (
     load_schema,
     schema_errors,
 )
+from scientific_runtime.fwi_registry import load_deepwave_manifest
 
 
 HASH_A = "sha256:" + "a" * 64
@@ -20,6 +21,8 @@ HASH_B = "sha256:" + "b" * 64
 HASH_C = "sha256:" + "c" * 64
 HASH_D = "sha256:" + "d" * 64
 ALGORITHM_VERSION = "1.1.0"
+CURRENT_OPTIMIZER_ALGORITHM_VERSION = "1.3.0"
+LEGACY_OPTIMIZER_ALGORITHM_VERSION = "1.2.0"
 
 
 def dataset_ref() -> dict:
@@ -138,6 +141,21 @@ def task_draft() -> dict:
     }
 
 
+def optimizer_task_draft(
+    *,
+    optimizer: str = "adam",
+    learning_rate_milli: int = 10_000,
+    algorithm_version: str = CURRENT_OPTIMIZER_ALGORITHM_VERSION,
+) -> dict:
+    draft = task_draft()
+    draft["schema_version"] = "1.1.0"
+    draft["algorithm"]["version"] = algorithm_version
+    draft["parameters"].update(
+        optimizer=optimizer, learning_rate_milli=learning_rate_milli
+    )
+    return draft
+
+
 def plan_graph() -> dict:
     dataset = dataset_ref()
     plan = {
@@ -196,6 +214,22 @@ def plan_graph() -> dict:
         "created_at": "2026-07-15T02:00:00Z",
         "extensions": {},
     }
+    plan["plan_hash"] = compute_plan_hash(plan)
+    return plan
+
+
+def optimizer_plan_graph(
+    *,
+    optimizer: str = "adam",
+    learning_rate_milli: int = 10_000,
+    algorithm_version: str = CURRENT_OPTIMIZER_ALGORITHM_VERSION,
+) -> dict:
+    plan = plan_graph()
+    plan["schema_version"] = "1.1.0"
+    plan["nodes"][0]["algorithm"]["version"] = algorithm_version
+    plan["nodes"][0]["parameters"].update(
+        optimizer=optimizer, learning_rate_milli=learning_rate_milli
+    )
     plan["plan_hash"] = compute_plan_hash(plan)
     return plan
 
@@ -416,6 +450,183 @@ class ScientificRuntimeSchemaTest(unittest.TestCase):
         draft["parameters"]["iterations"] = 2.5
         self.assertTrue(schema_errors("task-draft.schema.json", draft))
 
+    def test_optimizer_contract_minor_is_strict_and_legacy_remains_valid(self) -> None:
+        current_manifest = load_deepwave_manifest(
+            CURRENT_OPTIMIZER_ALGORITHM_VERSION
+        )
+        current_draft = optimizer_task_draft()
+        current_plan = optimizer_plan_graph()
+        for name, value in (
+            ("algorithm-manifest.schema.json", current_manifest),
+            ("task-draft.schema.json", current_draft),
+            ("plan-graph.schema.json", current_plan),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(schema_errors(name, value), [])
+
+        legacy_optimizer_manifest = load_deepwave_manifest(
+            LEGACY_OPTIMIZER_ALGORITHM_VERSION
+        )
+        legacy_optimizer_draft = optimizer_task_draft(
+            algorithm_version=LEGACY_OPTIMIZER_ALGORITHM_VERSION
+        )
+        legacy_optimizer_plan = optimizer_plan_graph(
+            algorithm_version=LEGACY_OPTIMIZER_ALGORITHM_VERSION
+        )
+        for name, value in (
+            ("algorithm-manifest.schema.json", legacy_optimizer_manifest),
+            ("task-draft.schema.json", legacy_optimizer_draft),
+            ("plan-graph.schema.json", legacy_optimizer_plan),
+        ):
+            with self.subTest(name=f"legacy-1.2:{name}"):
+                self.assertEqual(schema_errors(name, value), [])
+
+        self.assertEqual(
+            legacy_optimizer_manifest["parameter_schema"]["properties"]
+            ["iterations"]["minimum"],
+            0,
+        )
+        self.assertNotIn(
+            "maximum",
+            legacy_optimizer_manifest["parameter_schema"]["properties"]["seed"],
+        )
+        self.assertEqual(
+            current_manifest["parameter_schema"]["properties"]["iterations"]
+            ["minimum"],
+            1,
+        )
+        self.assertEqual(
+            current_manifest["parameter_schema"]["properties"]["seed"]["maximum"],
+            2147483647,
+        )
+
+        legacy_with_new_parameters = task_draft()
+        legacy_with_new_parameters["parameters"].update(
+            optimizer="adam", learning_rate_milli=10_000
+        )
+        self.assertTrue(
+            schema_errors("task-draft.schema.json", legacy_with_new_parameters)
+        )
+
+        current_without_optimizer = optimizer_task_draft()
+        current_without_optimizer["parameters"].pop("optimizer")
+        self.assertTrue(schema_errors("task-draft.schema.json", current_without_optimizer))
+
+        current_without_conditional_bounds = copy.deepcopy(current_manifest)
+        current_without_conditional_bounds["parameter_schema"].pop("allOf")
+        self.assertTrue(
+            schema_errors(
+                "algorithm-manifest.schema.json", current_without_conditional_bounds
+            )
+        )
+
+        current_with_zero_iterations = copy.deepcopy(current_manifest)
+        current_with_zero_iterations["parameter_schema"]["properties"]["iterations"][
+            "minimum"
+        ] = 0
+        self.assertTrue(
+            schema_errors("algorithm-manifest.schema.json", current_with_zero_iterations)
+        )
+
+        current_without_seed_maximum = copy.deepcopy(current_manifest)
+        current_without_seed_maximum["parameter_schema"]["properties"]["seed"].pop(
+            "maximum"
+        )
+        self.assertTrue(
+            schema_errors("algorithm-manifest.schema.json", current_without_seed_maximum)
+        )
+
+        current_advertising_forward = copy.deepcopy(current_manifest)
+        current_advertising_forward["task_types"].insert(0, "acoustic_forward_2d")
+        current_advertising_forward["parameter_schema"]["properties"]["preset"][
+            "enum"
+        ].insert(0, "forward")
+        self.assertTrue(
+            schema_errors("algorithm-manifest.schema.json", current_advertising_forward)
+        )
+
+        legacy_optimizer_with_current_bounds = copy.deepcopy(
+            legacy_optimizer_manifest
+        )
+        legacy_optimizer_with_current_bounds["parameter_schema"]["properties"][
+            "iterations"
+        ]["minimum"] = 1
+        legacy_optimizer_with_current_bounds["parameter_schema"]["properties"][
+            "seed"
+        ]["maximum"] = 2147483647
+        self.assertTrue(
+            schema_errors(
+                "algorithm-manifest.schema.json",
+                legacy_optimizer_with_current_bounds,
+            )
+        )
+
+        legacy_with_optimizer_conditions = algorithm_manifest()
+        legacy_with_optimizer_conditions["parameter_schema"]["allOf"] = copy.deepcopy(
+            current_manifest["parameter_schema"]["allOf"]
+        )
+        self.assertTrue(
+            schema_errors(
+                "algorithm-manifest.schema.json", legacy_with_optimizer_conditions
+            )
+        )
+
+        legacy_with_current_fwi_bounds = algorithm_manifest()
+        legacy_with_current_fwi_bounds["parameter_schema"]["properties"]["iterations"][
+            "minimum"
+        ] = 1
+        legacy_with_current_fwi_bounds["parameter_schema"]["properties"]["seed"][
+            "maximum"
+        ] = 2147483647
+        self.assertTrue(
+            schema_errors(
+                "algorithm-manifest.schema.json", legacy_with_current_fwi_bounds
+            )
+        )
+
+    def test_optimizer_learning_rate_uses_integer_fixed_point_and_profile_bounds(self) -> None:
+        for optimizer, lower, upper in (
+            ("adam", 100, 100_000),
+            ("sgd", 100_000_000, 1_000_000_000_000),
+        ):
+            for learning_rate_milli in (lower, upper):
+                with self.subTest(
+                    optimizer=optimizer, learning_rate_milli=learning_rate_milli
+                ):
+                    self.assertEqual(
+                        schema_errors(
+                            "task-draft.schema.json",
+                            optimizer_task_draft(
+                                optimizer=optimizer,
+                                learning_rate_milli=learning_rate_milli,
+                            ),
+                        ),
+                        [],
+                    )
+            for learning_rate_milli in (lower - 1, upper + 1):
+                self.assertTrue(
+                    schema_errors(
+                        "task-draft.schema.json",
+                        optimizer_task_draft(
+                            optimizer=optimizer,
+                            learning_rate_milli=learning_rate_milli,
+                        ),
+                    )
+                )
+
+        # Draft-07 treats a mathematically integral JSON number such as
+        # 10000.0 as an integer; the hash boundary separately rejects every
+        # Python float.  Here the schema rejects booleans, strings and a
+        # genuinely fractional value.
+        for invalid in (True, "10000", 10_000.5):
+            with self.subTest(invalid=invalid):
+                self.assertTrue(
+                    schema_errors(
+                        "task-draft.schema.json",
+                        optimizer_task_draft(learning_rate_milli=invalid),
+                    )
+                )
+
     def test_arbitrary_artifact_paths_are_rejected(self) -> None:
         artifact = artifact_manifest()
         artifact["location"] = {"relative_path": "../private/model.npy"}
@@ -486,6 +697,14 @@ class ScientificRuntimeCanonicalizationTest(unittest.TestCase):
         plan["extensions"] = {"org.example": {"threshold": 0.5}}
         with self.assertRaisesRegex(ValueError, "floating-point JSON"):
             compute_plan_hash(plan)
+
+    def test_optimizer_fixed_point_is_hash_bound_without_json_floats(self) -> None:
+        plan = optimizer_plan_graph(learning_rate_milli=2_000)
+        original_hash = compute_plan_hash(plan)
+        self.assertEqual(plan["plan_hash"], original_hash)
+
+        plan["nodes"][0]["parameters"]["learning_rate_milli"] = 2_001
+        self.assertNotEqual(compute_plan_hash(plan), original_hash)
 
 
 class ScientificRuntimeExecutionGateTest(unittest.TestCase):

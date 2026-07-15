@@ -8,7 +8,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from jsonschema import Draft7Validator
 from jsonschema.exceptions import SchemaError
@@ -32,6 +32,7 @@ from .task_store import (
     DispatchIntentSnapshot,
     SubmitGateContext,
     TaskSnapshot,
+    TaskSnapshotPage,
     TaskStore,
     TaskStoreConflict,
     encode_document,
@@ -613,6 +614,77 @@ class TaskService:
             raise TaskConflict(str(error)) from error
         return CreateTaskResult(snapshot=result.snapshot, replayed=result.replayed)
 
+    def lookup_compatible_create_task(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        drafts: Sequence[Mapping[str, Any]],
+        idempotency_key: str,
+    ) -> CreateTaskResult | None:
+        """Replay a create only when a validated historical request hash matches.
+
+        This is a read-only upgrade bridge.  It never creates from a historical
+        candidate and therefore cannot reopen old Algorithm versions for new
+        submissions.
+        """
+
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        _validate_idempotency_key(idempotency_key)
+        if (
+            isinstance(drafts, (str, bytes, Mapping))
+            or not isinstance(drafts, Sequence)
+            or not 1 <= len(drafts) <= 8
+        ):
+            raise TaskValidationError(
+                "INVALID_COMPATIBILITY_CANDIDATES",
+                ["historical create candidates must contain 1-8 drafts"],
+            )
+        request_hashes: list[str] = []
+        for draft in drafts:
+            if not isinstance(draft, Mapping):
+                raise TaskValidationError(
+                    "INVALID_COMPATIBILITY_CANDIDATES",
+                    ["historical create candidates must be TaskDraft objects"],
+                )
+            self._validate_schema("task-draft.schema.json", draft)
+            if draft["revision"] != 1:
+                raise TaskValidationError(
+                    "INVALID_INITIAL_REVISION",
+                    ["a historical create candidate must start at revision 1"],
+                )
+            self._validate_registered_draft(
+                draft, project_id=project_id, principal_id=principal_id
+            )
+            _, request_hash = encode_document(
+                {
+                    "project_id": project_id,
+                    "principal_id": principal_id,
+                    "draft": dict(draft),
+                }
+            )
+            request_hashes.append(request_hash)
+        if len(set(request_hashes)) != len(request_hashes):
+            raise TaskValidationError(
+                "INVALID_COMPATIBILITY_CANDIDATES",
+                ["historical create candidates must have distinct request identities"],
+            )
+        try:
+            replay = self._store.lookup_compatible_create_task(
+                project_id=project_id,
+                principal_id=principal_id,
+                idempotency_key=idempotency_key,
+                request_hashes=request_hashes,
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        if replay is None:
+            return None
+        return CreateTaskResult(snapshot=replay.snapshot, replayed=True)
+
     def get_task(
         self, task_id: str, *, project_id: str, principal_id: str
     ) -> TaskSnapshot:
@@ -627,6 +699,45 @@ class TaskService:
         ):
             raise TaskNotFound("task does not exist in the requested scope")
         return snapshot
+
+    def list_tasks(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> TaskSnapshotPage:
+        """Return a strict, scope-bound page without refreshing runtime state."""
+
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if cursor is not None and (
+            not isinstance(cursor, str) or OPAQUE_ID.fullmatch(cursor) is None
+        ):
+            raise TaskValidationError(
+                "INVALID_TASK_CURSOR",
+                ["cursor must be a v1 opaque task identifier"],
+            )
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise TaskValidationError(
+                "INVALID_TASK_LIST_LIMIT",
+                ["limit must be an integer from 1 to 50"],
+            )
+        try:
+            return self._store.list_tasks(
+                project_id=project_id,
+                principal_id=principal_id,
+                cursor=cursor,
+                limit=limit,
+            )
+        except TaskStoreConflict as error:
+            # A missing and a cross-scope cursor are deliberately
+            # indistinguishable to callers.
+            raise TaskValidationError(
+                "INVALID_TASK_CURSOR",
+                ["cursor does not identify a task in the requested scope"],
+            ) from error
 
     def revise_draft(
         self,
@@ -697,6 +808,102 @@ class TaskService:
             raise TaskIdempotencyConflict(str(error)) from error
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
+
+    def lookup_compatible_draft_revision(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_revision: int,
+        drafts: Sequence[Mapping[str, Any]],
+        idempotency_key: str,
+    ) -> TaskSnapshot | None:
+        """Replay one historical revision only through its exact ledger hash."""
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if not isinstance(expected_revision, int) or isinstance(expected_revision, bool):
+            raise TaskValidationError(
+                "INVALID_REVISION", ["expected_revision must be an integer"]
+            )
+        _validate_idempotency_key(idempotency_key)
+        if (
+            isinstance(drafts, (str, bytes, Mapping))
+            or not isinstance(drafts, Sequence)
+            or not 1 <= len(drafts) <= 8
+        ):
+            raise TaskValidationError(
+                "INVALID_COMPATIBILITY_CANDIDATES",
+                ["historical revision candidates must contain 1-8 drafts"],
+            )
+        request_hashes: list[str] = []
+        candidate_identity: tuple[str, int] | None = None
+        for draft in drafts:
+            if not isinstance(draft, Mapping):
+                raise TaskValidationError(
+                    "INVALID_COMPATIBILITY_CANDIDATES",
+                    ["historical revision candidates must be TaskDraft objects"],
+                )
+            self._validate_schema("task-draft.schema.json", draft)
+            identity = (draft["draft_id"], draft["revision"])
+            if draft["revision"] != expected_revision + 1:
+                raise TaskValidationError(
+                    "INVALID_REVISION",
+                    ["historical draft revision must increase by exactly one"],
+                )
+            if candidate_identity is None:
+                candidate_identity = identity
+            elif candidate_identity != identity:
+                raise TaskValidationError(
+                    "INVALID_COMPATIBILITY_CANDIDATES",
+                    ["historical revision candidates must share one draft identity"],
+                )
+            self._validate_registered_draft(
+                draft, project_id=project_id, principal_id=principal_id
+            )
+            _, request_hash = encode_document(
+                {
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "principal_id": principal_id,
+                    "expected_revision": expected_revision,
+                    "draft": dict(draft),
+                }
+            )
+            request_hashes.append(request_hash)
+        if len(set(request_hashes)) != len(request_hashes):
+            raise TaskValidationError(
+                "INVALID_COMPATIBILITY_CANDIDATES",
+                ["historical revision candidates must have distinct request identities"],
+            )
+        try:
+            replay = self._store.lookup_compatible_workbench_mutation(
+                project_id=project_id,
+                principal_id=principal_id,
+                operation="revise_draft",
+                idempotency_key=idempotency_key,
+                request_hashes=request_hashes,
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        if replay is None:
+            return None
+        expected_outcome = {
+            "task_id": task_id,
+            "draft_id": candidate_identity[0],
+            "draft_revision": candidate_identity[1],
+        }
+        if replay.task_id != task_id or replay.outcome != expected_outcome:
+            raise TaskIdempotencyConflict(
+                "idempotency key identifies another task or draft revision"
+            )
+        return self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
 
     def persist_plan(
         self,

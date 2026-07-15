@@ -134,11 +134,14 @@ function loadGuidedFunctions() {
     'normalizeGuidedSession',
     'normalizeGuidedCatalog',
     'guidedIntegerValue',
+    'guidedLearningRateValue',
+    'guidedLearningRateFromMilli',
     'validateGuidedFwiForm',
     'makeGuidedForm',
     'normalizeGuidedTaskProjection',
     'isGuidedReviewReady',
     'isGuidedApprovedSubmitPending',
+    'isGuidedApprovalCompleted',
     'normalizeGuidedArtifacts',
     'guidedDispatchExplanation',
     'renderGuidedArtifactsHtml',
@@ -150,6 +153,45 @@ function loadGuidedFunctions() {
   ].join('\n');
   vm.runInNewContext(source, sandbox);
   return sandbox.module.exports;
+}
+
+class GuidedFakeElement {
+  constructor(tagName, options = {}) {
+    this.tagName = tagName;
+    this.children = [];
+    this.dataset = {};
+    this.attributes = {};
+    this.listeners = {};
+    this.className = '';
+    this.type = '';
+    this.disabled = false;
+    this._textContent = '';
+    this._innerHTML = '';
+    this.innerHTMLWrites = 0;
+    this.scrollIntoViewCalls = [];
+    this.onInnerHTML = options.onInnerHTML || null;
+    const values = new Set();
+    this.classList = {
+      add: (...names) => names.forEach(name => values.add(name)),
+      remove: (...names) => names.forEach(name => values.delete(name)),
+      contains: name => values.has(name),
+    };
+  }
+
+  set textContent(value) { this._textContent = String(value); }
+  get textContent() { return this._textContent; }
+  set innerHTML(value) {
+    this.innerHTMLWrites += 1;
+    this._innerHTML = String(value);
+    if (this.onInnerHTML) this.onInnerHTML(this._innerHTML);
+  }
+  get innerHTML() { return this._innerHTML; }
+  append(...children) { this.children.push(...children); }
+  appendChild(child) { this.children.push(child); }
+  replaceChildren(...children) { this.children = [...children]; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  scrollIntoView(options) { this.scrollIntoViewCalls.push(options); }
 }
 
 function loadSseParser() {
@@ -968,6 +1010,16 @@ function testEmbeddingStatusUsesSameOriginHealthProxy() {
 
 function makeGuidedTask(overrides = {}) {
   const taskId = overrides.task_id || 'task-guided-1';
+  const planHash = overrides.plan_hash || `sha256:${'a'.repeat(64)}`;
+  const approval = overrides.approval
+    ? {
+        approval_id: 'approval-guided-1',
+        plan_id: 'plan-guided-1',
+        plan_hash: planHash,
+        decision: 'approved',
+        ...overrides.approval,
+      }
+    : null;
   return {
     task_id: taskId,
     status: overrides.status || 'AwaitingApproval',
@@ -976,17 +1028,26 @@ function makeGuidedTask(overrides = {}) {
       revision: 1,
       status: 'AwaitingApproval',
       goal: '<img src=x onerror=alert(1)>',
+      task_type: 'acoustic_fwi_2d',
       dataset: { id: 'marmousi_94_288', version: '1.0.0' },
+      algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
       parameters: {
         preset: 'fwi_smoke', device: 'cpu', iterations: overrides.iterations ?? 2, seed: 0,
+        optimizer: overrides.optimizer || 'adam',
+        learning_rate_milli: overrides.learning_rate_milli ?? 10000,
       },
     },
     plan: {
       plan_id: 'plan-guided-1',
-      plan_hash: `sha256:${'a'.repeat(64)}`,
-      nodes: [{ node_id: 'invert' }],
+      plan_hash: planHash,
+      draft: { draft_id: 'draft-guided-1', revision: 1 },
+      task_type: 'acoustic_fwi_2d',
+      nodes: [{
+        node_id: 'invert',
+        algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
+      }],
     },
-    approval: overrides.approval || null,
+    approval,
     dispatch: overrides.dispatch || null,
     runtime_status: overrides.adapter_status || null,
   };
@@ -1022,6 +1083,8 @@ function testGuidedFormHasStrictBoundaries() {
     device: 'cpu',
     iterations: 1,
     seed: 0,
+    optimizer: 'adam',
+    learning_rate: '10',
   };
   assert.equal(api.validateGuidedFwiForm(base).ok, true);
   assert.equal(api.validateGuidedFwiForm({
@@ -1031,6 +1094,7 @@ function testGuidedFormHasStrictBoundaries() {
     { iterations: 0 }, { iterations: 10001 }, { iterations: 1.5 }, { iterations: '01' },
     { seed: -1 }, { seed: 2147483648 }, { seed: '1.0' },
     { preset: 'custom' }, { device: 'auto' }, { dataset_id: '../secret' },
+    { optimizer: 'rmsprop' }, { learning_rate: '0.01' }, { learning_rate: 101 },
     { dataset_version: 'latest' }, { goal: '' }, { goal: 'x'.repeat(2001) },
   ]) {
     assert.equal(api.validateGuidedFwiForm({ ...base, ...patch }).ok, false, JSON.stringify(patch));
@@ -1041,7 +1105,38 @@ function testGuidedFormHasStrictBoundaries() {
   assert.equal(normalized.value.seed, 7);
   assert.deepEqual(Object.keys(normalized.value), [
     'goal', 'dataset_id', 'dataset_version', 'preset', 'device', 'iterations', 'seed',
+    'optimizer', 'learning_rate',
   ]);
+  assert.equal(api.validateGuidedFwiForm({
+    ...base, optimizer: 'sgd', learning_rate: '10000000',
+  }).ok, true);
+  assert.equal(api.validateGuidedFwiForm({
+    ...base, optimizer: 'sgd', learning_rate: '10',
+  }).ok, false);
+  assert.equal(api.guidedLearningRateFromMilli(10000), '10');
+  for (const [text, expected] of [
+    ['FWI 学习率 10.0000', '10.0000'],
+    ['FWI learning rate=1e1', '1e1'],
+    ['FWI lr -10', '-10'],
+    ['FWI lr +10', '+10'],
+  ]) {
+    const overrides = api.guidedOverridesFromExecutionText(text);
+    assert.equal(overrides.learning_rate, expected);
+    assert.equal(
+      api.validateGuidedFwiForm({ ...base, learning_rate: overrides.learning_rate }).ok,
+      false,
+      text,
+    );
+  }
+  for (const text of ['FWI optimizer RMSProp', '使用 RMSProp 做 FWI']) {
+    const overrides = api.guidedOverridesFromExecutionText(text);
+    assert.equal(overrides.optimizer, 'rmsprop');
+    const invalidForm = api.makeGuidedForm(overrides, {
+      datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
+    });
+    assert.equal(invalidForm.optimizer, 'rmsprop');
+    assert.equal(api.validateGuidedFwiForm({ ...base, ...invalidForm }).ok, false);
+  }
   assert.equal(api.guidedOverridesFromExecutionText('请做 Marmousi FWI，迭代50次').iterations, '50');
   assert.equal(api.guidedOverridesFromExecutionText('Marmousi FWI，50次迭代').iterations, '50');
   assert.equal(api.guidedOverridesFromExecutionText('运行50轮 FWI').iterations, '50');
@@ -1086,6 +1181,8 @@ function testGuidedFormHasStrictBoundaries() {
   assert.match(rejectedForward.errors.join('；'), /P1 Guided 当前不支持正演\/forward/);
   assert.match(html, /id="guidedIterations"[^>]+min="1" max="10000" step="1"/);
   assert.match(html, /超过 100 次可能长时间占用计算资源；当前不支持运行中取消/);
+  assert.match(html, /自然语言未写 CUDA\/GPU 时安全默认 CPU，不会自动切换/);
+  assert.match(html, /不支持：\$\{escapeHtml\(invalidOptimizer\)\}/);
   assert.match(html, /id="guidedSeed"[^>]+min="0" max="2147483647" step="1"/);
 }
 
@@ -1137,7 +1234,7 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   const api = loadGuidedFunctions();
   const catalog = {
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.1.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
   };
   const reviewTask = api.normalizeGuidedTaskProjection(makeGuidedTask());
   assert.equal(api.isGuidedReviewReady(reviewTask, catalog), true);
@@ -1149,6 +1246,7 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   const maximumProjection = api.normalizeGuidedTaskProjection(makeGuidedTask({
     iterations: 10000,
     status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
     dispatch: { state: 'dispatched' },
     adapter_status: {
       status: 'Running', stage: 'invert', completed: 9999, total: 10000,
@@ -1164,6 +1262,7 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   for (const dispatchState of ['pending', 'dispatching', 'dispatched', 'reconciliation_required']) {
     const task = api.normalizeGuidedTaskProjection(makeGuidedTask({
       status: 'Queued',
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
       dispatch: { state: dispatchState, failure_code: dispatchState === 'reconciliation_required' ? 'DISPATCH_RECEIPT_INVALID' : '' },
       adapter_status: {
         status: dispatchState === 'dispatched' ? 'Running' : 'Queued',
@@ -1177,6 +1276,48 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   }
   assert.match(api.guidedDispatchExplanation('pending'), /不会由浏览器重发/);
   assert.match(api.guidedDispatchExplanation('reconciliation_required'), /不会重试/);
+  const completed = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Queued',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'pending' },
+  }));
+  assert.ok(completed);
+  assert.equal(api.isGuidedApprovalCompleted(completed, completed.plan.hash), true);
+  const legacyProjection = makeGuidedTask({
+    status: 'Succeeded',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+  });
+  legacyProjection.draft.algorithm.version = '1.1.0';
+  legacyProjection.plan.nodes[0].algorithm.version = '1.1.0';
+  delete legacyProjection.draft.parameters.optimizer;
+  delete legacyProjection.draft.parameters.learning_rate_milli;
+  const normalizedLegacy = api.normalizeGuidedTaskProjection(legacyProjection);
+  assert.ok(normalizedLegacy, 'complete 1.0/1.1 projections remain readable');
+  assert.equal(normalizedLegacy.draft.optimizer, '');
+  assert.equal(normalizedLegacy.draft.learningRate, null);
+  const planHash = `sha256:${'a'.repeat(64)}`;
+  for (const malformed of [
+    { task_id: 'task-guided-1' },
+    {
+      task_id: 'task-guided-1', status: 'Queued', plan: { plan_hash: planHash },
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    },
+    makeGuidedTask({
+      status: 'Queued',
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    }),
+    makeGuidedTask({
+      status: 'Queued',
+      approval: {
+        approval_id: 'approval-guided-1', decision: 'approved',
+        plan_hash: `sha256:${'b'.repeat(64)}`,
+      },
+      dispatch: { state: 'pending' },
+    }),
+  ]) {
+    assert.equal(api.normalizeGuidedTaskProjection(malformed), null);
+  }
   assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask(), 'different-task'), null);
   assert.equal(api.normalizeGuidedTaskProjection({ ...makeGuidedTask(), task_id: '../bad' }), null);
   const taskSource = extractFunction('renderGuidedTaskHtml');
@@ -1265,6 +1406,10 @@ function testGuidedApprovalCannotBeBypassedOrReplayedAutomatically() {
   assert.match(approveSource, /returnPhase === 'approval_incomplete'/);
   assert.match(approveSource, /isGuidedReviewReady\(task, state\.guided\.catalog\)/);
   assert.match(approveSource, /guidedMutationKey\('approve', body\)/);
+  assert.match(approveSource, /isGuidedApprovalCompleted\(updated, body\.plan_hash\)/);
+  assert.match(approveSource, /state\.guided\.approvalReplayAvailable = true/);
+  assert.match(approveSource, /state\.guided\.phase = 'outcome_unknown'/);
+  assert.doesNotMatch(approveSource, /if \(error && error\.guidedOutcomeUnknown\)/);
   const mutationKeySource = extractFunction('guidedMutationKey');
   assert.match(mutationKeySource, /existing\.signature === signature/);
   const continueSource = extractFunction('continueGuidedApprovedSubmit');
@@ -1280,7 +1425,9 @@ function testGuidedApprovalCannotBeBypassedOrReplayedAutomatically() {
   assert.match(requestSource, /mutation && response\.status >= 500/);
 
   assert.match(extractFunction('openGuidedFwi'), /\['outcome_unknown', 'approval_incomplete'\]/);
-  assert.match(extractFunction('closeGuidedFwi'), /\['outcome_unknown', 'approval_incomplete'\]/);
+  assert.match(extractFunction('closeGuidedFwi'), /phase === 'outcome_unknown'/);
+  assert.match(extractFunction('closeGuidedFwi'), /approvalReplayAvailable === true/);
+  assert.match(extractFunction('reopenGuidedTask'), /approvalReplayAvailable === true/);
 
   const refreshSource = extractFunction('refreshGuidedTask');
   assert.match(refreshSource, /guidedApiPath\('task', taskId\)/);
@@ -1338,6 +1485,7 @@ async function testGuidedApprovedSubmitPendingStopsPolling() {
     isGuidedApprovedSubmitPending: () => true,
     loadGuidedArtifacts: async () => { artifactLoads += 1; },
     scheduleGuidedPoll: () => { scheduledPolls += 1; },
+    upsertGuidedTaskIndex() {},
     renderGuidedFwi() {},
   };
   vm.runInNewContext([
@@ -1372,11 +1520,727 @@ async function testGuidedApprovedSubmitPendingStopsPolling() {
   assert.equal(generatedKeys, 1);
 }
 
+async function testGuidedApproveFourXxRetainsOriginalKeyThroughGetRecovery() {
+  const taskId = 'task-guided-approve-1';
+  const planHash = `sha256:${'b'.repeat(64)}`;
+  const catalog = {
+    datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
+  };
+  const noApprovalProjection = makeGuidedTask({ task_id: taskId, plan_hash: planHash });
+  const approvedSubmitPendingProjection = makeGuidedTask({
+    task_id: taskId,
+    plan_hash: planHash,
+    approval: { approval_id: 'approval-guided-approve-1', decision: 'approved' },
+  });
+  const submittedProjection = makeGuidedTask({
+    task_id: taskId,
+    plan_hash: planHash,
+    status: 'Queued',
+    approval: { approval_id: 'approval-guided-approve-1', decision: 'approved' },
+    dispatch: { state: 'pending' },
+  });
+  // This is the exact partial shape that previously passed the permissive
+  // normalizer and was misclassified as a completed approval.
+  const malformedSubmittedProjection = {
+    task_id: taskId,
+    status: 'Queued',
+    plan: { plan_hash: planHash },
+    approval: { approval_id: 'approval-guided-approve-1', decision: 'approved' },
+  };
+  const reviewTask = loadGuidedFunctions().normalizeGuidedTaskProjection(
+    noApprovalProjection, taskId,
+  );
+  assert.ok(reviewTask);
+  let generatedKeys = 0;
+  let getCount = 0;
+  let postCount = 0;
+  let returnMalformedPost = false;
+  const fetchCalls = [];
+  const scheduledPolls = [];
+  const toasts = [];
+  const sandbox = {
+    module: { exports: {} },
+    state: {
+      guided: {
+        phase: 'review',
+        csrfToken: 'csrf-token-abcdefghijkl',
+        task: reviewTask,
+        taskId,
+        catalog,
+        mutation: '',
+        mutationKeys: Object.create(null),
+        pollInFlight: false,
+        generation: 11,
+        error: '',
+        outcomeUnknown: false,
+        approvalReplayAvailable: false,
+      },
+    },
+    createStableId(prefix) {
+      generatedKeys += 1;
+      return `${prefix}-stable-key-${generatedKeys}`;
+    },
+    guidedApiPath(resource) {
+      return resource === 'approve'
+        ? `/api/scientific-runtime/v1/tasks/${taskId}/approve`
+        : `/api/scientific-runtime/v1/tasks/${taskId}`;
+    },
+    async fetch(path, options) {
+      fetchCalls.push({ path, method: options.method, key: options.headers['Idempotency-Key'] });
+      if (options.method === 'POST') {
+        postCount += 1;
+        if (returnMalformedPost) {
+          return {
+            ok: true,
+            status: 200,
+            async json() { return { ok: true, data: malformedSubmittedProjection }; },
+          };
+        }
+        if (postCount === 1) {
+          return {
+            ok: false,
+            status: 409,
+            async json() {
+              return { ok: false, error: { code: 'SUBMIT_CONFLICT', message: 'submit conflict after approval' } };
+            },
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          async json() { return { ok: true, data: submittedProjection }; },
+        };
+      }
+      getCount += 1;
+      const projections = [
+        malformedSubmittedProjection,
+        noApprovalProjection,
+        approvedSubmitPendingProjection,
+      ];
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, data: projections[getCount - 1] };
+        },
+      };
+    },
+    guidedInvalidMutationResponse(message) {
+      const error = new Error(message);
+      error.guidedOutcomeUnknown = true;
+      return error;
+    },
+    upsertGuidedTaskIndex() {},
+    renderGuidedFwi() {},
+    clearGuidedPoll() {},
+    scheduleGuidedPoll(delay) { scheduledPolls.push(delay); },
+    async loadGuidedArtifacts() { throw new Error('queued task must not load artifacts'); },
+    showToast(message) { toasts.push(message); },
+  };
+  vm.runInNewContext([
+    "const GUIDED_API_PREFIX = '/api/scientific-runtime/v1';",
+    extractFunction('isSafeGuidedOpaqueId'),
+    extractFunction('isSafeGuidedIdentifier'),
+    extractFunction('isSafeGuidedVersion'),
+    extractFunction('isSafeGuidedPlanHash'),
+    extractFunction('isSafeGuidedCsrfToken'),
+    extractFunction('boundedGuidedText'),
+    extractFunction('hasGuidedUnsupportedForwardIntent'),
+    extractFunction('guidedIntegerValue'),
+    extractFunction('guidedLearningRateValue'),
+    extractFunction('guidedLearningRateFromMilli'),
+    extractFunction('validateGuidedFwiForm'),
+    extractFunction('normalizeGuidedTaskProjection'),
+    extractFunction('isGuidedReviewReady'),
+    extractFunction('isGuidedApprovedSubmitPending'),
+    extractFunction('guidedMutationKey'),
+    extractFunction('isGuidedApprovalCompleted'),
+    `async ${extractFunction('guidedApiRequest')}`,
+    extractFunction('continueGuidedApprovedSubmit'),
+    `async ${extractFunction('approveGuidedFwi')}`,
+    `async ${extractFunction('refreshGuidedTask')}`,
+    extractFunction('closeGuidedFwi'),
+    `async ${extractFunction('reopenGuidedTask')}`,
+    'module.exports = { approveGuidedFwi, continueGuidedApprovedSubmit, refreshGuidedTask, closeGuidedFwi, reopenGuidedTask };',
+  ].join('\n'), sandbox);
+
+  const api = sandbox.module.exports;
+  assert.equal(await api.approveGuidedFwi(), false);
+  assert.equal(postCount, 1);
+  assert.equal(generatedKeys, 1);
+  const retainedApprove = sandbox.state.guided.mutationKeys.approve;
+  assert.equal(retainedApprove.key, fetchCalls[0].key);
+  assert.equal(sandbox.state.guided.phase, 'outcome_unknown');
+  assert.equal(sandbox.state.guided.approvalReplayAvailable, true);
+  assert.equal(sandbox.state.guided.outcomeUnknown, true);
+  assert.match(sandbox.state.guided.error, /submit conflict after approval/);
+  assert.deepEqual(scheduledPolls, [0]);
+
+  assert.equal(api.closeGuidedFwi(), false);
+  assert.equal(await api.reopenGuidedTask('task-other'), false);
+  assert.equal(sandbox.state.guided.mutationKeys.approve, retainedApprove);
+  assert.match(toasts[0], /Mutation 尚未闭环/);
+  assert.match(toasts[1], /原 Idempotency-Key/);
+
+  assert.equal(await api.refreshGuidedTask(), false);
+  assert.equal(sandbox.state.guided.phase, 'outcome_unknown');
+  assert.equal(sandbox.state.guided.approvalReplayAvailable, true);
+  assert.equal(sandbox.state.guided.outcomeUnknown, true);
+  assert.match(sandbox.state.guided.error, /task response 无效/);
+  assert.equal(sandbox.state.guided.task, reviewTask, 'malformed GET must not replace the last legal task');
+  assert.equal(api.closeGuidedFwi(), false);
+  assert.equal(await api.reopenGuidedTask('task-other'), false);
+  assert.equal(sandbox.state.guided.mutationKeys.approve, retainedApprove);
+
+  assert.equal(await api.refreshGuidedTask(), true);
+  assert.equal(sandbox.state.guided.phase, 'outcome_unknown');
+  assert.equal(sandbox.state.guided.approvalReplayAvailable, true);
+  assert.match(sandbox.state.guided.error, /尚未证明原 approve mutation.*保留原 Idempotency-Key.*不会生成新 key/);
+  assert.equal(api.continueGuidedApprovedSubmit(), false);
+  assert.equal(generatedKeys, 1);
+  assert.equal(sandbox.state.guided.mutationKeys.approve, retainedApprove);
+
+  assert.equal(await api.refreshGuidedTask(), true);
+  assert.equal(sandbox.state.guided.phase, 'approval_incomplete');
+  assert.equal(sandbox.state.guided.approvalReplayAvailable, true);
+  assert.equal(api.closeGuidedFwi(), false);
+  assert.equal(await api.reopenGuidedTask('task-other'), false);
+  assert.equal(sandbox.state.guided.mutationKeys.approve, retainedApprove);
+
+  assert.equal(await api.continueGuidedApprovedSubmit(), true);
+  assert.equal(postCount, 2);
+  assert.equal(generatedKeys, 1);
+  assert.equal(fetchCalls.at(-1).key, retainedApprove.key);
+  assert.equal(sandbox.state.guided.phase, 'monitoring');
+  assert.equal(sandbox.state.guided.outcomeUnknown, false);
+  assert.equal(sandbox.state.guided.approvalReplayAvailable, false);
+
+  returnMalformedPost = true;
+  sandbox.state.guided.phase = 'review';
+  sandbox.state.guided.task = reviewTask;
+  sandbox.state.guided.mutation = '';
+  sandbox.state.guided.mutationKeys = Object.create(null);
+  sandbox.state.guided.error = '';
+  sandbox.state.guided.outcomeUnknown = false;
+  sandbox.state.guided.approvalReplayAvailable = false;
+  assert.equal(await api.approveGuidedFwi(), false);
+  assert.equal(postCount, 3);
+  assert.equal(generatedKeys, 2);
+  const malformedResponseKey = sandbox.state.guided.mutationKeys.approve;
+  assert.equal(malformedResponseKey.key, fetchCalls.at(-1).key);
+  assert.equal(sandbox.state.guided.phase, 'outcome_unknown');
+  assert.equal(sandbox.state.guided.outcomeUnknown, true);
+  assert.equal(sandbox.state.guided.approvalReplayAvailable, true);
+  assert.match(sandbox.state.guided.error, /缺少合法 task projection/);
+  assert.equal(api.closeGuidedFwi(), false);
+  assert.equal(await api.reopenGuidedTask('task-other'), false);
+  assert.equal(sandbox.state.guided.mutationKeys.approve, malformedResponseKey);
+}
+
 function testGuidedStateIsNotPersistedWithChats() {
   const persistenceSource = extractFunction('persistChatState');
   assert.doesNotMatch(persistenceSource, /guided/);
-  assert.match(html, /Scientific Runtime workflow state is deliberately session-memory only/);
+  assert.match(html, /active card stays in session memory/);
+  assert.match(html, /discovery index is loaded[\s\S]*scope-bound SQLite API/);
   assert.doesNotMatch(extractFunction('scheduleGuidedPoll'), /localStorage|sessionStorage/);
+}
+
+function testGuidedPollingPreservesReaderScrollPosition() {
+  function makeHarness(scrollTop) {
+    const chatArea = { scrollTop, scrollHeight: 1000, clientHeight: 200 };
+    const panel = new GuidedFakeElement('section', {
+      onInnerHTML() { chatArea.scrollHeight = 1200; },
+    });
+    const sandbox = {
+      module: { exports: {} },
+      state: { guided: { phase: 'loading' } },
+      document: {
+        getElementById(id) {
+          if (id === 'guidedFwiPanel') return panel;
+          if (id === 'chatArea') return chatArea;
+          return null;
+        },
+      },
+      renderGuidedFormHtml() { return ''; },
+      renderGuidedUnsupportedForwardHtml() { return ''; },
+      renderGuidedReviewHtml() { return ''; },
+      renderGuidedApprovedSubmitPendingHtml() { return ''; },
+      renderGuidedTaskHtml() { return ''; },
+      renderGuidedArtifactsHtml() { return ''; },
+      escapeHtml(value) { return String(value); },
+    };
+    vm.runInNewContext([
+      extractFunction('renderGuidedFwi'),
+      'module.exports = { renderGuidedFwi };',
+    ].join('\n'), sandbox);
+    return { render: sandbox.module.exports.renderGuidedFwi, chatArea, panel };
+  }
+
+  const reader = makeHarness(500);
+  reader.render();
+  assert.equal(reader.chatArea.scrollTop, 500, 'poll render must preserve an exact scrolled-up position');
+  assert.equal(reader.panel.scrollIntoViewCalls.length, 0);
+
+  const follower = makeHarness(770);
+  follower.render();
+  assert.equal(follower.chatArea.scrollTop, 1200, 'a reader within 48px should remain bottom-sticky');
+  assert.equal(follower.panel.scrollIntoViewCalls.length, 0);
+
+  const explicitReveal = makeHarness(400);
+  explicitReveal.render({ reveal: true });
+  assert.equal(explicitReveal.panel.scrollIntoViewCalls.length, 1);
+  assert.equal(explicitReveal.panel.scrollIntoViewCalls[0].block, 'start');
+  assert.equal(explicitReveal.chatArea.scrollTop, 400);
+  explicitReveal.render();
+  assert.equal(explicitReveal.panel.scrollIntoViewCalls.length, 1, 'ordinary refresh must not reveal again');
+  assert.equal(explicitReveal.chatArea.scrollTop, 400);
+}
+
+async function testGuidedSucceededRefreshRendersArtifactsOnce() {
+  const taskId = 'task-guided-1';
+  const succeededTask = {
+    taskId,
+    status: 'Succeeded',
+    approval: { id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+  };
+  const calls = [];
+  let renders = 0;
+  const sandbox = {
+    module: { exports: {} },
+    state: {
+      guided: {
+        taskId,
+        generation: 8,
+        pollInFlight: false,
+        artifactLoadInFlight: false,
+        task: null,
+        catalog: {},
+        artifacts: [],
+        error: '',
+        outcomeUnknown: false,
+        phase: 'monitoring',
+      },
+    },
+    isSafeGuidedOpaqueId: value => value === taskId,
+    clearGuidedPoll() {},
+    guidedApiPath(resource) {
+      return resource === 'artifacts'
+        ? `/api/scientific-runtime/v1/tasks/${taskId}/artifacts`
+        : `/api/scientific-runtime/v1/tasks/${taskId}`;
+    },
+    async guidedApiRequest(path) {
+      calls.push(path);
+      return path.endsWith('/artifacts') ? { artifacts: [{}, {}] } : { task_id: taskId };
+    },
+    normalizeGuidedTaskProjection: () => succeededTask,
+    normalizeGuidedArtifacts: (_data, expectedTaskId) => [
+      { taskId: expectedTaskId, artifactId: 'artifact-model' },
+      { taskId: expectedTaskId, artifactId: 'artifact-loss' },
+    ],
+    isGuidedApprovedSubmitPending: () => false,
+    upsertGuidedTaskIndex() {},
+    scheduleGuidedPoll() {},
+    renderGuidedFwi() { renders += 1; },
+  };
+  vm.runInNewContext([
+    `async ${extractFunction('loadGuidedArtifacts')}`,
+    `async ${extractFunction('refreshGuidedTask')}`,
+    'module.exports = { refreshGuidedTask };',
+  ].join('\n'), sandbox);
+
+  assert.equal(await sandbox.module.exports.refreshGuidedTask(), true);
+  assert.deepEqual(calls, [
+    `/api/scientific-runtime/v1/tasks/${taskId}`,
+    `/api/scientific-runtime/v1/tasks/${taskId}/artifacts`,
+  ]);
+  assert.equal(sandbox.state.guided.artifacts.length, 2);
+  assert.equal(renders, 1, 'Succeeded refresh should render once after the non-rendering artifact GET');
+}
+
+function testGuidedTaskIndexUsesSafeNormalizedDomText() {
+  const created = [];
+  const container = new GuidedFakeElement('div');
+  const sandbox = {
+    module: { exports: {} },
+    document: {
+      getElementById(id) { return id === 'guidedTaskHistory' ? container : null; },
+      createElement(tagName) {
+        const element = new GuidedFakeElement(tagName);
+        created.push(element);
+        return element;
+      },
+    },
+  };
+  const source = [
+    "const state = { guided: { taskId: '', taskIndex: [], taskIndexCursor: '', taskIndexPage: 0, taskIndexLoading: false, taskIndexError: '' } };",
+    'const reopenCalls = []; const taskIndexLoads = [];',
+    'function reopenGuidedTask(taskId) { reopenCalls.push(taskId); }',
+    'function loadGuidedTaskIndex(options) { taskIndexLoads.push(options); }',
+    extractFunction('isSafeGuidedOpaqueId'),
+    extractFunction('isSafeGuidedIdentifier'),
+    extractFunction('isSafeGuidedVersion'),
+    extractFunction('boundedGuidedText'),
+    extractFunction('guidedIntegerValue'),
+    extractFunction('guidedLearningRateFromMilli'),
+    extractFunction('normalizeGuidedTaskIndexPage'),
+    extractFunction('renderGuidedTaskIndex'),
+    'module.exports = { state, reopenCalls, taskIndexLoads, normalizeGuidedTaskIndexPage, renderGuidedTaskIndex };',
+  ].join('\n');
+  vm.runInNewContext(source, sandbox);
+  const api = sandbox.module.exports;
+  const maliciousGoal = '<img src=x onerror=alert(1)>';
+  const page = api.normalizeGuidedTaskIndexPage({
+    tasks: [
+      {
+        task_id: 'task-safe:1', status: 'Running', goal: maliciousGoal,
+        algorithm: { id: '<script>alert(1)</script>', version: '1.3.0' },
+        preset: 'fwi_smoke', device: 'cuda', iterations: 50, seed: 0,
+        optimizer: 'adam', learning_rate_milli: 10000,
+        relative_path: '../../../../etc/passwd', artifact_url: 'javascript:alert(1)',
+      },
+      { task_id: "bad' onclick='alert(1)", status: 'Running', goal: 'skip me' },
+      { task_id: 'task-unknown-status', status: '<img>', goal: 'skip me too' },
+    ],
+    next_cursor: '../../unsafe',
+  });
+  assert.equal(page.tasks.length, 1);
+  assert.equal(page.nextCursor, '');
+  assert.equal(page.tasks[0].goal, maliciousGoal);
+  assert.equal(page.tasks[0].algorithmId, '');
+  assert.equal(page.tasks[0].learningRate, '10');
+  assert.equal(Object.hasOwn(page.tasks[0], 'relative_path'), false);
+  assert.equal(Object.hasOwn(page.tasks[0], 'artifact_url'), false);
+
+  api.state.guided.taskIndex = page.tasks;
+  api.renderGuidedTaskIndex();
+  assert.equal(container.children.length, 1);
+  const button = container.children[0];
+  const header = button.children[0];
+  const label = header.children[0];
+  assert.equal(label.textContent, maliciousGoal);
+  assert.equal(created.some(element => element.tagName === 'img' || element.tagName === 'script'), false);
+  assert.equal(created.reduce((sum, element) => sum + element.innerHTMLWrites, 0), 0);
+  assert.equal(button.dataset.taskId, 'task-safe:1');
+  button.listeners.click();
+  assert.deepEqual(Array.from(api.reopenCalls), ['task-safe:1']);
+
+  api.state.guided.taskIndexPage = 5;
+  api.state.guided.taskIndexCursor = 'v1_ab';
+  api.renderGuidedTaskIndex();
+  const navigation = container.children[0];
+  assert.equal(navigation.children[0].textContent, '更早任务 · 第 6 页');
+  assert.equal(navigation.children[1].textContent, '回到最近任务');
+  assert.equal(container.children.at(-1).textContent, '查看下一页（更早）');
+  navigation.children[1].listeners.click();
+  assert.equal(api.taskIndexLoads.length, 1);
+  assert.equal(api.taskIndexLoads[0].reset, true);
+}
+
+async function testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursorAdvance() {
+  const allTasks = Array.from({ length: 125 }, (_, index) => ({
+    task_id: `task-page-${String(index).padStart(3, '0')}`,
+    status: index % 2 === 0 ? 'Succeeded' : 'Running',
+    goal: `durable task ${index}`,
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' },
+    preset: 'fwi_smoke',
+    device: 'cuda',
+    iterations: 2,
+    seed: index,
+    optimizer: 'adam',
+    learning_rate_milli: 10000,
+    created_at: '2026-07-15T01:00:00Z',
+    updated_at: '2026-07-15T01:01:00Z',
+  }));
+  const pageSize = 20;
+  const pageCount = Math.ceil(allTasks.length / pageSize);
+  const pageCursors = [];
+  const cursorToPage = Object.create(null);
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+    const end = Math.min((pageIndex + 1) * pageSize, allTasks.length);
+    if (end < allTasks.length) {
+      const cursor = `v1_${Buffer.from(allTasks[end - 1].task_id).toString('base64url')}`;
+      pageCursors[pageIndex] = cursor;
+      cursorToPage[cursor] = pageIndex + 1;
+    } else {
+      pageCursors[pageIndex] = '';
+    }
+  }
+
+  const requests = [];
+  let renders = 0;
+  const sandbox = {
+    module: { exports: {} },
+    allTasks,
+    pageCursors,
+    cursorToPage,
+    pageSize,
+    state: {
+      guided: {
+        csrfToken: 'csrf-token-1234567890',
+        session: null,
+        taskIndex: [],
+        taskIndexCursor: '',
+        taskIndexPage: 0,
+        taskIndexLoading: false,
+        taskIndexLoaded: false,
+        taskIndexError: '',
+      },
+    },
+    renderGuidedTaskIndex() { renders += 1; },
+    async guidedApiRequest(path) {
+      requests.push(path);
+      const match = /[?&]cursor=([^&]+)/.exec(path);
+      const cursor = match ? decodeURIComponent(match[1]) : '';
+      const pageIndex = cursor ? cursorToPage[cursor] : 0;
+      if (!Number.isInteger(pageIndex)) throw new Error(`unexpected cursor ${cursor}`);
+      const start = pageIndex * pageSize;
+      return {
+        tasks: allTasks.slice(start, start + pageSize),
+        next_cursor: pageCursors[pageIndex] || null,
+      };
+    },
+  };
+  vm.runInNewContext([
+    "const GUIDED_API_PREFIX = '/api/scientific-runtime/v1';",
+    extractFunction('isSafeGuidedOpaqueId'),
+    extractFunction('isSafeGuidedIdentifier'),
+    extractFunction('isSafeGuidedVersion'),
+    extractFunction('isSafeGuidedCsrfToken'),
+    extractFunction('boundedGuidedText'),
+    extractFunction('guidedApiPath'),
+    extractFunction('guidedIntegerValue'),
+    extractFunction('guidedLearningRateFromMilli'),
+    extractFunction('normalizeGuidedTaskIndexPage'),
+    `async ${extractFunction('loadGuidedTaskIndex')}`,
+    'module.exports = { loadGuidedTaskIndex };',
+  ].join('\n'), sandbox);
+
+  const load = sandbox.module.exports.loadGuidedTaskIndex;
+  const visible = new Set();
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+    const loaded = await load({ reset: pageIndex === 0 });
+    assert.equal(loaded, true);
+    const expected = allTasks
+      .slice(pageIndex * pageSize, (pageIndex + 1) * pageSize)
+      .map(item => item.task_id);
+    const actual = Array.from(sandbox.state.guided.taskIndex, item => item.taskId);
+    assert.deepEqual(actual, expected, `page ${pageIndex + 1} must be fully visible`);
+    actual.forEach(taskId => visible.add(taskId));
+    assert.equal(sandbox.state.guided.taskIndex.length <= pageSize, true);
+    assert.equal(sandbox.state.guided.taskIndexPage, pageIndex);
+  }
+  assert.equal(visible.size, allTasks.length);
+  assert.equal(sandbox.state.guided.taskIndexCursor, '');
+  assert.equal(requests.length, pageCount);
+
+  assert.equal(await load({ reset: false }), false);
+  assert.equal(requests.length, pageCount, 'an exhausted cursor must not issue or advance a GET');
+
+  assert.equal(await load({ reset: true }), true);
+  assert.equal(sandbox.state.guided.taskIndexPage, 0);
+  assert.deepEqual(
+    Array.from(sandbox.state.guided.taskIndex, item => item.taskId),
+    allTasks.slice(0, pageSize).map(item => item.task_id),
+  );
+  assert.equal(renders > 0, true);
+}
+
+function createGuidedRecoveryHarness(task, approvedSubmitPending = false) {
+  const requests = [];
+  const toasts = [];
+  let scheduledPolls = 0;
+  let taskIndexRenders = 0;
+  let guidedRenders = 0;
+  const welcome = new GuidedFakeElement('div');
+  const initialSummary = {
+    taskId: task.taskId,
+    status: task.status,
+    goal: task.draft.goal,
+    algorithmId: task.draft.algorithmId,
+    algorithmVersion: task.draft.algorithmVersion,
+    preset: task.draft.preset,
+    device: task.draft.device,
+    iterations: task.draft.iterations,
+    seed: task.draft.seed,
+    optimizer: task.draft.optimizer,
+    learningRate: task.draft.learningRate,
+    learningRateMilli: task.draft.learningRateMilli,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+  };
+  const sandbox = {
+    module: { exports: {} },
+    window: { innerWidth: 1024 },
+    document: {
+      getElementById(id) {
+        if (id === 'welcomeMsg') return welcome;
+        return null;
+      },
+    },
+    state: {
+      guided: {
+        phase: 'monitoring',
+        csrfToken: 'csrf-token-1234567890',
+        session: { mode: 'guided' },
+        catalog: { algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' } },
+        form: null,
+        task,
+        taskId: task.taskId,
+        artifacts: [],
+        mutation: '',
+        mutationKeys: Object.create(null),
+        pollTimer: null,
+        pollInFlight: false,
+        artifactLoadInFlight: false,
+        generation: 3,
+        error: '',
+        outcomeUnknown: false,
+        approvalReplayAvailable: false,
+        taskIndex: [initialSummary],
+        taskIndexCursor: 'v1_ab',
+        taskIndexPage: 0,
+        taskIndexLoading: false,
+        taskIndexLoaded: true,
+        taskIndexError: '',
+      },
+    },
+    clearGuidedPoll() {},
+    renderGuidedFwi() { guidedRenders += 1; },
+    renderGuidedTaskIndex() { taskIndexRenders += 1; },
+    showToast(message) { toasts.push(message); },
+    async guidedApiRequest(path, options) {
+      requests.push({ path, method: options && options.method ? options.method : 'GET' });
+      if (path.endsWith('/session')) return { csrf_token: 'unused-by-mock' };
+      if (path.endsWith('/catalog')) return { algorithms: [] };
+      if (path.endsWith(`/tasks/${task.taskId}`)) return { task_id: task.taskId };
+      throw new Error(`unexpected path ${path}`);
+    },
+    normalizeGuidedSession: () => ({ csrfToken: 'csrf-token-abcdefghijkl', mode: 'guided' }),
+    normalizeGuidedCatalog: () => ({ algorithm: { id: 'deepwave.acoustic_fwi', version: '1.3.0' } }),
+    normalizeGuidedTaskProjection: (_data, expectedTaskId) => (
+      expectedTaskId === task.taskId ? task : null
+    ),
+    isGuidedApprovedSubmitPending: () => approvedSubmitPending,
+    isGuidedReviewReady: () => false,
+    async loadGuidedArtifacts() { throw new Error('artifacts must not load in this scenario'); },
+    scheduleGuidedPoll() { scheduledPolls += 1; },
+    toggleSidebar() { throw new Error('desktop recovery must not toggle the sidebar'); },
+  };
+  vm.runInNewContext([
+    "const GUIDED_API_PREFIX = '/api/scientific-runtime/v1';",
+    extractFunction('isSafeGuidedOpaqueId'),
+    extractFunction('isSafeGuidedCsrfToken'),
+    extractFunction('boundedGuidedText'),
+    extractFunction('guidedApiPath'),
+    extractFunction('createGuidedFwiState'),
+    extractFunction('guidedTaskSummary'),
+    extractFunction('upsertGuidedTaskIndex'),
+    extractFunction('closeGuidedFwi'),
+    `async ${extractFunction('reopenGuidedTask')}`,
+    'module.exports = { closeGuidedFwi, reopenGuidedTask };',
+  ].join('\n'), sandbox);
+  return {
+    api: sandbox.module.exports,
+    sandbox,
+    requests,
+    toasts,
+    counts: {
+      get scheduledPolls() { return scheduledPolls; },
+      get taskIndexRenders() { return taskIndexRenders; },
+      get guidedRenders() { return guidedRenders; },
+    },
+  };
+}
+
+function makeRecoveredGuidedTask(status = 'Running') {
+  return {
+    taskId: 'task-guided-1',
+    status,
+    createdAt: '2026-07-15T01:00:00Z',
+    updatedAt: '2026-07-15T01:01:00Z',
+    draft: {
+      goal: 'durable task',
+      datasetId: 'marmousi_94_288',
+      datasetVersion: '1.0.0',
+      algorithmId: 'deepwave.acoustic_fwi',
+      algorithmVersion: '1.2.0',
+      preset: 'fwi_smoke',
+      device: 'cuda',
+      iterations: 50,
+      seed: 0,
+      optimizer: 'adam',
+      learningRate: '10',
+      learningRateMilli: 10000,
+    },
+    plan: { id: 'plan-guided-1', hash: `sha256:${'a'.repeat(64)}`, nodeCount: 1 },
+    approval: { id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: status === 'Running' ? 'dispatched' : '' },
+    adapter: null,
+  };
+}
+
+async function testGuidedCloseRetainsIndexAndReopensThroughGets() {
+  const task = makeRecoveredGuidedTask('Running');
+  const harness = createGuidedRecoveryHarness(task);
+  const retainedIndex = harness.sandbox.state.guided.taskIndex;
+
+  assert.equal(harness.api.closeGuidedFwi(), true);
+  assert.equal(harness.sandbox.state.guided.phase, 'closed');
+  assert.equal(harness.sandbox.state.guided.taskId, '');
+  assert.equal(harness.sandbox.state.guided.taskIndex, retainedIndex);
+  assert.equal(harness.sandbox.state.guided.taskIndex[0].taskId, task.taskId);
+  assert.equal(harness.sandbox.state.guided.taskIndexCursor, 'v1_ab');
+  assert.match(harness.toasts.at(-1), /任务未取消.*左栏持久任务/);
+
+  assert.equal(await harness.api.reopenGuidedTask(task.taskId), true);
+  assert.deepEqual(harness.requests, [
+    { path: '/api/scientific-runtime/v1/session', method: 'GET' },
+    { path: '/api/scientific-runtime/v1/catalog', method: 'GET' },
+    { path: `/api/scientific-runtime/v1/tasks/${task.taskId}`, method: 'GET' },
+  ]);
+  assert.equal(harness.sandbox.state.guided.taskId, task.taskId);
+  assert.equal(harness.sandbox.state.guided.task, task);
+  assert.equal(harness.sandbox.state.guided.catalog.algorithm.version, '1.3.0');
+  assert.equal(
+    harness.sandbox.state.guided.task.draft.algorithmVersion,
+    '1.2.0',
+    'a historical 1.2 task remains readable after the current catalog advances',
+  );
+  assert.equal(harness.sandbox.state.guided.phase, 'monitoring');
+  assert.equal(harness.sandbox.state.guided.taskIndex.length, 1);
+  assert.equal(harness.sandbox.state.guided.taskIndex[0].taskId, task.taskId);
+  assert.equal(harness.counts.scheduledPolls, 1);
+}
+
+async function testRecoveredApprovedPendingTaskIsFailClosed() {
+  const task = makeRecoveredGuidedTask('AwaitingApproval');
+  const harness = createGuidedRecoveryHarness(task, true);
+
+  assert.equal(await harness.api.reopenGuidedTask(task.taskId), true);
+  assert.equal(harness.sandbox.state.guided.phase, 'approval_incomplete');
+  assert.equal(harness.sandbox.state.guided.approvalReplayAvailable, false);
+  assert.match(harness.sandbox.state.guided.error, /缺少原 approve mutation.*不会生成新 key 重发/);
+  assert.equal(harness.counts.scheduledPolls, 0);
+  assert.equal(Object.keys(harness.sandbox.state.guided.mutationKeys).length, 0);
+  assert.equal(harness.requests.every(request => request.method === 'GET'), true);
+  assert.equal(harness.api.closeGuidedFwi(), true);
+  assert.equal(harness.sandbox.state.guided.phase, 'closed');
+  assert.equal(harness.sandbox.state.guided.taskId, '');
+  assert.equal(harness.sandbox.state.guided.taskIndex[0].taskId, task.taskId);
+  assert.match(harness.toasts.at(-1), /任务未取消.*左栏持久任务/);
+
+  const replayable = createGuidedRecoveryHarness(task, true);
+  replayable.sandbox.state.guided.phase = 'approval_incomplete';
+  replayable.sandbox.state.guided.approvalReplayAvailable = true;
+  assert.equal(await replayable.api.reopenGuidedTask('task-other'), false);
+  assert.equal(replayable.api.closeGuidedFwi(), false);
+  assert.equal(replayable.sandbox.state.guided.phase, 'approval_incomplete');
+  assert.equal(replayable.sandbox.state.guided.taskId, task.taskId);
+  assert.equal(replayable.requests.length, 0);
+  assert.match(replayable.toasts[0], /原 Idempotency-Key/);
+  assert.match(replayable.toasts[1], /Mutation 尚未闭环/);
 }
 
 async function main() {
@@ -1408,7 +2272,14 @@ async function main() {
   testGuidedCatalogProjectionDoesNotExposePaths();
   testGuidedApprovalCannotBeBypassedOrReplayedAutomatically();
   await testGuidedApprovedSubmitPendingStopsPolling();
+  await testGuidedApproveFourXxRetainsOriginalKeyThroughGetRecovery();
   testGuidedStateIsNotPersistedWithChats();
+  testGuidedPollingPreservesReaderScrollPosition();
+  await testGuidedSucceededRefreshRendersArtifactsOnce();
+  testGuidedTaskIndexUsesSafeNormalizedDomText();
+  await testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursorAdvance();
+  await testGuidedCloseRetainsIndexAndReopensThroughGets();
+  await testRecoveredApprovedPendingTaskIsFailClosed();
   console.log('ui message rendering tests passed');
 }
 

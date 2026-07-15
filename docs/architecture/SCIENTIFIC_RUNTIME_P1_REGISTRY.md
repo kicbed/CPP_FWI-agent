@@ -20,7 +20,9 @@
 | `scientific_runtime/registry_service.py` | Schema/manifest 校验、受信任 provisioning 边界以及 project/principal/permission 限域读取 |
 | `scientific_runtime/fwi_registry.py` | 固定 Marmousi sidecar/hash 验证到无路径 DatasetRef 的映射，以及已审 Deepwave manifest 加载 |
 | `scientific_runtime/registrations/deepwave_acoustic_fwi_v1.json` | 原始 `1.0.0` / iterations≤100 AlgorithmManifest 的不可变副本 |
-| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_1.json` | D-006 当前 `1.1.0` / iterations≤10000 AlgorithmManifest 的版本固定副本 |
+| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_1.json` | D-006 checkpoint 的 `1.1.0` / iterations≤10000 AlgorithmManifest 版本固定副本 |
+| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_2.json` | D-007 `1.2.0` / 六参数历史 AlgorithmManifest；不可变且仅供严格读兼容 |
+| `scientific_runtime/registrations/deepwave_acoustic_fwi_v1_3.json` | D-007 当前 `1.3.0` / 最终一致的六参数 FWI-only AlgorithmManifest 版本固定副本 |
 | `tests/test_scientific_runtime_registry.py` | migration、并发、不可变性、权限、损坏、TaskService/Gate 和预算测试 |
 
 普通 TaskService 和未来 Web 只读注册结果，不获得 registry mutation。当前 mutation 方法是内部
@@ -83,7 +85,13 @@ P1.1b 原始 Deepwave manifest 固定为 `deepwave.acoustic_fwi@1.0.0`，保留 
 parameters、I/O、policy resource caps、安全声明和 Adapter v1 metadata。D-006/P1-006 没有
 原地修改该身份，而是新增 `deepwave.acoustic_fwi@1.1.0` 和 Adapter `1.1.0`，把显式迭代上限
 扩展到 10000。启动既有数据库时会保留旧 snapshot 并注册新版本；旧 snapshot 在读取时继续
-接受 Schema/hash/索引一致性验证。新 Guided 任务只选 `1.1.0`。
+接受 Schema/hash/索引一致性验证。D-006 checkpoint 的新 Guided 任务只选 `1.1.0`；D-007
+随后新增 `deepwave.acoustic_fwi@1.2.0` / Adapter `1.2.0` 六参数快照；该已注册
+身份保持不可变并与 `1.0.0`/`1.1.0` 一起用于已有任务和收据的严格读兼容，不供
+新的 Guided dispatch 选择。D-007 当前新提交改用 `deepwave.acoustic_fwi@1.3.0` /
+Adapter `1.3.0`：其 manifest 只声明 `acoustic_fwi_2d` 与 `fwi_smoke|fwi_demo`，将
+iterations 固定为 `1..10000`、seed 固定为 `0..2147483647`，并以条件 Schema 对
+Adam/SGD 分别约束 `learning_rate_milli`；legacy Worker/MCP `forward` 不在其中。
 
 在本 P1.1b checkpoint 中，`fwi.deepwave_adapter` 尚未实现；后续 P1.2a 已为固定
 `acoustic_fwi_2d` 反演补齐六方法、幂等的标准 Adapter。**registered/allowlisted 不等于 executable/ready**
@@ -98,7 +106,9 @@ Worker 已有 OS 级资源隔离。
 index/schema 损坏、TaskService server-owned snapshot、P0 Gate、批准预算和路径脱敏。真实 FWI
 模型测试还验证 sidecar/hash 到无路径 DatasetRef 的映射。
 
-P1.2a 后已有固定 Deepwave Adapter/Worker handle 与两个主 artifact 的严格收集。仍未实现：
+在 P1.1b/P1.2a checkpoint 后已有固定 Deepwave Adapter/Worker handle 与两个主 artifact 的严格
+收集；当时仍未实现：
 部署数据库/API、独立 ACL/allowlist 撤销、批准预算消费、submit idempotency/dispatch intent
 事务、单 FWI 节点 capability gate、Web 确认卡和 P2 取消/lease/retry/reconciliation。当前
-`task_queued` 和所有 pre-runtime→runtime store 转换继续被拒绝。
+工作树的后续 P1.1c/P1 Guided 已补齐前述 submit/Web 最小闭环；完整 P2 可靠性仍 Pending。
+本历史 checkpoint 中 `task_queued` 和所有 pre-runtime→runtime store 转换继续被拒绝。

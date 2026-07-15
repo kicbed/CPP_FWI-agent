@@ -48,10 +48,12 @@ from .fwi_registry import (
 
 ALGORITHM_ID = DEEPWAVE_ALGORITHM_ID
 ALGORITHM_VERSION = DEEPWAVE_ALGORITHM_VERSION
-ADAPTER_VERSION = "1.1.0"
+ADAPTER_VERSION = "1.3.0"
 SUPPORTED_RECEIPT_BINDINGS = frozenset(
     {
         ("1.0.0", "1.0.0"),
+        ("1.1.0", "1.1.0"),
+        ("1.2.0", "1.2.0"),
         (ALGORITHM_VERSION, ADAPTER_VERSION),
     }
 )
@@ -61,8 +63,11 @@ SUPPORTED_ADAPTER_VERSIONS = frozenset(
 LOGICAL_ENTRYPOINT = "fwi.deepwave_adapter"
 MODEL_ID = "marmousi_94_288"
 BOUND_MANIFEST_HASH = (
-    "sha256:7edc327f9ead8fe547b9b09e87c262584118dbf0492789e12031438ef926a6e5"
+    "sha256:6424a8d70f8e962460484e085ed0ab216fb4706bd156b111bf31baa592f72d81"
 )
+GRADIENT_CLIP_QUANTILE = 0.98
+ADAM_LEARNING_RATE_MILLI_RANGE = (100, 100_000)
+SGD_LEARNING_RATE_MILLI_RANGE = (100_000_000, 1_000_000_000_000)
 CONTROL_DIRECTORY = ".scientific-runtime-adapter-v1"
 MAX_JSON_BYTES = 8 * 1024 * 1024
 # The only standard P1 output is a 94 x 288 float32 array (~106 KiB).  Keep
@@ -1261,6 +1266,28 @@ class DeepwaveAdapter:
                 "PARAMETERS_INVALID",
                 [f"inversion iterations must be in 1..{maximum}"],
             )
+        optimizer = value.get("optimizer")
+        if optimizer not in {"adam", "sgd"}:
+            raise AdapterValidationError(
+                "PARAMETERS_INVALID", ["optimizer must be adam or sgd"]
+            )
+        learning_rate_milli = value.get("learning_rate_milli")
+        bounds = (
+            ADAM_LEARNING_RATE_MILLI_RANGE
+            if optimizer == "adam"
+            else SGD_LEARNING_RATE_MILLI_RANGE
+        )
+        if (
+            type(learning_rate_milli) is not int
+            or not bounds[0] <= learning_rate_milli <= bounds[1]
+        ):
+            raise AdapterValidationError(
+                "PARAMETERS_INVALID",
+                [
+                    f"{optimizer} learning_rate_milli must be a strict integer "
+                    f"in {bounds[0]}..{bounds[1]}"
+                ],
+            )
         return value
 
     def _manifest_parameter_validator(self) -> Draft7Validator:
@@ -1357,9 +1384,11 @@ class DeepwaveAdapter:
             device_details = copy.deepcopy(dict(details or {}))
 
         # Keep the control-plane validator importable without the numerical
-        # environment.  The four public parameters are the only caller-
-        # controlled Worker config; all other numerical defaults are fixed by
-        # the versioned adapter/Worker source and are revalidated in the child.
+        # environment.  The six public parameters are the only caller-
+        # controlled Worker config.  The hash-bound plan carries the learning
+        # rate as integer milli-units; only this private boundary converts it
+        # to the finite float consumed by PyTorch.  Other numerical defaults
+        # remain fixed by versioned adapter/Worker source.
         normalized_material = {
             "adapter_version": ADAPTER_VERSION,
             "project_id": project_id,
@@ -1377,6 +1406,9 @@ class DeepwaveAdapter:
             "device": parameter_value["device"],
             "iterations": parameter_value["iterations"],
             "seed": parameter_value["seed"],
+            "optimizer": parameter_value["optimizer"],
+            "learning_rate": parameter_value["learning_rate_milli"] / 1000.0,
+            "gradient_clip_quantile": GRADIENT_CLIP_QUANTILE,
         }
         return AdapterValidation(
             project_id=project_id,
@@ -2252,6 +2284,8 @@ class DeepwaveAdapter:
         *,
         iterations: int,
         device: str,
+        optimizer: str,
+        learning_rate: float,
         losses: list[float],
         fingerprint: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -2271,7 +2305,16 @@ class DeepwaveAdapter:
         )
         finite_fields = ("loss_reduction_fraction",)
         text_fields = ("device_name", "torch_version", "deepwave_version")
-        required = {*integer_fields, *nonnegative_fields, *finite_fields, *text_fields, "device"}
+        required = {
+            *integer_fields,
+            *nonnegative_fields,
+            *finite_fields,
+            *text_fields,
+            "device",
+            "optimizer",
+            "learning_rate",
+            "gradient_clip_quantile",
+        }
         if any(field not in value for field in required):
             raise AdapterArtifactError(
                 "ADAPTER_ARTIFACT_INVALID: required structured metrics are missing"
@@ -2305,6 +2348,32 @@ class DeepwaveAdapter:
                 "ADAPTER_ARTIFACT_INVALID: metrics device differs from the request"
             )
         result["device"] = device
+        reported_learning_rate = value["learning_rate"]
+        reported_clip_quantile = value["gradient_clip_quantile"]
+        if (
+            value["optimizer"] != optimizer
+            or isinstance(reported_learning_rate, bool)
+            or not isinstance(reported_learning_rate, (int, float))
+            or not math.isfinite(float(reported_learning_rate))
+            or not math.isclose(
+                float(reported_learning_rate), learning_rate, rel_tol=0.0, abs_tol=1e-12
+            )
+            or isinstance(reported_clip_quantile, bool)
+            or not isinstance(reported_clip_quantile, (int, float))
+            or not math.isfinite(float(reported_clip_quantile))
+            or not math.isclose(
+                float(reported_clip_quantile),
+                GRADIENT_CLIP_QUANTILE,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise AdapterArtifactError(
+                "ADAPTER_ARTIFACT_INVALID: optimizer metrics differ from the frozen request"
+            )
+        result["optimizer"] = optimizer
+        result["learning_rate"] = float(reported_learning_rate)
+        result["gradient_clip_quantile"] = float(reported_clip_quantile)
         for field in text_fields:
             item = value[field]
             limit = 200 if field == "device_name" else 128
@@ -2468,10 +2537,20 @@ class DeepwaveAdapter:
             raise AdapterArtifactError(
                 "ADAPTER_ARTIFACT_INVALID: fwi_demo did not reduce its objective"
             )
+        # Adapter 1.2 adds public optimizer controls.  Persisted 1.0/1.1
+        # receipts intentionally retain their four-field parameter document,
+        # so collection must verify them against the historical worker
+        # defaults without mutating their signed lineage.
+        optimizer = record["parameters"].get("optimizer", "adam")
+        learning_rate_milli = record["parameters"].get(
+            "learning_rate_milli", 10_000
+        )
         metrics = self._scalar_metrics(
             metrics_document,
             iterations=record["parameters"]["iterations"],
             device=record["parameters"]["device"],
+            optimizer=optimizer,
+            learning_rate=learning_rate_milli / 1000.0,
             losses=losses,
             fingerprint=record["fingerprint"],
         )

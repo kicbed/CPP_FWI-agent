@@ -21,7 +21,12 @@
     "extensions"
   ],
   "properties": {
-    "schema_version": {"$ref": "common.schema.json#/definitions/schema_version"},
+    "schema_version": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/definitions/schema_version"},
+        {"$ref": "common.schema.json#/definitions/schema_version_1_1"}
+      ]
+    },
     "draft_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
     "revision": {"type": "integer", "minimum": 1},
     "status": {"enum": ["Draft", "NeedsInput", "AwaitingApproval"]},
@@ -60,6 +65,23 @@
     "extensions": {"$ref": "common.schema.json#/definitions/extensions"}
   },
   "allOf": [
+    {
+      "if": {"properties": {"schema_version": {"const": "1.0.0"}}},
+      "then": {
+        "properties": {
+          "parameters": {
+            "$ref": "common.schema.json#/definitions/fwi_parameters_v1_0"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "parameters": {
+            "$ref": "common.schema.json#/definitions/fwi_parameters_v1_1"
+          }
+        }
+      }
+    },
     {
       "if": {"properties": {"missing_fields": {"minItems": 1}}},
       "then": {"properties": {"status": {"const": "NeedsInput"}}}

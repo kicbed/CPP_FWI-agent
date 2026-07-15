@@ -220,6 +220,15 @@
     </div>
 
     <!-- Chat History -->
+    <div class="px-4 pt-4">
+      <div class="flex items-center justify-between gap-2 mb-2">
+        <p class="text-xs text-slate-400 uppercase tracking-wider font-medium">持久 FWI 任务</p>
+        <button type="button" onclick="loadGuidedTaskIndex({ reset: true })" class="text-[11px] text-slate-400 hover:text-accent transition-colors" title="从 SQLite 刷新任务列表">刷新</button>
+      </div>
+      <div id="guidedTaskHistory" class="space-y-1 max-h-52 overflow-y-auto" aria-live="polite"></div>
+    </div>
+
+    <!-- Chat History -->
     <div class="flex-1 overflow-y-auto px-4 pt-4 min-h-0">
       <div class="flex items-center justify-between gap-2 mb-2">
         <p class="text-xs text-slate-400 uppercase tracking-wider font-medium">历史对话</p>
@@ -350,7 +359,7 @@
       <!-- Messages container -->
       <div id="messages" class="max-w-3xl mx-auto space-y-4 hidden"></div>
 
-      <!-- Guided Scientific Runtime workflow. This state is intentionally not persisted. -->
+      <!-- Active Guided view; durable task discovery is restored from SQLite. -->
       <section id="guidedFwiPanel" aria-live="polite" class="max-w-5xl mx-auto mb-4 hidden"></section>
 
       <!-- Structured FWI job/result output -->
@@ -686,8 +695,8 @@
       fwiJob: restoredActiveChat.fwiJob,
       fwiPollTimer: null,
       fwiReceiptMissing: false,
-      // Scientific Runtime workflow state is deliberately session-memory only.
-      // persistChatState serializes an explicit chat envelope and never this object.
+      // The active card stays in session memory. Its discovery index is loaded
+      // from the scope-bound SQLite API and is never serialized into chat storage.
       guided: {
         phase: 'closed',
         csrfToken: '',
@@ -705,6 +714,13 @@
         generation: 0,
         error: '',
         outcomeUnknown: false,
+        approvalReplayAvailable: false,
+        taskIndex: [],
+        taskIndexCursor: '',
+        taskIndexPage: 0,
+        taskIndexLoading: false,
+        taskIndexLoaded: false,
+        taskIndexError: '',
       },
     };
 
@@ -732,6 +748,7 @@
       const clearAllButton = document.getElementById('clearAllChatsBtn');
       if (clearAllButton) clearAllButton.addEventListener('click', clearAllChats);
       checkStatus();
+      loadGuidedTaskIndex({ reset: true });
       setInterval(checkStatus, 15000);
       document.getElementById('userInput').focus();
     });
@@ -1665,12 +1682,13 @@
       return '';
     }
 
-    function createGuidedFwiState(generation = 0) {
+    function createGuidedFwiState(generation = 0, retained) {
+      const previous = retained && typeof retained === 'object' ? retained : {};
       return {
         phase: 'closed',
-        csrfToken: '',
-        session: null,
-        catalog: null,
+        csrfToken: isSafeGuidedCsrfToken(previous.csrfToken || '') ? previous.csrfToken : '',
+        session: previous.session || null,
+        catalog: previous.catalog || null,
         form: null,
         task: null,
         taskId: '',
@@ -1683,6 +1701,15 @@
         generation,
         error: '',
         outcomeUnknown: false,
+        approvalReplayAvailable: false,
+        taskIndex: Array.isArray(previous.taskIndex) ? previous.taskIndex : [],
+        taskIndexCursor: typeof previous.taskIndexCursor === 'string'
+          ? previous.taskIndexCursor : '',
+        taskIndexPage: Number.isInteger(previous.taskIndexPage)
+          && previous.taskIndexPage >= 0 ? previous.taskIndexPage : 0,
+        taskIndexLoading: previous.taskIndexLoading === true,
+        taskIndexLoaded: previous.taskIndexLoaded === true,
+        taskIndexError: boundedGuidedText(previous.taskIndexError, 500),
       };
     }
 
@@ -1698,6 +1725,17 @@
         || lower.match(/迭代(?:次数)?\s*[:：为=]?\s*([+-]?\d+(?:\.\d+)?)\s*(?:次|轮)?/)
         || lower.match(/([+-]?\d+(?:\.\d+)?)\s*(?:iterations?|iters?)\b/)
         || lower.match(/(?:iterations?|iters?)\s*(?:[:=]\s*)?([+-]?\d+(?:\.\d+)?)\b/);
+      const learningRateMatch = lower.match(
+        /(?:学习率|learning\s*rate|\blr\b)\s*[:：为=]?\s*([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?|[^\s,，;；。！？?]+)(?=$|[\s,，;；。！？?])/,
+      );
+      const labeledOptimizer = lower.match(
+        /(?:优化器|optimizer)\s*[:：为=]?\s*([a-z][a-z0-9_-]*)/,
+      );
+      const namedOptimizer = lower.match(
+        /\b(adamw|adam|sgd|rmsprop|adagrad|adadelta|lbfgs|lion)\b/,
+      );
+      const optimizer = labeledOptimizer
+        ? labeledOptimizer[1] : (namedOptimizer ? namedOptimizer[1] : 'adam');
       const unsupportedForward = hasGuidedUnsupportedForwardIntent(text);
       return {
         goal: text || '运行 Marmousi 二维声学 FWI',
@@ -1706,6 +1744,9 @@
           : (/\bdemo\b|演示/.test(lower) ? 'fwi_demo' : 'fwi_smoke'),
         device: /\bcuda\b|\bgpu\b/.test(lower) ? 'cuda' : 'cpu',
         iterations: iterationMatch ? iterationMatch[1] : (/\bdemo\b|演示/.test(lower) ? 5 : 2),
+        optimizer,
+        learning_rate: learningRateMatch
+          ? learningRateMatch[1] : (optimizer === 'sgd' ? '10000000' : '10'),
         unsupported_operation: unsupportedForward ? 'forward' : '',
       };
     }
@@ -1723,6 +1764,42 @@
         : (source.capabilities && typeof source.capabilities === 'object'
           ? Object.keys(source.capabilities).filter(key => source.capabilities[key] === true)
           : featureCapabilities);
+      const formSource = source.form && typeof source.form === 'object' ? source.form : {};
+      const learningSource = formSource.learning_rate && typeof formSource.learning_rate === 'object'
+        ? formSource.learning_rate : {};
+      const boundsSource = learningSource.bounds && typeof learningSource.bounds === 'object'
+        ? learningSource.bounds : {};
+      const bounds = {};
+      ['adam', 'sgd'].forEach(optimizer => {
+        const candidate = boundsSource[optimizer] && typeof boundsSource[optimizer] === 'object'
+          ? boundsSource[optimizer] : {};
+        const minimum = boundedGuidedText(candidate.minimum, 32);
+        const maximum = boundedGuidedText(candidate.maximum, 32);
+        if (guidedLearningRateValue(minimum, optimizer, { skipBounds: true })
+            && guidedLearningRateValue(maximum, optimizer, { skipBounds: true })) {
+          bounds[optimizer] = { minimum, maximum };
+        }
+      });
+      const profiles = (Array.isArray(formSource.optimization_profiles)
+        ? formSource.optimization_profiles : []).map(profile => {
+        if (!profile || typeof profile !== 'object' || Array.isArray(profile)) return null;
+        const optimizer = ['adam', 'sgd'].includes(profile.optimizer) ? profile.optimizer : '';
+        const learningRate = boundedGuidedText(profile.learning_rate, 32);
+        if (!optimizer || !guidedLearningRateValue(learningRate, optimizer)) return null;
+        const recommendation = ['recommended', 'conservative', 'experimental'].includes(profile.recommendation)
+          ? profile.recommendation : 'experimental';
+        return {
+          id: /^[a-z][a-z0-9_-]{0,63}$/.test(profile.id || '') ? profile.id : '',
+          label: boundedGuidedText(profile.label, 80),
+          optimizer,
+          learningRate,
+          recommendation,
+          evidence: boundedGuidedText(profile.evidence, 300),
+        };
+      }).filter(profile => profile && profile.id).slice(0, 10);
+      const clipSource = formSource.gradient_clip_quantile
+        && typeof formSource.gradient_clip_quantile === 'object'
+        ? formSource.gradient_clip_quantile : {};
       return {
         csrfToken: token,
         mode: boundedGuidedText(source.mode, 32),
@@ -1735,6 +1812,14 @@
           .filter(item => typeof item === 'string')
           .slice(0, 20)
           .map(item => item.slice(0, 80)),
+        optimization: {
+          optimizers: (Array.isArray(formSource.optimizers) ? formSource.optimizers : [])
+            .filter(item => ['adam', 'sgd'].includes(item)),
+          bounds,
+          profiles,
+          gradientClipQuantile: boundedGuidedText(clipSource.value, 16) || '0.98',
+          gradientClipEditable: clipSource.editable === true,
+        },
       };
     }
 
@@ -1791,12 +1876,44 @@
       return Number.isSafeInteger(number) && number >= minimum && number <= maximum ? number : null;
     }
 
+    function guidedLearningRateValue(value, optimizer, options) {
+      options = options || {};
+      const text = typeof value === 'number' && Number.isFinite(value)
+        ? String(value) : (typeof value === 'string' ? value.trim() : '');
+      const matched = text.match(/^(0|[1-9][0-9]*)(?:\.([0-9]{1,3}))?$/);
+      if (!matched) return null;
+      const whole = Number(matched[1]);
+      const fractionText = (matched[2] || '').padEnd(3, '0');
+      const milli = whole * 1000 + Number(fractionText || '0');
+      if (!Number.isSafeInteger(milli) || milli <= 0) return null;
+      const ranges = {
+        adam: [100, 100000],
+        sgd: [100000000, 1000000000000],
+      };
+      const range = ranges[optimizer];
+      if (!options.skipBounds && (!range || milli < range[0] || milli > range[1])) return null;
+      const trimmedFraction = (matched[2] || '').replace(/0+$/, '');
+      return {
+        text: trimmedFraction ? `${matched[1]}.${trimmedFraction}` : matched[1],
+        milli,
+      };
+    }
+
+    function guidedLearningRateFromMilli(value) {
+      if (!Number.isSafeInteger(value) || value <= 0 || value > 1000000000000) return null;
+      const whole = Math.floor(value / 1000);
+      const fraction = String(value % 1000).padStart(3, '0').replace(/0+$/, '');
+      return fraction ? `${whole}.${fraction}` : String(whole);
+    }
+
     function validateGuidedFwiForm(value) {
       const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
       const errors = [];
       const goal = typeof source.goal === 'string' ? source.goal.trim() : '';
       const iterations = guidedIntegerValue(source.iterations, 1, 10000);
       const seed = guidedIntegerValue(source.seed, 0, 2147483647);
+      const optimizer = ['adam', 'sgd'].includes(source.optimizer) ? source.optimizer : '';
+      const learningRate = guidedLearningRateValue(source.learning_rate, optimizer);
       const unsupportedForward = source.unsupported_operation === 'forward'
         || hasGuidedUnsupportedForwardIntent(goal);
       if (!goal || goal.length > 2000) errors.push('实验目标必须为 1–2000 个字符');
@@ -1807,6 +1924,12 @@
       if (!['cpu', 'cuda'].includes(source.device)) errors.push('设备仅允许 CPU 或 CUDA');
       if (iterations === null) errors.push('迭代次数必须是 1–10000 的整数');
       if (seed === null) errors.push('随机种子必须是 0–2147483647 的整数');
+      if (!optimizer) errors.push('优化器仅允许 Adam 或 SGD');
+      if (!learningRate) {
+        errors.push(optimizer === 'sgd'
+          ? 'SGD 学习率必须是 100000–1000000000，最多 3 位小数'
+          : 'Adam 学习率必须是 0.1–100，最多 3 位小数');
+      }
       return {
         ok: errors.length === 0,
         errors,
@@ -1818,6 +1941,8 @@
           device: source.device,
           iterations,
           seed,
+          optimizer,
+          learning_rate: learningRate.text,
         } : null,
       };
     }
@@ -1827,6 +1952,8 @@
       const selected = catalog.datasets.find(dataset => (
         dataset.id === source.dataset_id && dataset.version === source.dataset_version
       )) || catalog.datasets[0];
+      const optimizer = source.optimizer === undefined
+        ? 'adam' : String(source.optimizer).trim().toLowerCase();
       return {
         goal: typeof source.goal === 'string' && source.goal.trim()
           ? source.goal.trim().slice(0, 2000)
@@ -1837,6 +1964,9 @@
         device: ['cpu', 'cuda'].includes(source.device) ? source.device : 'cpu',
         iterations: source.iterations === undefined ? 2 : source.iterations,
         seed: source.seed === undefined ? 0 : source.seed,
+        optimizer,
+        learning_rate: source.learning_rate === undefined
+          ? (optimizer === 'sgd' ? '10000000' : '10') : String(source.learning_rate),
         unsupported_operation: source.unsupported_operation === 'forward'
           || hasGuidedUnsupportedForwardIntent(source.goal) ? 'forward' : '',
       };
@@ -1851,24 +1981,37 @@
         'Draft', 'NeedsInput', 'AwaitingApproval', 'Queued', 'Running', 'Waiting',
         'Retrying', 'Succeeded', 'Failed', 'Cancelled',
       ]);
-      const draftSource = source.draft && typeof source.draft === 'object' ? source.draft : {};
+      if (!allowedTaskStates.has(source.status)
+          || !source.draft || typeof source.draft !== 'object' || Array.isArray(source.draft)) {
+        return null;
+      }
+      const draftSource = source.draft;
       const draftDataset = Array.isArray(draftSource.datasets) && draftSource.datasets[0]
         ? draftSource.datasets[0]
         : (draftSource.dataset && typeof draftSource.dataset === 'object' ? draftSource.dataset : {});
       const draftParameters = draftSource.parameters && typeof draftSource.parameters === 'object'
         ? draftSource.parameters : {};
-      const planSource = source.plan && typeof source.plan === 'object' ? source.plan : {};
-      const approvalSource = source.approval && typeof source.approval === 'object' ? source.approval : {};
-      const dispatchSource = source.dispatch && typeof source.dispatch === 'object' ? source.dispatch : {};
+      const hasPlan = source.plan !== null && source.plan !== undefined;
+      const hasApproval = source.approval !== null && source.approval !== undefined;
+      const hasDispatch = source.dispatch !== null && source.dispatch !== undefined;
+      if ((hasPlan && (typeof source.plan !== 'object' || Array.isArray(source.plan)))
+          || (hasApproval && (typeof source.approval !== 'object' || Array.isArray(source.approval)))
+          || (hasDispatch && (typeof source.dispatch !== 'object' || Array.isArray(source.dispatch)))) {
+        return null;
+      }
+      const planSource = hasPlan ? source.plan : {};
+      const approvalSource = hasApproval ? source.approval : {};
+      const dispatchSource = hasDispatch ? source.dispatch : {};
       const adapterSource = source.adapter_status && typeof source.adapter_status === 'object'
         ? source.adapter_status
         : (source.runtime_status && typeof source.runtime_status === 'object' ? source.runtime_status : {});
       const dispatchState = dispatchSource.state || dispatchSource.status || '';
       const adapterStatus = ['Queued', 'Running', 'Succeeded', 'Failed'].includes(adapterSource.status)
         ? adapterSource.status : '';
-      return {
+      const normalized = {
+        projectionValid: true,
         taskId,
-        status: allowedTaskStates.has(source.status) ? source.status : 'Unknown',
+        status: source.status,
         draft: {
           id: isSafeGuidedOpaqueId(draftSource.draft_id) ? draftSource.draft_id : '',
           revision: Number.isInteger(draftSource.revision) && draftSource.revision >= 1
@@ -1878,10 +2021,20 @@
           goal: boundedGuidedText(draftSource.goal, 2000),
           datasetId: isSafeGuidedIdentifier(draftDataset.id) ? draftDataset.id : '',
           datasetVersion: isSafeGuidedVersion(draftDataset.version) ? draftDataset.version : '',
+          algorithmId: isSafeGuidedIdentifier(draftSource.algorithm?.id)
+            ? draftSource.algorithm.id : '',
+          algorithmVersion: isSafeGuidedVersion(draftSource.algorithm?.version)
+            ? draftSource.algorithm.version : '',
           preset: ['fwi_smoke', 'fwi_demo'].includes(draftParameters.preset) ? draftParameters.preset : '',
           device: ['cpu', 'cuda'].includes(draftParameters.device) ? draftParameters.device : '',
           iterations: guidedIntegerValue(draftParameters.iterations, 1, 10000),
           seed: guidedIntegerValue(draftParameters.seed, 0, 2147483647),
+          optimizer: ['adam', 'sgd'].includes(draftParameters.optimizer)
+            ? draftParameters.optimizer : '',
+          learningRateMilli: guidedIntegerValue(
+            draftParameters.learning_rate_milli, 1, 1000000000000,
+          ),
+          learningRate: guidedLearningRateFromMilli(draftParameters.learning_rate_milli),
         },
         plan: {
           id: isSafeGuidedOpaqueId(planSource.plan_id) ? planSource.plan_id : '',
@@ -1890,6 +2043,8 @@
         },
         approval: {
           id: isSafeGuidedOpaqueId(approvalSource.approval_id) ? approvalSource.approval_id : '',
+          planId: isSafeGuidedOpaqueId(approvalSource.plan_id) ? approvalSource.plan_id : '',
+          planHash: isSafeGuidedPlanHash(approvalSource.plan_hash) ? approvalSource.plan_hash : '',
           decision: ['approved', 'rejected'].includes(approvalSource.decision)
             ? approvalSource.decision : '',
         },
@@ -1906,11 +2061,96 @@
           total: guidedIntegerValue(adapterSource.total, 0, 10000),
           message: boundedGuidedText(adapterSource.message, 500),
         },
+        createdAt: boundedGuidedText(source.created_at, 80),
+        updatedAt: boundedGuidedText(source.updated_at, 80),
       };
+      const draftComplete = normalized.draft.id
+        && normalized.draft.revision >= 1
+        && normalized.draft.status
+        && normalized.draft.goal
+        && draftSource.task_type === 'acoustic_fwi_2d'
+        && normalized.draft.datasetId
+        && normalized.draft.datasetVersion
+        && normalized.draft.algorithmId
+        && normalized.draft.algorithmVersion
+        && normalized.draft.preset
+        && normalized.draft.device
+        && normalized.draft.iterations !== null
+        && normalized.draft.seed !== null;
+      if (!draftComplete) return null;
+
+      const hasOptimizer = Object.hasOwn(draftParameters, 'optimizer');
+      const hasLearningRate = Object.hasOwn(draftParameters, 'learning_rate_milli');
+      const legacyOptimization = ['1.0.0', '1.1.0'].includes(normalized.draft.algorithmVersion)
+        && !hasOptimizer && !hasLearningRate;
+      const currentOptimization = hasOptimizer && hasLearningRate
+        && normalized.draft.optimizer
+        && normalized.draft.learningRate
+        && guidedLearningRateValue(
+          normalized.draft.learningRate, normalized.draft.optimizer,
+        )?.milli === normalized.draft.learningRateMilli;
+      if (!legacyOptimization && !currentOptimization) return null;
+
+      if (hasPlan) {
+        const planDraft = planSource.draft && typeof planSource.draft === 'object'
+          && !Array.isArray(planSource.draft) ? planSource.draft : {};
+        const nodes = Array.isArray(planSource.nodes) ? planSource.nodes : [];
+        const node = nodes.length === 1 && nodes[0] && typeof nodes[0] === 'object'
+          && !Array.isArray(nodes[0]) ? nodes[0] : {};
+        if (!normalized.plan.id
+            || !normalized.plan.hash
+            || normalized.plan.nodeCount !== 1
+            || planSource.task_type !== 'acoustic_fwi_2d'
+            || planDraft.draft_id !== normalized.draft.id
+            || planDraft.revision !== normalized.draft.revision
+            || !isSafeGuidedOpaqueId(node.node_id)
+            || node.algorithm?.id !== normalized.draft.algorithmId
+            || node.algorithm?.version !== normalized.draft.algorithmVersion) {
+          return null;
+        }
+      } else if (normalized.plan.id || normalized.plan.hash || normalized.plan.nodeCount !== 0) {
+        return null;
+      }
+
+      if (hasApproval) {
+        if (!hasPlan
+            || !normalized.approval.id
+            || !normalized.approval.planId
+            || !normalized.approval.planHash
+            || !normalized.approval.decision
+            || normalized.approval.planId !== normalized.plan.id
+            || normalized.approval.planHash !== normalized.plan.hash) {
+          return null;
+        }
+      } else if (normalized.approval.id || normalized.approval.planId
+          || normalized.approval.planHash || normalized.approval.decision) {
+        return null;
+      }
+
+      if (hasDispatch) {
+        if (!['pending', 'dispatching', 'dispatched', 'reconciliation_required']
+          .includes(normalized.dispatch.state)) return null;
+      } else if (normalized.dispatch.state || normalized.dispatch.failureCode) {
+        return null;
+      }
+
+      const runtimeState = ['Queued', 'Running', 'Waiting', 'Retrying', 'Succeeded', 'Failed']
+        .includes(normalized.status);
+      if (runtimeState && (!hasPlan || !hasApproval
+          || normalized.approval.decision !== 'approved' || !hasDispatch)) return null;
+      if (['Draft', 'NeedsInput'].includes(normalized.status) && (hasApproval || hasDispatch)) return null;
+      if (normalized.status === 'AwaitingApproval' && hasDispatch) return null;
+      if (normalized.status === 'Cancelled') {
+        const preRuntimeCancellation = !hasApproval && !hasDispatch;
+        const runtimeCancellation = hasPlan && hasApproval
+          && normalized.approval.decision === 'approved' && hasDispatch;
+        if (!preRuntimeCancellation && !runtimeCancellation) return null;
+      }
+      return normalized;
     }
 
     function isGuidedReviewReady(task, catalog) {
-      if (!task || !catalog
+      if (!task || task.projectionValid !== true || !catalog
           || !isSafeGuidedOpaqueId(task.taskId)
           || task.status !== 'AwaitingApproval'
           || !isSafeGuidedOpaqueId(task.draft.id)
@@ -1922,7 +2162,9 @@
       const datasetRegistered = catalog.datasets.some(dataset => (
         dataset.id === task.draft.datasetId && dataset.version === task.draft.datasetVersion
       ));
-      return datasetRegistered && validateGuidedFwiForm({
+      const algorithmRegistered = task.draft.algorithmId === catalog.algorithm.id
+        && task.draft.algorithmVersion === catalog.algorithm.version;
+      return datasetRegistered && algorithmRegistered && validateGuidedFwiForm({
         goal: task.draft.goal,
         dataset_id: task.draft.datasetId,
         dataset_version: task.draft.datasetVersion,
@@ -1930,6 +2172,8 @@
         device: task.draft.device,
         iterations: task.draft.iterations,
         seed: task.draft.seed,
+        optimizer: task.draft.optimizer,
+        learning_rate: task.draft.learningRate,
       }).ok;
     }
 
@@ -1937,6 +2181,25 @@
       return Boolean(isGuidedReviewReady(task, catalog)
         && task.approval.id
         && task.approval.decision === 'approved');
+    }
+
+    function isGuidedApprovalCompleted(task, expectedPlanHash) {
+      return Boolean(task
+        && task.projectionValid === true
+        && isSafeGuidedPlanHash(expectedPlanHash)
+        && isSafeGuidedOpaqueId(task.draft.id)
+        && task.draft.revision >= 1
+        && isSafeGuidedOpaqueId(task.plan.id)
+        && task.plan.nodeCount === 1
+        && task.plan.hash === expectedPlanHash
+        && task.approval.id
+        && task.approval.planId === task.plan.id
+        && task.approval.planHash === expectedPlanHash
+        && task.approval.decision === 'approved'
+        && ['pending', 'dispatching', 'dispatched', 'reconciliation_required']
+          .includes(task.dispatch.state)
+        && ['Queued', 'Running', 'Waiting', 'Retrying', 'Succeeded', 'Failed', 'Cancelled']
+          .includes(task.status));
     }
 
     function normalizeGuidedArtifacts(value, expectedTaskId) {
@@ -2029,6 +2292,184 @@
       return envelope.data;
     }
 
+    function normalizeGuidedTaskIndexPage(value) {
+      const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+      const allowedStates = new Set([
+        'Draft', 'NeedsInput', 'AwaitingApproval', 'Queued', 'Running', 'Waiting',
+        'Retrying', 'Succeeded', 'Failed', 'Cancelled',
+      ]);
+      const tasks = (Array.isArray(source.tasks) ? source.tasks : []).map(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)
+            || !isSafeGuidedOpaqueId(item.task_id)
+            || !allowedStates.has(item.status)) return null;
+        const algorithm = item.algorithm && typeof item.algorithm === 'object'
+          ? item.algorithm : {};
+        const learningRate = guidedLearningRateFromMilli(item.learning_rate_milli);
+        return {
+          taskId: item.task_id,
+          status: item.status,
+          goal: boundedGuidedText(item.goal, 2000),
+          algorithmId: isSafeGuidedIdentifier(algorithm.id) ? algorithm.id : '',
+          algorithmVersion: isSafeGuidedVersion(algorithm.version) ? algorithm.version : '',
+          preset: ['fwi_smoke', 'fwi_demo'].includes(item.preset) ? item.preset : '',
+          device: ['cpu', 'cuda'].includes(item.device) ? item.device : '',
+          iterations: guidedIntegerValue(item.iterations, 1, 10000),
+          seed: guidedIntegerValue(item.seed, 0, 2147483647),
+          optimizer: ['adam', 'sgd'].includes(item.optimizer) ? item.optimizer : '',
+          learningRate,
+          learningRateMilli: learningRate ? item.learning_rate_milli : null,
+          createdAt: boundedGuidedText(item.created_at, 80),
+          updatedAt: boundedGuidedText(item.updated_at, 80),
+        };
+      }).filter(Boolean).slice(0, 50);
+      const nextCursor = typeof source.next_cursor === 'string'
+        && /^v1_[A-Za-z0-9_-]{2,171}$/.test(source.next_cursor)
+        ? source.next_cursor : '';
+      return { tasks, nextCursor };
+    }
+
+    function guidedTaskSummary(task) {
+      if (!task || !isSafeGuidedOpaqueId(task.taskId)) return null;
+      return {
+        taskId: task.taskId,
+        status: task.status,
+        goal: task.draft.goal,
+        algorithmId: task.draft.algorithmId,
+        algorithmVersion: task.draft.algorithmVersion,
+        preset: task.draft.preset,
+        device: task.draft.device,
+        iterations: task.draft.iterations,
+        seed: task.draft.seed,
+        optimizer: task.draft.optimizer,
+        learningRate: task.draft.learningRate,
+        learningRateMilli: task.draft.learningRateMilli,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+      };
+    }
+
+    function upsertGuidedTaskIndex(task) {
+      const summary = task && task.draft ? guidedTaskSummary(task) : task;
+      if (!summary || !isSafeGuidedOpaqueId(summary.taskId)) return false;
+      const existing = state.guided.taskIndex.filter(item => item.taskId !== summary.taskId);
+      state.guided.taskIndex = [summary, ...existing].slice(0, 100);
+      renderGuidedTaskIndex();
+      return true;
+    }
+
+    function renderGuidedTaskIndex() {
+      const container = document.getElementById('guidedTaskHistory');
+      if (!container) return;
+      container.replaceChildren();
+      if (state.guided.taskIndexPage > 0) {
+        const navigation = document.createElement('div');
+        navigation.className = 'flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-2 py-1.5';
+        const page = document.createElement('span');
+        page.className = 'text-[11px] text-slate-500';
+        page.textContent = `更早任务 · 第 ${state.guided.taskIndexPage + 1} 页`;
+        const latest = document.createElement('button');
+        latest.type = 'button';
+        latest.className = 'text-[11px] text-accent disabled:opacity-40';
+        latest.disabled = state.guided.taskIndexLoading;
+        latest.textContent = '回到最近任务';
+        latest.addEventListener('click', () => loadGuidedTaskIndex({ reset: true }));
+        navigation.append(page, latest);
+        container.appendChild(navigation);
+      }
+      if (state.guided.taskIndexLoading && state.guided.taskIndex.length === 0) {
+        const loading = document.createElement('p');
+        loading.className = 'text-xs text-slate-400 py-2';
+        loading.textContent = '正在读取 SQLite 任务…';
+        container.appendChild(loading);
+        return;
+      }
+      if (state.guided.taskIndex.length === 0) {
+        const empty = document.createElement('p');
+        empty.className = `text-xs py-2 ${state.guided.taskIndexError ? 'text-red-600' : 'text-slate-400'}`;
+        empty.textContent = state.guided.taskIndexError || '暂无持久任务';
+        container.appendChild(empty);
+        return;
+      }
+      state.guided.taskIndex.forEach(item => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.taskId = item.taskId;
+        button.className = `w-full rounded-lg border p-2 text-left text-xs transition-colors ${item.taskId === state.guided.taskId ? 'border-accent/40 bg-accent/5' : 'border-slate-200 hover:border-accent/30'}`;
+        const header = document.createElement('span');
+        header.className = 'flex items-center justify-between gap-2';
+        const label = document.createElement('strong');
+        label.className = 'truncate text-slate-700';
+        label.textContent = item.goal || item.taskId;
+        const status = document.createElement('span');
+        status.className = `data-pill ${item.status === 'Succeeded' ? '' : 'warning'}`;
+        status.textContent = item.status;
+        header.append(label, status);
+        const detail = document.createElement('span');
+        detail.className = 'mt-1 block truncate font-mono text-[11px] text-slate-500';
+        const optimization = item.optimizer && item.learningRate
+          ? ` · ${item.optimizer.toUpperCase()} LR ${item.learningRate}` : ' · legacy defaults';
+        detail.textContent = `${item.preset || 'FWI'} · ${item.device || '—'} · ${item.iterations ?? '—'} iter${optimization}`;
+        button.append(header, detail);
+        button.addEventListener('click', () => reopenGuidedTask(button.dataset.taskId));
+        container.appendChild(button);
+      });
+      if (state.guided.taskIndexCursor) {
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'w-full py-2 text-xs text-accent disabled:opacity-40';
+        more.disabled = state.guided.taskIndexLoading;
+        more.textContent = state.guided.taskIndexLoading ? '加载中…' : '查看下一页（更早）';
+        more.addEventListener('click', () => loadGuidedTaskIndex({ reset: false }));
+        container.appendChild(more);
+      }
+    }
+
+    async function loadGuidedTaskIndex(options) {
+      options = options || {};
+      if (state.guided.taskIndexLoading) return false;
+      const reset = options.reset !== false;
+      if (!reset && !state.guided.taskIndexCursor) return false;
+      state.guided.taskIndexLoading = true;
+      state.guided.taskIndexError = '';
+      renderGuidedTaskIndex();
+      try {
+        if (!isSafeGuidedCsrfToken(state.guided.csrfToken || '')) {
+          const sessionData = await guidedApiRequest(guidedApiPath('session'), { session: true });
+          const session = normalizeGuidedSession(sessionData);
+          if (!session) throw new Error('session response 缺少合法 CSRF/scope');
+          state.guided.csrfToken = session.csrfToken;
+          state.guided.session = session;
+        }
+        const cursor = reset ? '' : state.guided.taskIndexCursor;
+        const query = cursor ? `?limit=20&cursor=${encodeURIComponent(cursor)}` : '?limit=20';
+        const page = normalizeGuidedTaskIndexPage(
+          await guidedApiRequest(`${guidedApiPath('tasks')}${query}`),
+        );
+        // Keep one bounded, fully visible server page. Advancing the cursor
+        // replaces the window instead of silently dropping the newly fetched
+        // tail after an arbitrary client-side cap. The user can always return
+        // to the newest page and traverse the same durable cursor chain again.
+        state.guided.taskIndex = page.tasks;
+        state.guided.taskIndexCursor = page.nextCursor;
+        state.guided.taskIndexPage = reset ? 0 : state.guided.taskIndexPage + 1;
+        state.guided.taskIndexLoaded = true;
+        return true;
+      } catch (error) {
+        if (error && error.guidedCode === 'CSRF_FORBIDDEN' && !options.sessionRetry) {
+          state.guided.csrfToken = '';
+          state.guided.session = null;
+          state.guided.taskIndexLoading = false;
+          return await loadGuidedTaskIndex({ ...options, sessionRetry: true });
+        }
+        state.guided.taskIndexError = error && error.message
+          ? `任务列表不可用：${error.message}` : '任务列表不可用';
+        return false;
+      } finally {
+        state.guided.taskIndexLoading = false;
+        renderGuidedTaskIndex();
+      }
+    }
+
     function guidedInvalidMutationResponse(message) {
       const error = new Error(message);
       error.guidedOutcomeUnknown = true;
@@ -2084,6 +2525,72 @@
       </div>`;
     }
 
+    function guidedOptimizationProfiles() {
+      const profiles = state.guided.session?.optimization?.profiles;
+      if (Array.isArray(profiles) && profiles.length) return profiles;
+      return [
+        { id: 'adam_verified', label: 'Adam 已验证基线', optimizer: 'adam', learningRate: '10', recommendation: 'recommended', evidence: '固定 Marmousi CUDA 闭环已验证；本项目默认推荐。' },
+        { id: 'adam_conservative', label: 'Adam 保守检查', optimizer: 'adam', learningRate: '2', recommendation: 'conservative', evidence: '微型 CPU smoke 已验证 finite 更新；不等同于长程收敛结论。' },
+        { id: 'sgd_calibration', label: 'SGD 校准起点', optimizer: 'sgd', learningRate: '10000000', recommendation: 'experimental', evidence: '固定 Marmousi CUDA 两步 finite/model-update 校准已通过；仍不是收敛推荐。' },
+      ];
+    }
+
+    function renderGuidedOptimizationAdviceHtml(form) {
+      const active = form || state.guided.form || {};
+      const profiles = guidedOptimizationProfiles();
+      const cards = profiles.map(profile => {
+        const selected = profile.optimizer === active.optimizer
+          && guidedLearningRateValue(profile.learningRate, profile.optimizer)?.text
+            === guidedLearningRateValue(active.learning_rate, active.optimizer)?.text;
+        const badge = profile.recommendation === 'recommended'
+          ? '推荐' : (profile.recommendation === 'conservative' ? '保守' : '实验性');
+        const tone = profile.recommendation === 'experimental'
+          ? 'border-amber-200 bg-amber-50' : (selected ? 'border-indigo-300 bg-indigo-50' : 'border-slate-200 bg-white');
+        return `<button type="button" onclick="applyGuidedOptimizationProfile('${escapeHtml(profile.id)}')" class="text-left rounded-lg border ${tone} p-3 hover:border-accent/50"${state.guided.mutation ? ' disabled' : ''} data-optimization-profile="${escapeHtml(profile.id)}"><span class="flex items-center justify-between gap-2"><strong class="text-xs text-slate-800">${escapeHtml(profile.label)}</strong><span class="data-pill ${profile.recommendation === 'experimental' ? 'warning' : ''}">${escapeHtml(badge)}</span></span><span class="mt-2 block text-xs font-mono text-slate-700">${escapeHtml(profile.optimizer.toUpperCase())} · LR ${escapeHtml(profile.learningRate)} · clip q 0.98</span><span class="mt-1 block text-[11px] leading-relaxed text-slate-500">${escapeHtml(profile.evidence)}</span></button>`;
+      }).join('');
+      const customWarning = active.optimizer === 'sgd'
+        ? '<p class="mt-2 text-xs text-amber-800">SGD 当前是实验性分支；两步 CUDA 校准只证明有限输出和模型更新，不代表长程收敛或通用优化器经验值。</p>'
+        : '<p class="mt-2 text-xs text-slate-500">Adam 10 是唯一具备固定 Marmousi 长程闭环证据的推荐基线。</p>';
+      return `<section id="guidedOptimizationAdvice" class="sm:col-span-2 rounded-lg border border-slate-200 bg-slate-50 p-3"><div class="flex items-center justify-between gap-2"><div><h4 class="text-xs font-semibold uppercase tracking-wider text-slate-600">优化参数建议</h4><p class="text-[11px] text-slate-500 mt-1">点击卡片即可应用；证据等级不会被夸大。</p></div><span class="data-pill">clip q 0.98 固定</span></div><div class="mt-3 grid grid-cols-1 md:grid-cols-3 gap-2">${cards}</div>${customWarning}</section>`;
+    }
+
+    function refreshGuidedOptimizationAdvice() {
+      const container = document.getElementById('guidedOptimizationAdvice');
+      if (!container) return false;
+      const optimizer = document.getElementById('guidedOptimizer')?.value;
+      const learningRate = document.getElementById('guidedLearningRate')?.value;
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = renderGuidedOptimizationAdviceHtml({ optimizer, learning_rate: learningRate });
+      const replacement = wrapper.firstElementChild;
+      if (!replacement) return false;
+      container.replaceWith(replacement);
+      return true;
+    }
+
+    function applyGuidedOptimizationProfile(profileId) {
+      const profile = guidedOptimizationProfiles().find(item => item.id === profileId);
+      if (!profile || state.guided.mutation) return false;
+      const optimizer = document.getElementById('guidedOptimizer');
+      const learningRate = document.getElementById('guidedLearningRate');
+      if (!optimizer || !learningRate) return false;
+      optimizer.value = profile.optimizer;
+      learningRate.value = profile.learningRate;
+      refreshGuidedOptimizationAdvice();
+      return true;
+    }
+
+    function selectGuidedOptimizer(optimizer) {
+      if (!['adam', 'sgd'].includes(optimizer) || state.guided.mutation) return false;
+      const profile = guidedOptimizationProfiles().find(item => (
+        item.optimizer === optimizer
+        && (item.recommendation === 'recommended' || item.recommendation === 'experimental')
+      )) || guidedOptimizationProfiles().find(item => item.optimizer === optimizer);
+      const learningRate = document.getElementById('guidedLearningRate');
+      if (learningRate && profile) learningRate.value = profile.learningRate;
+      refreshGuidedOptimizationAdvice();
+      return true;
+    }
+
     function renderGuidedFormHtml() {
       const form = state.guided.form;
       const catalog = state.guided.catalog;
@@ -2093,6 +2600,11 @@
         return `<option value="${index}"${selected ? ' selected' : ''}>${escapeHtml(`${dataset.id}@${dataset.version}`)}</option>`;
       }).join('');
       const disabled = state.guided.mutation ? ' disabled' : '';
+      const invalidOptimizer = !['adam', 'sgd'].includes(form.optimizer)
+        ? boundedGuidedText(form.optimizer, 40) : '';
+      const invalidOptimizerOption = invalidOptimizer
+        ? `<option value="${escapeHtml(invalidOptimizer)}" selected disabled>不支持：${escapeHtml(invalidOptimizer)}</option>`
+        : '';
       const error = state.guided.error
         ? `<p class="mt-3 text-sm text-red-700" role="alert">${escapeHtml(state.guided.error)}</p>` : '';
       return `${renderGuidedCatalogPreview()}
@@ -2108,7 +2620,16 @@
           </label>
           <label class="text-xs font-semibold text-slate-600">设备
             <select id="guidedDevice" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm"><option value="cpu"${form.device === 'cpu' ? ' selected' : ''}>CPU</option><option value="cuda"${form.device === 'cuda' ? ' selected' : ''}>CUDA</option></select>
+            <span class="mt-1 block font-normal text-amber-700">长任务请明确确认设备；自然语言未写 CUDA/GPU 时安全默认 CPU，不会自动切换。</span>
           </label>
+          <label class="text-xs font-semibold text-slate-600">优化器
+            <select id="guidedOptimizer" onchange="selectGuidedOptimizer(this.value)" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm">${invalidOptimizerOption}<option value="adam"${form.optimizer === 'adam' ? ' selected' : ''}>Adam（推荐基线）</option><option value="sgd"${form.optimizer === 'sgd' ? ' selected' : ''}>SGD（实验性）</option></select>
+          </label>
+          <label class="text-xs font-semibold text-slate-600">学习率
+            <input id="guidedLearningRate" type="text" inputmode="decimal" value="${escapeHtml(String(form.learning_rate))}" oninput="refreshGuidedOptimizationAdvice()" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm font-mono" required>
+            <span class="mt-1 block font-normal text-slate-500">Adam: 0.1–100；SGD: 100000–1000000000；最多 3 位小数。</span>
+          </label>
+          ${renderGuidedOptimizationAdviceHtml(form)}
           <label class="text-xs font-semibold text-slate-600">迭代次数（1–10000）
             <input id="guidedIterations" type="number" min="1" max="10000" step="1" value="${escapeHtml(String(form.iterations))}" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm" required>
             <span class="mt-1 block font-normal text-amber-700">超过 100 次可能长时间占用计算资源；当前不支持运行中取消。</span>
@@ -2142,7 +2663,8 @@
         ? `<p class="mt-3 text-sm text-red-700" role="alert">${escapeHtml(state.guided.error)}</p>` : '';
       return `<section class="rounded-lg border border-indigo-200 bg-indigo-50 p-4" data-guided-view="review">
         <div class="flex flex-wrap items-start justify-between gap-3"><div><h4 class="font-heading font-semibold text-slate-900">服务器 Draft / Plan 确认卡</h4><p class="text-xs text-slate-500 mt-1">批准前不会进入运行队列</p></div><span class="data-pill warning">AwaitingApproval</span></div>
-        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>draft</dt><dd class="font-mono">${escapeHtml(`${draft.id || '—'} · revision ${draft.revision || '—'}`)}</dd><dt>goal</dt><dd>${escapeHtml(draft.goal || '—')}</dd><dt>dataset</dt><dd class="font-mono">${escapeHtml(`${draft.datasetId || '—'}@${draft.datasetVersion || '—'}`)}</dd><dt>preset / device</dt><dd>${escapeHtml(`${draft.preset || '—'} / ${draft.device || '—'}`)}</dd><dt>iterations / seed</dt><dd>${escapeHtml(`${draft.iterations ?? '—'} / ${draft.seed ?? '—'}`)}</dd><dt>plan</dt><dd class="font-mono">${escapeHtml(task.plan.id || '—')} · ${escapeHtml(String(task.plan.nodeCount))} node</dd><dt>plan_hash</dt><dd class="font-mono">${escapeHtml(task.plan.hash || 'invalid')}</dd></dl>
+        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>draft</dt><dd class="font-mono">${escapeHtml(`${draft.id || '—'} · revision ${draft.revision || '—'}`)}</dd><dt>goal</dt><dd>${escapeHtml(draft.goal || '—')}</dd><dt>dataset</dt><dd class="font-mono">${escapeHtml(`${draft.datasetId || '—'}@${draft.datasetVersion || '—'}`)}</dd><dt>preset / device</dt><dd>${escapeHtml(`${draft.preset || '—'} / ${draft.device || '—'}`)}</dd><dt>optimizer / LR</dt><dd class="font-mono">${escapeHtml(`${(draft.optimizer || '—').toUpperCase()} / ${draft.learningRate || '—'}`)}</dd><dt>gradient clip</dt><dd>quantile 0.98（版本固定）</dd><dt>iterations / seed</dt><dd>${escapeHtml(`${draft.iterations ?? '—'} / ${draft.seed ?? '—'}`)}</dd><dt>plan</dt><dd class="font-mono">${escapeHtml(task.plan.id || '—')} · ${escapeHtml(String(task.plan.nodeCount))} node</dd><dt>plan_hash</dt><dd class="font-mono">${escapeHtml(task.plan.hash || 'invalid')}</dd></dl>
+        <div class="mt-3 rounded-lg border ${draft.optimizer === 'adam' && draft.learningRate === '10' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800'} p-3 text-xs">${draft.optimizer === 'adam' && draft.learningRate === '10' ? '建议判断：当前参数与已验证推荐基线一致。' : (draft.optimizer === 'sgd' ? '建议判断：SGD 当前属于实验性校准分支，不提供收敛保证。' : '建议判断：当前为自定义 Adam 学习率，请重点验收 loss 与模型更新指标。')}</div>
         <div class="flex flex-wrap gap-2 mt-4">
           <button type="button" onclick="editGuidedDraft()"${disabled} class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">修改</button>
           <button type="button" onclick="approveGuidedFwi()"${disabled} class="px-3 py-2 rounded-lg bg-accent text-white text-sm font-semibold disabled:opacity-40">批准运行</button>
@@ -2157,11 +2679,11 @@
       const disabled = state.guided.mutation ? ' disabled' : '';
       const error = state.guided.error
         ? `<p class="mt-3 text-sm text-red-700" role="alert">${escapeHtml(state.guided.error)}</p>` : '';
+      const canReplay = state.guided.approvalReplayAvailable === true;
       return `<section class="rounded-lg border border-amber-300 bg-amber-50 p-4" data-guided-view="approved-submit-pending">
         <div class="flex flex-wrap items-start justify-between gap-3"><div><h4 class="font-heading font-semibold text-amber-900">Approval 已持久化，提交尚未确认</h4><p class="text-xs text-amber-700 mt-1">SQLite 仍为 AwaitingApproval；不会自动重发或创建新任务。</p></div><span class="data-pill warning">approved / not queued</span></div>
         <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>approval_id</dt><dd class="font-mono">${escapeHtml(task.approval.id)}</dd><dt>plan_hash</dt><dd class="font-mono">${escapeHtml(task.plan.hash)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd></dl>
-        <button type="button" onclick="continueGuidedApprovedSubmit()"${disabled} class="mt-4 px-3 py-2 rounded-lg bg-accent text-white text-sm font-semibold disabled:opacity-40">继续已批准提交（复用原 Idempotency-Key）</button>
-        <p class="mt-2 text-xs text-amber-700">这只重放同一 approve/submit mutation；不是任务 retry，也不会绕过当前 Plan。</p>${error}
+        ${canReplay ? `<button type="button" onclick="continueGuidedApprovedSubmit()"${disabled} class="mt-4 px-3 py-2 rounded-lg bg-accent text-white text-sm font-semibold disabled:opacity-40">继续已批准提交（复用原 Idempotency-Key）</button><p class="mt-2 text-xs text-amber-700">这只重放同一 approve/submit mutation；不是任务 retry，也不会绕过当前 Plan。</p>` : '<p class="mt-3 text-xs text-amber-800">页面恢复后没有原 mutation key，已 fail closed：只允许 GET 查询与审计，不会创建新 key。</p>'}${error}
       </section>`;
     }
 
@@ -2186,7 +2708,7 @@
         ? `<p class="mt-3 text-sm text-red-700" role="alert">${escapeHtml(state.guided.error)}</p>` : '';
       return `<section class="rounded-lg border ${isCrashState ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-white'} p-4" data-guided-view="task">
         <div class="flex flex-wrap items-start justify-between gap-3"><div><h4 class="font-heading font-semibold text-slate-900">Scientific Runtime task</h4><p class="text-xs text-slate-500 mt-1">SQLite 是任务状态真源；轮询只执行 GET</p></div><span class="data-pill ${task.status === 'Succeeded' ? '' : 'warning'}">${escapeHtml(task.status)}</span></div>
-        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd><dt>dispatch</dt><dd>${escapeHtml(task.dispatch.state || 'not recorded')}</dd><dt>dispatch evidence</dt><dd>${escapeHtml(guidedDispatchExplanation(task.dispatch.state))}</dd><dt>Adapter status</dt><dd>${escapeHtml(adapter.status || 'not available')}</dd><dt>stage</dt><dd>${escapeHtml(adapter.stage || '—')}</dd><dt>progress</dt><dd>${escapeHtml(`${completed} / ${total}`)}</dd><dt>message</dt><dd>${escapeHtml(adapter.message || task.dispatch.failureCode || '等待状态更新')}</dd></dl>
+        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd><dt>optimizer / LR</dt><dd class="font-mono">${escapeHtml(`${(task.draft.optimizer || 'legacy').toUpperCase()} / ${task.draft.learningRate || 'preset default'}`)}</dd><dt>dispatch</dt><dd>${escapeHtml(task.dispatch.state || 'not recorded')}</dd><dt>dispatch evidence</dt><dd>${escapeHtml(guidedDispatchExplanation(task.dispatch.state))}</dd><dt>Adapter status</dt><dd>${escapeHtml(adapter.status || 'not available')}</dd><dt>stage</dt><dd>${escapeHtml(adapter.stage || '—')}</dd><dt>progress</dt><dd>${escapeHtml(`${completed} / ${total}`)}</dd><dt>message</dt><dd>${escapeHtml(adapter.message || task.dispatch.failureCode || '等待状态更新')}</dd></dl>
         ${task.status === 'Succeeded' ? '' : '<button type="button" onclick="refreshGuidedTask()" class="mt-3 px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">刷新状态（GET）</button>'}${error}
       </section>`;
     }
@@ -2204,9 +2726,15 @@
       return `<section class="mt-4" data-guided-view="artifacts"><h4 class="font-heading font-semibold text-slate-900 mb-3">标准 ArtifactManifest</h4><div class="grid grid-cols-1 md:grid-cols-2 gap-3">${cards}</div></section>`;
     }
 
-    function renderGuidedFwi() {
+    function renderGuidedFwi(options) {
+      options = options || {};
       const panel = document.getElementById('guidedFwiPanel');
       if (!panel) return;
+      const chatArea = document.getElementById('chatArea');
+      const previousTop = chatArea ? chatArea.scrollTop : 0;
+      const wasNearBottom = chatArea
+        ? chatArea.scrollHeight - chatArea.clientHeight - chatArea.scrollTop <= 48
+        : false;
       if (state.guided.phase === 'closed') {
         panel.replaceChildren();
         panel.classList.add('hidden');
@@ -2235,9 +2763,13 @@
           content += renderGuidedArtifactsHtml(state.guided.taskId, state.guided.artifacts);
         }
       }
-      panel.innerHTML = `<div class="workbench-card p-4 shadow-sm" data-guided-fwi="true"><div class="flex items-start justify-between gap-3 mb-4"><div><h3 class="font-heading font-semibold text-slate-900">Guided FWI</h3><p class="text-xs text-slate-500 mt-1">Catalog → Draft / Plan → explicit approval → SQLite task → artifacts</p></div><button type="button" onclick="closeGuidedFwi()" aria-label="关闭 Guided FWI 面板" class="text-slate-400 hover:text-slate-700">×</button></div>${content}</div>`;
+      panel.innerHTML = `<div class="workbench-card p-4 shadow-sm" data-guided-fwi="true"><div class="flex items-start justify-between gap-3 mb-4"><div><h3 class="font-heading font-semibold text-slate-900">Guided FWI</h3><p class="text-xs text-slate-500 mt-1">Catalog → Draft / Plan → explicit approval → SQLite task → artifacts</p></div><button type="button" onclick="closeGuidedFwi()" title="关闭任务视图（不取消任务）" aria-label="关闭任务视图（不取消任务）" class="text-slate-400 hover:text-slate-700">×</button></div>${content}</div>`;
       panel.classList.remove('hidden');
-      scrollToBottom();
+      if (options.reveal === true && typeof panel.scrollIntoView === 'function') {
+        panel.scrollIntoView({ block: 'start' });
+      } else if (chatArea) {
+        chatArea.scrollTop = wasNearBottom ? chatArea.scrollHeight : previousTop;
+      }
     }
 
     async function openGuidedFwi(overrides) {
@@ -2256,7 +2788,7 @@
       }
       clearGuidedPoll();
       const generation = (state.guided.generation || 0) + 1;
-      state.guided = createGuidedFwiState(generation);
+      state.guided = createGuidedFwiState(generation, state.guided);
       document.getElementById('welcomeMsg').classList.add('hidden');
       if (overrides.unsupported_operation === 'forward'
           || hasGuidedUnsupportedForwardIntent(overrides.goal)) {
@@ -2265,11 +2797,11 @@
           unsupported_operation: 'forward',
         };
         state.guided.phase = 'unsupported_forward';
-        renderGuidedFwi();
+        renderGuidedFwi({ reveal: true });
         return true;
       }
       state.guided.phase = 'loading';
-      renderGuidedFwi();
+      renderGuidedFwi({ reveal: true });
       try {
         const sessionData = await guidedApiRequest(guidedApiPath('session'), { session: true });
         if (state.guided.generation !== generation) return false;
@@ -2295,19 +2827,103 @@
       }
     }
 
+    async function reopenGuidedTask(taskId) {
+      if (!isSafeGuidedOpaqueId(taskId) || state.guided.mutation) return false;
+      if (state.guided.phase === 'outcome_unknown'
+          || (state.guided.phase === 'approval_incomplete'
+            && state.guided.approvalReplayAvailable === true)) {
+        showToast('当前 mutation 仍持有原 Idempotency-Key；请先继续闭环或审计');
+        return false;
+      }
+      clearGuidedPoll();
+      const generation = (state.guided.generation || 0) + 1;
+      state.guided = createGuidedFwiState(generation, state.guided);
+      state.guided.taskId = taskId;
+      state.guided.phase = 'loading';
+      document.getElementById('welcomeMsg')?.classList.add('hidden');
+      renderGuidedFwi({ reveal: true });
+      try {
+        const sessionData = await guidedApiRequest(guidedApiPath('session'), { session: true });
+        if (state.guided.generation !== generation) return false;
+        const session = normalizeGuidedSession(sessionData);
+        if (!session) throw new Error('session response 缺少合法 CSRF/scope');
+        state.guided.csrfToken = session.csrfToken;
+        state.guided.session = session;
+        const catalogData = await guidedApiRequest(guidedApiPath('catalog'));
+        if (state.guided.generation !== generation) return false;
+        const catalog = normalizeGuidedCatalog(catalogData);
+        if (!catalog) throw new Error('catalog 没有可用的注册数据或算法');
+        state.guided.catalog = catalog;
+        const data = await guidedApiRequest(guidedApiPath('task', taskId));
+        if (state.guided.generation !== generation) return false;
+        const task = normalizeGuidedTaskProjection(data, taskId);
+        if (!task) throw new Error('task response 无效');
+        state.guided.task = task;
+        state.guided.form = {
+          goal: task.draft.goal,
+          dataset_id: task.draft.datasetId,
+          dataset_version: task.draft.datasetVersion,
+          preset: task.draft.preset,
+          device: task.draft.device,
+          iterations: task.draft.iterations,
+          seed: task.draft.seed,
+          optimizer: task.draft.optimizer || 'adam',
+          learning_rate: task.draft.learningRate || '10',
+        };
+        state.guided.approvalReplayAvailable = false;
+        const approvedSubmitPending = isGuidedApprovedSubmitPending(task, catalog);
+        if (approvedSubmitPending) {
+          state.guided.phase = 'approval_incomplete';
+          state.guided.error = '页面恢复后缺少原 approve mutation 的 Idempotency-Key；仅供审计，不会生成新 key 重发。';
+        } else if (task.status === 'AwaitingApproval' && isGuidedReviewReady(task, catalog)) {
+          state.guided.phase = 'review';
+        } else if (task.status === 'AwaitingApproval') {
+          state.guided.phase = 'terminal';
+          state.guided.error = '这是旧版或不兼容的待批准任务；当前页面只读展示，不会用新算法版本批准。';
+        } else if (task.status === 'Cancelled' && !task.approval.id) {
+          state.guided.phase = 'abandoned';
+        } else if (task.status === 'Succeeded') {
+          state.guided.phase = 'succeeded';
+          await loadGuidedArtifacts({ render: false });
+        } else if (['Failed', 'Cancelled'].includes(task.status)
+            || task.dispatch.state === 'reconciliation_required') {
+          state.guided.phase = 'terminal';
+        } else {
+          state.guided.phase = 'monitoring';
+          scheduleGuidedPoll();
+        }
+        upsertGuidedTaskIndex(task);
+        renderGuidedFwi();
+        if (window.innerWidth < 768 && document.getElementById('sidebar')?.classList.contains('open')) {
+          toggleSidebar();
+        }
+        return true;
+      } catch (error) {
+        if (state.guided.generation !== generation) return false;
+        state.guided.phase = 'error';
+        state.guided.error = error && error.message ? error.message : '无法恢复 Guided FWI task';
+        renderGuidedFwi();
+        return false;
+      }
+    }
+
     function closeGuidedFwi() {
       if (state.guided.mutation) {
         showToast('Guided mutation 正在等待服务器确认，暂不能关闭');
         return false;
       }
-      if (['outcome_unknown', 'approval_incomplete'].includes(state.guided.phase)) {
+      if (state.guided.phase === 'outcome_unknown'
+          || (state.guided.phase === 'approval_incomplete'
+            && state.guided.approvalReplayAvailable === true)) {
         showToast('Mutation 尚未闭环；保留当前 Idempotency-Key 以供继续或审计');
         return false;
       }
       clearGuidedPoll();
       const generation = (state.guided.generation || 0) + 1;
-      state.guided = createGuidedFwiState(generation);
+      state.guided = createGuidedFwiState(generation, state.guided);
       renderGuidedFwi();
+      renderGuidedTaskIndex();
+      showToast('已关闭任务视图；任务未取消，可从左栏持久任务重新打开');
       return true;
     }
 
@@ -2324,6 +2940,8 @@
         device: document.getElementById('guidedDevice')?.value,
         iterations: document.getElementById('guidedIterations')?.value,
         seed: document.getElementById('guidedSeed')?.value,
+        optimizer: document.getElementById('guidedOptimizer')?.value,
+        learning_rate: document.getElementById('guidedLearningRate')?.value,
         unsupported_operation: state.guided.form?.unsupported_operation,
       });
     }
@@ -2363,6 +2981,7 @@
         }
         state.guided.task = task;
         state.guided.taskId = task.taskId;
+        upsertGuidedTaskIndex(task);
         state.guided.form = {
           goal: task.draft.goal,
           dataset_id: task.draft.datasetId,
@@ -2371,6 +2990,8 @@
           device: task.draft.device,
           iterations: task.draft.iterations,
           seed: task.draft.seed,
+          optimizer: task.draft.optimizer,
+          learning_rate: task.draft.learningRate,
         };
         state.guided.phase = 'review';
         state.guided.mutation = '';
@@ -2400,6 +3021,7 @@
 
     function continueGuidedApprovedSubmit() {
       if (state.guided.phase !== 'approval_incomplete'
+          || state.guided.approvalReplayAvailable !== true
           || !isGuidedApprovedSubmitPending(state.guided.task, state.guided.catalog)) return false;
       return approveGuidedFwi();
     }
@@ -2418,6 +3040,7 @@
       }
       const body = { plan_hash: task.plan.hash };
       const key = guidedMutationKey('approve', body);
+      state.guided.approvalReplayAvailable = true;
       state.guided.mutation = 'approve';
       state.guided.error = '';
       renderGuidedFwi();
@@ -2427,24 +3050,51 @@
         });
         const updated = normalizeGuidedTaskProjection(data, task.taskId);
         if (!updated) throw guidedInvalidMutationResponse('approve response 缺少合法 task projection');
+        if (updated.plan.hash !== body.plan_hash) {
+          throw guidedInvalidMutationResponse('approve response 与已批准 Plan 不一致');
+        }
+        const approvedSubmitPending = isGuidedApprovedSubmitPending(
+          updated, state.guided.catalog,
+        );
+        if (!approvedSubmitPending && !isGuidedApprovalCompleted(updated, body.plan_hash)) {
+          throw guidedInvalidMutationResponse('approve response 未确认 Approval 与任务提交结果');
+        }
         state.guided.task = updated;
-        state.guided.phase = updated.status === 'Succeeded' ? 'succeeded' : 'monitoring';
+        upsertGuidedTaskIndex(updated);
         state.guided.mutation = '';
+        state.guided.outcomeUnknown = false;
+        if (approvedSubmitPending) {
+          // Approval committed but submit did not.  Retain the exact approve
+          // key and require an explicit user replay of the same compound
+          // mutation; never manufacture a replacement key.
+          state.guided.phase = 'approval_incomplete';
+          state.guided.approvalReplayAvailable = true;
+          renderGuidedFwi();
+          return false;
+        }
+        state.guided.approvalReplayAvailable = false;
+        state.guided.phase = updated.status === 'Succeeded'
+          ? 'succeeded'
+          : (['Failed', 'Cancelled'].includes(updated.status)
+            || updated.dispatch.state === 'reconciliation_required'
+            ? 'terminal' : 'monitoring');
+        if (updated.status === 'Succeeded') await loadGuidedArtifacts({ render: false });
         renderGuidedFwi();
-        if (updated.status === 'Succeeded') await loadGuidedArtifacts();
+        if (updated.status === 'Succeeded') return true;
         else if (!['Failed', 'Cancelled'].includes(updated.status)
             && updated.dispatch.state !== 'reconciliation_required') scheduleGuidedPoll();
         return true;
       } catch (error) {
         state.guided.mutation = '';
         state.guided.error = error && error.message ? error.message : '批准结果未知';
-        if (error && error.guidedOutcomeUnknown) {
-          state.guided.phase = 'outcome_unknown';
-          state.guided.outcomeUnknown = true;
-          scheduleGuidedPoll(0);
-        } else {
-          state.guided.phase = returnPhase;
-        }
+        // Once approve has been sent, even a structured 4xx can follow a
+        // partially committed approval/submit transaction.  Until a legal
+        // projection is observed, preserve the original key and recover only
+        // through GET; close/reopen must not erase this replay identity.
+        state.guided.approvalReplayAvailable = true;
+        state.guided.phase = 'outcome_unknown';
+        state.guided.outcomeUnknown = true;
+        scheduleGuidedPoll(0);
         renderGuidedFwi();
         return false;
       }
@@ -2471,6 +3121,7 @@
           throw guidedInvalidMutationResponse('abandon response 未确认 pre-runtime Cancelled');
         }
         state.guided.task = updated;
+        upsertGuidedTaskIndex(updated);
         state.guided.phase = 'abandoned';
         state.guided.mutation = '';
         renderGuidedFwi();
@@ -2494,6 +3145,10 @@
       const taskId = state.guided.taskId;
       if (!isSafeGuidedOpaqueId(taskId) || state.guided.pollInFlight) return false;
       const generation = state.guided.generation;
+      const protectedApproval = state.guided.approvalReplayAvailable === true;
+      const protectedPlanHash = protectedApproval
+        && isSafeGuidedPlanHash(state.guided.task?.plan?.hash)
+        ? state.guided.task.plan.hash : '';
       state.guided.pollInFlight = true;
       clearGuidedPoll();
       try {
@@ -2502,23 +3157,51 @@
         const task = normalizeGuidedTaskProjection(data, taskId);
         if (!task) throw new Error('task response 无效');
         state.guided.task = task;
+        upsertGuidedTaskIndex(task);
         state.guided.error = '';
         const approvedSubmitPending = isGuidedApprovedSubmitPending(task, state.guided.catalog);
-        if (task.status !== 'AwaitingApproval' || approvedSubmitPending) {
+        const protectedSubmitPending = protectedApproval
+          && approvedSubmitPending
+          && task.plan.hash === protectedPlanHash;
+        const protectedApprovalCompleted = protectedApproval
+          && isGuidedApprovalCompleted(task, protectedPlanHash);
+        const approvalStillUnproven = protectedApproval
+          && !protectedSubmitPending
+          && !protectedApprovalCompleted;
+        if (protectedApprovalCompleted) {
+          state.guided.outcomeUnknown = false;
+          state.guided.approvalReplayAvailable = false;
+        } else if (protectedSubmitPending) {
+          state.guided.outcomeUnknown = false;
+          // Approval is durable but submit is not: retain the original key for
+          // the explicit compound-mutation replay button.
+          state.guided.approvalReplayAvailable = true;
+        } else if (!protectedApproval && task.status !== 'AwaitingApproval') {
+          state.guided.outcomeUnknown = false;
+          state.guided.approvalReplayAvailable = false;
+        } else if (!protectedApproval && approvedSubmitPending) {
           state.guided.outcomeUnknown = false;
         }
-        if (approvedSubmitPending) {
+        if (approvalStillUnproven) {
+          state.guided.outcomeUnknown = true;
+          state.guided.approvalReplayAvailable = true;
+          state.guided.phase = 'outcome_unknown';
+          state.guided.error = 'GET 尚未证明原 approve mutation 对同一 Plan 已持久化并完成提交；保留原 Idempotency-Key，不会生成新 key。';
+        } else if (approvedSubmitPending) {
           state.guided.phase = 'approval_incomplete';
         } else if (task.status === 'Cancelled' && !task.approval.id) {
           state.guided.phase = 'abandoned';
         } else if (task.status === 'Succeeded') {
           state.guided.phase = 'succeeded';
-          await loadGuidedArtifacts();
+          await loadGuidedArtifacts({ render: false });
         } else if (['Failed', 'Cancelled'].includes(task.status)
             || task.dispatch.state === 'reconciliation_required') {
           state.guided.phase = 'terminal';
         } else if (state.guided.outcomeUnknown && task.status === 'AwaitingApproval') {
           state.guided.phase = 'outcome_unknown';
+          state.guided.error = task.approval.id
+            ? 'GET 未确认原 approve mutation 已完成提交；保留原 Idempotency-Key，仅允许继续审计。'
+            : 'GET 明确未发现持久 Approval；已 fail closed，保留原 Idempotency-Key 且不会生成新 key。';
         } else {
           state.guided.phase = 'monitoring';
           scheduleGuidedPoll();
@@ -2536,7 +3219,8 @@
       }
     }
 
-    async function loadGuidedArtifacts() {
+    async function loadGuidedArtifacts(options) {
+      options = options || {};
       const taskId = state.guided.taskId;
       if (!isSafeGuidedOpaqueId(taskId) || state.guided.artifactLoadInFlight) return false;
       const generation = state.guided.generation;
@@ -2550,12 +3234,12 @@
         } else {
           state.guided.error = '';
         }
-        renderGuidedFwi();
+        if (options.render !== false) renderGuidedFwi();
         return state.guided.artifacts.length === 2;
       } catch (error) {
         if (state.guided.generation !== generation) return false;
         state.guided.error = error && error.message ? `Artifact 查询失败：${error.message}` : 'Artifact 查询失败';
-        renderGuidedFwi();
+        if (options.render !== false) renderGuidedFwi();
         return false;
       } finally {
         if (state.guided.generation === generation) state.guided.artifactLoadInFlight = false;

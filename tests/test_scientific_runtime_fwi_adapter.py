@@ -42,7 +42,7 @@ PLAN_HASH = "sha256:" + "d" * 64
 
 
 def algorithm_identity() -> dict[str, Any]:
-    return {"id": "deepwave.acoustic_fwi", "version": "1.1.0"}
+    return {"id": "deepwave.acoustic_fwi", "version": "1.3.0"}
 
 
 def dataset_ref(*, content_hash: str = HASH_DATASET) -> dict[str, Any]:
@@ -79,6 +79,8 @@ def parameters() -> dict[str, Any]:
         "device": "cpu",
         "iterations": 2,
         "seed": 2026,
+        "optimizer": "adam",
+        "learning_rate_milli": 10_000,
     }
 
 
@@ -96,7 +98,7 @@ def development_fingerprint() -> dict[str, Any]:
     return {
         "provenance_mode": "development",
         "algorithm": algorithm_identity(),
-        "adapter_version": "1.1.0",
+        "adapter_version": "1.3.0",
         "source": {"identity_complete": False, "dirty": None},
         "environment": {"environment_lock_hash": HASH_ENVIRONMENT},
         "runtime": {
@@ -446,6 +448,9 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             "2,8,0.5\n",
             encoding="utf-8",
         )
+        config = json.loads(
+            (run_dir / "config.original.json").read_text(encoding="utf-8")
+        )
         metrics = {
             "iterations": 2,
             "initial_loss": 1.0,
@@ -462,6 +467,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             "device_name": "synthetic-test-cpu",
             "torch_version": "test-pytorch",
             "deepwave_version": "test-deepwave",
+            "optimizer": config.get("optimizer", "adam"),
+            "learning_rate": config.get("learning_rate", 10.0),
+            "gradient_clip_quantile": config.get(
+                "gradient_clip_quantile", 0.98
+            ),
             # These real legacy shapes are deliberately non-scalar.  The
             # standard ArtifactManifest metrics field must not copy them.
             "model_shape": [94, 288],
@@ -477,9 +487,6 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0l"
                 "EQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
             )
-        )
-        config = json.loads(
-            (run_dir / "config.original.json").read_text(encoding="utf-8")
         )
         legacy_manifest = {
             "type": "fwi_result",
@@ -648,6 +655,71 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(self.root_snapshot(), before)
         self.assertEqual(self.launcher.calls, [])
 
+    def test_optimizer_specific_bounds_and_worker_config_conversion(self) -> None:
+        before = self.root_snapshot()
+        valid_cases = (
+            ("adam", 100, 0.1),
+            ("adam", 100_000, 100.0),
+            ("sgd", 100_000_000, 100_000.0),
+            ("sgd", 1_000_000_000_000, 1_000_000_000.0),
+        )
+        for optimizer, learning_rate_milli, expected_rate in valid_cases:
+            with self.subTest(
+                optimizer=optimizer, learning_rate_milli=learning_rate_milli
+            ):
+                request = self.execution_kwargs()
+                request["parameters"].update(
+                    {
+                        "optimizer": optimizer,
+                        "learning_rate_milli": learning_rate_milli,
+                    }
+                )
+                validated = self.adapter.validate(**request)
+                self.assertEqual(validated.parameters["optimizer"], optimizer)
+                self.assertEqual(
+                    validated.parameters["learning_rate_milli"], learning_rate_milli
+                )
+                self.assertEqual(validated.worker_config["optimizer"], optimizer)
+                self.assertEqual(
+                    validated.worker_config["learning_rate"], expected_rate
+                )
+                self.assertEqual(
+                    validated.worker_config["gradient_clip_quantile"], 0.98
+                )
+
+        invalid_cases = (
+            ("adam", 99),
+            ("adam", 100_001),
+            ("sgd", 99_999_999),
+            ("sgd", 1_000_000_000_001),
+            ("adam", True),
+            ("adam", 10_000.0),
+            ("adam", "10000"),
+            ("lbfgs", 10_000),
+        )
+        for optimizer, learning_rate_milli in invalid_cases:
+            with self.subTest(
+                invalid_optimizer=optimizer,
+                invalid_learning_rate_milli=learning_rate_milli,
+            ):
+                request = self.execution_kwargs()
+                request["parameters"].update(
+                    {
+                        "optimizer": optimizer,
+                        "learning_rate_milli": learning_rate_milli,
+                    }
+                )
+                self.assert_input_rejected(request, code="PARAMETERS_INVALID")
+
+        for missing in ("optimizer", "learning_rate_milli"):
+            with self.subTest(missing=missing):
+                request = self.execution_kwargs()
+                request["parameters"].pop(missing)
+                self.assert_input_rejected(request, code="PARAMETERS_INVALID")
+
+        self.assertEqual(self.root_snapshot(), before)
+        self.assertEqual(self.launcher.calls, [])
+
     def test_submit_writes_fixed_worker_config_and_pathless_handle(self) -> None:
         handle, run_dir = self.submit_and_run_dir()
         self.assertEqual(len(self.launcher.calls), 1)
@@ -671,6 +743,9 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 "device": "cpu",
                 "iterations": 2,
                 "seed": 2026,
+                "optimizer": "adam",
+                "learning_rate": 10.0,
+                "gradient_clip_quantile": 0.98,
             },
         )
         handle_document = _plain(handle)
@@ -691,6 +766,33 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertNotIn("config_path", handle_document)
         self.assertEqual(_status_name(self.adapter.status(handle)), "queued")
         self.assertEqual(run_dir, call["run_dir"])
+
+    def test_submit_converts_sgd_milli_units_in_private_worker_config(self) -> None:
+        request = self.submit_kwargs(
+            task_id="task-sgd-config",
+            idempotency_key="task-sgd-config:invert:0001",
+        )
+        request["parameters"].update(
+            {"optimizer": "sgd", "learning_rate_milli": 100_000_000}
+        )
+        handle = self.adapter.submit(**request)
+        self.assertEqual(handle.algorithm, algorithm_identity())
+        config_path = self.launcher.calls[-1]["config_path"]
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            config,
+            {
+                "job_id": config["job_id"],
+                "model_id": "marmousi_94_288",
+                "preset": "fwi_smoke",
+                "device": "cpu",
+                "iterations": 2,
+                "seed": 2026,
+                "optimizer": "sgd",
+                "learning_rate": 100_000.0,
+                "gradient_clip_quantile": 0.98,
+            },
+        )
 
     def test_fixed_task_dispatcher_maps_snapshot_to_adapter_and_receipt(self) -> None:
         dataset = copy.deepcopy(self.dataset)
@@ -1010,78 +1112,139 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 with self.assertRaises((ValueError, RuntimeError, OSError)):
                     self.adapter.status(handle)
 
-    def test_current_dispatcher_reads_legacy_adapter_receipts(self) -> None:
-        handle, run_dir = self.submit_and_run_dir(
-            task_id="task-legacy-receipt",
-            idempotency_key="task-legacy-receipt:invert:0001",
-        )
-        self.write_success_artifacts(run_dir)
-
-        record_path = self.submission_record_path(handle)
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        record["algorithm"]["version"] = "1.0.0"
-        record["adapter_version"] = "1.0.0"
-        record["fingerprint"]["algorithm"]["version"] = "1.0.0"
-        record["fingerprint"]["adapter_version"] = "1.0.0"
-        record["request_hash"] = fwi_adapter_module._sha256_document(
-            self.adapter._record_request_payload(record)
-        )
-        self.adapter._write_submission(record_path, record)
-        legacy_handle = self.adapter._handle_from_record(record)
-
-        intent = DispatchIntentSnapshot(
-            intent_id="dispatch-legacy-receipt",
-            task_id=record["task_id"],
-            plan_id="plan-legacy-receipt",
-            plan_hash=record["plan_hash"],
-            approval_id="approval-legacy-receipt",
-            node_id=record["node_id"],
-            node_idempotency_key=record["idempotency_key"],
-            adapter_id="fwi.deepwave_adapter",
-            adapter_version="1.0.0",
-            request={},
-            request_hash="sha256:" + "e" * 64,
-            queue_fingerprint=copy.deepcopy(record["fingerprint"]),
-            state="dispatched",
-            handle=legacy_handle.as_dict(),
-            failure_code=None,
-            created_at=NOW,
-            dispatch_claimed_at=NOW,
-            outcome_recorded_at=NOW,
-        )
-        dispatcher = DeepwaveTaskDispatcher(self.adapter)
-        self.assertEqual(dispatcher.status(intent)["status"], "Succeeded")
-        artifacts = dispatcher.collect(intent)
-        self.assertEqual(len(artifacts), 2)
-        artifact, data = dispatcher.read_artifact(
-            intent, artifacts[0]["artifact_id"]
-        )
-        self.assertEqual(artifact["fingerprint"]["adapter_version"], "1.0.0")
+    def test_receipt_bindings_are_exact_version_pairs(self) -> None:
         self.assertEqual(
-            artifact["lineage"]["algorithm"]["version"], "1.0.0"
+            fwi_adapter_module.SUPPORTED_RECEIPT_BINDINGS,
+            frozenset(
+                {
+                    ("1.0.0", "1.0.0"),
+                    ("1.1.0", "1.1.0"),
+                    ("1.2.0", "1.2.0"),
+                    ("1.3.0", "1.3.0"),
+                }
+            ),
         )
-        self.assertEqual(len(data), artifact["size_bytes"])
 
-        mismatched_intent = dataclasses.replace(intent, adapter_version="1.1.0")
-        with self.assertRaisesRegex(DispatchError, "DISPATCH_RECEIPT_INVALID"):
-            dispatcher.status(mismatched_intent)
+    def test_current_dispatcher_reads_true_v1_0_v1_1_and_v1_2_receipts(self) -> None:
+        dispatcher = DeepwaveTaskDispatcher(self.adapter)
+        last_intent: DispatchIntentSnapshot | None = None
+        last_record: dict[str, Any] | None = None
+        last_record_path: Path | None = None
+
+        for index, legacy_version in enumerate(
+            ("1.0.0", "1.1.0", "1.2.0"), start=1
+        ):
+            with self.subTest(legacy_version=legacy_version):
+                handle, run_dir = self.submit_and_run_dir(
+                    task_id=f"task-legacy-{index}",
+                    idempotency_key=f"task-legacy-{index}:invert:0001",
+                )
+                self.write_success_artifacts(run_dir)
+
+                # Real 1.0/1.1 receipts predate the six-field optimizer
+                # contract.  Their public parameters and private Worker config
+                # omit optimizer controls and resolve to the historical
+                # Adam/10.0/0.98 defaults only inside the read path.  Version
+                # 1.2 already carries those controls and must retain them.
+                config_path = run_dir / "config.original.json"
+                legacy_config = json.loads(config_path.read_text(encoding="utf-8"))
+                if legacy_version in {"1.0.0", "1.1.0"}:
+                    for field in (
+                        "optimizer",
+                        "learning_rate",
+                        "gradient_clip_quantile",
+                    ):
+                        legacy_config.pop(field)
+                config_path.write_text(json.dumps(legacy_config), encoding="utf-8")
+
+                record_path = self.submission_record_path(handle)
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                record["algorithm"]["version"] = legacy_version
+                record["adapter_version"] = legacy_version
+                record["fingerprint"]["algorithm"]["version"] = legacy_version
+                record["fingerprint"]["adapter_version"] = legacy_version
+                if legacy_version in {"1.0.0", "1.1.0"}:
+                    record["parameters"].pop("optimizer")
+                    record["parameters"].pop("learning_rate_milli")
+                    for field in (
+                        "optimizer",
+                        "learning_rate",
+                        "gradient_clip_quantile",
+                    ):
+                        record["worker_config"].pop(field)
+                record["request_hash"] = fwi_adapter_module._sha256_document(
+                    self.adapter._record_request_payload(record)
+                )
+                self.adapter._write_submission(record_path, record)
+                legacy_handle = self.adapter._handle_from_record(record)
+
+                intent = DispatchIntentSnapshot(
+                    intent_id=f"dispatch-legacy-{index}",
+                    task_id=record["task_id"],
+                    plan_id=f"plan-legacy-{index}",
+                    plan_hash=record["plan_hash"],
+                    approval_id=f"approval-legacy-{index}",
+                    node_id=record["node_id"],
+                    node_idempotency_key=record["idempotency_key"],
+                    adapter_id="fwi.deepwave_adapter",
+                    adapter_version=legacy_version,
+                    request={},
+                    request_hash="sha256:" + "e" * 64,
+                    queue_fingerprint=copy.deepcopy(record["fingerprint"]),
+                    state="dispatched",
+                    handle=legacy_handle.as_dict(),
+                    failure_code=None,
+                    created_at=NOW,
+                    dispatch_claimed_at=NOW,
+                    outcome_recorded_at=NOW,
+                )
+                self.assertEqual(dispatcher.status(intent)["status"], "Succeeded")
+                artifacts = dispatcher.collect(intent)
+                self.assertEqual(len(artifacts), 2)
+                self.assertEqual(artifacts[0]["metrics"]["optimizer"], "adam")
+                self.assertEqual(artifacts[0]["metrics"]["learning_rate"], 10.0)
+                self.assertEqual(
+                    artifacts[0]["metrics"]["gradient_clip_quantile"], 0.98
+                )
+                artifact, data = dispatcher.read_artifact(
+                    intent, artifacts[0]["artifact_id"]
+                )
+                self.assertEqual(
+                    artifact["fingerprint"]["adapter_version"], legacy_version
+                )
+                self.assertEqual(
+                    artifact["lineage"]["algorithm"]["version"], legacy_version
+                )
+                self.assertEqual(len(data), artifact["size_bytes"])
+
+                mismatched_version = "1.3.0"
+                mismatched_intent = dataclasses.replace(
+                    intent, adapter_version=mismatched_version
+                )
+                with self.assertRaisesRegex(
+                    DispatchError, "DISPATCH_RECEIPT_INVALID"
+                ):
+                    dispatcher.status(mismatched_intent)
+                last_intent = intent
+                last_record = record
+                last_record_path = record_path
+
+        assert last_intent is not None
         dispatching_legacy = dataclasses.replace(
-            intent, state="dispatching", handle=None
+            last_intent, state="dispatching", handle=None
         )
         with self.assertRaisesRegex(DispatchError, "DISPATCH_INTENT_INVALID"):
             dispatcher.dispatch(dispatching_legacy)
 
-        record["algorithm"]["version"] = "1.1.0"
-        record["fingerprint"]["algorithm"]["version"] = "1.1.0"
-        record["request_hash"] = fwi_adapter_module._sha256_document(
-            self.adapter._record_request_payload(record)
-        )
-        self.adapter._write_submission(record_path, record)
-        mixed_handle = self.adapter._handle_from_record(record)
+        assert last_record is not None and last_record_path is not None
+        last_record["adapter_version"] = "1.0.0"
+        last_record["fingerprint"]["adapter_version"] = "1.0.0"
+        self.adapter._write_submission(last_record_path, last_record)
+        mixed_handle = self.adapter._handle_from_record(last_record)
         with self.assertRaisesRegex(
             RuntimeError, "private record version is unsupported"
         ):
-            self.adapter._read_submission(record_path)
+            self.adapter._read_submission(last_record_path)
         with self.assertRaisesRegex(RuntimeError, "ADAPTER_HANDLE_INVALID"):
             self.adapter.status(mixed_handle)
 
@@ -1138,6 +1301,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             "nan_count_string": ("nan_count", "bad"),
             "device_path": ("device", "/private/device"),
             "loss_mismatch": ("initial_loss", 123.0),
+            "optimizer_mismatch": ("optimizer", "sgd"),
+            "learning_rate_mismatch": ("learning_rate", 2.0),
+            "learning_rate_boolean": ("learning_rate", True),
+            "gradient_clip_mismatch": ("gradient_clip_quantile", 0.95),
+            "gradient_clip_boolean": ("gradient_clip_quantile", True),
         }
         for index, (label, (field, replacement)) in enumerate(
             metric_mutations.items(), start=1
@@ -1229,6 +1397,12 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             self.assertEqual(
                 manifest["fingerprint"]["provenance_mode"], "development"
             )
+            self.assertEqual(manifest["metrics"]["optimizer"], "adam")
+            self.assertEqual(manifest["metrics"]["learning_rate"], 10.0)
+            self.assertEqual(
+                manifest["metrics"]["gradient_clip_quantile"], 0.98
+            )
+            self.assertNotIn("gradient_clip_values", manifest["metrics"])
 
         for artifact_type, path in expected_paths.items():
             with self.subTest(artifact_type=artifact_type):
@@ -1442,6 +1616,8 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 "device": "cpu",
                 "iterations": 1,
                 "seed": 2026,
+                "optimizer": "adam",
+                "learning_rate_milli": 10_000,
             },
             resources={
                 "device": "cpu",

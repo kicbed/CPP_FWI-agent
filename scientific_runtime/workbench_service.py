@@ -8,12 +8,17 @@ filesystem path, shell fragment, Adapter handle, or Worker job identifier.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import copy
 import hashlib
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping
+
+from jsonschema import Draft7Validator
 
 from scientific_runtime_contracts import compute_plan_hash
 
@@ -55,12 +60,51 @@ FORM_FIELDS = frozenset(
         "device",
         "iterations",
         "seed",
+        "optimizer",
+        "learning_rate",
     }
 )
+LEGACY_FORM_FIELDS = FORM_FIELDS - {"optimizer", "learning_rate"}
+LEGACY_ALGORITHM_VERSIONS = ("1.0.0", "1.1.0")
 PRESETS = frozenset({"fwi_smoke", "fwi_demo"})
 DEVICES = frozenset({"cpu", "cuda"})
+OPTIMIZERS = frozenset({"adam", "sgd"})
+LEARNING_RATE_SCALE = 1000
+LEARNING_RATE_INPUT = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,3})?$")
+LEARNING_RATE_BOUNDS = {
+    "adam": (Decimal("0.1"), Decimal("100")),
+    "sgd": (Decimal("100000"), Decimal("1000000000")),
+}
+GRADIENT_CLIP_QUANTILE = "0.98"
+OPTIMIZATION_PROFILES = (
+    {
+        "id": "adam_verified",
+        "label": "Adam 已验证基线",
+        "optimizer": "adam",
+        "learning_rate": "10",
+        "recommendation": "recommended",
+        "evidence": "固定 Marmousi CUDA 闭环已验证；本项目默认推荐。",
+    },
+    {
+        "id": "adam_conservative",
+        "label": "Adam 保守检查",
+        "optimizer": "adam",
+        "learning_rate": "2",
+        "recommendation": "conservative",
+        "evidence": "微型 CPU smoke 已验证 finite 更新；不等同于长程收敛结论。",
+    },
+    {
+        "id": "sgd_calibration",
+        "label": "SGD 校准起点",
+        "optimizer": "sgd",
+        "learning_rate": "10000000",
+        "recommendation": "experimental",
+        "evidence": "固定 Marmousi CUDA 两步 finite/model-update 校准已通过；仍不是收敛推荐。",
+    },
+)
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+TASK_CURSOR = re.compile(r"^v1_[A-Za-z0-9_-]{2,171}$")
 
 
 class WorkbenchError(RuntimeError):
@@ -115,6 +159,36 @@ def _identity(document: Mapping[str, Any]) -> dict[str, Any]:
         key: copy.deepcopy(document[key])
         for key in ("id", "version", "content_hash", "data_type")
     }
+
+
+def _encode_task_cursor(task_id: str) -> str:
+    encoded = base64.urlsafe_b64encode(task_id.encode("ascii")).decode("ascii")
+    return "v1_" + encoded.rstrip("=")
+
+
+def _decode_task_cursor(cursor: str) -> str:
+    if not isinstance(cursor, str) or TASK_CURSOR.fullmatch(cursor) is None:
+        raise WorkbenchValidationError(
+            "INVALID_TASK_CURSOR", ["task cursor is invalid"]
+        )
+    token = cursor.removeprefix("v1_")
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        decoded = base64.b64decode(
+            padded.encode("ascii"), altchars=b"-_", validate=True
+        ).decode("ascii")
+    except (binascii.Error, UnicodeDecodeError) as error:
+        raise WorkbenchValidationError(
+            "INVALID_TASK_CURSOR", ["task cursor is invalid"]
+        ) from error
+    if (
+        OPAQUE_ID.fullmatch(decoded) is None
+        or _encode_task_cursor(decoded) != cursor
+    ):
+        raise WorkbenchValidationError(
+            "INVALID_TASK_CURSOR", ["task cursor is invalid"]
+        )
+    return decoded
 
 
 def _value(value: Any, field: str, default: Any = None) -> Any:
@@ -320,6 +394,23 @@ class GuidedWorkbench:
                 "devices": sorted(DEVICES),
                 "iterations": {"minimum": 1, "maximum": MAX_FWI_ITERATIONS},
                 "seed": {"minimum": 0, "maximum": 2147483647},
+                "optimizers": sorted(OPTIMIZERS),
+                "learning_rate": {
+                    "representation": "decimal_string",
+                    "scale": LEARNING_RATE_SCALE,
+                    "bounds": {
+                        optimizer: {
+                            "minimum": format(bounds[0], "f"),
+                            "maximum": format(bounds[1], "f"),
+                        }
+                        for optimizer, bounds in sorted(LEARNING_RATE_BOUNDS.items())
+                    },
+                },
+                "gradient_clip_quantile": {
+                    "value": GRADIENT_CLIP_QUANTILE,
+                    "editable": False,
+                },
+                "optimization_profiles": copy.deepcopy(list(OPTIMIZATION_PROFILES)),
             },
             "features": {
                 "approval_required": True,
@@ -365,15 +456,16 @@ class GuidedWorkbench:
 
     def _validated_form(
         self, form: Mapping[str, Any]
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]:
         if not isinstance(form, Mapping):
             raise WorkbenchValidationError(
                 "INVALID_FORM", ["form must be a JSON object"]
             )
         keys = set(form)
+        legacy_form = keys == LEGACY_FORM_FIELDS
         unknown = sorted(str(key) for key in keys - FORM_FIELDS)
         missing = sorted(FORM_FIELDS - keys)
-        if unknown or missing:
+        if keys not in (FORM_FIELDS, LEGACY_FORM_FIELDS):
             errors = []
             if missing:
                 errors.append("missing fields: " + ", ".join(missing))
@@ -381,7 +473,11 @@ class GuidedWorkbench:
                 errors.append("unknown fields: " + ", ".join(unknown))
             raise WorkbenchValidationError("INVALID_FORM_FIELDS", errors)
 
-        goal = form["goal"]
+        expanded = {key: copy.deepcopy(value) for key, value in form.items()}
+        if legacy_form:
+            expanded.update(optimizer="adam", learning_rate="10")
+
+        goal = expanded["goal"]
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
             raise WorkbenchValidationError(
                 "INVALID_GOAL", ["goal must contain 1-2000 non-blank characters"]
@@ -392,20 +488,23 @@ class GuidedWorkbench:
             raise WorkbenchValidationError(
                 "INVALID_GOAL", ["goal must contain valid Unicode text"]
             ) from error
-        if form["dataset_id"] != DATASET_ID or form["dataset_version"] != DATASET_VERSION:
+        if (
+            expanded["dataset_id"] != DATASET_ID
+            or expanded["dataset_version"] != DATASET_VERSION
+        ):
             raise WorkbenchValidationError(
                 "DATASET_UNSUPPORTED",
                 [f"P1 Guided supports only {DATASET_ID}@{DATASET_VERSION}"],
             )
-        if not isinstance(form["preset"], str) or form["preset"] not in PRESETS:
+        if not isinstance(expanded["preset"], str) or expanded["preset"] not in PRESETS:
             raise WorkbenchValidationError(
                 "PRESET_UNSUPPORTED", ["preset must be fwi_smoke or fwi_demo"]
             )
-        if not isinstance(form["device"], str) or form["device"] not in DEVICES:
+        if not isinstance(expanded["device"], str) or expanded["device"] not in DEVICES:
             raise WorkbenchValidationError(
                 "DEVICE_UNSUPPORTED", ["device must be cpu or cuda"]
             )
-        iterations = form["iterations"]
+        iterations = expanded["iterations"]
         if (
             type(iterations) is not int
             or not 1 <= iterations <= MAX_FWI_ITERATIONS
@@ -414,11 +513,46 @@ class GuidedWorkbench:
                 "ITERATIONS_OUT_OF_RANGE",
                 [f"iterations must be an integer from 1 to {MAX_FWI_ITERATIONS}"],
             )
-        seed = form["seed"]
+        seed = expanded["seed"]
         if type(seed) is not int or not 0 <= seed <= 2147483647:
             raise WorkbenchValidationError(
                 "SEED_OUT_OF_RANGE",
                 ["seed must be an integer from 0 to 2147483647"],
+            )
+        optimizer = expanded["optimizer"]
+        if not isinstance(optimizer, str) or optimizer not in OPTIMIZERS:
+            raise WorkbenchValidationError(
+                "OPTIMIZER_UNSUPPORTED", ["optimizer must be adam or sgd"]
+            )
+        learning_rate_text = expanded["learning_rate"]
+        if (
+            not isinstance(learning_rate_text, str)
+            or LEARNING_RATE_INPUT.fullmatch(learning_rate_text) is None
+        ):
+            raise WorkbenchValidationError(
+                "LEARNING_RATE_INVALID",
+                ["learning_rate must be a plain positive decimal with at most 3 places"],
+            )
+        try:
+            learning_rate = Decimal(learning_rate_text)
+        except InvalidOperation as error:
+            raise WorkbenchValidationError(
+                "LEARNING_RATE_INVALID", ["learning_rate is not a finite decimal"]
+            ) from error
+        minimum, maximum = LEARNING_RATE_BOUNDS[optimizer]
+        scaled = learning_rate * LEARNING_RATE_SCALE
+        if (
+            not learning_rate.is_finite()
+            or not minimum <= learning_rate <= maximum
+            or scaled != scaled.to_integral_value()
+        ):
+            raise WorkbenchValidationError(
+                "LEARNING_RATE_OUT_OF_RANGE",
+                [
+                    f"{optimizer} learning_rate must be in "
+                    f"{format(minimum, 'f')}..{format(maximum, 'f')} "
+                    "with at most 0.001 precision"
+                ],
             )
 
         dataset = self._call(
@@ -444,8 +578,12 @@ class GuidedWorkbench:
                 "GUIDED_CAPABILITY_UNAVAILABLE",
                 ["the fixed Dataset/Algorithm registration is not executable"],
             )
-        normalized = {field: copy.deepcopy(form[field]) for field in sorted(FORM_FIELDS)}
-        return normalized, dataset, manifest
+        normalized = {
+            field: copy.deepcopy(expanded[field]) for field in sorted(FORM_FIELDS)
+        }
+        normalized["learning_rate"] = format(learning_rate.normalize(), "f")
+        normalized["learning_rate_milli"] = int(scaled)
+        return normalized, dataset, manifest, legacy_form
 
     @staticmethod
     def _resources(form: Mapping[str, Any], manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -466,6 +604,37 @@ class GuidedWorkbench:
             "wall_time_seconds": wall_time,
         }
 
+    @staticmethod
+    def _optimization_suggestions(form: Mapping[str, Any]) -> list[str]:
+        optimizer = form["optimizer"]
+        learning_rate = form["learning_rate"]
+        if optimizer == "adam" and learning_rate == "10":
+            guidance = (
+                "Adam learning_rate=10 with gradient_clip_quantile=0.98 is the "
+                "verified fixed-Marmousi baseline and the recommended starting point."
+            )
+        elif optimizer == "adam" and learning_rate == "2":
+            guidance = (
+                "Adam learning_rate=2 is a conservative smoke starting point; its "
+                "micro-test evidence is not a long-run convergence guarantee."
+            )
+        elif optimizer == "sgd":
+            guidance = (
+                "SGD learning_rate=10000000 passed a fixed-Marmousi CUDA two-update "
+                "finite/model-update calibration. It remains experimental and is "
+                "not a convergence recommendation."
+            )
+        else:
+            guidance = (
+                "This custom Adam learning rate differs from the verified baseline; "
+                "inspect the loss curve and model-update metrics before drawing conclusions."
+            )
+        return [
+            guidance,
+            "Review the fixed dataset, optimizer, learning rate, resources, and "
+            "synthetic-workflow limits before approval.",
+        ]
+
     def _draft(
         self,
         *,
@@ -476,7 +645,7 @@ class GuidedWorkbench:
         revision: int,
     ) -> dict[str, Any]:
         return {
-            "schema_version": "1.0.0",
+            "schema_version": "1.1.0",
             "draft_id": draft_id,
             "revision": revision,
             "status": "AwaitingApproval",
@@ -489,13 +658,12 @@ class GuidedWorkbench:
                 "device": form["device"],
                 "iterations": form["iterations"],
                 "seed": form["seed"],
+                "optimizer": form["optimizer"],
+                "learning_rate_milli": form["learning_rate_milli"],
             },
             "resources": self._resources(form, manifest),
             "missing_fields": [],
-            "suggestions": [
-                "Review the fixed dataset, parameters, resources, and "
-                "synthetic-workflow limits before approval."
-            ],
+            "suggestions": self._optimization_suggestions(form),
             "confidence": {
                 "intent": 1.0,
                 "parameters": 1.0,
@@ -507,6 +675,77 @@ class GuidedWorkbench:
             },
             "extensions": {},
         }
+
+    def _legacy_draft_candidates(
+        self,
+        *,
+        form: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        draft_id: str,
+        revision: int,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Rebuild exact immutable seven-field Workbench request documents.
+
+        The returned drafts are read-only replay candidates.  New mutations
+        always use :meth:`_draft` and the current Algorithm version.
+        """
+
+        registered = self._call(
+            self._registry.list_algorithms, allowlisted_only=True
+        )
+        manifests = {
+            manifest.get("version"): manifest
+            for manifest in registered
+            if manifest.get("id") == ALGORITHM_ID
+            and manifest.get("version") in LEGACY_ALGORITHM_VERSIONS
+            and TASK_TYPE in manifest.get("task_types", [])
+            and manifest.get("security", {}).get("allowlisted") is True
+        }
+        candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for version in LEGACY_ALGORITHM_VERSIONS:
+            manifest = manifests.get(version)
+            if manifest is None:
+                continue
+            parameters = {
+                "preset": form["preset"],
+                "device": form["device"],
+                "iterations": form["iterations"],
+                "seed": form["seed"],
+            }
+            # A changed seven-field request can exceed an old Algorithm's own
+            # immutable bounds.  It is not a candidate for that old request,
+            # but can still be a valid new current-version mutation.
+            if not Draft7Validator(manifest["parameter_schema"]).is_valid(parameters):
+                continue
+            draft = {
+                "schema_version": "1.0.0",
+                "draft_id": draft_id,
+                "revision": revision,
+                "status": "AwaitingApproval",
+                "goal": form["goal"],
+                "task_type": TASK_TYPE,
+                "datasets": [copy.deepcopy(dict(dataset))],
+                "algorithm": {"id": manifest["id"], "version": manifest["version"]},
+                "parameters": parameters,
+                "resources": self._resources(form, manifest),
+                "missing_fields": [],
+                "suggestions": [
+                    "Review the fixed dataset, parameters, resources, and "
+                    "synthetic-workflow limits before approval."
+                ],
+                "confidence": {
+                    "intent": 1.0,
+                    "parameters": 1.0,
+                    "datasets": 1.0,
+                    "explanation": (
+                        "All executable values came from the validated Guided form "
+                        "and Registry snapshots."
+                    ),
+                },
+                "extensions": {},
+            }
+            candidates.append((draft, manifest))
+        return candidates
 
     def _plan(
         self,
@@ -537,8 +776,14 @@ class GuidedWorkbench:
             draft["resources"],
         )
         dataset = draft["datasets"][0]
+        schema_version = draft.get("schema_version")
+        if schema_version not in {"1.0.0", "1.1.0"}:
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID",
+                ["draft schema version cannot be used to compose a plan"],
+            )
         plan = {
-            "schema_version": "1.0.0",
+            "schema_version": schema_version,
             "plan_id": plan_id,
             "draft": {"draft_id": draft["draft_id"], "revision": revision},
             "task_type": TASK_TYPE,
@@ -622,7 +867,7 @@ class GuidedWorkbench:
         return _value(result, "snapshot", result)
 
     def create_task(self, form: Mapping[str, Any], key: str) -> dict[str, Any]:
-        normalized, dataset, manifest = self._validated_form(form)
+        normalized, dataset, manifest, legacy_form = self._validated_form(form)
         create_key = self._mutation_key("create", key)
         draft_id = _stable_id(
             "draft",
@@ -638,6 +883,51 @@ class GuidedWorkbench:
             draft_id=draft_id,
             revision=1,
         )
+        compatible_manifests = {manifest["version"]: manifest}
+        if legacy_form:
+            legacy_candidates = self._legacy_draft_candidates(
+                form=normalized,
+                dataset=dataset,
+                draft_id=draft_id,
+                revision=1,
+            )
+            compatible_manifests.update(
+                {candidate_manifest["version"]: candidate_manifest
+                 for _, candidate_manifest in legacy_candidates}
+            )
+            replay = self._call(
+                self._tasks.lookup_compatible_create_task,
+                drafts=[candidate for candidate, _ in legacy_candidates] + [draft],
+                idempotency_key=create_key,
+                **self._scope,
+            )
+            if replay is not None:
+                snapshot = _value(replay, "snapshot", replay)
+                original_revision = (
+                    snapshot.draft.get("draft_id") == draft_id
+                    and snapshot.draft.get("revision") == 1
+                )
+                if (
+                    original_revision
+                    and snapshot.status == "AwaitingApproval"
+                    and snapshot.plan is None
+                ):
+                    replay_version = snapshot.draft.get("algorithm", {}).get("version")
+                    replay_manifest = compatible_manifests.get(replay_version)
+                    if replay_manifest is None:
+                        raise WorkbenchRuntimeError(
+                            "SERVICE_RESPONSE_INVALID",
+                            ["replayed draft has no compatible immutable manifest"],
+                        )
+                    snapshot = self._persist_plan(
+                        snapshot=snapshot,
+                        manifest=replay_manifest,
+                        request_key=key,
+                        mutation_key=self._mutation_key("create-plan", key),
+                    )
+                result = self._project(snapshot)
+                result["replayed"] = True
+                return result
         created = self._call(
             self._tasks.create_task,
             draft=draft,
@@ -676,7 +966,7 @@ class GuidedWorkbench:
             raise WorkbenchValidationError(
                 "INVALID_REVISION", ["expected_revision must be a positive integer"]
             )
-        normalized, dataset, manifest = self._validated_form(form)
+        normalized, dataset, manifest, legacy_form = self._validated_form(form)
         current = self._call(self._tasks.get_task, task_id, **self._scope)
         current_revision = current.draft["revision"]
         target_revision = expected_revision + 1
@@ -688,20 +978,51 @@ class GuidedWorkbench:
             draft_id=current.draft["draft_id"],
             revision=target_revision,
         )
-        revised = self._call(
-            self._tasks.revise_draft,
-            task_id=task_id,
-            expected_revision=expected_revision,
-            draft=draft,
-            idempotency_key=self._mutation_key("revise", key),
-            **self._scope,
-        )
+        revised = None
+        compatible_replayed = False
+        compatible_manifests = {manifest["version"]: manifest}
+        if legacy_form:
+            legacy_candidates = self._legacy_draft_candidates(
+                form=normalized,
+                dataset=dataset,
+                draft_id=current.draft["draft_id"],
+                revision=target_revision,
+            )
+            compatible_manifests.update(
+                {candidate_manifest["version"]: candidate_manifest
+                 for _, candidate_manifest in legacy_candidates}
+            )
+            revised = self._call(
+                self._tasks.lookup_compatible_draft_revision,
+                task_id=task_id,
+                expected_revision=expected_revision,
+                drafts=[candidate for candidate, _ in legacy_candidates] + [draft],
+                idempotency_key=self._mutation_key("revise", key),
+                **self._scope,
+            )
+            compatible_replayed = revised is not None
+        if revised is None:
+            revised = self._call(
+                self._tasks.revise_draft,
+                task_id=task_id,
+                expected_revision=expected_revision,
+                draft=draft,
+                idempotency_key=self._mutation_key("revise", key),
+                **self._scope,
+            )
         snapshot = _value(revised, "snapshot", revised)
         returned_revision = snapshot.draft.get("revision")
         if returned_revision == target_revision:
+            plan_version = snapshot.draft.get("algorithm", {}).get("version")
+            plan_manifest = compatible_manifests.get(plan_version)
+            if plan_manifest is None:
+                raise WorkbenchRuntimeError(
+                    "SERVICE_RESPONSE_INVALID",
+                    ["revised draft has no compatible immutable manifest"],
+                )
             snapshot = self._persist_plan(
                 snapshot=snapshot,
-                manifest=manifest,
+                manifest=plan_manifest,
                 request_key=key,
                 mutation_key=self._mutation_key("revise-plan", key),
             )
@@ -711,7 +1032,9 @@ class GuidedWorkbench:
                 ["revision replay returned an older task aggregate"],
             )
         result = self._project(snapshot)
-        result["replayed"] = bool(_value(revised, "replayed", replay_candidate))
+        result["replayed"] = compatible_replayed or bool(
+            _value(revised, "replayed", replay_candidate)
+        )
         return result
 
     def _approval(
@@ -941,6 +1264,66 @@ class GuidedWorkbench:
             self._tasks.get_dispatch_intent, task_id, **self._scope
         )
         return self._project(snapshot, intent=intent)
+
+    def list_tasks(
+        self, cursor: str | None = None, limit: int = 20
+    ) -> dict[str, Any]:
+        """Return a bounded discovery page without touching runtime adapters."""
+
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise WorkbenchValidationError(
+                "INVALID_TASK_LIST_LIMIT", ["limit must be an integer from 1 to 50"]
+            )
+        raw_cursor = None if cursor is None else _decode_task_cursor(cursor)
+        page = self._call(
+            self._tasks.list_tasks,
+            cursor=raw_cursor,
+            limit=limit,
+            **self._scope,
+        )
+        snapshots = _value(page, "snapshots")
+        next_cursor = _value(page, "next_cursor")
+        if not isinstance(snapshots, (list, tuple)) or (
+            next_cursor is not None
+            and (not isinstance(next_cursor, str) or OPAQUE_ID.fullmatch(next_cursor) is None)
+        ):
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID", ["task list service returned an invalid page"]
+            )
+        tasks: list[dict[str, Any]] = []
+        for snapshot in snapshots:
+            if (
+                not isinstance(snapshot, TaskSnapshot)
+                or snapshot.project_id != self._project_id
+                or snapshot.principal_id != self._principal_id
+            ):
+                raise WorkbenchRuntimeError(
+                    "SERVICE_RESPONSE_INVALID", ["task list crossed its bound scope"]
+                )
+            draft = snapshot.draft
+            parameters = draft.get("parameters", {})
+            tasks.append(
+                {
+                    "task_id": snapshot.task_id,
+                    "status": snapshot.status,
+                    "goal": draft.get("goal", ""),
+                    "algorithm": copy.deepcopy(draft.get("algorithm")),
+                    "preset": parameters.get("preset"),
+                    "device": parameters.get("device"),
+                    "iterations": parameters.get("iterations"),
+                    "seed": parameters.get("seed"),
+                    "optimizer": parameters.get("optimizer"),
+                    "learning_rate_milli": parameters.get("learning_rate_milli"),
+                    "created_at": snapshot.created_at,
+                    "updated_at": snapshot.updated_at,
+                }
+            )
+        return {
+            "tasks": tasks,
+            "next_cursor": (
+                None if next_cursor is None else _encode_task_cursor(next_cursor)
+            ),
+        }
 
     def list_events(
         self, task_id: str, after_sequence: int = 0, limit: int = 100

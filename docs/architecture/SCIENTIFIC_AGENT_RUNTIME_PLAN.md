@@ -4,7 +4,7 @@
 
 - 决策编号：`D-003`
 - 决策状态：**Accepted**
-- Runtime 实现状态：**P0 + P1 Verified；按用户要求停在 P2 之前**
+- Runtime 实现状态：**P0 + P1 Verified；P2.1 有界任务发现/重开 Verified；完整 P2 仍 Pending**
 - 用户确认日期：2026-07-15
 - 实现分支：`feature/scientific-agent-runtime`
 - 基线分支：`feature/fwi-deepwave-2d-acoustic`
@@ -246,7 +246,9 @@ checkpoint 恢复仍属于 P2，P1 不伪装已具备这些能力。
 
 实现与现场验证见
 `docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md`；P1 已达到上述完成标准，P2 仍为
-Pending，未因 Guided Web 状态轮询而提前实现恢复语义。
+Pending，未因 Guided Web 状态轮询而提前实现恢复语义。后续 D-007 维护
+切片为当前 FWI 补充 Adam/SGD 与受校验学习率，并保持人工批准和单节点
+执行边界；该配置维护不等于 P2 可靠性完成。
 
 ### P2：持久任务可靠性加固
 
@@ -256,6 +258,20 @@ Pending，未因 Guided Web 状态轮询而提前实现恢复语义。
 - 取消、超时、有限重试和启动 reconciliation；
 - SSE 任务事件和浏览器刷新恢复；
 - 多任务列表，不再每个对话只保留一个 FWI job。
+
+当前只启动了一个经用户确认的有界先行切片 **P2.1 任务发现/重开**：
+
+- 从 SQLite Task Store 按 `project_id`/`principal_id` 精确限域、定界分页读取持久任务摘要；
+- 页面加载时恢复左栏发现索引，用户可重开单个任务卡；关闭卡片只关闭
+  视图，不取消或删除任务；
+- 列表 GET 不触发 Adapter status refresh，重开后仍由现有的单任务 GET 读取/轮询；
+- 轮询重绘保持用户阅读位置：只有用户原本在底部时继续跟随，显式打开/重开
+  才一次性展示任务卡。
+
+P2.1 当前为 **Verified**。它不包含自动重建运行意图、
+pending/dispatching reconciliation、取消、超时、lease/heartbeat、retry 或 SSE，
+也不会在恢复页面后为已批准但未确认 submit 的任务生成新幂等键。因此完整
+P2 仍为 **Pending**。
 
 完成标准：重复请求不重复建任务；控制面重启后恢复或明确终结任务；取消能到达 Worker；
 已提交任务不依赖浏览器连接存活。
@@ -355,3 +371,4 @@ Pending，未因 Guided Web 状态轮询而提前实现恢复语义。
 | 日期 | 变更 | 来源 |
 |---|---|---|
 | 2026-07-15 | 收紧 P0 为最小 FWI 契约；把最小 TaskService/幂等/状态查询提前到 P1；明确 SQLite/Redis 责任、执行环境指纹、确定性 Gate 和 P4 后置 | 用户提供的六项风险评估 |
+| 2026-07-15 | 增加 D-007 配置/交互维护与 P2.1 有界任务发现；不扩大到取消、重试、reconciliation 或 SSE | 用户明确报告优化器、轮询滚动和任务卡恢复三项问题并要求修复 |

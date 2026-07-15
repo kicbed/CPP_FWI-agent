@@ -18,7 +18,12 @@
     "extensions"
   ],
   "properties": {
-    "schema_version": {"$ref": "common.schema.json#/definitions/schema_version"},
+    "schema_version": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/definitions/schema_version"},
+        {"$ref": "common.schema.json#/definitions/schema_version_1_1"}
+      ]
+    },
     "id": {"$ref": "common.schema.json#/definitions/identifier"},
     "version": {"$ref": "common.schema.json#/definitions/semantic_version"},
     "task_types": {
@@ -44,7 +49,14 @@
               "type": "object",
               "additionalProperties": false,
               "required": ["enum"],
-              "properties": {"enum": {"const": ["forward", "fwi_smoke", "fwi_demo"]}}
+              "properties": {
+                "enum": {
+                  "oneOf": [
+                    {"const": ["forward", "fwi_smoke", "fwi_demo"]},
+                    {"const": ["fwi_smoke", "fwi_demo"]}
+                  ]
+                }
+              }
             },
             "device": {
               "type": "object",
@@ -58,7 +70,7 @@
               "required": ["type", "minimum", "maximum"],
               "properties": {
                 "type": {"const": "integer"},
-                "minimum": {"const": 0},
+                "minimum": {"enum": [0, 1]},
                 "maximum": {"enum": [100, 10000]}
               }
             },
@@ -68,17 +80,83 @@
               "required": ["type", "minimum"],
               "properties": {
                 "type": {"const": "integer"},
-                "minimum": {"const": 0}
+                "minimum": {"const": 0},
+                "maximum": {"const": 2147483647}
+              }
+            },
+            "optimizer": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["enum"],
+              "properties": {"enum": {"const": ["adam", "sgd"]}}
+            },
+            "learning_rate_milli": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "minimum", "maximum"],
+              "properties": {
+                "type": {"const": "integer"},
+                "minimum": {"const": 100},
+                "maximum": {"const": 1000000000000}
               }
             }
           }
         },
         "required": {
-          "type": "array",
-          "minItems": 4,
-          "maxItems": 4,
-          "items": {"enum": ["preset", "device", "iterations", "seed"]},
-          "uniqueItems": true
+          "oneOf": [
+            {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "items": {"enum": ["preset", "device", "iterations", "seed"]},
+              "uniqueItems": true
+            },
+            {
+              "type": "array",
+              "minItems": 6,
+              "maxItems": 6,
+              "items": {
+                "enum": [
+                  "preset",
+                  "device",
+                  "iterations",
+                  "seed",
+                  "optimizer",
+                  "learning_rate_milli"
+                ]
+              },
+              "uniqueItems": true
+            }
+          ]
+        },
+        "allOf": {
+          "const": [
+            {
+              "if": {
+                "properties": {"optimizer": {"const": "adam"}},
+                "required": ["optimizer"]
+              },
+              "then": {
+                "properties": {
+                  "learning_rate_milli": {"minimum": 100, "maximum": 100000}
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {"optimizer": {"const": "sgd"}},
+                "required": ["optimizer"]
+              },
+              "then": {
+                "properties": {
+                  "learning_rate_milli": {
+                    "minimum": 100000000,
+                    "maximum": 1000000000000
+                  }
+                }
+              }
+            }
+          ]
         }
       }
     },
@@ -152,5 +230,137 @@
       }
     },
     "extensions": {"$ref": "common.schema.json#/definitions/extensions"}
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"schema_version": {"const": "1.0.0"}}},
+      "then": {
+        "properties": {
+          "parameter_schema": {
+            "not": {"required": ["allOf"]},
+            "properties": {
+              "properties": {
+                "maxProperties": 4,
+                "properties": {
+                  "preset": {
+                    "properties": {
+                      "enum": {"const": ["forward", "fwi_smoke", "fwi_demo"]}
+                    }
+                  },
+                  "iterations": {
+                    "properties": {
+                      "minimum": {"const": 0}
+                    }
+                  },
+                  "seed": {
+                    "not": {"required": ["maximum"]}
+                  }
+                }
+              },
+              "required": {"maxItems": 4}
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "task_types": {"const": ["acoustic_fwi_2d"]},
+          "parameter_schema": {
+            "required": [
+              "$schema",
+              "type",
+              "additionalProperties",
+              "properties",
+              "required",
+              "allOf"
+            ],
+            "properties": {
+              "properties": {
+                "minProperties": 6,
+                "required": [
+                  "preset",
+                  "device",
+                  "iterations",
+                  "seed",
+                  "optimizer",
+                  "learning_rate_milli"
+                ],
+                "properties": {
+                  "preset": {
+                    "properties": {
+                      "enum": {"const": ["fwi_smoke", "fwi_demo"]}
+                    }
+                  }
+                }
+              },
+              "required": {"minItems": 6}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["schema_version", "version"],
+        "properties": {
+          "schema_version": {"const": "1.1.0"},
+          "version": {"const": "1.2.0"}
+        }
+      },
+      "then": {
+        "properties": {
+          "parameter_schema": {
+            "properties": {
+              "properties": {
+                "properties": {
+                  "iterations": {
+                    "properties": {
+                      "minimum": {"const": 0},
+                      "maximum": {"const": 10000}
+                    }
+                  },
+                  "seed": {
+                    "not": {"required": ["maximum"]}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["schema_version", "version"],
+        "properties": {
+          "schema_version": {"const": "1.1.0"},
+          "version": {"not": {"const": "1.2.0"}}
+        }
+      },
+      "then": {
+        "properties": {
+          "parameter_schema": {
+            "properties": {
+              "properties": {
+                "properties": {
+                  "iterations": {
+                    "properties": {
+                      "minimum": {"const": 1},
+                      "maximum": {"const": 10000}
+                    }
+                  },
+                  "seed": {
+                    "required": ["maximum"],
+                    "properties": {
+                      "maximum": {"const": 2147483647}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

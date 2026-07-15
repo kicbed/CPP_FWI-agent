@@ -26,6 +26,7 @@ _CONTENT_LENGTH = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _BAD_ENCODED_PATH = re.compile(r"%(?:00|25|2e|2f|5c)", re.IGNORECASE)
 _PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _QUERY = re.compile(r"^[A-Za-z0-9_=&-]+$")
+_TASK_CURSOR = re.compile(r"^v1_[A-Za-z0-9_-]{2,171}$")
 
 _MUTATION_ENDPOINTS = frozenset({"create_task", "revise_task", "approve", "abandon"})
 _FORM_FIELDS = frozenset(
@@ -37,6 +38,8 @@ _FORM_FIELDS = frozenset(
         "device",
         "iterations",
         "seed",
+        "optimizer",
+        "learning_rate",
     }
 )
 _ALLOWED_ARTIFACT_TYPES = {
@@ -81,7 +84,7 @@ class _ApplicationInvariantError(RuntimeError):
 @dataclass(frozen=True)
 class _Route:
     endpoint: str
-    allowed_method: str
+    allowed_methods: tuple[str, ...]
     task_id: str | None = None
     artifact_id: str | None = None
 
@@ -90,7 +93,7 @@ class _Route:
 class _RequestContext:
     headers: dict[str, str]
     route: _Route
-    query: dict[str, int]
+    query: dict[str, int | str]
     idempotency_key: str
 
 
@@ -312,11 +315,11 @@ def _decode_request_path(raw_target: str) -> tuple[str, str | None]:
 
 def _route(path: str) -> _Route:
     if path == f"{API_PREFIX}/session":
-        return _Route("session", "GET")
+        return _Route("session", ("GET",))
     if path == f"{API_PREFIX}/catalog":
-        return _Route("catalog", "GET")
+        return _Route("catalog", ("GET",))
     if path == f"{API_PREFIX}/tasks":
-        return _Route("create_task", "POST")
+        return _Route("task_collection", ("GET", "POST"))
 
     prefix = f"{API_PREFIX}/tasks/"
     if not path.startswith(prefix):
@@ -326,14 +329,14 @@ def _route(path: str) -> _Route:
     if _OPAQUE_ID.fullmatch(task_id) is None:
         raise _RequestError(400, "INVALID_IDENTITY", "request identity is invalid")
     if len(parts) == 1:
-        return _Route("get_task", "GET", task_id=task_id)
+        return _Route("get_task", ("GET",), task_id=task_id)
     if len(parts) == 2:
         endpoints = {
-            "draft": ("revise_task", "PUT"),
-            "approve": ("approve", "POST"),
-            "abandon": ("abandon", "POST"),
-            "events": ("events", "GET"),
-            "artifacts": ("artifacts", "GET"),
+            "draft": ("revise_task", ("PUT",)),
+            "approve": ("approve", ("POST",)),
+            "abandon": ("abandon", ("POST",)),
+            "events": ("events", ("GET",)),
+            "artifacts": ("artifacts", ("GET",)),
         }
         matched = endpoints.get(parts[1])
         if matched is not None:
@@ -344,31 +347,42 @@ def _route(path: str) -> _Route:
             raise _RequestError(400, "INVALID_IDENTITY", "request identity is invalid")
         return _Route(
             "artifact_content",
-            "GET",
+            ("GET",),
             task_id=task_id,
             artifact_id=artifact_id,
         )
     raise _RequestError(404, "NOT_FOUND", "requested resource was not found")
 
 
-def _query_values(route: _Route, raw_query: str | None) -> dict[str, int]:
+def _query_values(route: _Route, raw_query: str | None) -> dict[str, int | str]:
     if raw_query is None:
         return {}
-    if route.endpoint != "events" or _QUERY.fullmatch(raw_query) is None:
+    if route.endpoint not in {"events", "task_collection"} or _QUERY.fullmatch(raw_query) is None:
         raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
-    values: dict[str, int] = {}
+    values: dict[str, int | str] = {}
+    allowed = (
+        {"after_sequence", "limit"}
+        if route.endpoint == "events"
+        else {"cursor", "limit"}
+    )
     for item in raw_query.split("&"):
         if item.count("=") != 1:
             raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
         key, raw_value = item.split("=", 1)
-        if key not in {"after_sequence", "limit"} or key in values or not raw_value.isascii():
+        if key not in allowed or key in values or not raw_value.isascii():
             raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
+        if key == "cursor":
+            if _TASK_CURSOR.fullmatch(raw_value) is None:
+                raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
+            values[key] = raw_value
+            continue
         if not raw_value.isdigit() or (len(raw_value) > 1 and raw_value.startswith("0")):
             raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
         number = int(raw_value)
         if key == "after_sequence" and not 0 <= number <= 2**63 - 1:
             raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
-        if key == "limit" and not 1 <= number <= 100:
+        maximum_limit = 50 if route.endpoint == "task_collection" else 100
+        if key == "limit" and not 1 <= number <= maximum_limit:
             raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
         values[key] = number
     return values
@@ -453,10 +467,19 @@ def _application_error(error: Exception) -> APIResponse:
 def _validated_form(
     payload: Mapping[str, Any], *, revision: bool
 ) -> tuple[dict[str, Any], int | None]:
-    expected = _FORM_FIELDS | ({"expected_revision"} if revision else set())
-    if set(payload) != expected:
+    revision_fields = {"expected_revision"} if revision else set()
+    supplied_form_fields = set(payload) - revision_fields
+    legacy_form_fields = _FORM_FIELDS - {"optimizer", "learning_rate"}
+    if (
+        supplied_form_fields not in (_FORM_FIELDS, legacy_form_fields)
+        or (revision and "expected_revision" not in payload)
+        or (not revision and "expected_revision" in payload)
+    ):
         raise _RequestError(422, "INVALID_FORM", "request validation failed")
-    form = {key: payload[key] for key in _FORM_FIELDS}
+    form = {key: payload[key] for key in supplied_form_fields}
+    # Preserve the seven-field wire shape until the Workbench can perform an
+    # exact durable replay check.  It applies Adam/LR=10 only after that check;
+    # partial optimizer input remains invalid.
     if not revision:
         return form, None
     expected_revision = payload["expected_revision"]
@@ -613,12 +636,12 @@ class WorkbenchAPI:
         path, raw_query = _decode_request_path(raw_target)
         route = _route(path)
         query = _query_values(route, raw_query)
-        if method != route.allowed_method:
+        if method not in route.allowed_methods:
             raise _RequestError(
                 405,
                 "METHOD_NOT_ALLOWED",
                 "request method is not allowed",
-                extra_headers={"Allow": route.allowed_method},
+                extra_headers={"Allow": ", ".join(route.allowed_methods)},
             )
 
         if route.endpoint != "session":
@@ -629,6 +652,17 @@ class WorkbenchAPI:
                 raise _RequestError(403, "CSRF_FORBIDDEN", "CSRF token is invalid")
 
         key = ""
+        endpoint = (
+            "list_tasks"
+            if route.endpoint == "task_collection" and method == "GET"
+            else "create_task"
+            if route.endpoint == "task_collection"
+            else route.endpoint
+        )
+        route = _Route(endpoint, route.allowed_methods, route.task_id, route.artifact_id)
+        if route.endpoint == "create_task" and query:
+            raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
+
         if route.endpoint in _MUTATION_ENDPOINTS:
             origin = normalized.get("origin")
             if origin is None or origin not in self._allowed_origins:
@@ -697,6 +731,14 @@ class WorkbenchAPI:
                 return _success_response(data)
             if route.endpoint == "catalog":
                 return _success_response(self._application.list_catalog())
+            if route.endpoint == "list_tasks":
+                result = self._application.list_tasks(
+                    cursor=query.get("cursor"),
+                    limit=query.get("limit", 20),
+                )
+                if not isinstance(result, Mapping):
+                    raise _ApplicationInvariantError("invalid task list result")
+                return _success_response(result)
             if route.endpoint == "create_task":
                 form, _ = _validated_form(payload, revision=False)
                 return _success_response(self._application.create_task(form, key), status=201)

@@ -148,9 +148,21 @@ curl --fail --silent http://127.0.0.1:50052/health
 预期出现 Guided FWI 表单，而不是旧 `fwi_job_submitted` 结果或一段示例代码。表单应显示：
 
 - session scope 与 P1 capability；
-- 固定 `marmousi_94_288@1.0.0` 数据和 `deepwave.acoustic_fwi@1.1.0` 算法；
-- 只有实验目标、注册数据、preset、device、iterations 和 seed 等受控字段，没有服务器
+- 固定 `marmousi_94_288@1.0.0` 数据和当前 `deepwave.acoustic_fwi@1.3.0` 算法；
+- 只有实验目标、注册数据、preset、device、iterations、seed、optimizer 和 learning rate
+  等受控字段，没有服务器
   路径、shell 或 Worker job ID 输入。
+- 当前标准 manifest 只提供 `fwi_smoke|fwi_demo` 反演 preset，不把 legacy Worker/MCP
+  `forward` 显示为可选 Algorithm capability。
+
+自然语言请求如果没有明确写 CUDA/GPU，表单安全默认 CPU 并给出提示；系统不会
+在创建或运行后自动切换已确认 task 的 device。
+
+浏览器始终发送完整九个 form 字段，revise 另带 `expected_revision`。`/v1` API 仅为既有
+loopback 客户端保留精确历史七个 form 字段（revise 仍要求 `expected_revision`）：同 key
+升级重放会用旧 1.0/1.1 composer 重建并精确匹配 durable request hash；未命中历史记录才补为
+Adam/LR 10 后按当前 `1.3.0` 处理。只提供 optimizer/learning rate 之一或其他部分 form
+shape 必须返回 422，同 key 不同 payload 必须冲突。
 
 纯理论问句“什么是 FWI？只解释，不要运行任务。”仍应走聊天，不打开执行卡。
 
@@ -164,12 +176,19 @@ curl --fail --silent http://127.0.0.1:50052/health
 | device | `cuda` | `cpu` |
 | iterations | `1` | `1` |
 | seed | `20260715` | `20260715` |
+| optimizer | `adam` | `adam` |
+| learning rate | `10` | `10` |
 
 点击 **生成 Draft / Plan 确认卡**。预期：
 
 - 显示真实 `task_id`、draft revision 1、单节点 plan 和 64 位 `plan_hash`；
+- 确认卡显示 Adam/LR 10 为固定 Marmousi 已验证基线、`gradient_clip_quantile=0.98`
+  为版本固定值，持久 Draft/Plan 中的学习率为 `learning_rate_milli=10000`；
 - task 为 `AwaitingApproval`，页面明确显示“批准前不会进入运行队列”；
 - `FWI_RUN_ROOT` 没有因为创建确认卡而新增 Worker job。
+
+选择 **SGD 校准起点** 时，卡片应说明 LR `10000000` 已通过固定 Marmousi CUDA
+两步 finite/model-update 校准，但仍是实验性起点而非长程收敛推荐。
 
 点击 **修改**，把 seed 改为 `20260716`，再点击 **重新生成确认卡**。预期 revision
 变为 2，`plan_hash` 改变，仍为 `AwaitingApproval`。
@@ -183,7 +202,11 @@ pre-runtime 草稿，没有发送运行中 cancel。放弃后重新打开 Smoke 
 把 iterations 改为 `10000`，只点击 **生成 Draft / Plan 确认卡**，不要批准。预期：
 
 - 表单接受整数 10000，Draft/Plan 保留该值并停在 `AwaitingApproval`；
-- 算法版本为 `deepwave.acoustic_fwi@1.1.0`，旧 `1.0.0` 快照仍保持上限 100；
+- 当前算法版本为 `deepwave.acoustic_fwi@1.3.0`；旧 `1.0.0` 快照仍保持上限 100，
+  `1.1.0` 保留 10000 上限，`1.2.0` 保留不可变六参数历史快照；三者均只供
+  严格读兼容，不供新 Guided 任务选择；
+- 当前 `1.3.0` manifest 必须同时体现 FWI-only、iterations `1..10000`、seed
+  `0..2147483647` 和 Adam/SGD 各自的条件学习率边界；
 - 页面显示长任务警告，且创建确认卡不会新增 Worker job；
 - 点击 **放弃草稿** 后变为 `Cancelled`。
 
@@ -205,13 +228,26 @@ retry 或完成时间保证。
 
 如 approval 已持久化但 submit 预检失败，页面应停止自动轮询，显示
 **继续已批准提交（复用原 Idempotency-Key）**。这是由用户显式重放同一 approve/submit
-mutation，不是 P2 task retry。Artifact GET 临时失败或不足两个时，应显示
+mutation，不是 P2 task retry。approve 即使返回结构化 4xx，只要没有合法成功 projection，
+页面也必须先保留原 key 并进入 GET 审计态，期间不能关闭/重开来清掉该 key。Artifact GET
+临时失败或不足两个时，应显示
 **重新获取 artifacts（GET）**，不重跑 Worker。
 
-### 5.5 重启边界
+### 5.5 轮询不抢占滚动位置
 
-`./stop.sh` 后用 `./start.sh --no-build` 重启，SQLite 终态、事件和 artifact 仍可通过已知
-`task_id` 查询。P1 页面不持久化当前卡、不提供任务列表或刷新后自动恢复；这些仍属 P2。
+任务运行时向上滚动阅读其他内容，等待至少两次状态刷新。预期 `scrollTop` 保持，
+不会每次被拉到最下方。用户自己滚回底部后，后续轮询才继续跟随底部；显式
+打开或重开 task 时可一次性把任务卡展示到视口。
+
+### 5.6 关闭卡片、左栏找回与重启边界
+
+点击 Guided 任务卡的 `×`，预期页面明确说明只关闭视图、不取消任务；同一 task
+仍出现在左栏“持久 FWI 任务”中，点击后可重开。刷新整个页面后，左栏应再次从
+SQLite 发现 task，而不是从聊天记录或 `localStorage` 猜测。
+
+`./stop.sh` 后用 `./start.sh --no-build` 重启，左栏仍应发现原 task；重开后 SQLite 终态、
+事件和 artifact 仍可查询。这一 P2-001 切片只是发现/重开，不代表 cancel、retry、
+lease/reconciliation 或 SSE 已实现。
 
 ## 6. 验收 legacy MCP/FWI Result 兼容性（自动化）
 
@@ -228,7 +264,7 @@ python3 -m unittest discover -s web/tests -p 'test_*.py' -v
 node web/tests/ui_message_rendering_test.js
 ```
 
-当前预期为 Web/Workbench Python 27/27 PASS，UI Node 输出
+当前预期为 Web/Workbench Python 29/29 PASS，UI Node 输出
 `ui message rendering tests passed`。这组测试同时证明执行型文本先进入 Guided、纯理论文本仍
 走聊天、旧结果不会把无合法回执的说明或代码误标成已提交，并覆盖旧 artifact 路径/后缀边界。
 如要人工查看旧 Worker 目录、六张 PNG 或 `metrics.json`，只使用已经由兼容 MCP 或 Worker

@@ -1,0 +1,102 @@
+{
+  "schema_version": "1.1.0",
+  "id": "deepwave.acoustic_fwi",
+  "version": "1.3.0",
+  "task_types": ["acoustic_fwi_2d"],
+  "parameter_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "preset": {"enum": ["fwi_smoke", "fwi_demo"]},
+      "device": {"enum": ["cpu", "cuda"]},
+      "iterations": {"type": "integer", "minimum": 1, "maximum": 10000},
+      "seed": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+      "optimizer": {"enum": ["adam", "sgd"]},
+      "learning_rate_milli": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 1000000000000
+      }
+    },
+    "required": [
+      "preset",
+      "device",
+      "iterations",
+      "seed",
+      "optimizer",
+      "learning_rate_milli"
+    ],
+    "allOf": [
+      {
+        "if": {
+          "properties": {"optimizer": {"const": "adam"}},
+          "required": ["optimizer"]
+        },
+        "then": {
+          "properties": {
+            "learning_rate_milli": {"minimum": 100, "maximum": 100000}
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {"optimizer": {"const": "sgd"}},
+          "required": ["optimizer"]
+        },
+        "then": {
+          "properties": {
+            "learning_rate_milli": {
+              "minimum": 100000000,
+              "maximum": 1000000000000
+            }
+          }
+        }
+      }
+    ]
+  },
+  "inputs": [
+    {"port": "model", "data_type": "velocity_model_2d"}
+  ],
+  "outputs": [
+    {"port": "inverted_model", "data_type": "inverted_velocity_model_2d"},
+    {"port": "loss", "data_type": "loss_curve"}
+  ],
+  "resource_limits": {
+    "devices": ["cpu", "cuda"],
+    "max_gpu_count": 1,
+    "max_cpu_cores": 16,
+    "max_memory_mb": 65536,
+    "max_wall_time_seconds": 7200
+  },
+  "security": {
+    "allowlisted": true,
+    "side_effects": ["compute", "write_artifacts"],
+    "arbitrary_paths": false,
+    "shell": false,
+    "network_access": false
+  },
+  "adapter": {
+    "protocol": "algorithm-adapter-v1",
+    "version": "1.3.0",
+    "entrypoint_ref": "fwi.deepwave_adapter",
+    "methods": ["validate", "estimate", "submit", "status", "cancel", "collect"],
+    "idempotent_submit": true,
+    "checkpoint_capable": false
+  },
+  "extensions": {
+    "org.agent_rpc.fwi_guidance": {
+      "gradient_clip_quantile": "0.98",
+      "verified_profile": {
+        "optimizer": "adam",
+        "learning_rate_milli": 10000,
+        "evidence_scope": {
+          "dataset_id": "marmousi_94_288",
+          "dataset_version": "1.0.0",
+          "device": "cuda",
+          "claim": "bounded synthetic workflow evidence, not general convergence"
+        }
+      }
+    }
+  }
+}

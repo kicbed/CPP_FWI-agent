@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import sqlite3
 import tempfile
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scientific_runtime.registry_service import RegistryService
+from scientific_runtime.fwi_registry import load_deepwave_manifest
 from scientific_runtime.task_dispatcher import DispatchPreparation
 from scientific_runtime.task_service import TaskService
 from scientific_runtime.task_store import SQLiteTaskStore
@@ -18,10 +20,10 @@ from scientific_runtime.workbench_service import (
     WorkbenchConflict,
     WorkbenchNotFound,
     WorkbenchValidationError,
+    _stable_id,
 )
 from scientific_runtime_contracts import schema_errors
 from tests.test_scientific_runtime_contracts import (
-    algorithm_manifest,
     artifact_manifest,
     dataset_ref,
     fingerprint,
@@ -42,13 +44,24 @@ def guided_form(**changes):
         "device": "cuda",
         "iterations": 2,
         "seed": 2026,
+        "optimizer": "adam",
+        "learning_rate": "10",
     }
     value.update(changes)
     return value
 
 
+def legacy_guided_form(**changes):
+    value = guided_form(**changes)
+    value.pop("optimizer")
+    value.pop("learning_rate")
+    return value
+
+
 def development_fingerprint() -> dict:
     value = fingerprint()
+    value["algorithm"]["version"] = "1.3.0"
+    value["adapter_version"] = "1.3.0"
     value["provenance_mode"] = "development"
     value["source"] = {"identity_complete": False, "dirty": None}
     return value
@@ -71,7 +84,7 @@ class FakeDispatcher:
         ]
         return DispatchPreparation(
             adapter_id="fwi.deepwave_adapter",
-            adapter_version="1.1.0",
+            adapter_version="1.3.0",
             request=request,
             queue_fingerprint=queue_fingerprint,
         )
@@ -88,7 +101,7 @@ class FakeDispatcher:
             "plan_hash": intent.plan_hash,
             "request_hash": "sha256:" + "a" * 64,
             "algorithm": copy.deepcopy(intent.request["algorithm"]),
-            "fingerprint": fingerprint(),
+            "fingerprint": development_fingerprint(),
             "adapter_version": intent.adapter_version,
         }
 
@@ -127,7 +140,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.store = SQLiteTaskStore(Path(self.temporary.name) / "tasks.sqlite3")
         self.registry = RegistryService(self.store, clock=lambda: NOW)
         self.registry.register_dataset(dataset=dataset_ref())
-        self.registry.register_algorithm(manifest=algorithm_manifest())
+        self.registry.register_algorithm(manifest=load_deepwave_manifest())
         self.dispatcher = FakeDispatcher()
         self.task_number = 0
 
@@ -161,6 +174,56 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def legacy_draft(
+        self,
+        *,
+        version: str,
+        form: dict,
+        draft_id: str,
+        revision: int,
+    ) -> dict:
+        manifest = load_deepwave_manifest(version)
+        self.registry.register_algorithm(manifest=manifest)
+        dataset = self.registry.get_dataset(
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            dataset_id="marmousi_94_288",
+            version="1.0.0",
+            permission="execute",
+        )
+        return {
+            "schema_version": "1.0.0",
+            "draft_id": draft_id,
+            "revision": revision,
+            "status": "AwaitingApproval",
+            "goal": form["goal"],
+            "task_type": "acoustic_fwi_2d",
+            "datasets": [copy.deepcopy(dataset)],
+            "algorithm": {"id": manifest["id"], "version": version},
+            "parameters": {
+                "preset": form["preset"],
+                "device": form["device"],
+                "iterations": form["iterations"],
+                "seed": form["seed"],
+            },
+            "resources": self.workbench._resources(form, manifest),
+            "missing_fields": [],
+            "suggestions": [
+                "Review the fixed dataset, parameters, resources, and "
+                "synthetic-workflow limits before approval."
+            ],
+            "confidence": {
+                "intent": 1.0,
+                "parameters": 1.0,
+                "datasets": 1.0,
+                "explanation": (
+                    "All executable values came from the validated Guided form "
+                    "and Registry snapshots."
+                ),
+            },
+            "extensions": {},
+        }
+
     def test_capabilities_and_catalog_are_fixed_scoped_and_path_free(self) -> None:
         capabilities = self.workbench.session_capabilities()
         self.assertEqual(capabilities["mode"], "guided")
@@ -173,9 +236,33 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(
             capabilities["form"]["iterations"], {"minimum": 1, "maximum": 10000}
         )
+        self.assertEqual(capabilities["form"]["optimizers"], ["adam", "sgd"])
+        self.assertEqual(
+            capabilities["form"]["learning_rate"],
+            {
+                "representation": "decimal_string",
+                "scale": 1000,
+                "bounds": {
+                    "adam": {"minimum": "0.1", "maximum": "100"},
+                    "sgd": {"minimum": "100000", "maximum": "1000000000"},
+                },
+            },
+        )
+        self.assertEqual(
+            capabilities["form"]["gradient_clip_quantile"],
+            {"value": "0.98", "editable": False},
+        )
+        self.assertEqual(
+            [profile["recommendation"] for profile in capabilities["form"]["optimization_profiles"]],
+            ["recommended", "conservative", "experimental"],
+        )
+        self.assertIn(
+            "CUDA 两步 finite/model-update 校准已通过",
+            capabilities["form"]["optimization_profiles"][2]["evidence"],
+        )
         self.assertEqual(
             capabilities["algorithm"],
-            {"id": "deepwave.acoustic_fwi", "version": "1.1.0"},
+            {"id": "deepwave.acoustic_fwi", "version": "1.3.0"},
         )
         self.assertEqual(
             capabilities["capabilities"],
@@ -193,7 +280,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(catalog["datasets"][0]["id"], "marmousi_94_288")
         self.assertNotIn("access_scope", catalog["datasets"][0])
         self.assertEqual(len(catalog["algorithms"]), 1)
-        self.assertEqual(catalog["algorithms"][0]["version"], "1.1.0")
+        self.assertEqual(catalog["algorithms"][0]["version"], "1.3.0")
         serialized = repr(catalog)
         self.assertNotIn("entrypoint_ref", serialized)
         self.assertNotIn("/root/", serialized)
@@ -209,6 +296,10 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(snapshot.plan["nodes"][0]["node_id"], "invert")
         self.assertEqual(snapshot.plan["nodes"][0]["dependencies"], [])
         self.assertEqual(snapshot.draft["resources"]["gpu_count"], 1)
+        self.assertEqual(snapshot.draft["schema_version"], "1.1.0")
+        self.assertEqual(snapshot.plan["schema_version"], "1.1.0")
+        self.assertEqual(snapshot.draft["parameters"]["optimizer"], "adam")
+        self.assertEqual(snapshot.draft["parameters"]["learning_rate_milli"], 10000)
         self.assertNotIn("idempotency_key", result["plan"]["nodes"][0])
         self.assertIsNone(result["dispatch"])
 
@@ -226,6 +317,145 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                 guided_form(iterations=3), "http-create-replay"
             )
         self.assertEqual(caught.exception.code, "IDEMPOTENCY_CONFLICT")
+
+    def test_seven_field_create_replays_exact_legacy_versions_and_completes_old_plan(self) -> None:
+        for version in ("1.0.0", "1.1.0"):
+            with self.subTest(version=version):
+                key = f"legacy-create-{version}"
+                form = legacy_guided_form()
+                draft_id = _stable_id(
+                    "draft", PROJECT_ID, PRINCIPAL_ID, 1, key
+                )
+                old_draft = self.legacy_draft(
+                    version=version,
+                    form=form,
+                    draft_id=draft_id,
+                    revision=1,
+                )
+                seeded = self.tasks.create_task(
+                    draft=old_draft,
+                    idempotency_key=self.workbench._mutation_key("create", key),
+                    project_id=PROJECT_ID,
+                    principal_id=PRINCIPAL_ID,
+                )
+                self.assertIsNone(seeded.snapshot.plan)
+                before_task_number = self.task_number
+
+                replay = self.workbench.create_task(form, key)
+                snapshot = self.store.get_task(seeded.snapshot.task_id)
+                self.assertTrue(replay["replayed"])
+                self.assertEqual(replay["task_id"], seeded.snapshot.task_id)
+                self.assertEqual(self.task_number, before_task_number)
+                self.assertEqual(snapshot.draft, old_draft)
+                self.assertEqual(snapshot.plan["schema_version"], "1.0.0")
+                self.assertEqual(snapshot.plan["nodes"][0]["algorithm"]["version"], version)
+                self.assertEqual(snapshot.plan["nodes"][0]["parameters"], old_draft["parameters"])
+
+                exact_again = self.workbench.create_task(form, key)
+                self.assertTrue(exact_again["replayed"])
+                self.assertEqual(exact_again["plan"], replay["plan"])
+                with self.assertRaises(WorkbenchConflict) as caught:
+                    self.workbench.create_task(
+                        dict(form, goal="different durable request"), key
+                    )
+                self.assertEqual(caught.exception.code, "IDEMPOTENCY_CONFLICT")
+
+        new_key = "seven-field-current-create"
+        current = self.workbench.create_task(legacy_guided_form(), new_key)
+        current_snapshot = self.store.get_task(current["task_id"])
+        self.assertFalse(current["replayed"])
+        self.assertEqual(current_snapshot.draft["algorithm"]["version"], "1.3.0")
+        self.assertEqual(current_snapshot.draft["parameters"]["optimizer"], "adam")
+        self.assertEqual(current_snapshot.draft["parameters"]["learning_rate_milli"], 10_000)
+        current_replay = self.workbench.create_task(legacy_guided_form(), new_key)
+        self.assertTrue(current_replay["replayed"])
+        self.assertEqual(current_replay["task_id"], current["task_id"])
+
+    def test_seven_field_create_and_revise_replay_old_hash_after_later_revision(self) -> None:
+        create_key = "legacy-delayed-create"
+        create_form = legacy_guided_form()
+        draft_id = _stable_id("draft", PROJECT_ID, PRINCIPAL_ID, 1, create_key)
+        initial = self.legacy_draft(
+            version="1.1.0",
+            form=create_form,
+            draft_id=draft_id,
+            revision=1,
+        )
+        created = self.tasks.create_task(
+            draft=initial,
+            idempotency_key=self.workbench._mutation_key("create", create_key),
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+        )
+
+        revise_key = "legacy-delayed-revise"
+        revise_form = legacy_guided_form(device="cpu", iterations=3, seed=7)
+        revision = self.legacy_draft(
+            version="1.1.0",
+            form=revise_form,
+            draft_id=draft_id,
+            revision=2,
+        )
+        self.tasks.revise_draft(
+            task_id=created.snapshot.task_id,
+            expected_revision=1,
+            draft=revision,
+            idempotency_key=self.workbench._mutation_key("revise", revise_key),
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+        )
+
+        delayed_create = self.workbench.create_task(create_form, create_key)
+        self.assertTrue(delayed_create["replayed"])
+        self.assertEqual(delayed_create["draft"]["revision"], 2)
+        self.assertIsNone(delayed_create["plan"])
+
+        delayed_revision = self.workbench.revise_task(
+            created.snapshot.task_id, 1, revise_form, revise_key
+        )
+        self.assertTrue(delayed_revision["replayed"])
+        self.assertEqual(delayed_revision["draft"]["revision"], 2)
+        self.assertEqual(delayed_revision["draft"]["algorithm"]["version"], "1.1.0")
+        self.assertEqual(delayed_revision["plan"]["nodes"][0]["parameters"], revision["parameters"])
+        self.assertEqual(
+            self.store.get_task(created.snapshot.task_id).plan["schema_version"],
+            "1.0.0",
+        )
+
+        with self.assertRaises(WorkbenchConflict) as caught:
+            self.workbench.revise_task(
+                created.snapshot.task_id,
+                1,
+                dict(revise_form, iterations=4),
+                revise_key,
+            )
+        self.assertEqual(caught.exception.code, "IDEMPOTENCY_CONFLICT")
+
+        other = self.workbench.create_task(
+            guided_form(), "legacy-revise-other-task-create"
+        )
+        with self.assertRaises(WorkbenchConflict) as caught:
+            self.workbench.revise_task(other["task_id"], 1, revise_form, revise_key)
+        self.assertEqual(caught.exception.code, "IDEMPOTENCY_CONFLICT")
+
+        current = self.workbench.revise_task(
+            created.snapshot.task_id,
+            2,
+            legacy_guided_form(iterations=4, seed=8),
+            "seven-field-current-revise",
+        )
+        self.assertFalse(current["replayed"])
+        self.assertEqual(current["draft"]["revision"], 3)
+        self.assertEqual(current["draft"]["algorithm"]["version"], "1.3.0")
+        self.assertEqual(current["draft"]["parameters"]["optimizer"], "adam")
+        current_replay = self.workbench.revise_task(
+            created.snapshot.task_id,
+            2,
+            legacy_guided_form(iterations=4, seed=8),
+            "seven-field-current-revise",
+        )
+        self.assertTrue(current_replay["replayed"])
+        self.assertEqual(current_replay["draft"]["revision"], 3)
 
     def test_form_rejects_browser_execution_controls_and_boolean_integers(self) -> None:
         for forbidden in ("path", "shell", "handle", "job_id", "extra_args"):
@@ -257,6 +487,125 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                         guided_form(iterations=value), f"bad-iterations-{index}"
                     )
                 self.assertEqual(caught.exception.code, "ITERATIONS_OUT_OF_RANGE")
+
+    def test_optimizer_profiles_are_hash_bound_and_invalid_values_create_nothing(self) -> None:
+        sgd = self.workbench.create_task(
+            guided_form(optimizer="sgd", learning_rate="10000000"),
+            "create-sgd-profile",
+        )
+        snapshot = self.store.get_task(sgd["task_id"])
+        self.assertEqual(
+            snapshot.draft["parameters"],
+            {
+                "preset": "fwi_smoke",
+                "device": "cuda",
+                "iterations": 2,
+                "seed": 2026,
+                "optimizer": "sgd",
+                "learning_rate_milli": 10_000_000_000,
+            },
+        )
+        self.assertEqual(
+            snapshot.plan["nodes"][0]["parameters"],
+            snapshot.draft["parameters"],
+        )
+        self.assertIn("experimental", " ".join(snapshot.draft["suggestions"]).lower())
+        before = self.task_number
+
+        invalid = (
+            ({"optimizer": "rmsprop"}, "OPTIMIZER_UNSUPPORTED"),
+            ({"optimizer": True}, "OPTIMIZER_UNSUPPORTED"),
+            ({"learning_rate": 10}, "LEARNING_RATE_INVALID"),
+            ({"learning_rate": "01"}, "LEARNING_RATE_INVALID"),
+            ({"learning_rate": "1e1"}, "LEARNING_RATE_INVALID"),
+            ({"learning_rate": "+10"}, "LEARNING_RATE_INVALID"),
+            ({"learning_rate": "10.0000"}, "LEARNING_RATE_INVALID"),
+            ({"learning_rate": "0.099"}, "LEARNING_RATE_OUT_OF_RANGE"),
+            ({"learning_rate": "100.001"}, "LEARNING_RATE_OUT_OF_RANGE"),
+            (
+                {"optimizer": "sgd", "learning_rate": "99999.999"},
+                "LEARNING_RATE_OUT_OF_RANGE",
+            ),
+            (
+                {"optimizer": "sgd", "learning_rate": "1000000000.001"},
+                "LEARNING_RATE_OUT_OF_RANGE",
+            ),
+        )
+        for index, (changes, code) in enumerate(invalid):
+            with self.subTest(changes=changes):
+                with self.assertRaises(WorkbenchValidationError) as caught:
+                    self.workbench.create_task(
+                        guided_form(**changes), f"invalid-optimizer-{index}"
+                    )
+                self.assertEqual(caught.exception.code, code)
+        self.assertEqual(self.task_number, before)
+
+    def test_task_discovery_is_paginated_scope_bound_and_read_only(self) -> None:
+        created = [
+            self.workbench.create_task(guided_form(goal=f"task {index}"), f"list-{index}")
+            for index in range(3)
+        ]
+        status_calls = self.dispatcher.status_calls
+
+        first = self.workbench.list_tasks(limit=2)
+        self.assertEqual(
+            [item["task_id"] for item in first["tasks"]],
+            [created[2]["task_id"], created[1]["task_id"]],
+        )
+        self.assertRegex(first["next_cursor"], r"^v1_[A-Za-z0-9_-]+$")
+        self.assertEqual(first["tasks"][0]["optimizer"], "adam")
+        self.assertEqual(first["tasks"][0]["learning_rate_milli"], 10_000)
+
+        second = self.workbench.list_tasks(cursor=first["next_cursor"], limit=2)
+        self.assertEqual(
+            [item["task_id"] for item in second["tasks"]],
+            [created[0]["task_id"]],
+        )
+        self.assertIsNone(second["next_cursor"])
+        self.assertEqual(self.dispatcher.status_calls, status_calls)
+        serialized = repr(first)
+        self.assertNotIn("access_scope", serialized)
+        self.assertNotIn("entrypoint_ref", serialized)
+        self.assertNotIn("job_id", serialized)
+
+        foreign_draft = copy.deepcopy(self.store.get_task(created[0]["task_id"]).draft)
+        foreign_draft["draft_id"] = "draft-foreign-list"
+        foreign = self.store.create_task(
+            task_id="task-foreign-list",
+            project_id="other-project",
+            principal_id="other-user",
+            draft=foreign_draft,
+            idempotency_key="foreign-list-task",
+            request_hash="sha256:" + "d" * 64,
+            now=NOW,
+        )
+
+        def encoded_cursor(task_id: str) -> str:
+            token = base64.urlsafe_b64encode(task_id.encode("ascii")).decode("ascii")
+            return "v1_" + token.rstrip("=")
+
+        failures = []
+        for cursor in (
+            encoded_cursor(foreign.snapshot.task_id),
+            encoded_cursor("task-does-not-exist"),
+        ):
+            with self.assertRaises(WorkbenchValidationError) as caught:
+                self.workbench.list_tasks(cursor=cursor)
+            failures.append((caught.exception.code, caught.exception.errors))
+        self.assertEqual(failures[0], failures[1])
+        self.assertEqual(failures[0][0], "INVALID_TASK_CURSOR")
+
+        for cursor in ("", "v1_!!", first["next_cursor"] + "="):
+            with self.subTest(cursor=cursor):
+                with self.assertRaises(WorkbenchValidationError) as caught:
+                    self.workbench.list_tasks(cursor=cursor)
+                self.assertEqual(caught.exception.code, "INVALID_TASK_CURSOR")
+
+        for limit in (0, 51, True, "20"):
+            with self.subTest(limit=limit):
+                with self.assertRaises(WorkbenchValidationError) as caught:
+                    self.workbench.list_tasks(limit=limit)
+                self.assertEqual(caught.exception.code, "INVALID_TASK_LIST_LIMIT")
 
     def test_revise_uses_cas_builds_new_plan_and_replays_exactly(self) -> None:
         created = self.workbench.create_task(guided_form(), "create-revise")

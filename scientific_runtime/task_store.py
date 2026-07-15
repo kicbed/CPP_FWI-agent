@@ -105,6 +105,14 @@ class TaskSnapshot:
 
 
 @dataclass(frozen=True)
+class TaskSnapshotPage:
+    """One stable, scope-bound keyset page of durable task aggregates."""
+
+    snapshots: tuple[TaskSnapshot, ...]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
 class CreateTaskRecord:
     """Store result indicating whether an idempotent create was replayed."""
 
@@ -263,6 +271,18 @@ class TaskStore(Protocol):
     ) -> CreateTaskRecord | None:
         ...
 
+    def lookup_compatible_create_task(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_hashes: Sequence[str],
+    ) -> CreateTaskRecord | None:
+        """Look up one create record against precomputed exact request hashes."""
+
+        ...
+
     def lookup_submit_task(
         self,
         *,
@@ -319,6 +339,16 @@ class TaskStore(Protocol):
     def get_task(self, task_id: str) -> TaskSnapshot | None:
         ...
 
+    def list_tasks(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> TaskSnapshotPage:
+        ...
+
     def lookup_workbench_mutation(
         self,
         *,
@@ -328,6 +358,19 @@ class TaskStore(Protocol):
         idempotency_key: str,
         request_hash: str,
     ) -> WorkbenchMutationRecord | None:
+        ...
+
+    def lookup_compatible_workbench_mutation(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        operation: str,
+        idempotency_key: str,
+        request_hashes: Sequence[str],
+    ) -> WorkbenchMutationRecord | None:
+        """Look up one mutation against precomputed exact request hashes."""
+
         ...
 
     def append_draft_revision(
@@ -418,6 +461,35 @@ def encode_document(value: Mapping[str, Any]) -> tuple[str, str]:
         raise TaskStoreConflict(f"document is not finite JSON: {error}") from error
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return text, f"sha256:{digest}"
+
+
+def _request_hash_set(values: str | Sequence[str]) -> frozenset[str]:
+    """Validate the bounded exact-hash set used only for version replay.
+
+    This deliberately accepts hashes rather than an unqualified idempotency-key
+    lookup: callers must first reconstruct and validate every historical request
+    shape they are willing to replay.
+    """
+
+    candidates: Sequence[str]
+    if isinstance(values, str):
+        candidates = (values,)
+    elif isinstance(values, Sequence):
+        candidates = values
+    else:
+        raise TaskStoreConflict("compatible request hashes are invalid")
+    if not 1 <= len(candidates) <= 8:
+        raise TaskStoreConflict("compatible request hashes are invalid")
+    result = frozenset(candidates)
+    if len(result) != len(candidates) or any(
+        not isinstance(value, str)
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+        for value in result
+    ):
+        raise TaskStoreConflict("compatible request hashes are invalid")
+    return result
 
 
 def _decode_document(text: str, *, label: str) -> dict[str, Any]:
@@ -1228,8 +1300,9 @@ class SQLiteTaskStore:
         principal_id: str,
         operation: str,
         idempotency_key: str,
-        request_hash: str,
+        request_hash: str | Sequence[str],
     ) -> WorkbenchMutationRecord | None:
+        acceptable_hashes = _request_hash_set(request_hash)
         if operation not in WORKBENCH_MUTATION_OPERATIONS:
             raise TaskStoreConflict("workbench mutation operation is invalid")
         row = connection.execute(
@@ -1245,7 +1318,7 @@ class SQLiteTaskStore:
         ).fetchone()
         if row is None:
             return None
-        if row["request_hash"] != request_hash:
+        if row["request_hash"] not in acceptable_hashes:
             raise IdempotencyConflict(
                 "idempotency key was already used for another workbench request"
             )
@@ -1361,6 +1434,50 @@ class SQLiteTaskStore:
                 operation=operation,
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
+            )
+            if record is None:
+                connection.commit()
+                return None
+            snapshot = self._load_snapshot(connection, record.task_id)
+            if (
+                snapshot is None
+                or snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreCorruption(
+                    "workbench mutation crosses its task scope"
+                )
+            connection.commit()
+            return record
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def lookup_compatible_workbench_mutation(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        operation: str,
+        idempotency_key: str,
+        request_hashes: Sequence[str],
+    ) -> WorkbenchMutationRecord | None:
+        """Read a scoped mutation only if one exact historical hash matches."""
+
+        acceptable_hashes = _request_hash_set(request_hashes)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            record = self._load_workbench_mutation(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                operation=operation,
+                idempotency_key=idempotency_key,
+                request_hash=tuple(acceptable_hashes),
             )
             if record is None:
                 connection.commit()
@@ -1557,6 +1674,57 @@ class SQLiteTaskStore:
                     "idempotency record crosses its project or principal scope"
                 )
             return CreateTaskRecord(snapshot=snapshot, replayed=True)
+        finally:
+            connection.close()
+
+    def lookup_compatible_create_task(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_hashes: Sequence[str],
+    ) -> CreateTaskRecord | None:
+        """Read a scoped create only if one exact historical hash matches."""
+
+        acceptable_hashes = _request_hash_set(request_hashes)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            replay = connection.execute(
+                """
+                SELECT request_hash, task_id
+                FROM idempotency_records
+                WHERE project_id = ? AND principal_id = ?
+                  AND operation = 'create_task' AND idempotency_key = ?
+                """,
+                (project_id, principal_id, idempotency_key),
+            ).fetchone()
+            if replay is None:
+                connection.commit()
+                return None
+            if replay["request_hash"] not in acceptable_hashes:
+                raise IdempotencyConflict(
+                    "idempotency key was already used for another create request"
+                )
+            snapshot = self._load_snapshot(connection, replay["task_id"])
+            if snapshot is None:
+                raise TaskStoreCorruption(
+                    "idempotency record references a missing task"
+                )
+            if (
+                snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreCorruption(
+                    "idempotency record crosses its project or principal scope"
+                )
+            connection.commit()
+            return CreateTaskRecord(snapshot=snapshot, replayed=True)
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -1917,6 +2085,116 @@ class SQLiteTaskStore:
             snapshot = self._load_snapshot(connection, task_id)
             connection.commit()
             return snapshot
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def list_tasks(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> TaskSnapshotPage:
+        """List one immutable-creation-order page inside an exact task scope.
+
+        ``cursor`` is the task identity returned as the previous page's
+        ``next_cursor``.  The application/HTTP layers may encode that identity,
+        but the store always resolves it inside the requested scope before it
+        can influence the keyset boundary.
+        """
+
+        if (
+            not isinstance(project_id, str)
+            or not project_id
+            or not isinstance(principal_id, str)
+            or not principal_id
+        ):
+            raise TaskStoreConflict("task list scope is invalid")
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise TaskStoreConflict("task list cursor is invalid")
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise TaskStoreConflict("task list limit is invalid")
+
+        connection = self._connect()
+        try:
+            # Resolve the cursor and every aggregate from one WAL snapshot.
+            # Ordering uses immutable created_at + task_id rather than mutable
+            # updated_at, so progress events cannot move a task between pages.
+            connection.execute("BEGIN")
+            parameters: list[Any] = [project_id, principal_id]
+            boundary = ""
+            if cursor is not None:
+                cursor_row = connection.execute(
+                    """
+                    SELECT task_id, created_at
+                    FROM tasks
+                    WHERE task_id = ? AND project_id = ? AND principal_id = ?
+                    """,
+                    (cursor, project_id, principal_id),
+                ).fetchone()
+                if cursor_row is None:
+                    raise TaskStoreConflict("task list cursor is invalid")
+                cursor_snapshot = self._load_snapshot(connection, cursor)
+                if (
+                    cursor_snapshot is None
+                    or cursor_snapshot.project_id != project_id
+                    or cursor_snapshot.principal_id != principal_id
+                    or cursor_snapshot.created_at != cursor_row["created_at"]
+                ):
+                    raise TaskStoreCorruption(
+                        "task list cursor differs from its durable aggregate"
+                    )
+                boundary = """
+                  AND (
+                        created_at < ?
+                        OR (created_at = ? AND task_id < ?)
+                  )
+                """
+                parameters.extend(
+                    [
+                        cursor_snapshot.created_at,
+                        cursor_snapshot.created_at,
+                        cursor,
+                    ]
+                )
+            parameters.append(limit + 1)
+            rows = connection.execute(
+                f"""
+                SELECT task_id
+                FROM tasks
+                WHERE project_id = ? AND principal_id = ?
+                {boundary}
+                ORDER BY created_at DESC, task_id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            page_rows = rows[:limit]
+            snapshots: list[TaskSnapshot] = []
+            for row in page_rows:
+                snapshot = self._load_snapshot(connection, row["task_id"])
+                if snapshot is None:
+                    raise TaskStoreCorruption("listed task aggregate is missing")
+                if (
+                    snapshot.project_id != project_id
+                    or snapshot.principal_id != principal_id
+                ):
+                    raise TaskStoreCorruption("listed task crossed its durable scope")
+                snapshots.append(snapshot)
+            next_cursor = (
+                str(page_rows[-1]["task_id"])
+                if len(rows) > limit and page_rows
+                else None
+            )
+            connection.commit()
+            return TaskSnapshotPage(
+                snapshots=tuple(snapshots), next_cursor=next_cursor
+            )
         except Exception:
             if connection.in_transaction:
                 connection.rollback()

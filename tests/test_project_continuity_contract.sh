@@ -38,6 +38,8 @@ required_files=(
     scientific_runtime/registry_service.py
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1.json
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1_1.json
+    scientific_runtime/registrations/deepwave_acoustic_fwi_v1_2.json
+    scientific_runtime/registrations/deepwave_acoustic_fwi_v1_3.json
     scientific_runtime/task_store.py
     scientific_runtime/task_service.py
     scientific_runtime/task_dispatcher.py
@@ -46,6 +48,7 @@ required_files=(
     scientific_runtime/migrations/0002_catalog_registry.sql
     scientific_runtime/migrations/0003_submit_dispatch.sql
     scientific_runtime/migrations/0004_workbench_runtime.sql
+    scientific_runtime/migrations/0005_task_discovery.sql
     tests/test_scientific_runtime_registry.py
     tests/test_scientific_runtime_fwi_adapter.py
     tests/test_scientific_runtime_task_service.py
@@ -77,11 +80,14 @@ require_text docs/PROJECT_CONTINUITY.md '## D-003：'
 require_text docs/PROJECT_CONTINUITY.md '## D-004：'
 require_text docs/PROJECT_CONTINUITY.md '## D-005：'
 require_text docs/PROJECT_CONTINUITY.md '## D-006：'
+require_text docs/PROJECT_CONTINUITY.md '## D-007：'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
-require_text docs/PROJECT_CONTINUITY.md 'P0 + P1 最小持久垂直切片 Verified / P2 Pending'
+require_text docs/PROJECT_CONTINUITY.md 'P2.1 有界切片'
+require_text docs/PROJECT_CONTINUITY.md '完整 P2 Pending'
+require_text docs/PROJECT_CONTINUITY.md '精确历史七个 form 字段'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '<!-- scientific-agent-runtime-plan: v1 -->'
-require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md 'Runtime 实现状态：**P0 + P1 Verified；按用户要求停在 P2 之前**'
+require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '完整 P2 仍 Pending'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '<!-- scientific-runtime-p0-contracts: v1 -->'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'P1.1a TaskStore、P1.1b Registry 与 P1.2a 固定 Deepwave'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'submit/API/调度仍未实现'
@@ -100,12 +106,15 @@ require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md '不自动重发�
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '<!-- scientific-runtime-p1-guided-web: v1 -->'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '实现状态：**Verified**'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md 'Guided 路由 fail closed 为 503'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '当前浏览器的 create/revise mutation 始终发送完整九个 form 字段'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '不广告 legacy Worker/MCP `forward`'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '仍属 Pending：运行中 cancel'
 require_text docs/PROJECT_PROGRESS.md '<!-- project-progress-schema: v1 -->'
-require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1 Verified（含 D-006/P1-006）；P2 Pending（按用户要求暂停）**'
+require_text docs/PROJECT_PROGRESS.md 'P2-001 有界发现/重开已验证'
+require_text docs/PROJECT_PROGRESS.md '完整 P2 Pending'
 require_text docs/PROJECT_PROGRESS.md '| P0 最小 FWI 契约 | Verified |'
 require_text docs/PROJECT_PROGRESS.md '| P1 最小持久垂直切片 | Verified |'
-require_text docs/PROJECT_PROGRESS.md '停在 P2 之前'
+require_text docs/PROJECT_PROGRESS.md '当前新 Guided 任务使用 contract minor `1.1.0`'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'D-005` / **Proposed'
@@ -224,7 +233,11 @@ fi
 
 secret_hits="$TMP_ROOT/secret-hits.txt"
 : > "$secret_hits"
-secret_token_pattern='sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|[Aa][Kk][Ii][Aa][0-9A-Za-z]{16}'
+# Require a token boundary so ordinary identifiers such as
+# "task-list-foreign-principal" do not expose the embedded "sk-list..."
+# substring as a credential. The synthetic probes below still exercise every
+# high-confidence token family at the beginning of a line.
+secret_token_pattern='(^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|[Aa][Kk][Ii][Aa][0-9A-Za-z]{16})'
 private_key_prefix='-----BEGIN'
 private_key_marker="${private_key_prefix} PRIVATE KEY-----"
 private_key_pattern="${private_key_prefix} (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"

@@ -29,6 +29,7 @@ from scientific_runtime import (
     TaskValidationError,
 )
 from scientific_runtime_contracts import compute_plan_hash, schema_errors
+from scientific_runtime.fwi_registry import load_deepwave_manifest
 from scientific_runtime.task_store import APPLICATION_ID, encode_document
 from tests.test_scientific_runtime_contracts import (
     append_second_plan_node,
@@ -36,6 +37,8 @@ from tests.test_scientific_runtime_contracts import (
     approval_decision,
     dataset_ref,
     fingerprint,
+    optimizer_plan_graph,
+    optimizer_task_draft,
     plan_graph,
     run_event,
     task_draft,
@@ -45,10 +48,33 @@ from tests.test_scientific_runtime_contracts import (
 NOW = "2026-07-15T03:00:00Z"
 PROJECT_ID = "project-1"
 PRINCIPAL_ID = "user-1"
+CURRENT_ALGORITHM_VERSION = "1.3.0"
+CURRENT_ADAPTER_VERSION = "1.3.0"
+
+
+def executable_approval_decision(plan: dict) -> dict:
+    value = approval_decision(plan)
+    value["scope"]["algorithms"] = [
+        {"id": "deepwave.acoustic_fwi", "version": CURRENT_ALGORITHM_VERSION}
+    ]
+    return value
+
+
+def executable_fingerprint() -> dict:
+    value = fingerprint()
+    value["algorithm"]["version"] = CURRENT_ALGORITHM_VERSION
+    value["adapter_version"] = CURRENT_ADAPTER_VERSION
+    return value
+
+
+def executable_run_event() -> dict:
+    value = run_event()
+    value["fingerprint"] = executable_fingerprint()
+    return value
 
 
 def dispatch_fingerprint() -> dict:
-    value = fingerprint()
+    value = executable_fingerprint()
     value["provenance_mode"] = "development"
     value["source"] = {"identity_complete": False, "dirty": None}
     return value
@@ -78,7 +104,7 @@ class FakeDispatcher:
         ]
         return DispatchPreparation(
             adapter_id="fwi.deepwave_adapter",
-            adapter_version="1.1.0",
+            adapter_version=CURRENT_ADAPTER_VERSION,
             request=request,
             queue_fingerprint=current_fingerprint,
         )
@@ -108,7 +134,7 @@ class FakeDispatcher:
             "algorithm": copy.deepcopy(intent.request["algorithm"]),
             # The queued fingerprint is preflight evidence.  Runtime events
             # bind to the actual fingerprint returned in this receipt.
-            "fingerprint": fingerprint(),
+            "fingerprint": executable_fingerprint(),
             "adapter_version": intent.adapter_version,
         }
 
@@ -155,6 +181,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.registry = RegistryService(self.store, clock=lambda: NOW)
         self.registry.register_dataset(dataset=dataset_ref())
         self.registry.register_algorithm(manifest=algorithm_manifest())
+        self.registry.register_algorithm(manifest=load_deepwave_manifest())
         self.next_id = 0
 
         def make_task_id() -> str:
@@ -191,6 +218,31 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             task_id=task_id, approval=approval, **self.scope
         )
         return plan, approval
+
+    def create_executable(
+        self, *, draft: dict | None = None, key: str = "create-key"
+    ):
+        return self.create(draft=draft or optimizer_task_draft(), key=key)
+
+    def persist_executable_plan_and_approval(
+        self, task_id: str, *, plan: dict | None = None
+    ) -> tuple[dict, dict]:
+        snapshot = self.store.get_task(task_id)
+        self.assertIsNotNone(snapshot)
+        current_plan = (
+            copy.deepcopy(plan) if plan is not None else optimizer_plan_graph()
+        )
+        current_plan["draft"] = {
+            "draft_id": snapshot.draft["draft_id"],
+            "revision": snapshot.draft["revision"],
+        }
+        current_plan["plan_hash"] = compute_plan_hash(current_plan)
+        self.service.persist_plan(task_id=task_id, plan=current_plan, **self.scope)
+        approval = executable_approval_decision(current_plan)
+        self.service.persist_approval(
+            task_id=task_id, approval=approval, **self.scope
+        )
+        return current_plan, approval
 
     def raw_count(self, table: str) -> int:
         self.assertIn(
@@ -235,7 +287,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 4)
+        self.assertEqual(self.store.migration_version(), 5)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -251,7 +303,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 4)
+        self.assertEqual(reopened.migration_version(), 5)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -338,12 +390,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 4)] * 8)
+        self.assertEqual(results, [("wal", 5)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 5")
+            connection.execute("PRAGMA user_version = 6")
             connection.commit()
         finally:
             connection.close()
@@ -435,6 +487,107 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(self.raw_count("draft_revisions"), 1)
         self.assertEqual(self.raw_count("idempotency_records"), 1)
 
+    def test_compatible_replay_is_exact_hash_and_scope_bound_for_create_and_revise(self) -> None:
+        initial = task_draft()
+        created = self.create(draft=initial, key="compatible-create-key")
+        exact_create = self.service.lookup_compatible_create_task(
+            drafts=[initial],
+            idempotency_key="compatible-create-key",
+            **self.scope,
+        )
+        self.assertTrue(exact_create.replayed)
+        self.assertEqual(exact_create.snapshot.task_id, created.snapshot.task_id)
+
+        changed_initial = copy.deepcopy(initial)
+        changed_initial["goal"] = "a different create payload"
+        with self.assertRaises(TaskIdempotencyConflict):
+            self.service.lookup_compatible_create_task(
+                drafts=[changed_initial],
+                idempotency_key="compatible-create-key",
+                **self.scope,
+            )
+
+        _, create_hash = encode_document(
+            {
+                "project_id": PROJECT_ID,
+                "principal_id": PRINCIPAL_ID,
+                "draft": initial,
+            }
+        )
+        self.assertIsNone(
+            self.store.lookup_compatible_create_task(
+                project_id="other-project",
+                principal_id=PRINCIPAL_ID,
+                idempotency_key="compatible-create-key",
+                request_hashes=[create_hash],
+            )
+        )
+
+        revision = copy.deepcopy(initial)
+        revision["revision"] = 2
+        revision["goal"] = "exact revision payload"
+        self.service.revise_draft(
+            task_id=created.snapshot.task_id,
+            expected_revision=1,
+            draft=revision,
+            idempotency_key="compatible-revise-key",
+            **self.scope,
+        )
+        exact_revision = self.service.lookup_compatible_draft_revision(
+            task_id=created.snapshot.task_id,
+            expected_revision=1,
+            drafts=[revision],
+            idempotency_key="compatible-revise-key",
+            **self.scope,
+        )
+        self.assertEqual(exact_revision.draft, revision)
+
+        changed_revision = copy.deepcopy(revision)
+        changed_revision["goal"] = "a different revision payload"
+        with self.assertRaises(TaskIdempotencyConflict):
+            self.service.lookup_compatible_draft_revision(
+                task_id=created.snapshot.task_id,
+                expected_revision=1,
+                drafts=[changed_revision],
+                idempotency_key="compatible-revise-key",
+                **self.scope,
+            )
+
+        _, revision_hash = encode_document(
+            {
+                "task_id": created.snapshot.task_id,
+                "project_id": PROJECT_ID,
+                "principal_id": PRINCIPAL_ID,
+                "expected_revision": 1,
+                "draft": revision,
+            }
+        )
+        self.assertIsNone(
+            self.store.lookup_compatible_workbench_mutation(
+                project_id="other-project",
+                principal_id=PRINCIPAL_ID,
+                operation="revise_draft",
+                idempotency_key="compatible-revise-key",
+                request_hashes=[revision_hash],
+            )
+        )
+
+        other_initial = task_draft()
+        other_initial["draft_id"] = "draft-compatible-other-task"
+        other = self.create(
+            draft=other_initial, key="compatible-other-task"
+        )
+        other_revision = copy.deepcopy(revision)
+        other_revision["draft_id"] = other.snapshot.draft["draft_id"]
+        with self.assertRaises(TaskIdempotencyConflict):
+            self.service.lookup_compatible_draft_revision(
+                task_id=other.snapshot.task_id,
+                expected_revision=1,
+                drafts=[other_revision],
+                idempotency_key="compatible-revise-key",
+                **self.scope,
+            )
+
     def test_corrupt_idempotency_scope_fails_closed(self) -> None:
         foreign_dataset = self.register_project_dataset("project-2")
         foreign_draft = task_draft()
@@ -516,7 +669,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(self.raw_count("idempotency_records"), 0)
 
     def test_scope_isolation_and_approval_actor_are_enforced(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
         with self.assertRaises(TaskNotFound):
             self.service.get_task(
@@ -534,7 +687,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 draft=revision,
             )
 
-        plan = plan_graph()
+        plan = optimizer_plan_graph()
         with self.assertRaises(TaskNotFound):
             self.service.persist_plan(
                 task_id=task_id,
@@ -543,7 +696,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 plan=plan,
             )
         self.service.persist_plan(task_id=task_id, plan=plan, **self.scope)
-        approval = approval_decision(plan)
+        approval = executable_approval_decision(plan)
         with self.assertRaises(TaskNotFound):
             self.service.persist_approval(
                 task_id=task_id,
@@ -551,7 +704,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 principal_id=PRINCIPAL_ID,
                 approval=approval,
             )
-        foreign_approval = approval_decision(plan)
+        foreign_approval = executable_approval_decision(plan)
         foreign_approval["actor"]["id"] = "user-2"
         with self.assertRaisesRegex(TaskValidationError, "APPROVAL_ACTOR_MISMATCH"):
             self.service.persist_approval(
@@ -567,7 +720,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 principal_id=PRINCIPAL_ID,
             )
         self.seed_validated_queue_event(task_id)
-        started = run_event()
+        started = executable_run_event()
         started.update(
             {"event_id": "event-started-002", "sequence": 2, "task_id": task_id}
         )
@@ -591,6 +744,154 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             idempotency_key="create-key",
         )
         self.assertNotEqual(other.snapshot.task_id, task_id)
+
+    def test_task_list_is_scope_bound_keyset_paginated_and_read_only(self) -> None:
+        created_ids: list[str] = []
+        for number in range(1, 5):
+            draft = task_draft()
+            draft["draft_id"] = f"draft-list-{number:04d}"
+            created_ids.append(
+                self.create(draft=draft, key=f"create-list-{number:04d}")
+                .snapshot.task_id
+            )
+
+        foreign_draft = task_draft()
+        foreign_draft["draft_id"] = "draft-list-foreign-principal"
+        self.store.create_task(
+            task_id="task-list-foreign-principal",
+            project_id=PROJECT_ID,
+            principal_id="user-2",
+            draft=foreign_draft,
+            idempotency_key="create-list-foreign-principal",
+            request_hash="sha256:" + "f" * 64,
+            now=NOW,
+        )
+
+        before = {
+            table: self.raw_count(table)
+            for table in (
+                "run_events",
+                "dispatch_intents",
+                "dispatch_attempts",
+                "dispatch_outcomes",
+                "workbench_mutations",
+                "task_abandonments",
+            )
+        }
+        transaction_states: list[bool] = []
+        original_load_snapshot = self.store._load_snapshot
+
+        def observe_transaction(connection, task_id):
+            transaction_states.append(connection.in_transaction)
+            return original_load_snapshot(connection, task_id)
+
+        self.store._load_snapshot = observe_transaction
+        try:
+            first = self.service.list_tasks(limit=2, **self.scope)
+        finally:
+            del self.store.__dict__["_load_snapshot"]
+        self.assertEqual(
+            [snapshot.task_id for snapshot in first.snapshots],
+            list(reversed(created_ids[2:4])),
+        )
+        self.assertEqual(first.next_cursor, created_ids[2])
+        self.assertTrue(transaction_states)
+        self.assertTrue(all(transaction_states))
+
+        # A new task sorts ahead of the cursor.  It must neither duplicate nor
+        # displace the older remainder of the already-started traversal.
+        inserted = task_draft()
+        inserted["draft_id"] = "draft-list-inserted"
+        inserted_id = self.create(
+            draft=inserted, key="create-list-inserted"
+        ).snapshot.task_id
+        second = self.service.list_tasks(
+            cursor=first.next_cursor, limit=2, **self.scope
+        )
+        self.assertEqual(
+            [snapshot.task_id for snapshot in second.snapshots],
+            list(reversed(created_ids[0:2])),
+        )
+        self.assertIsNone(second.next_cursor)
+        self.assertNotIn(
+            inserted_id,
+            [snapshot.task_id for snapshot in first.snapshots + second.snapshots],
+        )
+        self.assertNotIn(
+            "task-list-foreign-principal",
+            [snapshot.task_id for snapshot in first.snapshots + second.snapshots],
+        )
+        self.assertEqual(
+            {
+                table: self.raw_count(table)
+                for table in (
+                    "run_events",
+                    "dispatch_intents",
+                    "dispatch_attempts",
+                    "dispatch_outcomes",
+                    "workbench_mutations",
+                    "task_abandonments",
+                )
+            },
+            before,
+        )
+
+        def unexpected_call():
+            raise AssertionError("task listing must not allocate mutable state")
+
+        reopened = TaskService(
+            SQLiteTaskStore(self.database_path),
+            task_id_factory=unexpected_call,
+            clock=unexpected_call,
+        ).list_tasks(limit=50, **self.scope)
+        self.assertEqual(
+            [snapshot.task_id for snapshot in reopened.snapshots],
+            [inserted_id, *list(reversed(created_ids))],
+        )
+
+    def test_task_list_rejects_invalid_limits_and_opaque_or_cross_scope_cursors(
+        self,
+    ) -> None:
+        draft = task_draft()
+        draft["draft_id"] = "draft-list-validation"
+        self.create(draft=draft, key="create-list-validation")
+
+        for limit in (True, 0, 51, 1.0):
+            with self.subTest(limit=limit):
+                with self.assertRaises(TaskValidationError) as raised:
+                    self.service.list_tasks(limit=limit, **self.scope)
+                self.assertEqual(raised.exception.code, "INVALID_TASK_LIST_LIMIT")
+
+        for cursor in (True, "", "task/not-opaque"):
+            with self.subTest(cursor=cursor):
+                with self.assertRaises(TaskValidationError) as raised:
+                    self.service.list_tasks(cursor=cursor, **self.scope)
+                self.assertEqual(raised.exception.code, "INVALID_TASK_CURSOR")
+
+        foreign_draft = task_draft()
+        foreign_draft["draft_id"] = "draft-list-cross-scope-cursor"
+        self.store.create_task(
+            task_id="task-list-cross-scope-cursor",
+            project_id="project-2",
+            principal_id=PRINCIPAL_ID,
+            draft=foreign_draft,
+            idempotency_key="create-list-cross-scope-cursor",
+            request_hash="sha256:" + "e" * 64,
+            now=NOW,
+        )
+        cursor_errors = []
+        for cursor in ("task-list-cross-scope-cursor", "task-list-missing"):
+            with self.subTest(cursor=cursor):
+                with self.assertRaises(TaskValidationError) as raised:
+                    self.service.list_tasks(cursor=cursor, **self.scope)
+                cursor_errors.append((raised.exception.code, raised.exception.errors))
+        self.assertEqual(cursor_errors[0], cursor_errors[1])
+        self.assertEqual(cursor_errors[0][0], "INVALID_TASK_CURSOR")
+
+        for limit in (True, 0, 51):
+            with self.subTest(store_limit=limit):
+                with self.assertRaises(TaskStoreConflict):
+                    self.store.list_tasks(limit=limit, **self.scope)
 
     def test_draft_revisions_append_and_invalidate_current_plan(self) -> None:
         created = self.create()
@@ -985,12 +1286,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             self.store.get_task(task_id)
 
     def test_runtime_state_and_events_commit_atomically_and_are_append_only(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        self.persist_plan_and_approval(task_id)
+        self.persist_executable_plan_and_approval(task_id)
         queued_event = self.seed_validated_queue_event(task_id)
 
-        started = run_event()
+        started = executable_run_event()
         started.update(
             {
                 "event_id": "event-started-002",
@@ -1059,9 +1360,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             connection.close()
 
     def test_event_insert_rolls_back_when_status_update_fails(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        self.persist_plan_and_approval(task_id)
+        self.persist_executable_plan_and_approval(task_id)
         queued_event = self.seed_validated_queue_event(task_id)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -1079,7 +1380,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         finally:
             connection.close()
 
-        started = run_event()
+        started = executable_run_event()
         started.update(
             {
                 "event_id": "event-started-rollback",
@@ -1100,12 +1401,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
 
     def test_run_event_semantics_are_checked_beyond_json_schema(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        self.persist_plan_and_approval(task_id)
+        self.persist_executable_plan_and_approval(task_id)
         self.seed_validated_queue_event(task_id)
 
-        incoherent = run_event()
+        incoherent = executable_run_event()
         incoherent.update(
             {
                 "event_id": "event-incoherent-002",
@@ -1124,7 +1425,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 **self.scope,
             )
 
-        deferred = run_event()
+        deferred = executable_run_event()
         deferred.update(
             {
                 "event_id": "event-waiting-002",
@@ -1147,7 +1448,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             len(self.service.list_run_events(task_id, **self.scope)), 1
         )
 
-        started = run_event()
+        started = executable_run_event()
         started.update(
             {"event_id": "event-started-002", "sequence": 2, "task_id": task_id}
         )
@@ -1157,7 +1458,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             event=started,
             **self.scope,
         )
-        drifted = run_event()
+        drifted = executable_run_event()
         drifted.update(
             {
                 "event_id": "event-drifted-003",
@@ -1185,11 +1486,11 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(len(self.service.list_run_events(task_id, **self.scope)), 2)
 
     def test_p1_single_node_success_is_terminal(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        self.persist_plan_and_approval(task_id)
+        self.persist_executable_plan_and_approval(task_id)
         self.seed_validated_queue_event(task_id)
-        started = run_event()
+        started = executable_run_event()
         started.update(
             {"event_id": "event-started-002", "sequence": 2, "task_id": task_id}
         )
@@ -1200,7 +1501,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             **self.scope,
         )
 
-        success = run_event()
+        success = executable_run_event()
         success.update(
             {
                 "event_id": "event-succeeded-003",
@@ -1228,7 +1529,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
         self.assertEqual(terminal.status, "Succeeded")
 
-        late_progress = run_event()
+        late_progress = executable_run_event()
         late_progress.update(
             {
                 "event_id": "event-progress-004",
@@ -1254,11 +1555,11 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(len(self.service.list_run_events(task_id, **self.scope)), 3)
 
     def test_p2_checkpoint_and_waiting_state_remain_unavailable(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        self.persist_plan_and_approval(task_id)
+        self.persist_executable_plan_and_approval(task_id)
         self.seed_validated_queue_event(task_id)
-        started = run_event()
+        started = executable_run_event()
         started.update(
             {"event_id": "event-started-002", "sequence": 2, "task_id": task_id}
         )
@@ -1269,7 +1570,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             **self.scope,
         )
 
-        checkpoint = run_event()
+        checkpoint = executable_run_event()
         checkpoint.update(
             {
                 "event_id": "event-checkpoint-003",
@@ -1294,12 +1595,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
 
     def test_run_event_must_match_plan_node_and_fingerprint(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        self.persist_plan_and_approval(task_id)
+        self.persist_executable_plan_and_approval(task_id)
         self.seed_validated_queue_event(task_id)
 
-        unknown_node = run_event()
+        unknown_node = executable_run_event()
         unknown_node.update(
             {
                 "event_id": "event-unknown-node",
@@ -1330,7 +1631,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):
-                event = run_event()
+                event = executable_run_event()
                 event.update(
                     {
                         "event_id": f"event-bad-{label}",
@@ -1355,11 +1656,11 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
 
     def test_success_event_cannot_carry_an_error(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        self.persist_plan_and_approval(task_id)
+        self.persist_executable_plan_and_approval(task_id)
         self.seed_validated_queue_event(task_id)
-        success = run_event()
+        success = executable_run_event()
         success.update(
             {
                 "event_id": "event-false-success",
@@ -1491,17 +1792,17 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self, *, key: str
     ) -> tuple[str, dict, FakeDispatcher, TaskService]:
         token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-        draft = task_draft()
+        draft = optimizer_task_draft()
         draft["draft_id"] = f"draft-{token}"
-        created = self.create(draft=draft, key=f"create-{key}")
+        created = self.create_executable(draft=draft, key=f"create-{key}")
         task_id = created.snapshot.task_id
-        plan = plan_graph()
+        plan = optimizer_plan_graph()
         plan["plan_id"] = f"plan-{token}"
         plan["draft"]["draft_id"] = draft["draft_id"]
         plan["nodes"][0]["idempotency_key"] = f"node-{token}-submit"
         plan["plan_hash"] = compute_plan_hash(plan)
         self.service.persist_plan(task_id=task_id, plan=plan, **self.scope)
-        approval = approval_decision(plan)
+        approval = executable_approval_decision(plan)
         approval["approval_id"] = f"approval-{token}"
         self.service.persist_approval(
             task_id=task_id, approval=approval, **self.scope
@@ -1601,9 +1902,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
     def test_atomic_submit_consumes_budget_queues_and_dispatches_after_commit(
         self,
     ) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(self.store)
         service = self.submit_service(dispatcher)
 
@@ -1661,9 +1962,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
     def test_submit_adapter_error_is_sticky_reconciliation_not_task_failure(
         self,
     ) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(
             self.store, failure_code="SUBMISSION_RECONCILIATION_REQUIRED"
         )
@@ -1693,9 +1994,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(dispatcher.dispatch_calls, 1)
 
     def test_invalid_dispatch_receipt_requires_reconciliation(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(self.store)
         valid_dispatch = dispatcher.dispatch
 
@@ -1717,9 +2018,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
 
     def test_submit_exact_replay_precedes_expiry_budget_and_preflight(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         now = [NOW]
         dispatcher = FakeDispatcher(self.store)
         service = self.submit_service(dispatcher, clock=lambda: now[0])
@@ -1834,9 +2135,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(self.store.get_task(task_id).status, "AwaitingApproval")
 
     def test_submit_idempotency_conflict_and_new_key_cannot_duplicate_task(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(self.store)
         service = self.submit_service(dispatcher)
         service.submit_task(
@@ -1903,9 +2204,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(dispatcher.dispatch_calls, 0)
 
     def test_concurrent_same_submit_key_converges_to_one_dispatch(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(self.store)
         barrier = threading.Barrier(8)
 
@@ -1939,9 +2240,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
 
     def test_concurrent_different_submit_keys_admit_only_one_task(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(self.store)
         barrier = threading.Barrier(8)
 
@@ -1978,9 +2279,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
 
     def test_submit_status_failure_rolls_back_every_admission_write(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         connection = sqlite3.connect(self.database_path)
         try:
             connection.execute(
@@ -2022,9 +2323,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(dispatcher.dispatch_calls, 0)
 
     def test_commit_before_dispatch_crash_stays_pending_and_is_not_retried(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(self.store)
         original_claim = self.store.claim_dispatch
 
@@ -2059,9 +2360,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
     def test_started_worker_without_receipt_stays_dispatching_and_is_not_retried(
         self,
     ) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(self.store)
         original_record = self.store.record_dispatch_success
 
@@ -2435,9 +2736,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "ADAPTER_ARTIFACT_INVALID")
 
     def test_hash_consistent_dispatch_request_tampering_fails_closed(self) -> None:
-        created = self.create()
+        created = self.create_executable()
         task_id = created.snapshot.task_id
-        _, approval = self.persist_plan_and_approval(task_id)
+        _, approval = self.persist_executable_plan_and_approval(task_id)
         self.submit_service(FakeDispatcher(self.store)).submit_task(
             task_id=task_id,
             approval_id=approval["approval_id"],

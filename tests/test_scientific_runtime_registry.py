@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
+from jsonschema import Draft7Validator
+
 from scientific_runtime import (
     RegistryCorruption,
     RegistryConflict,
@@ -32,6 +34,7 @@ from scientific_runtime.task_store import (
 from scientific_runtime_contracts import (
     compute_plan_hash,
     evaluate_execution_gate,
+    schema_errors,
 )
 from tests.test_scientific_runtime_contracts import (
     algorithm_manifest,
@@ -92,13 +95,17 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_fresh_v4_has_all_migration_checksums(self) -> None:
-        self.assertEqual(self.store.migration_version(), 4)
+    def test_fresh_v5_has_all_migration_checksums_and_task_discovery_index(self) -> None:
+        self.assertEqual(self.store.migration_version(), 5)
         connection = sqlite3.connect(self.database_path)
         try:
             rows = connection.execute(
                 "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
             ).fetchall()
+            index_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                ("idx_tasks_scope_created",),
+            ).fetchone()[0]
         finally:
             connection.close()
         self.assertEqual(
@@ -108,6 +115,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
                 (2, "0002_catalog_registry.sql"),
                 (3, "0003_submit_dispatch.sql"),
                 (4, "0004_workbench_runtime.sql"),
+                (5, "0005_task_discovery.sql"),
             ],
         )
         for version, name, checksum in rows:
@@ -117,6 +125,11 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
                 hashlib.sha256(path.read_bytes()).hexdigest(),
                 msg=f"migration {version}",
             )
+        self.assertEqual(
+            " ".join(index_sql.split()),
+            "CREATE INDEX idx_tasks_scope_created ON tasks(project_id, "
+            "principal_id, created_at DESC, task_id DESC)",
+        )
 
     def test_dataset_registration_is_immutable_idempotent_and_project_scoped(self) -> None:
         dataset = dataset_for()
@@ -221,8 +234,11 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
 
     def test_packaged_algorithm_upgrade_preserves_legacy_parameter_policy(self) -> None:
         legacy = load_deepwave_manifest("1.0.0")
+        previous = load_deepwave_manifest("1.1.0")
+        optimizer_version = load_deepwave_manifest("1.2.0")
         current = load_deepwave_manifest()
         legacy_json, legacy_hash = encode_document(legacy)
+        _, optimizer_version_hash = encode_document(optimizer_version)
         self.assertEqual(
             legacy_hash,
             "sha256:20c22a2c54259622435850b05eb7eeb020ff4d74af2cec51439aa465793f8dcd",
@@ -233,12 +249,45 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
             100,
         )
         self.assertEqual(legacy["adapter"]["version"], "1.0.0")
-        self.assertEqual(current["version"], "1.1.0")
+        self.assertEqual(previous["version"], "1.1.0")
+        self.assertEqual(
+            previous["parameter_schema"]["properties"]["iterations"]["maximum"],
+            10000,
+        )
+        self.assertEqual(previous["adapter"]["version"], "1.1.0")
+        self.assertEqual(optimizer_version["version"], "1.2.0")
+        self.assertEqual(
+            optimizer_version_hash,
+            "sha256:f1ead959e4aaffadb0c32b6ed98dedce508f5153c9e41453b65d28f1c9daea66",
+        )
+        self.assertEqual(
+            optimizer_version["parameter_schema"]["properties"]["iterations"]["minimum"],
+            0,
+        )
+        self.assertNotIn(
+            "maximum",
+            optimizer_version["parameter_schema"]["properties"]["seed"],
+        )
+        self.assertEqual(optimizer_version["adapter"]["version"], "1.2.0")
+        self.assertEqual(current["version"], "1.3.0")
+        self.assertEqual(current["schema_version"], "1.1.0")
         self.assertEqual(
             current["parameter_schema"]["properties"]["iterations"]["maximum"],
             10000,
         )
-        self.assertEqual(current["adapter"]["version"], "1.1.0")
+        self.assertEqual(
+            current["parameter_schema"]["properties"]["iterations"]["minimum"],
+            1,
+        )
+        self.assertEqual(
+            current["parameter_schema"]["properties"]["seed"]["maximum"],
+            2147483647,
+        )
+        self.assertEqual(current["adapter"]["version"], "1.3.0")
+        self.assertEqual(
+            set(current["parameter_schema"]["required"]),
+            {"preset", "device", "iterations", "seed", "optimizer", "learning_rate_milli"},
+        )
 
         self.registry.register_algorithm(manifest=legacy)
         connection = sqlite3.connect(self.database_path)
@@ -260,6 +309,8 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         reopened = RegistryService(
             SQLiteTaskStore(self.database_path), clock=lambda: NOW
         )
+        reopened.register_algorithm(manifest=previous)
+        reopened.register_algorithm(manifest=optimizer_version)
         reopened.register_algorithm(manifest=current)
         self.assertEqual(
             reopened.get_algorithm(
@@ -282,7 +333,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         self.assertEqual(legacy_row_after, legacy_row_before)
         self.assertEqual(
             [value["version"] for value in reopened.list_algorithms()],
-            ["1.0.0", "1.1.0"],
+            ["1.0.0", "1.1.0", "1.2.0", "1.3.0"],
         )
 
     def test_iteration_policy_is_bound_to_algorithm_version(self) -> None:
@@ -309,6 +360,11 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
 
         current_draft = task_draft()
         current_draft["draft_id"] = "draft-current-limit"
+        current_draft["schema_version"] = "1.1.0"
+        current_draft["algorithm"]["version"] = "1.3.0"
+        current_draft["parameters"].update(
+            {"optimizer": "adam", "learning_rate_milli": 10000}
+        )
         current_draft["parameters"]["iterations"] = 10000
         created = service.create_task(
             project_id=PROJECT_ID,
@@ -766,7 +822,60 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
 
     def test_packaged_fwi_snapshot_is_schema_valid_and_path_free(self) -> None:
         manifest = load_deepwave_manifest()
-        self.assertEqual(manifest, algorithm_manifest())
+        self.assertEqual(schema_errors("algorithm-manifest.schema.json", manifest), [])
+        self.assertEqual(manifest["version"], "1.3.0")
+        self.assertEqual(manifest["adapter"]["version"], "1.3.0")
+        self.assertEqual(manifest["task_types"], ["acoustic_fwi_2d"])
+        self.assertEqual(
+            manifest["parameter_schema"]["properties"]["preset"]["enum"],
+            ["fwi_smoke", "fwi_demo"],
+        )
+        self.assertIn("optimizer", manifest["parameter_schema"]["required"])
+        parameter_validator = Draft7Validator(manifest["parameter_schema"])
+        base_parameters = {
+            "preset": "fwi_smoke",
+            "device": "cuda",
+            "iterations": 2,
+            "seed": 2026,
+        }
+        for optimizer, learning_rate_milli in (
+            ("adam", 100),
+            ("adam", 100_000),
+            ("sgd", 100_000_000),
+            ("sgd", 1_000_000_000_000),
+        ):
+            self.assertEqual(
+                list(
+                    parameter_validator.iter_errors(
+                        base_parameters
+                        | {
+                            "optimizer": optimizer,
+                            "learning_rate_milli": learning_rate_milli,
+                        }
+                    )
+                ),
+                [],
+            )
+        for optimizer, learning_rate_milli in (
+            ("adam", 100_001),
+            ("sgd", 99_999_999),
+        ):
+            self.assertTrue(
+                list(
+                    parameter_validator.iter_errors(
+                        base_parameters
+                        | {
+                            "optimizer": optimizer,
+                            "learning_rate_milli": learning_rate_milli,
+                        }
+                    )
+                )
+            )
+        for invalid_parameters in (
+            base_parameters | {"iterations": 0, "optimizer": "adam", "learning_rate_milli": 10_000},
+            base_parameters | {"seed": 2147483648, "optimizer": "adam", "learning_rate_milli": 10_000},
+        ):
+            self.assertTrue(list(parameter_validator.iter_errors(invalid_parameters)))
         metadata = {
             "id": "marmousi_94_288",
             "shape": [94, 288],
@@ -990,10 +1099,44 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def upgrade_fixture_to_v4(self) -> None:
+        self.upgrade_fixture_to_v3()
+        migration_path = (
+            Path(__file__).parents[1]
+            / "scientific_runtime"
+            / "migrations"
+            / "0004_workbench_runtime.sql"
+        )
+        migration_text = migration_path.read_text(encoding="utf-8")
+        connection = sqlite3.connect(self.database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            for statement in _migration_statements(migration_text):
+                connection.execute(statement)
+            connection.execute(
+                """
+                INSERT INTO schema_migrations(version, name, checksum, applied_at)
+                VALUES (4, ?, ?, ?)
+                """,
+                (
+                    migration_path.name,
+                    hashlib.sha256(migration_text.encode("utf-8")).hexdigest(),
+                    NOW,
+                ),
+            )
+            connection.execute("PRAGMA user_version = 4")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def test_v1_database_upgrades_in_place_and_backfills_approval_budget(self) -> None:
         task_id, approval = self.seed_v1_database()
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 4)
+        self.assertEqual(store.migration_version(), 5)
         snapshot = store.get_task(task_id)
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.approval, approval)
@@ -1007,7 +1150,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
         task_id, _ = self.seed_v1_database()
         self.upgrade_fixture_to_v2()
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 4)
+        self.assertEqual(store.migration_version(), 5)
         self.assertEqual(store.get_task(task_id).status, "AwaitingApproval")
         connection = sqlite3.connect(self.database_path)
         try:
@@ -1028,7 +1171,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
             }.issubset(tables)
         )
 
-    def test_v3_database_upgrades_to_v4_and_abandonment_tamper_fails_closed(
+    def test_v3_database_upgrades_to_current_and_abandonment_tamper_fails_closed(
         self,
     ) -> None:
         task_id, approval = self.seed_v1_database()
@@ -1048,7 +1191,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
             connection.close()
 
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 4)
+        self.assertEqual(store.migration_version(), 5)
         snapshot = store.get_task(task_id)
         self.assertEqual(snapshot.approval, approval)
         abandoned = TaskService(store, clock=lambda: NOW).abandon_task(
@@ -1089,6 +1232,48 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
             connection.close()
         with self.assertRaisesRegex(TaskStoreCorruption, "task abandonment hash"):
             store.get_task(task_id)
+
+    def test_v4_database_upgrades_to_v5_task_discovery_without_rewriting_tasks(
+        self,
+    ) -> None:
+        task_id, approval = self.seed_v1_database()
+        self.upgrade_fixture_to_v4()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    ("idx_tasks_scope_created",),
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+        store = SQLiteTaskStore(self.database_path)
+        self.assertEqual(store.migration_version(), 5)
+        snapshot = store.get_task(task_id)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.approval, approval)
+        page = store.list_tasks(
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            limit=20,
+        )
+        self.assertEqual(
+            [listed.task_id for listed in page.snapshots], [task_id]
+        )
+        self.assertIsNone(page.next_cursor)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertIsNotNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    ("idx_tasks_scope_created",),
+                ).fetchone()
+            )
+        finally:
+            connection.close()
 
     def test_v3_upgrade_rejects_unexplainable_v2_runtime_state_atomically(self) -> None:
         task_id, _ = self.seed_v1_database()
@@ -1161,12 +1346,18 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(reopen, range(8)))
-        self.assertEqual(results, [(4, approval["approval_id"])] * 8)
+        self.assertEqual(results, [(5, approval["approval_id"])] * 8)
         connection = sqlite3.connect(self.database_path)
         try:
             self.assertEqual(
                 connection.execute(
                     "SELECT COUNT(*) FROM schema_migrations WHERE version = 2"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 5"
                 ).fetchone()[0],
                 1,
             )

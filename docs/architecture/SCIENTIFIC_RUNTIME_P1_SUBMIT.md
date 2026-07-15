@@ -5,7 +5,7 @@
 - 对应决策：`D-003`
 - 实现切片：`P1.1c`
 - 实现状态：**Implemented / Verified — atomic admission and one-shot dispatch**
-- 阶段状态：P1 仍在进行；Guided Web、P2 可靠恢复和 P3 DAG 尚未实现
+- checkpoint 阶段状态：P1 当时仍在进行；Guided Web、P2 可靠恢复和 P3 DAG 尚未实现
 
 本切片把已验证的 SQLite Task Store、Registry 和固定 Deepwave Adapter 接成一个最小后端
 闭环。浏览器或 LLM 只能提交 task identity、current approval identity 和独立的 mutation
@@ -52,11 +52,15 @@ Store 在一个 `BEGIN IMMEDIATE` 中按以下顺序执行：
 任一步失败都会一起回滚预算、intent、idempotency、event 和状态。Adapter preflight 在事务前
 完成；Adapter `submit`/Worker `Popen` 只会在 SQLite commit 后发生。
 
-P1 capability 精确限制为：单节点、无依赖、`acoustic_fwi_2d`、
-当前 `deepwave.acoustic_fwi@1.1.0`、`marmousi_94_288@1.0.0`、`fwi_smoke|fwi_demo`，以及固定
+P1.1c/D-006 checkpoint 的 capability 精确限制为：单节点、无依赖、`acoustic_fwi_2d`、
+`deepwave.acoustic_fwi@1.1.0`、`marmousi_94_288@1.0.0`、`fwi_smoke|fwi_demo`，以及固定
 `fwi.deepwave_adapter@1.1.0`。原始 P1.1c checkpoint 使用的 Algorithm/Adapter `1.0.0` 快照
-保持不可变；D-006/P1-006 通过 minor version 扩展显式迭代上限。多节点即使通过通用 Gate
-也被拒绝，留给 P3。
+保持不可变；D-006/P1-006 通过 minor version 扩展显式迭代上限。D-007 的 `1.2.0`
+Algorithm/Adapter 是不可变的六参数历史快照，和 `1.0.0`/`1.1.0` 一起仅保留既有
+收据的严格读取。当前新 dispatch 精确使用 Algorithm/Adapter `1.3.0` 与六参数 FWI
+plan；其 manifest 只允许 `acoustic_fwi_2d`、`fwi_smoke|fwi_demo`、iterations
+`1..10000`、seed `0..2147483647` 及 Adam/SGD 各自的条件学习率边界，不广告 legacy
+`forward`。多节点即使通过通用 Gate 也被拒绝，留给 P3。
 
 ## 3. Fingerprint 语义
 
@@ -114,5 +118,6 @@ Scientific Runtime 聚焦组合当前为 117/117：contract 28、Registry 24、T
 fingerprint receipt 绑定、hash-consistent intent tamper、固定 Dispatcher 映射、v1/v2/v3 升级和
 不可解释旧 runtime 拒绝。
 
-仍 Pending：部署 HTTP/Guided Web 数据选择与批准卡、Adapter status/collect 的产品轮询与结果
-展示、P2 lease/heartbeat/cancel/retry/reconciliation/SSE、P3 DAG，以及 P4 Agent Planner。
+本 checkpoint 当时仍 Pending 的部署 HTTP/Guided Web、Adapter status/collect 产品轮询与
+结果展示已由 P1-005 验证。当前仍 Pending：完整 P2
+lease/heartbeat/cancel/retry/reconciliation/SSE、P3 DAG，以及 P4 Agent Planner。

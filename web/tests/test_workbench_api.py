@@ -59,6 +59,10 @@ class FakeApplication:
     def create_task(self, form, key):
         return self._call("create_task", form, key) | {"task_id": "task-1"}
 
+    def list_tasks(self, *, cursor=None, limit=20):
+        self._call("list_tasks", cursor=cursor, limit=limit)
+        return {"tasks": [], "next_cursor": None}
+
     def get_task(self, task_id, *, refresh=True):
         return self._call("get_task", task_id, refresh=refresh) | {"task_id": task_id}
 
@@ -102,6 +106,8 @@ def guided_form() -> dict:
         "device": "cpu",
         "iterations": 1,
         "seed": 7,
+        "optimizer": "adam",
+        "learning_rate": "10",
     }
 
 
@@ -292,10 +298,100 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertNotIn("expected_revision", call[1][2])
         self.assertEqual(call[1][2]["iterations"], 2)
 
+        legacy = guided_form()
+        legacy.pop("optimizer")
+        legacy.pop("learning_rate")
+        response = self.mutation("POST", f"{API_PREFIX}/tasks", legacy)
+        self.assertEqual(response.status, 201)
+        legacy_call = self.application.calls[-1]
+        self.assertEqual(legacy_call[0], "create_task")
+        self.assertEqual(legacy_call[1][0], legacy)
+
+        legacy_revision = dict(legacy, expected_revision=1, iterations=3)
+        response = self.mutation(
+            "PUT", f"{API_PREFIX}/tasks/task-1/draft", legacy_revision
+        )
+        self.assertEqual(response.status, 200)
+        legacy_call = self.application.calls[-1]
+        self.assertEqual(legacy_call[0], "revise_task")
+        self.assertEqual(legacy_call[1][0:2], ("task-1", 1))
+        self.assertEqual(legacy_call[1][2], dict(legacy, iterations=3))
+
+        partial_optimizer = dict(legacy, optimizer="adam")
+        response = self.mutation(
+            "POST", f"{API_PREFIX}/tasks", partial_optimizer
+        )
+        self.assertEqual(response.status, 422)
+        self.assertEqual(self.decode(response)["error"]["code"], "INVALID_FORM")
+
         smuggled = dict(form, project_id="other-project")
         response = self.mutation("POST", f"{API_PREFIX}/tasks", smuggled)
         self.assertEqual(response.status, 422)
         self.assertEqual(self.decode(response)["error"]["code"], "INVALID_FORM")
+
+    def test_task_collection_get_is_csrf_scoped_paginated_and_body_free(self):
+        cursor = "v1_dGFzay0x"
+        response = self.api.dispatch(
+            "GET",
+            f"{API_PREFIX}/tasks?limit=2&cursor={cursor}",
+            self.get_headers(),
+            b"",
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.decode(response)["data"], {"tasks": [], "next_cursor": None})
+        self.assertEqual(
+            self.application.calls[-1],
+            ("list_tasks", (), {"cursor": cursor, "limit": 2}),
+        )
+
+        response = self.api.dispatch(
+            "GET", f"{API_PREFIX}/tasks", {"Host": HOST}, b""
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.decode(response)["error"]["code"], "CSRF_FORBIDDEN")
+
+        response = self.api.dispatch(
+            "GET",
+            f"{API_PREFIX}/tasks",
+            self.get_headers() | {"Content-Length": "2"},
+            b"{}",
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual(self.decode(response)["error"]["code"], "BODY_FORBIDDEN")
+
+        body = json.dumps(guided_form(), separators=(",", ":")).encode("utf-8")
+        response = self.api.dispatch(
+            "POST",
+            f"{API_PREFIX}/tasks?limit=2",
+            self.mutation_headers(body),
+            body,
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual(self.decode(response)["error"]["code"], "INVALID_QUERY")
+
+    def test_task_collection_query_and_methods_fail_closed(self):
+        invalid_targets = (
+            f"{API_PREFIX}/tasks?cursor=bad",
+            f"{API_PREFIX}/tasks?cursor=v1_!!",
+            f"{API_PREFIX}/tasks?cursor=v1_dGFzay0x=",
+            f"{API_PREFIX}/tasks?cursor=v1_dGFzay0x&cursor=v1_dGFzay0y",
+            f"{API_PREFIX}/tasks?limit=0",
+            f"{API_PREFIX}/tasks?limit=51",
+            f"{API_PREFIX}/tasks?limit=01",
+            f"{API_PREFIX}/tasks?after_sequence=1",
+            f"{API_PREFIX}/tasks?project_id=other",
+        )
+        for target in invalid_targets:
+            with self.subTest(target=target):
+                response = self.api.dispatch("GET", target, self.get_headers(), b"")
+                self.assertEqual(response.status, 400)
+                self.assertEqual(self.decode(response)["error"]["code"], "INVALID_QUERY")
+
+        response = self.api.dispatch(
+            "PUT", f"{API_PREFIX}/tasks", self.get_headers(), b""
+        )
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.headers["Allow"], "GET, POST")
 
     def test_task_approval_abandon_status_events_and_artifact_routes(self):
         task_path = f"{API_PREFIX}/tasks/task-1"
