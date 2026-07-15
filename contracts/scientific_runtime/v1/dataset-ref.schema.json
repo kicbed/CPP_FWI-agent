@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agent-rpc.local/schemas/scientific-runtime/v1/dataset-ref.schema.json",
+  "title": "DatasetRef v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "version",
+    "content_hash",
+    "data_type",
+    "immutable",
+    "metadata",
+    "lineage",
+    "access_scope",
+    "extensions"
+  ],
+  "properties": {
+    "schema_version": {"$ref": "common.schema.json#/definitions/schema_version"},
+    "id": {"$ref": "common.schema.json#/definitions/identifier"},
+    "version": {"$ref": "common.schema.json#/definitions/semantic_version"},
+    "content_hash": {"$ref": "common.schema.json#/definitions/sha256"},
+    "data_type": {"const": "velocity_model_2d"},
+    "immutable": {"const": true},
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shape", "dtype", "axis_order", "units", "physics", "parameter", "grid_spacing_m", "value_range"],
+      "properties": {
+        "shape": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "dtype": {"enum": ["float32", "float64", "uint16"]},
+        "axis_order": {"const": ["z", "x"]},
+        "units": {"type": "string", "minLength": 1, "maxLength": 64},
+        "physics": {"const": "2d_acoustic_constant_density"},
+        "parameter": {"const": "vp"},
+        "grid_spacing_m": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dx", "dz"],
+          "properties": {
+            "dx": {"type": "number", "exclusiveMinimum": 0},
+            "dz": {"type": "number", "exclusiveMinimum": 0}
+          }
+        },
+        "value_range": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimum", "maximum"],
+          "properties": {
+            "minimum": {"type": "number"},
+            "maximum": {"type": "number"}
+          }
+        }
+      }
+    },
+    "lineage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["relation", "dataset"],
+        "properties": {
+          "relation": {"enum": ["derived_from", "subset_of", "converted_from"]},
+          "dataset": {"$ref": "common.schema.json#/definitions/dataset_identity"}
+        }
+      }
+    },
+    "access_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_id", "principals", "permissions"],
+      "properties": {
+        "project_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
+        "principals": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "common.schema.json#/definitions/opaque_id"}
+        },
+        "permissions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["read", "execute"]}
+        }
+      }
+    },
+    "extensions": {"$ref": "common.schema.json#/definitions/extensions"}
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agent-rpc.local/schemas/scientific-runtime/v1/task-draft.schema.json",
+  "title": "TaskDraft v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "draft_id",
+    "revision",
+    "status",
+    "goal",
+    "task_type",
+    "datasets",
+    "algorithm",
+    "parameters",
+    "resources",
+    "missing_fields",
+    "suggestions",
+    "confidence",
+    "extensions"
+  ],
+  "properties": {
+    "schema_version": {"$ref": "common.schema.json#/definitions/schema_version"},
+    "draft_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
+    "revision": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["Draft", "NeedsInput", "AwaitingApproval"]},
+    "goal": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "task_type": {"enum": ["acoustic_forward_2d", "acoustic_fwi_2d"]},
+    "datasets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "dataset-ref.schema.json"}
+    },
+    "algorithm": {"$ref": "common.schema.json#/definitions/algorithm_identity"},
+    "parameters": {"$ref": "common.schema.json#/definitions/fwi_parameters"},
+    "resources": {"$ref": "common.schema.json#/definitions/resource_request"},
+    "missing_fields": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$"}
+    },
+    "suggestions": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 500}
+    },
+    "confidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intent", "parameters", "datasets", "explanation"],
+      "properties": {
+        "intent": {"type": "number", "minimum": 0, "maximum": 1},
+        "parameters": {"type": "number", "minimum": 0, "maximum": 1},
+        "datasets": {"type": "number", "minimum": 0, "maximum": 1},
+        "explanation": {"type": "string", "minLength": 1, "maxLength": 1000}
+      }
+    },
+    "extensions": {"$ref": "common.schema.json#/definitions/extensions"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"missing_fields": {"minItems": 1}}},
+      "then": {"properties": {"status": {"const": "NeedsInput"}}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "AwaitingApproval"}}},
+      "then": {"properties": {"missing_fields": {"maxItems": 0}}}
+    }
+  ]
+}

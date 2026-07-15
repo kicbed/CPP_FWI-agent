@@ -6,9 +6,9 @@
 - 活跃决策：`D-003`、`D-004`；`D-005` 仍为 Proposed
 - 活跃分支：`feature/scientific-agent-runtime`
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
-- 总体状态：**Ready to start P0（治理静态验证通过，真实新会话冷启动演练待完成）**
-- 当前阶段：**P0（尚未开始）**
-- 下一动作：等待用户发出 README 中的 P0.1 开始口令或等价指示
+- 总体状态：**P0 已完成并验证；Ready to start P1 最小持久垂直切片**
+- 当前阶段：**P1（尚未开始）**
+- 下一动作：P1.1 实现 SQLite WAL 最小 Task Store/TaskService 的持久身份、幂等创建、事件和状态查询
 - 当前阻塞：无
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
 
@@ -20,8 +20,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 | 阶段 | 状态 | 已完成内容 | 验证证据 | 下一出口条件 |
 |---|---|---|---|---|
-| 准备 | Implemented | D-003 计划/进度、D-004 验证、D-005 提案与静态安全门 | launcher/continuity/runtime-secret/diff/SSH checkpoint：PASS | 新会话冷启动演练（非 P0 授权阻塞） |
-| P0 最小 FWI 契约 | Pending | 无 | 无 | 七类可演进 Schema、Gate、API/Adapter 规范与测试 |
+| 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
+| P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计 | 合同 23/23、CTest 39/39、FWI Runner 1/1、FWI Python 26/26、Web Python 7/7、UI/governance：PASS | —（阶段完成） |
 | P1 最小持久垂直切片 | Pending | 无 | 无 | SQLite TaskService→FWI Adapter→Guided Web |
 | P2 持久可靠性加固 | Pending | 无 | 无 | lease、取消、重试、恢复和 SSE 通过 |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
@@ -39,8 +39,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 - 当前可运行基线是实验分支上的 Deepwave 二维声学 FWI MVP。
 - 现有 FWI 固定白名单、参数校验、独立 Worker 和 artifact 路由是迁移时必须保护的安全边界。
-- 当前通用 Orchestrator 仍以固定/单跳路由为主；尚无通用 TaskDraft、审批、DAG、幂等、
-  服务端取消或重启恢复。
+- 当前通用 Orchestrator 仍以固定/单跳路由为主；P0 只有 TaskDraft/PlanGraph 等合同和无副作用
+  参考 Gate，尚无持久 TaskService、审批 API、DAG 调度、服务端取消或重启恢复。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
 - 2026-07-15 用户的风险评估已收紧顺序：最小 FWI Schema 先行，最小 SQLite TaskService
   提前到首个垂直切片，Redis 不作为任务事实源，P4 Agent Planner 后置。
@@ -49,11 +49,11 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 ### 尚未开始
 
-- 没有创建 D-003 的 Schema、TaskService、数据库或新 Web API。
+- 没有创建 SQLite TaskService、运行数据库、Dataset Catalog 注册或新 Web API。
 - 没有把现有 FWI 改造成通用 Algorithm Adapter。
 - 没有实现 Guided/Agent 新 UI、审批卡、DAG 或子 Agent 调度。
 
-### 准备阶段静态验证（2026-07-15）
+### 准备阶段与冷启动验证（2026-07-15）
 
 - `bash tests/test_codex_project_launcher.sh`：PASS；
 - `bash tests/test_project_continuity_contract.sh`：PASS；
@@ -65,24 +65,37 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 - 首个 SSH checkpoint：`b5ac633` 已推送到 `origin/feature/scientific-agent-runtime`；
   推送后 `git rev-parse HEAD` 与 `git rev-parse @{upstream}` 一致。
 
-这些结果只验证跨会话治理切片；本次未改动 C++、Python 数值路径或
-Web 运行时，因此不把旧 FWI 测试记为本切片的重跑证据。
-一个真实的新 Codex 会话仍需在首个请求时完成 branch/diff/ledger 冷启动 reconciliation；
-在那之前不把“自动恢复”标记为端到端 Verified。
-该演练是跨会话治理的非阻塞验收项：用户现在可以授权 P0.1；但新会话在修改 P0
-文件前必须先完成该 preflight，并在账本中将准备阶段更新为 Verified/Completed。
+本会话按 `AGENTS.md` 完整读取 continuity/plan/progress/Git policy，确认当前分支、干净工作树、
+upstream 和 `ffeb5bc` ancestor，运行只读 helper，随后以代码和测试重新核对账本。真实新会话
+冷启动 reconciliation 演练完成，因此准备阶段从 Implemented 更新为 Verified/Completed。
 
-### 下一可执行切片：P0.1
+### P0.1 合同切片验证（2026-07-15）
 
-1. 审计现有 `ExperimentSpec`、`AlgorithmCard`、A2A Task、FWI config/manifest 的可复用字段；
-2. 新建仅覆盖最小 FWI 链路的版本化 `DatasetRef`、`AlgorithmManifest`、`TaskDraft`、`PlanGraph`、
-   `ApprovalDecision`、`RunEvent` 和 `ArtifactManifest` Schema；
-3. 定义 `schema_version`、受控 `extensions`、规范化/hash、嵌套执行环境指纹（含
-   commit/tree/dirty/diff 身份、deterministic flags 与已知非确定性）和版本演进规则；
-4. 编写正例、缺/未知字段、越界资源、任意/无权数据、hash 不符、未注册/非 allowlist/
-   版本未 pin/类型不匹配算法、有环 DAG、未确认字段、幂等键异常、side-effect policy 失败、
-   批准过期/plan hash 不符和 dirty provenance 缺失测试；
-5. 只落契约和测试，不改变当前 FWI 运行路径。D-005 未获批时不审计/迁移旧 prompt。
+- `contracts/scientific_runtime/v1/`：七类公共 Schema 与共享定义；顶层未知字段拒绝，只允许
+  namespaced extensions；DatasetRef v1 只覆盖当前二维速度模型输入；
+- `scientific_runtime_contracts/validation.py`：NFC/整数 JSON canonicalization、plan hash 和无
+  存储/调度/提交副作用的 deterministic Gate 参考实现；
+- `docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md`：状态转换、版本演进、执行指纹、
+  API 草案、Adapter v1、Proto 映射、威胁模型及 ExperimentSpec/AlgorithmCard/A2A/FWI 差异；
+- `python3 -m unittest tests.test_scientific_runtime_contracts -v`：23/23 PASS，覆盖七类正例、
+  缺/未知字段、资源/参数越界、任意路径、数据权限/hash、算法注册/allowlist/version pin、
+  I/O 类型、DAG、未确认字段、幂等键、副作用、批准/plan hash、dirty provenance；
+- `ctest --test-dir build --output-on-failure`：39/39 PASS；
+- `ctest --test-dir mcp_server_integrated/build --output-on-failure`：1/1 PASS；
+- FWI Python：26/26 PASS；Web Python：7/7 PASS；UI message、launcher、continuity、
+  runtime-secret 和 `codex-project --check`：PASS。
+
+P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `FWI_RUN_ROOT` 执行边界。
+这些验证证明合同和回归基线通过，不证明 P1 TaskService 或科学效果。
+
+### 下一可执行切片：P1.1
+
+1. 定义最小 SQLite migration 和 storage interface，启用 WAL；SQLite 是唯一任务事实源；
+2. 持久化 immutable task ID、draft revision、plan、approval、task state、append-only event 和
+   create/submit idempotency mapping；
+3. 先实现创建与状态查询的服务层及重启后身份/事件仍可查询测试；
+4. 未完成批准事务和 Deepwave Adapter 前不提交真实 FWI job，不提前制作表面 Web 闭环；
+5. D-005 未获批，继续不审计、迁移或删除旧 prompt-like 文件。
 
 ## 新会话恢复协议
 
@@ -107,6 +120,8 @@ Web 运行时，因此不把旧 FWI 测试记为本切片的重跑证据。
 |---|---|---|---|---|---|
 | 2026-07-15 | PREP-001 | Pending → Implemented | D-003/D-004、实施计划、进度账本、Git 规则与 D-005 提案 | launcher/continuity/runtime-secret/diff：PASS | 新会话冷启动演练；等待用户开始 P0.1 |
 | 2026-07-15 | PREP-002 / D-004 | Partially implemented → Verified | 独立实现分支首个 SSH checkpoint | `b5ac633` 本地/upstream 一致 | 准备阶段仅余首个新会话冷启动演练 |
+| 2026-07-15 | PREP-003 | Implemented → Verified | 真实新会话 branch/diff/ancestor/ledger/helper reconciliation | live preflight + governance tests：PASS | 准备阶段完成 |
+| 2026-07-15 | P0-001 | Pending → Verified | 七类 Schema、canonical/hash、Gate、fingerprint、状态/API/Adapter/Proto、威胁与差异审计 | contract 23/23、CTest 39/39、runner 1/1、FWI 26/26、Web 7/7、UI/governance：PASS | P0 阶段完成；P1.1 SQLite Task Store/TaskService |
 
 记录规则：
 

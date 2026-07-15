@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agent-rpc.local/schemas/scientific-runtime/v1/approval-decision.schema.json",
+  "title": "ApprovalDecision v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "approval_id",
+    "plan_id",
+    "plan_hash",
+    "decision",
+    "actor",
+    "scope",
+    "decided_at",
+    "expires_at",
+    "extensions"
+  ],
+  "properties": {
+    "schema_version": {"$ref": "common.schema.json#/definitions/schema_version"},
+    "approval_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
+    "plan_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
+    "plan_hash": {"$ref": "common.schema.json#/definitions/sha256"},
+    "decision": {"enum": ["approved", "rejected"]},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id"],
+      "properties": {
+        "type": {"enum": ["user", "agent_delegation"]},
+        "id": {"$ref": "common.schema.json#/definitions/opaque_id"}
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["datasets", "algorithms", "resource_limits", "side_effects", "max_tasks"],
+      "properties": {
+        "datasets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "common.schema.json#/definitions/dataset_identity"}
+        },
+        "algorithms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "common.schema.json#/definitions/algorithm_identity"}
+        },
+        "resource_limits": {"$ref": "common.schema.json#/definitions/resource_request"},
+        "side_effects": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["compute", "write_artifacts"]}
+        },
+        "max_tasks": {"type": "integer", "minimum": 1, "maximum": 100}
+      }
+    },
+    "delegation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "revocable", "budget_id"],
+      "properties": {
+        "session_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
+        "revocable": {"const": true},
+        "budget_id": {"$ref": "common.schema.json#/definitions/opaque_id"}
+      }
+    },
+    "decided_at": {"$ref": "common.schema.json#/definitions/timestamp"},
+    "expires_at": {"$ref": "common.schema.json#/definitions/timestamp"},
+    "extensions": {"$ref": "common.schema.json#/definitions/extensions"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"actor": {"properties": {"type": {"const": "agent_delegation"}}}}},
+      "then": {"required": ["delegation"]},
+      "else": {"not": {"required": ["delegation"]}}
+    }
+  ]
+}

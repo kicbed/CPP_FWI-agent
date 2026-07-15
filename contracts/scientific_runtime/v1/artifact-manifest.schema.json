@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agent-rpc.local/schemas/scientific-runtime/v1/artifact-manifest.schema.json",
+  "title": "ArtifactManifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_id",
+    "task_id",
+    "node_id",
+    "artifact_type",
+    "media_type",
+    "location",
+    "content_hash",
+    "size_bytes",
+    "created_at",
+    "metrics",
+    "display",
+    "fingerprint",
+    "lineage",
+    "extensions"
+  ],
+  "properties": {
+    "schema_version": {"$ref": "common.schema.json#/definitions/schema_version"},
+    "artifact_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
+    "task_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
+    "node_id": {"$ref": "common.schema.json#/definitions/identifier"},
+    "artifact_type": {"$ref": "common.schema.json#/definitions/data_type"},
+    "media_type": {"type": "string", "pattern": "^[a-z0-9.+-]+/[A-Za-z0-9.+-]+$"},
+    "location": {"$ref": "common.schema.json#/definitions/artifact_location"},
+    "content_hash": {"$ref": "common.schema.json#/definitions/sha256"},
+    "size_bytes": {"type": "integer", "minimum": 0},
+    "created_at": {"$ref": "common.schema.json#/definitions/timestamp"},
+    "metrics": {
+      "type": "object",
+      "additionalProperties": {"type": ["number", "string", "boolean", "null"]}
+    },
+    "display": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "title", "order"],
+      "properties": {
+        "component": {"enum": ["image", "metric_table", "line_chart", "text", "download"]},
+        "title": {"type": "string", "minLength": 1, "maxLength": 200},
+        "order": {"type": "integer", "minimum": 0}
+      }
+    },
+    "fingerprint": {"$ref": "common.schema.json#/definitions/reproducibility_fingerprint"},
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan_hash", "algorithm", "inputs"],
+      "properties": {
+        "plan_hash": {"$ref": "common.schema.json#/definitions/sha256"},
+        "algorithm": {"$ref": "common.schema.json#/definitions/algorithm_identity"},
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "common.schema.json#/definitions/dataset_identity"}
+        }
+      }
+    },
+    "extensions": {"$ref": "common.schema.json#/definitions/extensions"}
+  }
+}
