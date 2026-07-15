@@ -43,7 +43,28 @@
 - 自己从浏览器逐步验收：[Web 前端端到端测试](docs/FRONTEND_TEST.md)
 - 会话隔离、上下文窗口、历史保留与隐私：[对话上下文与历史管理](docs/CONVERSATION_MANAGEMENT.md)
 - 跨 Codex 会话延续的已采纳方向与待实现项：[项目持续开发与已采纳决策](docs/PROJECT_CONTINUITY.md)
+- 已批准的下一代科研任务 Runtime 完整阶段：[科研任务 Agent Runtime 实施计划](docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md)
+- 各阶段实际 checkpoint 和下一安全动作：[科研任务 Runtime 进度账本](docs/PROJECT_PROGRESS.md)
+- 分支、提交、SSH 推送与待确认的 AI 提示词提案：[Git 与 AI 提示词管理规则](docs/GIT_AND_PROMPT_POLICY.md)
 - 新 Codex 会话如何自动接续项目：[Codex 自动接续与跨会话工作流](docs/CODEX_WORKFLOW.md)
+
+## 下一阶段：已批准，尚未实现
+
+下一步将把当前的“固定/单跳路由 + FWI 特例执行”升级为 Guided/Agent 双模式
+科研任务平台。两种模式将共用受验证的任务草稿、批准、持久调度、算法适配和
+artifact 协议，并逐步支持数据选择、意图确认、任务图、取消/恢复、新算法接入和结果分析。
+
+这个方向已记录为 `D-003 Accepted`，但 P0–P6 运行时代码目前都是 `Pending`；本 README
+下方的“当前能做什么”才是已实现基线。新会话会根据进度账本从首个未完成切片继续，
+不会因为计划文档存在就把它误报为已上线。
+
+要开始第一个切片，在当前或任意新 Codex 会话中直接说（不需要执行项目脚本）：
+
+```text
+开始 D-003 的 P0.1，只做最小 FWI 契约审计、Schema 和测试，不改变现有 FWI 行为。
+```
+
+这句话只授权开始 P0.1，不会自动跳到 TaskService、Web、P4 Agent Planner 或启动 FWI 计算。
 
 ## 当前能做什么
 

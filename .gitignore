@@ -118,3 +118,7 @@ docs/upgrade/*prompts*.md
 docs/upgrade/local-*.md
 docs/upgrade/next-session*.md
 docs/superpowers/plans/*.md
+
+# ==================== 本地 AI 开发提示词 ====================
+/.local-prompts/
+*.local-prompt.md

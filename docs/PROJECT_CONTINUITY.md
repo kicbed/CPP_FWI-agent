@@ -105,16 +105,99 @@
 - 隔离测试覆盖自动接续规则、固定 CLI 参数、shell 注入、敏感路径过滤、FWI 状态字段
   白名单和工作树不变性。具体机制见 `docs/CODEX_WORKFLOW.md`。
 
+## D-003：双模式科研任务平台与持久任务内核
+
+- 决策状态：**Accepted**
+- 实现状态：**Governance implemented / Runtime pending**
+- 用户确认日期：2026-07-15
+- 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
+- 进度账本：`docs/PROJECT_PROGRESS.md`
+
+### 已采纳方向
+
+1. 产品交互升级为 Guided/Agent 双模式：人工可以直接选数据、算法和参数，Agent 也可以
+   从自然语言生成结构化任务草稿、建议和计划。
+2. 两种模式共用唯一任务内核：
+   `DatasetRef → TaskDraft → PlanGraph → ApprovalDecision → Durable Task Runtime → ArtifactManifest`。
+3. 采用“动态规划控制面 + 确定性执行面”。Agent 负责理解、建议、拆解、评审和分析；
+   Schema、Policy、Scheduler 和版本固定的 Algorithm Adapter 决定实际执行。
+4. 默认在执行前由用户确认计划。会话级 Agent 授权必须显式、限域、有限预算、可撤销且
+   可审计，不能把一句模糊文本解释为永久全权授权。
+5. 长任务必须支持持久事件、幂等、等待、取消、有限重试、checkpoint 和重启 reconciliation。
+6. 新算法通过标准 AlgorithmManifest、输入输出/参数 Schema、资源与安全声明、Adapter 和
+   conformance test 接入；MCP/A2A 作为适配与互操作边界，而不是任务状态唯一真源。
+7. 数据只通过已导入、哈希和 metadata 校验的 ID/版本引用，不接受 LLM 或浏览器传入的任意
+   服务器路径。
+8. Deepwave FWI 是第一个标准 Adapter 和回归基线；后续以真实去噪、质量评价与 FWI 任务图
+   验证多算法接入。
+9. P0 只定义覆盖最小 FWI 链路的可演进契约；最小 SQLite TaskService、幂等创建和
+   状态查询提前到首个垂直切片，不在无持久任务身份时先做表面 Web 闭环。
+10. SQLite/Task Store 是任务、计划、批准、状态和事件的唯一权威事实源；Redis 只用于
+    缓存、锁、lease 和通知。
+11. 可复现性必须记录算法/代码版本、commit/tree/dirty/diff 身份、镜像 digest 或环境
+    lock、Python/CUDA/PyTorch/Deepwave、随机种子、硬件、deterministic flags、规范化配置和
+    数据 hash；这是 provenance，不冒充跨 GPU/库版本 bitwise 一致保证。
+12. Agent 置信度只用于解释/澄清；数据版本/hash/权限、算法注册/allowlist/版本 pin、
+    I/O 类型、Schema、资源、DAG 无环、字段完整、有效批准/plan hash、side-effect policy 和幂等键
+    等确定性检查才能打开执行门。
+13. P4 Agent Planner/子 Agent 必须在 P0–P3 可靠性基线 Verified 后启动，不作为近期主线。
+
+D-003 是 D-001 的通用化，不替代 D-001。现有 FWI 白名单、参数边界、路径校验、MCP 安全
+启动和“未提交不得伪装为执行”规则，在新任务内核通过等价或更强测试前继续有效。
+
+### 当前实现边界
+
+- 已实现并静态验证：获批架构计划、跨会话进度账本、Git 管理规则和冷启动
+  reconciliation 协议/启动契约。
+- 待验证：一个真实的新 Codex 会话仍需完成冷启动 reconciliation 演练；静态测试不冒充
+  该端到端验收。
+- 尚未实现：P0–P6 的 Schema、TaskService、Dataset Catalog、审批 API、DAG、恢复调度、
+  Guided/Agent 新 UI、通用 Algorithm SDK 和去噪链路。
+- 不得因本文存在就声称下一代任务平台已经可用；每项真实状态见进度账本并现场验证。
+
+## D-004：Git checkpoint 管理
+
+- 决策状态：**Accepted**
+- 实现状态：**Partially implemented / first SSH checkpoint pending**
+- 用户确认日期：2026-07-15
+- 完整规则：`docs/GIT_AND_PROMPT_POLICY.md`
+
+### 已采纳规则
+
+1. D-003 从 FWI 已验证基线创建独立 `feature/scientific-agent-runtime` 分支，按可验证
+   纵向切片提交并通过 SSH 推送，不直接修改或推送 `main`。
+2. 提交前检查相关 diff、测试、进度账本、暂存清单和敏感信息；不提交构建、环境、模型、
+   数据、运行状态、数据库、日志或缓存。
+
+## D-005：AI 提示词分类管理
+
+- 决策状态：**Proposed / awaiting user confirmation**
+- 实现状态：**Pending**
+- 提案日期：2026-07-15
+- 完整提案：`docs/GIT_AND_PROMPT_POLICY.md`
+
+### 待确认提案
+
+1. 临时开发 prompt、原始聊天和窗口交接文本不上传，使用专用 Git 忽略位置；
+2. 决定产品行为的脱敏运行时 prompt 作为可复现源码版本化、评审和测试；
+3. 不用“先上传、最后再删”保护隐私，因为删除最新文件不会清除 Git 历史；
+4. 旧 prompt-like 文档不破坏性批量删除；D-005 获批后再在 P0 审计。
+
+当前安全默认：在 D-005 获批前，本分支不上传临时 prompt/原始聊天，也不迁移或删除
+已有产品运行时 prompt。这是本次 checkpoint 的保守处理，不等于用户已批准全部提案。
+
 ## 新会话的最小检查清单
 
 ```text
 1. 用户在仓库中正常打开 Codex 后直接提问，无需执行项目脚本
 2. Codex 依据根 AGENTS.md 自动完整阅读 docs/PROJECT_CONTINUITY.md
-3. Codex 自行检查当前分支、git status、git diff，保护用户已有改动
-4. 区分 Accepted / Implemented / Verified / Pending
-5. 针对当前任务检查真实代码和测试，不依赖本文中的旧状态快照
-6. 用户明确要求保留的决定自动写入本文；其他新建议先征得同意
-7. 修改后记录测试证据；不写入秘密、模型和运行产物
+3. D-003 工作还必须完整阅读架构计划、PROJECT_PROGRESS 和 Git/提示词规则
+4. Codex 自行检查当前分支、git status、git diff，保护用户已有改动
+5. 现场核对进度账本，区分 Accepted / Implemented / Verified / Pending
+6. 从依赖已满足的 next safe action 继续，不依赖旧状态快照或重复已验证工作
+7. 用户明确要求保留的决定自动写入本文；其他新建议先征得同意
+8. 修改后更新进度和测试证据；不写入秘密、模型和运行产物
+9. D-005 在用户明确确认前仍是 Proposed，不得报告为 Accepted
 ```
 
 ## 决策变更记录
@@ -125,3 +208,7 @@
 | 2026-07-15 | D-002 | 新增并标记 Accepted | 用户明确要求跨新 Codex 窗口持续保留决策，并规定新建议需征得同意后加入 |
 | 2026-07-15 | D-002 | 增加安全 Codex 项目入口并完成隔离测试 | 用户要求新 Codex 在目录中启动即可了解工程，并能基于共享工作区持续开发 |
 | 2026-07-15 | D-002 | 改为普通 Codex 会话自动接续，辅助脚本降级为内部诊断 | 用户明确要求启动 Codex 后直接提问，不再记忆或手动运行项目脚本；“保留这个”等明确表述自动触发持久记录更新 |
+| 2026-07-15 | D-003 | 新增并标记 Accepted，运行时实现仍为 Pending | 用户认可 Guided/Agent 双模式、动态规划控制面与确定性任务内核方案，并要求先保存计划和跨会话进度 |
+| 2026-07-15 | D-003 | 根据风险评估调整阶段边界 | 用户指出 P0 过度设计、P1/P2 倒置、SQLite/Redis 真值、环境可复现、置信度与 P4 优先级六项风险 |
+| 2026-07-15 | D-004 | 新增并标记 Accepted | 用户明确要求 Codex 管理 Git，使用独立实现分支和可验证 checkpoint |
+| 2026-07-15 | D-005 | 新增并标记 Proposed | 用户对 AI prompt 是否上传仍有保留；记录可审批提案，本次先采用不上传临时 prompt 的安全默认 |
