@@ -3,7 +3,7 @@
 <!-- git-prompt-policy: v1 -->
 
 - Git 决策：`D-004` / **Accepted**
-- Git 实现状态：**Partially implemented / first SSH checkpoint pending**
+- Git 实现状态：**Verified — first SSH checkpoint pushed**
 - 提示词提案：`D-005` / **Proposed — awaiting user confirmation**
 - 记录日期：2026-07-15
 
@@ -21,6 +21,9 @@
 - 不自动修改或推送 `main`，不 force-push，不重写已经发布的功能分支历史，不使用
   `git reset --hard` 或 `git checkout --` 清理用户改动。
 - 远端操作使用现有 SSH remote，不依赖 `gh`。
+
+首个 checkpoint `b5ac633` 已推送到
+`origin/feature/scientific-agent-runtime`；本地 branch/upstream 在推送后指向同一提交。
 
 截至 2026-07-15 的现场快照显示，本地 `main` 相对 `origin/main` 为 ahead 57 / behind 2。
 这是会过期的证据，每次操作前必须重查；D-003 开发不得因此自动切换、reset、rebase

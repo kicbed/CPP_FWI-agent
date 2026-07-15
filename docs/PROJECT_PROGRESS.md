@@ -20,7 +20,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 | 阶段 | 状态 | 已完成内容 | 验证证据 | 下一出口条件 |
 |---|---|---|---|---|
-| 准备 | Implemented | D-003 计划/进度、D-004 规则、D-005 提案与静态安全门 | launcher/continuity/runtime-secret/diff：PASS | 首个 SSH checkpoint；新会话冷启动演练（非 P0 授权阻塞） |
+| 准备 | Implemented | D-003 计划/进度、D-004 验证、D-005 提案与静态安全门 | launcher/continuity/runtime-secret/diff/SSH checkpoint：PASS | 新会话冷启动演练（非 P0 授权阻塞） |
 | P0 最小 FWI 契约 | Pending | 无 | 无 | 七类可演进 Schema、Gate、API/Adapter 规范与测试 |
 | P1 最小持久垂直切片 | Pending | 无 | 无 | SQLite TaskService→FWI Adapter→Guided Web |
 | P2 持久可靠性加固 | Pending | 无 | 无 | lease、取消、重试、恢复和 SSE 通过 |
@@ -62,6 +62,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 - `git diff --check`：PASS；
 - `bash tests/test_project_continuity_contract.sh` 内置的 Git-visible 禁止路径和高置信密钥/
   私钥扫描：PASS（除两处精确白名单的脱敏 C++ 安全 fixture 外无命中）。
+- 首个 SSH checkpoint：`b5ac633` 已推送到 `origin/feature/scientific-agent-runtime`；
+  推送后 `git rev-parse HEAD` 与 `git rev-parse @{upstream}` 一致。
 
 这些结果只验证跨会话治理切片；本次未改动 C++、Python 数值路径或
 Web 运行时，因此不把旧 FWI 测试记为本切片的重跑证据。
@@ -104,6 +106,7 @@ Web 运行时，因此不把旧 FWI 测试记为本切片的重跑证据。
 | 日期 | 切片 | 状态变化 | 交付物 | 验证 | 下一动作/阻塞 |
 |---|---|---|---|---|---|
 | 2026-07-15 | PREP-001 | Pending → Implemented | D-003/D-004、实施计划、进度账本、Git 规则与 D-005 提案 | launcher/continuity/runtime-secret/diff：PASS | 新会话冷启动演练；等待用户开始 P0.1 |
+| 2026-07-15 | PREP-002 / D-004 | Partially implemented → Verified | 独立实现分支首个 SSH checkpoint | `b5ac633` 本地/upstream 一致 | 准备阶段仅余首个新会话冷启动演练 |
 
 记录规则：
 
