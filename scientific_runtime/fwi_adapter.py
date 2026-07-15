@@ -2454,6 +2454,60 @@ class DeepwaveAdapter:
             ),
         ]
 
+    def read_artifact(
+        self, handle: AdapterHandle, artifact_id: str
+    ) -> tuple[dict[str, Any], bytes]:
+        """Return one revalidated standard artifact without trusting a path."""
+
+        if (
+            not isinstance(artifact_id, str)
+            or re.fullmatch(r"artifact-[0-9a-f]{32}", artifact_id) is None
+        ):
+            raise AdapterArtifactError(
+                "ARTIFACT_ID_INVALID: artifact identity is malformed"
+            )
+        manifests = self.collect(handle)
+        manifest = next(
+            (value for value in manifests if value.get("artifact_id") == artifact_id),
+            None,
+        )
+        if manifest is None:
+            raise AdapterArtifactError(
+                "ARTIFACT_NOT_FOUND: artifact identity is not part of this task"
+            )
+        record = self._record_for_handle(handle)
+        location = manifest.get("location")
+        relative_path = (
+            location.get("relative_path") if isinstance(location, Mapping) else None
+        )
+        prefix = f"{record['job_id']}/"
+        if not isinstance(relative_path, str) or not relative_path.startswith(prefix):
+            raise AdapterArtifactError(
+                "ADAPTER_ARTIFACT_INVALID: artifact location is not task-bound"
+            )
+        worker_relative_path = relative_path[len(prefix):]
+        media_type = manifest.get("media_type")
+        maximum = {
+            "application/x-npy": MAX_NPY_BYTES,
+            "text/csv": MAX_CSV_BYTES,
+        }.get(media_type)
+        if maximum is None:
+            raise AdapterArtifactError(
+                "ADAPTER_ARTIFACT_INVALID: artifact media type is unsupported"
+            )
+        data = self._read_artifact_bytes(
+            self._job_directory(record), worker_relative_path, max_bytes=maximum
+        )
+        content_hash = "sha256:" + hashlib.sha256(data).hexdigest()
+        if (
+            len(data) != manifest.get("size_bytes")
+            or content_hash != manifest.get("content_hash")
+        ):
+            raise AdapterArtifactError(
+                "ADAPTER_ARTIFACT_INVALID: artifact changed during validated access"
+            )
+        return copy.deepcopy(manifest), data
+
 
 __all__ = [
     "AdapterArtifactError",

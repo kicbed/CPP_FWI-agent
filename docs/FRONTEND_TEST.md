@@ -1,6 +1,6 @@
 # Web 前端端到端测试
 
-本文给第一次运行项目的使用者一条可执行的验收路径：配置本地 secret、核对固定模型、一键启动、从中文请求提交 FWI、查看六张图和真实指标，最后一键关闭。
+本文给第一次运行项目的使用者一条可执行的验收路径：配置本地 secret、核对固定模型、一键启动，优先走完 P1 Guided 的确认/修改/批准/状态/NPY+CSV 闭环，再可选检查旧 MCP/FWI Result 的六张图兼容性，最后一键关闭。
 
 只在受信任的本机或受控容器中执行。当前 Web 没有用户认证，不要把 8080 或 5000 端口暴露到公网；不要在终端、截图、聊天、Issue 或日志粘贴内容中输出 API Key。
 
@@ -132,163 +132,96 @@ curl --fail --silent \
 curl --fail --silent http://127.0.0.1:50052/health
 ```
 
-## 5. 依次测试四类中文请求
+## 5. 验收 P1 Guided Web 闭环
 
-### 5.1 提交正演
+首先确认使用默认 loopback 地址。P1 Guided API 在 `WEB_HOST=0.0.0.0` 下会 fail closed，
+不要用容器 wildcard 绑定做这项验收。
 
-在聊天输入：
+### 5.1 用执行请求打开确认卡
 
-```text
-使用 marmousi_94_288 运行一个二维声学正演演示。
-```
-
-预期：
-
-- 回复被解析为 `fwi_job_submitted`；
-- FWI Result 面板显示严格格式的 `job_id`；
-- 初始状态为 `queued` 或 `running`；任务很快时也可能在首次轮询前直接变为 `succeeded`；
-- 任务最终明确进入 `succeeded` 或 `failed`，不会一直伪装成功。
-
-### 5.2 提交两次更新 smoke
-
-正演完成后输入：
+可点击页面快捷入口 **Smoke CUDA**（无 CUDA 时选 **Smoke CPU**），也可在聊天输入：
 
 ```text
-使用 marmousi_94_288 运行两次迭代的二维声学 FWI smoke test。
+帮我做个 Marmousi FWI，使用 CUDA，迭代1次。
 ```
 
-没有 CUDA 时明确要求 CPU：
+预期出现 Guided FWI 表单，而不是旧 `fwi_job_submitted` 结果或一段示例代码。表单应显示：
 
-```text
-使用 CPU 和 marmousi_94_288 运行两次迭代的二维声学 FWI smoke test。
-```
+- session scope 与 P1 capability；
+- 固定 `marmousi_94_288@1.0.0` 数据和 `deepwave.acoustic_fwi@1.0.0` 算法；
+- 只有实验目标、注册数据、preset、device、iterations 和 seed 等受控字段，没有服务器
+  路径、shell 或 Worker job ID 输入。
 
-预期新任务的 `total_iterations` 为 2。smoke 的验收目标是 forward/backward、梯度裁剪和模型更新链路均为 finite；它不以高质量反演为目标。
+纯理论问句“什么是 FWI？只解释，不要运行任务。”仍应走聊天，不打开执行卡。
 
-smoke 默认 2 次、demo 默认 5 次，也支持显式指定 1–100 次。可另外输入：
+### 5.2 创建、修改与放弃 pre-runtime 草稿
 
-```text
-使用 marmousi_94_288 在 CUDA 上运行 50 次迭代的 FWI，并向我展示结果。
-```
+建议验收值：
 
-下面这条更口语化的表达也必须得到完全相同的真实提交结果，不能只返回 Python 示例代码：
+| 字段 | CUDA 建议值 | CPU 建议值 |
+|---|---:|---:|
+| preset | `fwi_smoke` | `fwi_smoke` |
+| device | `cuda` | `cpu` |
+| iterations | `1` | `1` |
+| seed | `20260715` | `20260715` |
 
-```text
-做一下marmousi的反演测试，迭代50次，完成后展示结果
-```
+点击 **生成 Draft / Plan 确认卡**。预期：
 
-预期先异步返回新 `job_id`，状态中的 `total_iterations` 为 50；计算成功后页面自动加载
-结果。右侧“最近 FWI 任务”应依次显示 `queued/running/succeeded`；如果回答里没有合法
-`fwi_job_submitted` 和 `job_id`，页面必须显示红色“FWI 任务未提交”，不要把说明文字或
-代码块当成运行成功。为缩短日常回归时间可以把 50 改为 3。超过 100、负数或小数应被明确
-拒绝且不创建任务。
+- 显示真实 `task_id`、draft revision 1、单节点 plan 和 64 位 `plan_hash`；
+- task 为 `AwaitingApproval`，页面明确显示“批准前不会进入运行队列”；
+- `FWI_RUN_ROOT` 没有因为创建确认卡而新增 Worker job。
 
-### 5.3 查询刚才任务状态
+点击 **修改**，把 seed 改为 `20260716`，再点击 **重新生成确认卡**。预期 revision
+变为 2，`plan_hash` 改变，仍为 `AwaitingApproval`。
 
-输入：
+如要验收放弃，点击 **放弃草稿**。预期任务变为 `Cancelled`，页面明确说明只终止了
+pre-runtime 草稿，没有发送运行中 cancel。放弃后重新打开 Smoke 入口，创建另一个任务
+继续下一步。
 
-```text
-查看刚才 FWI 任务的状态。
-```
+### 5.3 人工批准、真实状态和结果
 
-预期面板显示：
+在新任务的确认卡点击 **批准运行**。预期：
 
-- `job_id` 与刚才 smoke 一致；
-- `status` 为 `queued|running|succeeded|failed` 之一；
-- `stage`、`iteration / total_iterations` 和 `message` 来自真实 `status.json`；
-- 未结束时可点击“刷新状态”，页面也会自动轮询。
+1. dispatch 进入 `dispatched`，task 为 `Queued`、`Running`、`Succeeded` 之一；任务较快时
+   页面可能看不到每个中间帧，但终态不会被伪造；
+2. 状态来自 SQLite task + Adapter GET 查询，页面不显示 Adapter handle 或 Worker job ID；
+3. `Succeeded` 后恰好显示两张 ArtifactManifest 卡：
+   `inverted_velocity_model_2d` NPY 和 `loss_curve` CSV；
+4. 两张卡都显示 size 与 SHA-256，**通过受控 endpoint 下载** 返回 attachment，不使用
+   `/fwi-artifacts/<job_id>/...` 路径。
 
-### 5.4 获取结果和损失曲线
+如 approval 已持久化但 submit 预检失败，页面应停止自动轮询，显示
+**继续已批准提交（复用原 Idempotency-Key）**。这是由用户显式重放同一 approve/submit
+mutation，不是 P2 task retry。Artifact GET 临时失败或不足两个时，应显示
+**重新获取 artifacts（GET）**，不重跑 Worker。
 
-状态成功后输入：
+### 5.4 重启边界
 
-```text
-显示刚才的反演结果和损失曲线。
-```
+`./stop.sh` 后用 `./start.sh --no-build` 重启，SQLite 终态、事件和 artifact 仍可通过已知
+`task_id` 查询。P1 页面不持久化当前卡、不提供任务列表或刷新后自动恢复；这些仍属 P2。
 
-预期系统读取该 job 的 `manifest.json`、`metrics.json` 和 `config.resolved.json`，而不是重新启动计算。
+## 6. 验收 legacy MCP/FWI Result 兼容性（自动化）
 
-## 6. 核对六张图片
+正常页面中的执行型 FWI 快捷入口和聊天文本现在有意统一进入 Guided 确认卡，不能再用手工
+聊天绕过批准去触发旧 MCP 提交。旧 `fwi_job_submitted` renderer、六张 PNG、状态查询和
+`/fwi-artifacts` 路由只作为兼容边界保留，由回归测试验收：
 
-FWI Result 面板必须出现以下六张卡片：
-
-1. 真实速度模型；
-2. 初始速度模型；
-3. 反演速度模型；
-4. 模型误差；
-5. 观测 / 模拟 / 残差炮集；
-6. 损失曲线。
-
-图片加载失败时，卡片应明确显示“artifact 不存在或无法解码”，不能只是空白。
-
-从页面复制 `job_id`，仅把下面占位符替换为该 ID：
+两条普通聊天 transport 还固定携带 `allow_legacy_fwi_submit=false`。后端根据 actual tool
+plan 在 MCP 执行前拒绝旧 `fwi_submit_demo`，因此前端 classifier 将来发生漂移时也不会直接
+提交；该 caller-carried 字段用于本机 Web 产品策略，不是用户认证或远程权限边界。
 
 ```bash
-JOB_ID='fwi-YYYYMMDDTHHMMSSZ-xxxxxxxxxxxx'
-RUN_DIR="/root/fwi-runs/$JOB_ID"
-
-test -s "$RUN_DIR/figures/true_model.png"
-test -s "$RUN_DIR/figures/initial_model.png"
-test -s "$RUN_DIR/figures/inverted_model.png"
-test -s "$RUN_DIR/figures/model_error.png"
-test -s "$RUN_DIR/figures/shot_gathers.png"
-test -s "$RUN_DIR/figures/loss_curve.png"
-printf '六张 PNG 均存在且非空\n'
+python3 -m unittest discover -s web/tests -p 'test_*.py' -v
+node web/tests/ui_message_rendering_test.js
 ```
 
-还可以通过与浏览器相同的受控路由检查 Content-Type：
+当前预期为 Web/Workbench Python 27/27 PASS，UI Node 输出
+`ui message rendering tests passed`。这组测试同时证明执行型文本先进入 Guided、纯理论文本仍
+走聊天、旧结果不会把无合法回执的说明或代码误标成已提交，并覆盖旧 artifact 路径/后缀边界。
+如要人工查看旧 Worker 目录、六张 PNG 或 `metrics.json`，只使用已经由兼容 MCP 或 Worker
+CLI 创建的已知 `job_id`；这不是 P1 Guided 的验收结果，Guided 页面只展示标准 NPY/CSV。
 
-```bash
-curl --fail --head \
-  "http://127.0.0.1:8080/fwi-artifacts/$JOB_ID/figures/loss_curve.png"
-```
-
-预期包含 `Content-Type: image/png`。不要尝试用该路由读取模型三件套或 `.env`；它们不在允许的 artifact 范围内。
-
-## 7. 核对页面指标与文件
-
-先查看结构化文件。它们不包含 LLM API Key：
-
-```bash
-/root/.venvs/cpp-fwi-agent/bin/python -m json.tool "$RUN_DIR/status.json"
-/root/.venvs/cpp-fwi-agent/bin/python -m json.tool "$RUN_DIR/metrics.json"
-/root/.venvs/cpp-fwi-agent/bin/python -m json.tool "$RUN_DIR/manifest.json"
-```
-
-页面和文件至少应一致显示：
-
-| 项目 | 当前 Marmousi 预期 |
-|---|---|
-| shape | `94 × 288` |
-| dx / dz | `10 m / 10 m` |
-| source frequency | `8 Hz` |
-| dt / nt | `0.001 s / 2000` |
-| shots / receivers | `3 / 96` |
-| iterations | forward 为 0；smoke 默认 2；demo 默认 5；显式覆盖时为请求的 1–100 |
-| initial/final loss | 与 `metrics.json` 数值一致 |
-| loss reduction | 与 `(initial-final)/initial` 一致 |
-| model relative L2 | initial → final，与文件一致 |
-| device | CPU 名称或实际 CUDA 设备名称 |
-| runtime | 与 `elapsed_seconds` 一致 |
-
-还要确认：
-
-```bash
-/root/.venvs/cpp-fwi-agent/bin/python - "$RUN_DIR/metrics.json" <<'PY'
-import json, math, sys
-with open(sys.argv[1], encoding="utf-8") as stream:
-    m = json.load(stream)
-assert m["nan_count"] == 0, m
-assert m["inf_count"] == 0, m
-assert math.isfinite(m["initial_loss"]), m
-assert math.isfinite(m["final_loss"]), m
-print("metrics finite: PASS")
-PY
-```
-
-对于 `fwi_demo`，只有 `final_loss < initial_loss` 才能标为成功。两次更新的 `fwi_smoke` 只要求数值链路和模型更新有效，不应据此声称反演质量改善。
-
-## 8. 验收本地知识库、公式与“不启动任务”
+## 7. 验收本地知识库、公式与“不启动任务”
 
 在终端记录当前 job 目录数量：
 
@@ -332,7 +265,7 @@ test "$BEFORE" = "$AFTER" && printf '理论问题未创建任务：PASS\n'
 不要运行任务。”复测基础资料也可以，但不要把“Embedding 在线”误当成本地 FWI 资料是否
 可用的唯一判断。
 
-## 9. 常见失败排查
+## 8. 常见失败排查
 
 ### 启动时模型或哈希失败
 
@@ -389,7 +322,7 @@ tail -n 80 "$RUN_DIR/run.log"
 
 确认任务已经 `succeeded`，`manifest.json` 中有六个 figure 条目，文件存在且 artifact URL 以同一个 job_id 开头。404 表示文件或 job 不存在；403 通常表示路径、安全后缀、符号链接或目录边界校验拒绝了请求。
 
-## 10. 一键关闭
+## 9. 一键关闭
 
 ```bash
 ./stop.sh

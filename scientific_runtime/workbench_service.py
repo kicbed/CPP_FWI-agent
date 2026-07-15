@@ -1,0 +1,988 @@
+"""Server-owned Guided composer and path-free Workbench facade.
+
+The browser supplies only the small, documented FWI form.  Registry snapshots,
+contract documents, resource requests, approval scopes, and every execution
+identifier are assembled here.  In particular, this boundary never accepts a
+filesystem path, shell fragment, Adapter handle, or Worker job identifier.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Mapping
+
+from scientific_runtime_contracts import compute_plan_hash
+
+from .registry_service import (
+    RegistryConflict,
+    RegistryCorruption,
+    RegistryNotFound,
+    RegistryService,
+    RegistryServiceError,
+    RegistryValidationError,
+)
+from .task_service import (
+    TaskConflict,
+    TaskDispatchError,
+    TaskIdempotencyConflict,
+    TaskNotFound,
+    TaskService,
+    TaskServiceError,
+    TaskValidationError,
+)
+from .task_store import DispatchIntentSnapshot, TaskSnapshot, TaskStoreError
+
+
+DATASET_ID = "marmousi_94_288"
+DATASET_VERSION = "1.0.0"
+ALGORITHM_ID = "deepwave.acoustic_fwi"
+ALGORITHM_VERSION = "1.0.0"
+TASK_TYPE = "acoustic_fwi_2d"
+NODE_ID = "invert"
+
+FORM_FIELDS = frozenset(
+    {
+        "goal",
+        "dataset_id",
+        "dataset_version",
+        "preset",
+        "device",
+        "iterations",
+        "seed",
+    }
+)
+PRESETS = frozenset({"fwi_smoke", "fwi_demo"})
+DEVICES = frozenset({"cpu", "cuda"})
+SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+class WorkbenchError(RuntimeError):
+    """Base class for stable Guided Workbench failures."""
+
+    def __init__(self, code: str, errors: list[str] | tuple[str, ...]):
+        self.code = code
+        self.errors = tuple(errors)
+        super().__init__(f"{code}: {'; '.join(self.errors)}")
+
+
+class WorkbenchValidationError(WorkbenchError, ValueError):
+    """A browser form or public method argument is invalid."""
+
+
+class WorkbenchNotFound(WorkbenchError):
+    """A task or visible Catalog entry does not exist in this session scope."""
+
+
+class WorkbenchConflict(WorkbenchError):
+    """A revision, plan, state, or mutation idempotency precondition conflicts."""
+
+
+class WorkbenchRuntimeError(WorkbenchError):
+    """A trusted persistence, dispatch, status, or artifact boundary failed."""
+
+
+def _utc_now() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _stable_digest(*parts: Any) -> str:
+    encoded = json.dumps(
+        parts,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stable_id(prefix: str, *parts: Any) -> str:
+    return f"{prefix}-{_stable_digest(*parts)[:40]}"
+
+
+def _identity(document: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: copy.deepcopy(document[key])
+        for key in ("id", "version", "content_hash", "data_type")
+    }
+
+
+def _value(value: Any, field: str, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, Mapping):
+        return value.get(field, default)
+    return getattr(value, field, default)
+
+
+def _as_mapping(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    converter = getattr(value, "as_dict", None)
+    if callable(converter):
+        result = converter()
+        if isinstance(result, Mapping):
+            return copy.deepcopy(dict(result))
+    fields = getattr(value, "__dataclass_fields__", None)
+    if fields is not None:
+        return {
+            name: copy.deepcopy(getattr(value, name))
+            for name in fields
+        }
+    raise WorkbenchRuntimeError(
+        "SERVICE_RESPONSE_INVALID", ["expected a mapping-like service result"]
+    )
+
+
+def _timestamp(value: str, *, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as error:
+        raise WorkbenchRuntimeError(
+            "WORKBENCH_CLOCK_INVALID", [f"{field} must be an aware ISO-8601 timestamp"]
+        ) from error
+    if parsed.tzinfo is None:
+        raise WorkbenchRuntimeError(
+            "WORKBENCH_CLOCK_INVALID", [f"{field} must include a timezone"]
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _public_dataset(dataset: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": dataset["id"],
+        "version": dataset["version"],
+        "content_hash": dataset["content_hash"],
+        "data_type": dataset["data_type"],
+        "immutable": dataset["immutable"],
+        "metadata": copy.deepcopy(dataset["metadata"]),
+        "lineage": copy.deepcopy(dataset["lineage"]),
+    }
+
+
+def _public_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": manifest["id"],
+        "version": manifest["version"],
+        "task_types": copy.deepcopy(manifest["task_types"]),
+        "parameter_schema": copy.deepcopy(manifest["parameter_schema"]),
+        "inputs": copy.deepcopy(manifest["inputs"]),
+        "outputs": copy.deepcopy(manifest["outputs"]),
+        "resource_limits": copy.deepcopy(manifest["resource_limits"]),
+    }
+
+
+def _public_node(node: Mapping[str, Any]) -> dict[str, Any]:
+    # Node mutation keys are an internal Adapter boundary, not browser state.
+    return {
+        key: copy.deepcopy(node[key])
+        for key in (
+            "node_id",
+            "algorithm",
+            "inputs",
+            "outputs",
+            "dependencies",
+            "parameters",
+            "resources",
+            "side_effects",
+            "risks",
+            "acceptance_criteria",
+        )
+    }
+
+
+def _public_artifact(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    projected = copy.deepcopy(dict(manifest))
+    # The Adapter location starts with its private Worker job identifier.  The
+    # browser gets only a stable logical identity; bytes remain available only
+    # through GuidedWorkbench.read_artifact(task_id, artifact_id).
+    projected["location"] = {
+        "relative_path": f"{projected['task_id']}/{projected['artifact_id']}"
+    }
+    extensions = projected.get("extensions")
+    if isinstance(extensions, dict):
+        adapter_detail = extensions.get("org.agent_rpc.adapter")
+        if isinstance(adapter_detail, Mapping):
+            public_detail = copy.deepcopy(dict(adapter_detail))
+            public_detail.pop("worker_job_id", None)
+            if public_detail:
+                extensions["org.agent_rpc.adapter"] = public_detail
+            else:
+                extensions.pop("org.agent_rpc.adapter", None)
+    return projected
+
+
+class GuidedWorkbench:
+    """Deterministic Guided facade for one authenticated project session."""
+
+    def __init__(
+        self,
+        task_service: TaskService,
+        registry_service: RegistryService,
+        *,
+        project_id: str,
+        principal_id: str,
+        clock: Callable[[], str] = _utc_now,
+    ) -> None:
+        if not isinstance(project_id, str) or OPAQUE_ID.fullmatch(project_id) is None:
+            raise WorkbenchValidationError(
+                "INVALID_SESSION_SCOPE", ["project_id must be a v1 opaque identifier"]
+            )
+        if not isinstance(principal_id, str) or OPAQUE_ID.fullmatch(principal_id) is None:
+            raise WorkbenchValidationError(
+                "INVALID_SESSION_SCOPE", ["principal_id must be a v1 opaque identifier"]
+            )
+        self._tasks = task_service
+        self._registry = registry_service
+        self._project_id = project_id
+        self._principal_id = principal_id
+        self._clock = clock
+
+    @property
+    def _scope(self) -> dict[str, str]:
+        return {
+            "project_id": self._project_id,
+            "principal_id": self._principal_id,
+        }
+
+    def _mutation_key(self, stage: str, key: str) -> str:
+        if (
+            not isinstance(key, str)
+            or not key
+            or len(key) > 255
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in key)
+        ):
+            raise WorkbenchValidationError(
+                "INVALID_IDEMPOTENCY_KEY",
+                ["key must contain 1-255 characters and no control characters"],
+            )
+        return f"workbench:{stage}:{_stable_digest(self._project_id, self._principal_id, key)}"
+
+    def _call(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return function(*args, **kwargs)
+        except WorkbenchError:
+            raise
+        except (TaskNotFound, RegistryNotFound) as error:
+            raise WorkbenchNotFound("NOT_FOUND", [str(error)]) from error
+        except (TaskIdempotencyConflict,) as error:
+            raise WorkbenchConflict("IDEMPOTENCY_CONFLICT", [str(error)]) from error
+        except TaskConflict as error:
+            raise WorkbenchConflict("TASK_CONFLICT", [str(error)]) from error
+        except TaskValidationError as error:
+            raise WorkbenchValidationError(error.code, list(error.errors)) from error
+        except RegistryValidationError as error:
+            raise WorkbenchValidationError(error.code, list(error.errors)) from error
+        except RegistryConflict as error:
+            raise WorkbenchConflict("REGISTRY_CONFLICT", [str(error)]) from error
+        except TaskDispatchError as error:
+            raise WorkbenchRuntimeError(error.code, [str(error)]) from error
+        except (RegistryCorruption,) as error:
+            raise WorkbenchRuntimeError("REGISTRY_CORRUPTION", [str(error)]) from error
+        except RegistryServiceError as error:
+            raise WorkbenchRuntimeError("REGISTRY_UNAVAILABLE", [str(error)]) from error
+        except TaskServiceError as error:
+            raise WorkbenchRuntimeError("TASK_SERVICE_UNAVAILABLE", [str(error)]) from error
+        except TaskStoreError as error:
+            raise WorkbenchRuntimeError("TASK_STORE_UNAVAILABLE", [str(error)]) from error
+
+    def session_capabilities(self) -> dict[str, Any]:
+        return {
+            "mode": "guided",
+            "scope": {
+                "project_id": self._project_id,
+                "principal_id": self._principal_id,
+            },
+            "task_type": TASK_TYPE,
+            "dataset": {"id": DATASET_ID, "version": DATASET_VERSION},
+            "algorithm": {"id": ALGORITHM_ID, "version": ALGORITHM_VERSION},
+            "form": {
+                "fields": sorted(FORM_FIELDS),
+                "presets": sorted(PRESETS),
+                "devices": sorted(DEVICES),
+                "iterations": {"minimum": 1, "maximum": 100},
+                "seed": {"minimum": 0, "maximum": 2147483647},
+            },
+            "features": {
+                "approval_required": True,
+                "abandon_pre_runtime": True,
+                "running_cancel": False,
+                "automatic_reconciliation": False,
+                "streaming_events": False,
+            },
+            "capabilities": {
+                "cancel": False,
+                "retry": False,
+                "sse": False,
+                "automatic_reconciliation": False,
+                "dag": False,
+            },
+        }
+
+    def list_catalog(self) -> dict[str, Any]:
+        datasets = self._call(
+            self._registry.list_datasets,
+            project_id=self._project_id,
+            principal_id=self._principal_id,
+            permission="execute",
+        )
+        algorithms = self._call(self._registry.list_algorithms, allowlisted_only=True)
+        return {
+            "datasets": [
+                _public_dataset(dataset)
+                for dataset in datasets
+                if dataset.get("id") == DATASET_ID
+                and dataset.get("version") == DATASET_VERSION
+                and dataset.get("data_type") == "velocity_model_2d"
+            ],
+            "algorithms": [
+                _public_manifest(manifest)
+                for manifest in algorithms
+                if manifest.get("id") == ALGORITHM_ID
+                and manifest.get("version") == ALGORITHM_VERSION
+                and TASK_TYPE in manifest.get("task_types", [])
+                and manifest.get("security", {}).get("allowlisted") is True
+            ],
+        }
+
+    def _validated_form(
+        self, form: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        if not isinstance(form, Mapping):
+            raise WorkbenchValidationError(
+                "INVALID_FORM", ["form must be a JSON object"]
+            )
+        keys = set(form)
+        unknown = sorted(str(key) for key in keys - FORM_FIELDS)
+        missing = sorted(FORM_FIELDS - keys)
+        if unknown or missing:
+            errors = []
+            if missing:
+                errors.append("missing fields: " + ", ".join(missing))
+            if unknown:
+                errors.append("unknown fields: " + ", ".join(unknown))
+            raise WorkbenchValidationError("INVALID_FORM_FIELDS", errors)
+
+        goal = form["goal"]
+        if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
+            raise WorkbenchValidationError(
+                "INVALID_GOAL", ["goal must contain 1-2000 non-blank characters"]
+            )
+        try:
+            goal.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise WorkbenchValidationError(
+                "INVALID_GOAL", ["goal must contain valid Unicode text"]
+            ) from error
+        if form["dataset_id"] != DATASET_ID or form["dataset_version"] != DATASET_VERSION:
+            raise WorkbenchValidationError(
+                "DATASET_UNSUPPORTED",
+                [f"P1 Guided supports only {DATASET_ID}@{DATASET_VERSION}"],
+            )
+        if not isinstance(form["preset"], str) or form["preset"] not in PRESETS:
+            raise WorkbenchValidationError(
+                "PRESET_UNSUPPORTED", ["preset must be fwi_smoke or fwi_demo"]
+            )
+        if not isinstance(form["device"], str) or form["device"] not in DEVICES:
+            raise WorkbenchValidationError(
+                "DEVICE_UNSUPPORTED", ["device must be cpu or cuda"]
+            )
+        iterations = form["iterations"]
+        if type(iterations) is not int or not 1 <= iterations <= 100:
+            raise WorkbenchValidationError(
+                "ITERATIONS_OUT_OF_RANGE", ["iterations must be an integer from 1 to 100"]
+            )
+        seed = form["seed"]
+        if type(seed) is not int or not 0 <= seed <= 2147483647:
+            raise WorkbenchValidationError(
+                "SEED_OUT_OF_RANGE",
+                ["seed must be an integer from 0 to 2147483647"],
+            )
+
+        dataset = self._call(
+            self._registry.get_dataset,
+            project_id=self._project_id,
+            principal_id=self._principal_id,
+            dataset_id=DATASET_ID,
+            version=DATASET_VERSION,
+            permission="execute",
+        )
+        manifest = self._call(
+            self._registry.get_algorithm,
+            algorithm_id=ALGORITHM_ID,
+            version=ALGORITHM_VERSION,
+            require_allowlisted=True,
+        )
+        if (
+            dataset.get("data_type") != "velocity_model_2d"
+            or TASK_TYPE not in manifest.get("task_types", [])
+            or manifest.get("security", {}).get("allowlisted") is not True
+        ):
+            raise WorkbenchRuntimeError(
+                "GUIDED_CAPABILITY_UNAVAILABLE",
+                ["the fixed Dataset/Algorithm registration is not executable"],
+            )
+        normalized = {field: copy.deepcopy(form[field]) for field in sorted(FORM_FIELDS)}
+        return normalized, dataset, manifest
+
+    @staticmethod
+    def _resources(form: Mapping[str, Any], manifest: Mapping[str, Any]) -> dict[str, Any]:
+        # The browser selects only the device.  Counts and safety ceilings are
+        # a deterministic server policy bounded by the registered manifest.
+        limits = manifest["resource_limits"]
+        device = form["device"]
+        wall_time = min(
+            int(limits["max_wall_time_seconds"]),
+            (600 if device == "cpu" else 300)
+            + int(form["iterations"]) * (60 if device == "cpu" else 30),
+        )
+        return {
+            "device": device,
+            "gpu_count": 1 if device == "cuda" else 0,
+            "cpu_cores": min(4, int(limits["max_cpu_cores"])),
+            "memory_mb": min(8192, int(limits["max_memory_mb"])),
+            "wall_time_seconds": wall_time,
+        }
+
+    def _draft(
+        self,
+        *,
+        form: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        draft_id: str,
+        revision: int,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0.0",
+            "draft_id": draft_id,
+            "revision": revision,
+            "status": "AwaitingApproval",
+            "goal": form["goal"],
+            "task_type": TASK_TYPE,
+            "datasets": [copy.deepcopy(dict(dataset))],
+            "algorithm": {"id": manifest["id"], "version": manifest["version"]},
+            "parameters": {
+                "preset": form["preset"],
+                "device": form["device"],
+                "iterations": form["iterations"],
+                "seed": form["seed"],
+            },
+            "resources": self._resources(form, manifest),
+            "missing_fields": [],
+            "suggestions": [
+                "Review the fixed dataset, parameters, resources, and "
+                "synthetic-workflow limits before approval."
+            ],
+            "confidence": {
+                "intent": 1.0,
+                "parameters": 1.0,
+                "datasets": 1.0,
+                "explanation": (
+                    "All executable values came from the validated Guided form "
+                    "and Registry snapshots."
+                ),
+            },
+            "extensions": {},
+        }
+
+    def _plan(
+        self,
+        *,
+        task_id: str,
+        draft: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        request_key: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        revision = draft["revision"]
+        plan_id = _stable_id(
+            "plan",
+            self._project_id,
+            self._principal_id,
+            task_id,
+            revision,
+            request_key,
+        )
+        node_key = _stable_id(
+            "node",
+            self._project_id,
+            self._principal_id,
+            task_id,
+            revision,
+            request_key,
+            draft["parameters"],
+            draft["resources"],
+        )
+        dataset = draft["datasets"][0]
+        plan = {
+            "schema_version": "1.0.0",
+            "plan_id": plan_id,
+            "draft": {"draft_id": draft["draft_id"], "revision": revision},
+            "task_type": TASK_TYPE,
+            "nodes": [
+                {
+                    "node_id": NODE_ID,
+                    "algorithm": copy.deepcopy(draft["algorithm"]),
+                    "inputs": [
+                        {
+                            "port": manifest["inputs"][0]["port"],
+                            "dataset": _identity(dataset),
+                        }
+                    ],
+                    "outputs": copy.deepcopy(manifest["outputs"]),
+                    "dependencies": [],
+                    "parameters": copy.deepcopy(draft["parameters"]),
+                    "resources": copy.deepcopy(draft["resources"]),
+                    "side_effects": copy.deepcopy(manifest["security"]["side_effects"]),
+                    "idempotency_key": node_key,
+                    "risks": [
+                        {
+                            "code": "synthetic_baseline",
+                            "severity": "medium",
+                            "mitigation": (
+                                "Treat the result as bounded workflow evidence, "
+                                "not a general scientific conclusion."
+                            ),
+                        }
+                    ],
+                    "acceptance_criteria": [
+                        {
+                            "id": "validated_artifacts",
+                            "description": (
+                                "The fixed Adapter validates all returned "
+                                "artifacts and finite metrics."
+                            ),
+                            "required": True,
+                        }
+                    ],
+                }
+            ],
+            "missing_fields": [],
+            "plan_hash": "sha256:" + "0" * 64,
+            "created_at": created_at,
+            "extensions": {},
+        }
+        plan["plan_hash"] = compute_plan_hash(plan)
+        return plan
+
+    def _persist_plan(
+        self,
+        *,
+        snapshot: TaskSnapshot,
+        manifest: Mapping[str, Any],
+        request_key: str,
+        mutation_key: str,
+    ) -> TaskSnapshot:
+        plan = self._plan(
+            task_id=snapshot.task_id,
+            draft=snapshot.draft,
+            manifest=manifest,
+            request_key=request_key,
+            created_at=snapshot.updated_at,
+        )
+        if (
+            snapshot.plan is not None
+            and snapshot.plan.get("plan_id") == plan["plan_id"]
+            and snapshot.plan.get("draft") == plan["draft"]
+        ):
+            # A lost response may return the current aggregate after this plan
+            # was already persisted.  Reuse its original created_at and exact
+            # bytes so the mutation-ledger request hash remains replayable.
+            plan = copy.deepcopy(snapshot.plan)
+        result = self._call(
+            self._tasks.persist_plan,
+            task_id=snapshot.task_id,
+            plan=plan,
+            idempotency_key=mutation_key,
+            **self._scope,
+        )
+        return _value(result, "snapshot", result)
+
+    def create_task(self, form: Mapping[str, Any], key: str) -> dict[str, Any]:
+        normalized, dataset, manifest = self._validated_form(form)
+        create_key = self._mutation_key("create", key)
+        draft_id = _stable_id(
+            "draft",
+            self._project_id,
+            self._principal_id,
+            1,
+            key,
+        )
+        draft = self._draft(
+            form=normalized,
+            dataset=dataset,
+            manifest=manifest,
+            draft_id=draft_id,
+            revision=1,
+        )
+        created = self._call(
+            self._tasks.create_task,
+            draft=draft,
+            idempotency_key=create_key,
+            **self._scope,
+        )
+        snapshot = _value(created, "snapshot", created)
+        create_replayed = bool(_value(created, "replayed", False))
+        original_revision = (
+            snapshot.draft.get("draft_id") == draft_id
+            and snapshot.draft.get("revision") == 1
+        )
+        if not create_replayed or (
+            original_revision
+            and snapshot.status == "AwaitingApproval"
+            and snapshot.plan is None
+        ):
+            snapshot = self._persist_plan(
+                snapshot=snapshot,
+                manifest=manifest,
+                request_key=key,
+                mutation_key=self._mutation_key("create-plan", key),
+            )
+        result = self._project(snapshot)
+        result["replayed"] = create_replayed
+        return result
+
+    def revise_task(
+        self,
+        task_id: str,
+        expected_revision: int,
+        form: Mapping[str, Any],
+        key: str,
+    ) -> dict[str, Any]:
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise WorkbenchValidationError(
+                "INVALID_REVISION", ["expected_revision must be a positive integer"]
+            )
+        normalized, dataset, manifest = self._validated_form(form)
+        current = self._call(self._tasks.get_task, task_id, **self._scope)
+        current_revision = current.draft["revision"]
+        target_revision = expected_revision + 1
+        replay_candidate = current_revision >= target_revision
+        draft = self._draft(
+            form=normalized,
+            dataset=dataset,
+            manifest=manifest,
+            draft_id=current.draft["draft_id"],
+            revision=target_revision,
+        )
+        revised = self._call(
+            self._tasks.revise_draft,
+            task_id=task_id,
+            expected_revision=expected_revision,
+            draft=draft,
+            idempotency_key=self._mutation_key("revise", key),
+            **self._scope,
+        )
+        snapshot = _value(revised, "snapshot", revised)
+        returned_revision = snapshot.draft.get("revision")
+        if returned_revision == target_revision:
+            snapshot = self._persist_plan(
+                snapshot=snapshot,
+                manifest=manifest,
+                request_key=key,
+                mutation_key=self._mutation_key("revise-plan", key),
+            )
+        elif type(returned_revision) is not int or returned_revision < target_revision:
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID",
+                ["revision replay returned an older task aggregate"],
+            )
+        result = self._project(snapshot)
+        result["replayed"] = bool(_value(revised, "replayed", replay_candidate))
+        return result
+
+    def _approval(
+        self, *, snapshot: TaskSnapshot, request_key: str, decided_at: str
+    ) -> dict[str, Any]:
+        if snapshot.plan is None:
+            raise WorkbenchConflict("PLAN_REQUIRED", ["task has no current plan"])
+        decided = _timestamp(decided_at, field="clock")
+        dataset = snapshot.draft["datasets"][0]
+        return {
+            "schema_version": "1.0.0",
+            "approval_id": _stable_id(
+                "approval",
+                self._project_id,
+                self._principal_id,
+                snapshot.task_id,
+                snapshot.draft["revision"],
+                request_key,
+                snapshot.plan["plan_hash"],
+            ),
+            "plan_id": snapshot.plan["plan_id"],
+            "plan_hash": snapshot.plan["plan_hash"],
+            "decision": "approved",
+            "actor": {"type": "user", "id": self._principal_id},
+            "scope": {
+                "datasets": [_identity(dataset)],
+                "algorithms": [copy.deepcopy(snapshot.draft["algorithm"])],
+                "resource_limits": copy.deepcopy(snapshot.draft["resources"]),
+                "side_effects": copy.deepcopy(
+                    snapshot.plan["nodes"][0]["side_effects"]
+                ),
+                "max_tasks": 1,
+            },
+            "decided_at": _format_timestamp(decided),
+            "expires_at": _format_timestamp(decided + timedelta(hours=1)),
+            "extensions": {},
+        }
+
+    def approve_and_submit(
+        self, task_id: str, plan_hash: str, key: str
+    ) -> dict[str, Any]:
+        if not isinstance(plan_hash, str) or SHA256.fullmatch(plan_hash) is None:
+            raise WorkbenchValidationError(
+                "INVALID_PLAN_HASH", ["plan_hash must be a sha256 identity"]
+            )
+        # Validate the key before taking the clock or performing any mutation.
+        approval_key = self._mutation_key("approve", key)
+        submit_key = self._mutation_key("submit", key)
+        current = self._call(self._tasks.get_task, task_id, **self._scope)
+        if current.plan is None or current.plan["plan_hash"] != plan_hash:
+            raise WorkbenchConflict(
+                "PLAN_HASH_CONFLICT", ["plan_hash does not identify the current plan"]
+            )
+        expected_approval_id = _stable_id(
+            "approval",
+            self._project_id,
+            self._principal_id,
+            current.task_id,
+            current.draft["revision"],
+            key,
+            plan_hash,
+        )
+        if (
+            current.approval is not None
+            and current.approval.get("approval_id") == expected_approval_id
+            and current.approval.get("plan_hash") == plan_hash
+        ):
+            approval = copy.deepcopy(current.approval)
+        else:
+            approval = self._approval(
+                snapshot=current, request_key=key, decided_at=self._clock()
+            )
+        try:
+            approved = self._call(
+                self._tasks.persist_approval,
+                task_id=task_id,
+                approval=approval,
+                idempotency_key=approval_key,
+                **self._scope,
+            )
+        except WorkbenchConflict as error:
+            # Two first-use requests can sample different clock values before
+            # either approval commits.  Recover only if the winner persisted
+            # the exact deterministic approval identity for this key/plan;
+            # replaying its immutable bytes then matches the durable request
+            # hash.  Every other conflict remains closed.
+            if error.code != "IDEMPOTENCY_CONFLICT":
+                raise
+            converged = self._call(self._tasks.get_task, task_id, **self._scope)
+            persisted = converged.approval
+            if (
+                persisted is None
+                or persisted.get("approval_id") != expected_approval_id
+                or persisted.get("plan_hash") != plan_hash
+                or converged.plan is None
+                or converged.plan.get("plan_hash") != plan_hash
+                or persisted.get("plan_id") != converged.plan.get("plan_id")
+            ):
+                raise
+            approval = copy.deepcopy(persisted)
+            approved = self._call(
+                self._tasks.persist_approval,
+                task_id=task_id,
+                approval=approval,
+                idempotency_key=approval_key,
+                **self._scope,
+            )
+        approved_snapshot = _value(approved, "snapshot", approved)
+        submitted = self._call(
+            self._tasks.submit_task,
+            task_id=task_id,
+            approval_id=approved_snapshot.approval["approval_id"],
+            idempotency_key=submit_key,
+            **self._scope,
+        )
+        snapshot = _value(submitted, "snapshot")
+        intent = _value(submitted, "intent")
+        result = self._project(snapshot, intent=intent)
+        result.update(
+            {
+                "submitted": True,
+                "replayed": bool(_value(submitted, "replayed", False)),
+                "dispatch_attempted": bool(
+                    _value(submitted, "dispatch_attempted", False)
+                ),
+            }
+        )
+        return result
+
+    def abandon_task(self, task_id: str, key: str) -> dict[str, Any]:
+        result = self._call(
+            self._tasks.abandon_task,
+            task_id=task_id,
+            idempotency_key=self._mutation_key("abandon", key),
+            **self._scope,
+        )
+        snapshot = _value(result, "snapshot", result)
+        response = self._project(snapshot)
+        response["replayed"] = bool(_value(result, "replayed", False))
+        return response
+
+    def _project(
+        self,
+        snapshot: TaskSnapshot,
+        *,
+        intent: DispatchIntentSnapshot | Mapping[str, Any] | None = None,
+        adapter_status: Any = None,
+    ) -> dict[str, Any]:
+        draft = snapshot.draft
+        plan = snapshot.plan
+        approval = snapshot.approval
+        dispatch = None
+        if intent is not None:
+            dispatch = {
+                "state": _value(intent, "state"),
+                "failure_code": _value(intent, "failure_code"),
+                "created_at": _value(intent, "created_at"),
+                "dispatch_claimed_at": _value(intent, "dispatch_claimed_at"),
+                "outcome_recorded_at": _value(intent, "outcome_recorded_at"),
+            }
+        status = _as_mapping(adapter_status)
+        if status is not None:
+            for internal in ("job_id", "handle", "submission_id", "relative_path"):
+                status.pop(internal, None)
+        return {
+            "task_id": snapshot.task_id,
+            "status": snapshot.status,
+            "draft": {
+                "draft_id": draft["draft_id"],
+                "revision": draft["revision"],
+                "status": draft["status"],
+                "goal": draft["goal"],
+                "task_type": draft["task_type"],
+                "dataset": _public_dataset(draft["datasets"][0]),
+                "algorithm": copy.deepcopy(draft["algorithm"]),
+                "parameters": copy.deepcopy(draft["parameters"]),
+                "resources": copy.deepcopy(draft["resources"]),
+                "missing_fields": copy.deepcopy(draft["missing_fields"]),
+                "suggestions": copy.deepcopy(draft["suggestions"]),
+            },
+            "plan": (
+                None
+                if plan is None
+                else {
+                    "plan_id": plan["plan_id"],
+                    "plan_hash": plan["plan_hash"],
+                    "draft": copy.deepcopy(plan["draft"]),
+                    "task_type": plan["task_type"],
+                    "nodes": [_public_node(node) for node in plan["nodes"]],
+                    "created_at": plan["created_at"],
+                }
+            ),
+            "approval": (
+                None
+                if approval is None
+                else {
+                    "approval_id": approval["approval_id"],
+                    "plan_id": approval["plan_id"],
+                    "plan_hash": approval["plan_hash"],
+                    "decision": approval["decision"],
+                    "decided_at": approval["decided_at"],
+                    "expires_at": approval["expires_at"],
+                }
+            ),
+            "dispatch": dispatch,
+            "runtime_status": status,
+            "created_at": snapshot.created_at,
+            "updated_at": snapshot.updated_at,
+        }
+
+    def get_task(self, task_id: str, refresh: bool = True) -> dict[str, Any]:
+        if type(refresh) is not bool:
+            raise WorkbenchValidationError(
+                "INVALID_REFRESH", ["refresh must be a boolean"]
+            )
+        if refresh:
+            result = self._call(
+                self._tasks.refresh_runtime_status, task_id=task_id, **self._scope
+            )
+            return self._project(
+                _value(result, "snapshot"),
+                intent=_value(result, "intent"),
+                adapter_status=_value(result, "adapter_status"),
+            )
+        snapshot = self._call(self._tasks.get_task, task_id, **self._scope)
+        intent = self._call(
+            self._tasks.get_dispatch_intent, task_id, **self._scope
+        )
+        return self._project(snapshot, intent=intent)
+
+    def list_events(
+        self, task_id: str, after_sequence: int = 0, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        events = self._call(
+            self._tasks.list_run_events,
+            task_id,
+            after_sequence=after_sequence,
+            limit=limit,
+            **self._scope,
+        )
+        projected: list[dict[str, Any]] = []
+        for event in events:
+            value = copy.deepcopy(event)
+            adapter_detail = value.get("extensions", {}).get(
+                "org.agent_rpc.adapter_status"
+            )
+            if isinstance(adapter_detail, dict):
+                adapter_detail.pop("job_id", None)
+            projected.append(value)
+        return projected
+
+    def list_artifacts(self, task_id: str) -> list[dict[str, Any]]:
+        manifests = self._call(
+            self._tasks.collect_artifacts, task_id=task_id, **self._scope
+        )
+        return [_public_artifact(manifest) for manifest in manifests]
+
+    def read_artifact(
+        self, task_id: str, artifact_id: str
+    ) -> tuple[dict[str, Any], bytes]:
+        if not isinstance(artifact_id, str) or OPAQUE_ID.fullmatch(artifact_id) is None:
+            raise WorkbenchValidationError(
+                "INVALID_ARTIFACT_ID", ["artifact_id must be a v1 opaque identifier"]
+            )
+        result = self._call(
+            self._tasks.read_artifact,
+            task_id=task_id,
+            artifact_id=artifact_id,
+            **self._scope,
+        )
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise WorkbenchRuntimeError(
+                "ARTIFACT_RESPONSE_INVALID", ["artifact service returned an invalid response"]
+            )
+        manifest, data = result
+        if not isinstance(manifest, Mapping) or not isinstance(data, bytes):
+            raise WorkbenchRuntimeError(
+                "ARTIFACT_RESPONSE_INVALID", ["artifact service returned an invalid response"]
+            )
+        return _public_artifact(manifest), data

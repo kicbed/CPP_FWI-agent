@@ -45,9 +45,15 @@ TASK_STATUSES = frozenset(
     }
 )
 
+WORKBENCH_MUTATION_OPERATIONS = frozenset(
+    {"revise_draft", "persist_plan", "persist_approval", "abandon_task"}
+)
+
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    "Draft": frozenset({"Draft", "NeedsInput", "AwaitingApproval"}),
-    "NeedsInput": frozenset({"NeedsInput", "Draft", "AwaitingApproval"}),
+    "Draft": frozenset({"Draft", "NeedsInput", "AwaitingApproval", "Cancelled"}),
+    "NeedsInput": frozenset(
+        {"NeedsInput", "Draft", "AwaitingApproval", "Cancelled"}
+    ),
     "AwaitingApproval": frozenset({"AwaitingApproval", "Queued", "Cancelled"}),
     "Queued": frozenset({"Running", "Failed", "Cancelled"}),
     "Running": frozenset(
@@ -95,6 +101,7 @@ class TaskSnapshot:
     approval: dict[str, Any] | None
     created_at: str
     updated_at: str
+    abandonment: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +178,15 @@ class SubmitTaskRecord:
     snapshot: TaskSnapshot
     intent: DispatchIntentSnapshot
     replayed: bool
+
+
+@dataclass(frozen=True)
+class WorkbenchMutationRecord:
+    """A durable non-submit Workbench mutation and its stable outcome."""
+
+    task_id: str
+    operation: str
+    outcome: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -303,6 +319,17 @@ class TaskStore(Protocol):
     def get_task(self, task_id: str) -> TaskSnapshot | None:
         ...
 
+    def lookup_workbench_mutation(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        operation: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> WorkbenchMutationRecord | None:
+        ...
+
     def append_draft_revision(
         self,
         *,
@@ -310,17 +337,50 @@ class TaskStore(Protocol):
         expected_revision: int,
         draft: Mapping[str, Any],
         now: str,
+        project_id: str | None = None,
+        principal_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
     ) -> TaskSnapshot:
         ...
 
     def store_plan(
-        self, *, task_id: str, plan: Mapping[str, Any], now: str
+        self,
+        *,
+        task_id: str,
+        plan: Mapping[str, Any],
+        now: str,
+        project_id: str | None = None,
+        principal_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
     ) -> TaskSnapshot:
         ...
 
     def store_approval(
-        self, *, task_id: str, approval: Mapping[str, Any], now: str
+        self,
+        *,
+        task_id: str,
+        approval: Mapping[str, Any],
+        now: str,
+        project_id: str | None = None,
+        principal_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
     ) -> TaskSnapshot:
+        ...
+
+    def abandon_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        abandonment: Mapping[str, Any],
+        idempotency_key: str,
+        request_hash: str,
+        now: str,
+    ) -> tuple[TaskSnapshot, bool]:
         ...
 
     def commit_runtime_transition(
@@ -1160,6 +1220,169 @@ class SQLiteTaskStore:
             tasks_used=row["tasks_used"],
         )
 
+    @staticmethod
+    def _load_workbench_mutation(
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        principal_id: str,
+        operation: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> WorkbenchMutationRecord | None:
+        if operation not in WORKBENCH_MUTATION_OPERATIONS:
+            raise TaskStoreConflict("workbench mutation operation is invalid")
+        row = connection.execute(
+            """
+            SELECT task_id, request_hash,
+                   outcome_json AS document_json,
+                   outcome_hash AS document_hash
+            FROM workbench_mutations
+            WHERE project_id = ? AND principal_id = ?
+              AND operation = ? AND idempotency_key = ?
+            """,
+            (project_id, principal_id, operation, idempotency_key),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["request_hash"] != request_hash:
+            raise IdempotencyConflict(
+                "idempotency key was already used for another workbench request"
+            )
+        outcome = _decode_hashed_document(row, label="workbench mutation outcome")
+        valid_outcome = False
+        if operation == "revise_draft":
+            valid_outcome = (
+                set(outcome) == {"task_id", "draft_id", "draft_revision"}
+                and isinstance(outcome.get("draft_id"), str)
+                and bool(outcome["draft_id"])
+                and type(outcome.get("draft_revision")) is int
+                and outcome["draft_revision"] >= 1
+            )
+        elif operation == "persist_plan":
+            valid_outcome = (
+                set(outcome) == {"task_id", "plan_id", "plan_hash"}
+                and isinstance(outcome.get("plan_id"), str)
+                and bool(outcome["plan_id"])
+                and isinstance(outcome.get("plan_hash"), str)
+                and len(outcome["plan_hash"]) == 71
+                and outcome["plan_hash"].startswith("sha256:")
+                and all(character in "0123456789abcdef" for character in outcome["plan_hash"][7:])
+            )
+        elif operation == "persist_approval":
+            valid_outcome = (
+                set(outcome) == {"task_id", "approval_id", "decision"}
+                and isinstance(outcome.get("approval_id"), str)
+                and bool(outcome["approval_id"])
+                and outcome.get("decision") in {"approved", "rejected"}
+            )
+        elif operation == "abandon_task":
+            valid_outcome = (
+                set(outcome) == {"task_id", "status"}
+                and outcome.get("status") == "Cancelled"
+            )
+        if not valid_outcome or outcome.get("task_id") != row["task_id"]:
+            raise TaskStoreCorruption(
+                "workbench mutation outcome is invalid"
+            )
+        return WorkbenchMutationRecord(
+            task_id=row["task_id"], operation=operation, outcome=outcome
+        )
+
+    @staticmethod
+    def _record_workbench_mutation(
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        principal_id: str,
+        operation: str,
+        idempotency_key: str,
+        request_hash: str,
+        task_id: str,
+        outcome: Mapping[str, Any],
+        now: str,
+    ) -> None:
+        if operation not in WORKBENCH_MUTATION_OPERATIONS:
+            raise TaskStoreConflict("workbench mutation operation is invalid")
+        outcome_json, outcome_hash = encode_document(outcome)
+        connection.execute(
+            """
+            INSERT INTO workbench_mutations(
+                project_id, principal_id, operation, idempotency_key,
+                request_hash, task_id, outcome_json, outcome_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                principal_id,
+                operation,
+                idempotency_key,
+                request_hash,
+                task_id,
+                outcome_json,
+                outcome_hash,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _mutation_arguments(
+        *,
+        project_id: str | None,
+        principal_id: str | None,
+        idempotency_key: str | None,
+        request_hash: str | None,
+    ) -> tuple[str, str, str, str] | None:
+        values = (project_id, principal_id, idempotency_key, request_hash)
+        if all(value is None for value in values):
+            return None
+        if not all(isinstance(value, str) and value for value in values):
+            raise TaskStoreConflict(
+                "workbench mutation identity must be provided as one complete set"
+            )
+        return values  # type: ignore[return-value]
+
+    def lookup_workbench_mutation(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        operation: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> WorkbenchMutationRecord | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            record = self._load_workbench_mutation(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                operation=operation,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if record is None:
+                connection.commit()
+                return None
+            snapshot = self._load_snapshot(connection, record.task_id)
+            if (
+                snapshot is None
+                or snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreCorruption(
+                    "workbench mutation crosses its task scope"
+                )
+            connection.commit()
+            return record
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def create_task(
         self,
         *,
@@ -1686,7 +1909,18 @@ class SQLiteTaskStore:
     def get_task(self, task_id: str) -> TaskSnapshot | None:
         connection = self._connect()
         try:
-            return self._load_snapshot(connection, task_id)
+            # Pin every query used to assemble the aggregate to one WAL read
+            # snapshot. Without this transaction a concurrent RunEvent commit
+            # could make the task row and latest-event row come from different
+            # SQLite snapshots and look corrupt for one read.
+            connection.execute("BEGIN")
+            snapshot = self._load_snapshot(connection, task_id)
+            connection.commit()
+            return snapshot
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -1698,6 +1932,54 @@ class SQLiteTaskStore:
         ).fetchone()
         if row is None:
             return None
+        abandonment_row = connection.execute(
+            """
+            SELECT task_id, project_id, principal_id,
+                   document_json, document_hash, abandoned_at
+            FROM task_abandonments WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        abandonment = None
+        if abandonment_row is not None:
+            abandonment = _decode_hashed_document(
+                abandonment_row, label="task abandonment"
+            )
+            actor = abandonment.get("actor")
+            if (
+                set(abandonment)
+                != {
+                    "schema_version",
+                    "task_id",
+                    "previous_status",
+                    "status",
+                    "reason",
+                    "actor",
+                    "abandoned_at",
+                    "extensions",
+                }
+                or abandonment.get("schema_version") != "1.0.0"
+                or abandonment.get("task_id") != row["task_id"]
+                or abandonment.get("previous_status")
+                not in {"Draft", "NeedsInput", "AwaitingApproval"}
+                or abandonment.get("status") != "Cancelled"
+                or abandonment.get("reason") != "user_discarded_draft"
+                or actor
+                != {"type": "user", "id": abandonment_row["principal_id"]}
+                or abandonment.get("abandoned_at")
+                != abandonment_row["abandoned_at"]
+                or abandonment.get("extensions") != {}
+                or abandonment_row["project_id"] != row["project_id"]
+                or abandonment_row["principal_id"] != row["principal_id"]
+            ):
+                raise TaskStoreCorruption(
+                    "task abandonment differs from its immutable index"
+                )
+        pre_runtime_abandoned = row["status"] == "Cancelled" and abandonment is not None
+        if (abandonment is None) != (not pre_runtime_abandoned):
+            raise TaskStoreCorruption(
+                "task abandonment does not match the Cancelled state"
+            )
         if row["current_draft_id"] is None or row["current_draft_revision"] is None:
             raise TaskStoreCorruption("task has no current draft revision")
         draft_row = connection.execute(
@@ -1724,6 +2006,11 @@ class SQLiteTaskStore:
             if draft.get("status") != row["status"]:
                 raise TaskStoreCorruption(
                     "task status does not match its current pre-runtime draft"
+                )
+        elif pre_runtime_abandoned:
+            if draft.get("status") != abandonment.get("previous_status"):
+                raise TaskStoreCorruption(
+                    "abandoned task does not retain its final pre-runtime draft"
                 )
         elif draft.get("status") != "AwaitingApproval":
             raise TaskStoreCorruption(
@@ -1833,11 +2120,10 @@ class SQLiteTaskStore:
             """,
             (task_id,),
         ).fetchone()
-        runtime_status = row["status"] not in {
-            "Draft",
-            "NeedsInput",
-            "AwaitingApproval",
-        }
+        runtime_status = (
+            row["status"] not in {"Draft", "NeedsInput", "AwaitingApproval"}
+            and not pre_runtime_abandoned
+        )
         if not runtime_status and event_summary["event_count"] != 0:
             raise TaskStoreCorruption("pre-runtime task unexpectedly has run events")
         intent_binding = connection.execute(
@@ -1910,6 +2196,7 @@ class SQLiteTaskStore:
             approval=approval,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            abandonment=abandonment,
         )
 
     def _load_dispatch_intent(
@@ -2477,20 +2764,58 @@ class SQLiteTaskStore:
         expected_revision: int,
         draft: Mapping[str, Any],
         now: str,
+        project_id: str | None = None,
+        principal_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
     ) -> TaskSnapshot:
         document_json, document_hash = encode_document(draft)
+        mutation = self._mutation_arguments(
+            project_id=project_id,
+            principal_id=principal_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT status, current_draft_id, current_draft_revision
+                SELECT status, project_id, principal_id,
+                       current_draft_id, current_draft_revision
                 FROM tasks WHERE task_id = ?
                 """,
                 (task_id,),
             ).fetchone()
             if row is None:
                 raise TaskStoreConflict("task does not exist")
+            if mutation is not None:
+                mutation_project, mutation_principal, key, mutation_hash = mutation
+                if (
+                    row["project_id"] != mutation_project
+                    or row["principal_id"] != mutation_principal
+                ):
+                    raise TaskStoreConflict("workbench mutation crosses task scope")
+                replay = self._load_workbench_mutation(
+                    connection,
+                    project_id=mutation_project,
+                    principal_id=mutation_principal,
+                    operation="revise_draft",
+                    idempotency_key=key,
+                    request_hash=mutation_hash,
+                )
+                if replay is not None:
+                    if replay.task_id != task_id:
+                        raise IdempotencyConflict(
+                            "idempotency key identifies another task"
+                        )
+                    snapshot = self._load_snapshot(connection, task_id)
+                    if snapshot is None:
+                        raise TaskStoreCorruption(
+                            "workbench replay references a missing task"
+                        )
+                    connection.commit()
+                    return snapshot
             if row["current_draft_revision"] != expected_revision:
                 raise TaskStoreConflict("draft revision precondition failed")
             if draft["draft_id"] != row["current_draft_id"]:
@@ -2527,12 +2852,28 @@ class SQLiteTaskStore:
                 """,
                 (draft["status"], draft["revision"], now, task_id),
             )
+            if mutation is not None:
+                self._record_workbench_mutation(
+                    connection,
+                    project_id=mutation[0],
+                    principal_id=mutation[1],
+                    operation="revise_draft",
+                    idempotency_key=mutation[2],
+                    request_hash=mutation[3],
+                    task_id=task_id,
+                    outcome={
+                        "task_id": task_id,
+                        "draft_id": draft["draft_id"],
+                        "draft_revision": draft["revision"],
+                    },
+                    now=now,
+                )
             snapshot = self._load_snapshot(connection, task_id)
             if snapshot is None:
                 raise TaskStoreCorruption("updated task cannot be read")
             connection.commit()
             return snapshot
-        except (TaskStoreConflict, TaskStoreCorruption):
+        except (IdempotencyConflict, TaskStoreConflict, TaskStoreCorruption):
             if connection.in_transaction:
                 connection.rollback()
             raise
@@ -2552,21 +2893,63 @@ class SQLiteTaskStore:
             connection.close()
 
     def store_plan(
-        self, *, task_id: str, plan: Mapping[str, Any], now: str
+        self,
+        *,
+        task_id: str,
+        plan: Mapping[str, Any],
+        now: str,
+        project_id: str | None = None,
+        principal_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
     ) -> TaskSnapshot:
         document_json, document_hash = encode_document(plan)
+        mutation = self._mutation_arguments(
+            project_id=project_id,
+            principal_id=principal_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             task = connection.execute(
                 """
-                SELECT status, current_draft_id, current_draft_revision
+                SELECT status, project_id, principal_id,
+                       current_draft_id, current_draft_revision
                 FROM tasks WHERE task_id = ?
                 """,
                 (task_id,),
             ).fetchone()
             if task is None:
                 raise TaskStoreConflict("task does not exist")
+            if mutation is not None:
+                mutation_project, mutation_principal, key, mutation_hash = mutation
+                if (
+                    task["project_id"] != mutation_project
+                    or task["principal_id"] != mutation_principal
+                ):
+                    raise TaskStoreConflict("workbench mutation crosses task scope")
+                replay = self._load_workbench_mutation(
+                    connection,
+                    project_id=mutation_project,
+                    principal_id=mutation_principal,
+                    operation="persist_plan",
+                    idempotency_key=key,
+                    request_hash=mutation_hash,
+                )
+                if replay is not None:
+                    if replay.task_id != task_id:
+                        raise IdempotencyConflict(
+                            "idempotency key identifies another task"
+                        )
+                    snapshot = self._load_snapshot(connection, task_id)
+                    if snapshot is None:
+                        raise TaskStoreCorruption(
+                            "workbench replay references a missing task"
+                        )
+                    connection.commit()
+                    return snapshot
             if task["status"] != "AwaitingApproval":
                 raise TaskStoreConflict(
                     "plans can only target an AwaitingApproval draft"
@@ -2587,6 +2970,22 @@ class SQLiteTaskStore:
                     or existing["document_hash"] != document_hash
                 ):
                     raise TaskStoreConflict("plan_id already identifies another plan")
+                if mutation is not None:
+                    self._record_workbench_mutation(
+                        connection,
+                        project_id=mutation[0],
+                        principal_id=mutation[1],
+                        operation="persist_plan",
+                        idempotency_key=mutation[2],
+                        request_hash=mutation[3],
+                        task_id=task_id,
+                        outcome={
+                            "task_id": task_id,
+                            "plan_id": plan["plan_id"],
+                            "plan_hash": plan["plan_hash"],
+                        },
+                        now=now,
+                    )
                 snapshot = self._load_snapshot(connection, task_id)
                 if snapshot is None:
                     raise TaskStoreCorruption("task with stored plan cannot be read")
@@ -2633,12 +3032,28 @@ class SQLiteTaskStore:
                 """,
                 (plan["plan_id"], now, task_id),
             )
+            if mutation is not None:
+                self._record_workbench_mutation(
+                    connection,
+                    project_id=mutation[0],
+                    principal_id=mutation[1],
+                    operation="persist_plan",
+                    idempotency_key=mutation[2],
+                    request_hash=mutation[3],
+                    task_id=task_id,
+                    outcome={
+                        "task_id": task_id,
+                        "plan_id": plan["plan_id"],
+                        "plan_hash": plan["plan_hash"],
+                    },
+                    now=now,
+                )
             snapshot = self._load_snapshot(connection, task_id)
             if snapshot is None:
                 raise TaskStoreCorruption("task with stored plan cannot be read")
             connection.commit()
             return snapshot
-        except (TaskStoreConflict, TaskStoreCorruption):
+        except (IdempotencyConflict, TaskStoreConflict, TaskStoreCorruption):
             if connection.in_transaction:
                 connection.rollback()
             raise
@@ -2658,18 +3073,62 @@ class SQLiteTaskStore:
             connection.close()
 
     def store_approval(
-        self, *, task_id: str, approval: Mapping[str, Any], now: str
+        self,
+        *,
+        task_id: str,
+        approval: Mapping[str, Any],
+        now: str,
+        project_id: str | None = None,
+        principal_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
     ) -> TaskSnapshot:
         document_json, document_hash = encode_document(approval)
+        mutation = self._mutation_arguments(
+            project_id=project_id,
+            principal_id=principal_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             task = connection.execute(
-                "SELECT status, current_plan_id FROM tasks WHERE task_id = ?",
+                """
+                SELECT status, project_id, principal_id, current_plan_id
+                FROM tasks WHERE task_id = ?
+                """,
                 (task_id,),
             ).fetchone()
             if task is None:
                 raise TaskStoreConflict("task does not exist")
+            if mutation is not None:
+                mutation_project, mutation_principal, key, mutation_hash = mutation
+                if (
+                    task["project_id"] != mutation_project
+                    or task["principal_id"] != mutation_principal
+                ):
+                    raise TaskStoreConflict("workbench mutation crosses task scope")
+                replay = self._load_workbench_mutation(
+                    connection,
+                    project_id=mutation_project,
+                    principal_id=mutation_principal,
+                    operation="persist_approval",
+                    idempotency_key=key,
+                    request_hash=mutation_hash,
+                )
+                if replay is not None:
+                    if replay.task_id != task_id:
+                        raise IdempotencyConflict(
+                            "idempotency key identifies another task"
+                        )
+                    snapshot = self._load_snapshot(connection, task_id)
+                    if snapshot is None:
+                        raise TaskStoreCorruption(
+                            "workbench replay references a missing task"
+                        )
+                    connection.commit()
+                    return snapshot
             if task["status"] != "AwaitingApproval":
                 raise TaskStoreConflict(
                     "decisions can only target an AwaitingApproval task"
@@ -2698,6 +3157,22 @@ class SQLiteTaskStore:
                 ):
                     raise TaskStoreConflict(
                         "approval_id already identifies another decision"
+                    )
+                if mutation is not None:
+                    self._record_workbench_mutation(
+                        connection,
+                        project_id=mutation[0],
+                        principal_id=mutation[1],
+                        operation="persist_approval",
+                        idempotency_key=mutation[2],
+                        request_hash=mutation[3],
+                        task_id=task_id,
+                        outcome={
+                            "task_id": task_id,
+                            "approval_id": approval["approval_id"],
+                            "decision": approval["decision"],
+                        },
+                        now=now,
                     )
                 snapshot = self._load_snapshot(connection, task_id)
                 if snapshot is None:
@@ -2733,12 +3208,28 @@ class SQLiteTaskStore:
                 """,
                 (approval["approval_id"], now, task_id),
             )
+            if mutation is not None:
+                self._record_workbench_mutation(
+                    connection,
+                    project_id=mutation[0],
+                    principal_id=mutation[1],
+                    operation="persist_approval",
+                    idempotency_key=mutation[2],
+                    request_hash=mutation[3],
+                    task_id=task_id,
+                    outcome={
+                        "task_id": task_id,
+                        "approval_id": approval["approval_id"],
+                        "decision": approval["decision"],
+                    },
+                    now=now,
+                )
             snapshot = self._load_snapshot(connection, task_id)
             if snapshot is None:
                 raise TaskStoreCorruption("task with stored approval cannot be read")
             connection.commit()
             return snapshot
-        except (TaskStoreConflict, TaskStoreCorruption):
+        except (IdempotencyConflict, TaskStoreConflict, TaskStoreCorruption):
             if connection.in_transaction:
                 connection.rollback()
             raise
@@ -2750,6 +3241,130 @@ class SQLiteTaskStore:
             if connection.in_transaction:
                 connection.rollback()
             raise TaskStoreConflict("approval conflicts with durable state") from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def abandon_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        abandonment: Mapping[str, Any],
+        idempotency_key: str,
+        request_hash: str,
+        now: str,
+    ) -> tuple[TaskSnapshot, bool]:
+        """Atomically audit a user discard and terminate only pre-runtime work."""
+
+        document_json, document_hash = encode_document(abandonment)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            replay = self._load_workbench_mutation(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                operation="abandon_task",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if replay is not None:
+                if replay.task_id != task_id:
+                    raise IdempotencyConflict(
+                        "idempotency key identifies another task"
+                    )
+                snapshot = self._load_snapshot(connection, task_id)
+                if snapshot is None:
+                    raise TaskStoreCorruption(
+                        "workbench replay references a missing task"
+                    )
+                connection.commit()
+                return snapshot, True
+
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreConflict("task does not exist")
+            if (
+                task["project_id"] != project_id
+                or task["principal_id"] != principal_id
+            ):
+                raise TaskStoreConflict("workbench mutation crosses task scope")
+            if task["status"] not in {"Draft", "NeedsInput", "AwaitingApproval"}:
+                raise TaskStoreConflict(
+                    "only a pre-runtime task can be abandoned"
+                )
+            if "Cancelled" not in ALLOWED_TRANSITIONS[task["status"]]:
+                raise TaskStoreConflict("pre-runtime abandonment transition is invalid")
+            if connection.execute(
+                "SELECT 1 FROM task_abandonments WHERE task_id = ?", (task_id,)
+            ).fetchone() is not None:
+                raise TaskStoreCorruption(
+                    "pre-runtime task already has an abandonment record"
+                )
+            connection.execute(
+                """
+                INSERT INTO task_abandonments(
+                    task_id, project_id, principal_id, document_json,
+                    document_hash, abandoned_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    project_id,
+                    principal_id,
+                    document_json,
+                    document_hash,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET status = 'Cancelled', updated_at = ?
+                WHERE task_id = ?
+                """,
+                (now, task_id),
+            )
+            self._record_workbench_mutation(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                operation="abandon_task",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                task_id=task_id,
+                outcome={"task_id": task_id, "status": "Cancelled"},
+                now=now,
+            )
+            snapshot = self._load_snapshot(connection, task_id)
+            if snapshot is None or snapshot.status != "Cancelled":
+                raise TaskStoreCorruption("abandoned task cannot be read")
+            connection.commit()
+            return snapshot, False
+        except (IdempotencyConflict, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "task abandonment conflicts with durable state"
+            ) from error
         except Exception:
             if connection.in_transaction:
                 connection.rollback()

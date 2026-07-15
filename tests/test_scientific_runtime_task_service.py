@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import sqlite3
@@ -17,6 +18,7 @@ from scientific_runtime import (
     RegistryService,
     SQLiteTaskStore,
     TaskConflict,
+    TaskDispatchError,
     TaskIdempotencyConflict,
     TaskNotFound,
     TaskService,
@@ -58,6 +60,12 @@ class FakeDispatcher:
         self.failure_code = failure_code
         self.prepare_calls = 0
         self.dispatch_calls = 0
+        self.status_calls = 0
+        self.collect_calls = 0
+        self.read_calls = 0
+        self.adapter_status: dict | None = None
+        self.manifests: list[dict] = []
+        self.artifact_data: dict[str, bytes] = {}
         self.lock = threading.Lock()
 
     def prepare(self, snapshot):
@@ -103,6 +111,40 @@ class FakeDispatcher:
             "fingerprint": fingerprint(),
             "adapter_version": intent.adapter_version,
         }
+
+    def status(self, intent):
+        with self.lock:
+            self.status_calls += 1
+        value = copy.deepcopy(self.adapter_status) if self.adapter_status else {
+            "status": "Queued",
+            "stage": "queued",
+            "completed": 0,
+            "total": intent.request["parameters"]["iterations"],
+            "message": "FWI job is queued",
+            "updated_at": NOW,
+            "terminal": False,
+        }
+        value.update(
+            {
+                "job_id": intent.handle["job_id"],
+                "task_id": intent.task_id,
+                "node_id": intent.node_id,
+            }
+        )
+        return value
+
+    def collect(self, intent):
+        with self.lock:
+            self.collect_calls += 1
+        return copy.deepcopy(self.manifests)
+
+    def read_artifact(self, intent, artifact_id):
+        with self.lock:
+            self.read_calls += 1
+        manifest = next(
+            value for value in self.manifests if value["artifact_id"] == artifact_id
+        )
+        return copy.deepcopy(manifest), self.artifact_data[artifact_id]
 
 
 class ScientificRuntimeTaskServiceTest(unittest.TestCase):
@@ -164,6 +206,8 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "dispatch_attempts",
                 "dispatch_outcomes",
                 "submit_idempotency_links",
+                "workbench_mutations",
+                "task_abandonments",
             },
         )
         connection = sqlite3.connect(self.database_path)
@@ -191,7 +235,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 3)
+        self.assertEqual(self.store.migration_version(), 4)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -207,7 +251,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 3)
+        self.assertEqual(reopened.migration_version(), 4)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -225,6 +269,52 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
         self.assertTrue(replay.replayed)
         self.assertEqual(replay.snapshot.task_id, created.snapshot.task_id)
+
+    def test_aggregate_reads_use_explicit_sqlite_read_transactions(self) -> None:
+        created = self.create(key="create-aggregate-read-transaction")
+        plan = plan_graph()
+        self.service.persist_plan(
+            task_id=created.snapshot.task_id,
+            plan=plan,
+            idempotency_key="aggregate-read-plan-key",
+            **self.scope,
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            request_hash = connection.execute(
+                """
+                SELECT request_hash FROM workbench_mutations
+                WHERE project_id = ? AND principal_id = ?
+                  AND operation = 'persist_plan' AND idempotency_key = ?
+                """,
+                (PROJECT_ID, PRINCIPAL_ID, "aggregate-read-plan-key"),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        transaction_states: list[bool] = []
+        original_load_snapshot = self.store._load_snapshot
+
+        def observe_transaction(connection, task_id):
+            transaction_states.append(connection.in_transaction)
+            return original_load_snapshot(connection, task_id)
+
+        self.store._load_snapshot = observe_transaction
+        try:
+            snapshot = self.store.get_task(created.snapshot.task_id)
+            mutation = self.store.lookup_workbench_mutation(
+                project_id=PROJECT_ID,
+                principal_id=PRINCIPAL_ID,
+                operation="persist_plan",
+                idempotency_key="aggregate-read-plan-key",
+                request_hash=request_hash,
+            )
+        finally:
+            del self.store.__dict__["_load_snapshot"]
+
+        self.assertIsNotNone(snapshot)
+        self.assertIsNotNone(mutation)
+        self.assertEqual(transaction_states, [True, True])
 
     def test_database_path_must_be_absolute_private_and_non_symlinked(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be absolute"):
@@ -248,12 +338,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 3)] * 8)
+        self.assertEqual(results, [("wal", 4)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 4")
+            connection.execute("PRAGMA user_version = 5")
             connection.commit()
         finally:
             connection.close()
@@ -604,6 +694,179 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(replayed_old_approval.approval, second_approval)
         self.assertEqual(self.raw_count("plans"), 1)
         self.assertEqual(self.raw_count("approvals"), 2)
+
+    def test_legacy_exact_plan_and_approval_reserve_new_idempotency_keys(
+        self,
+    ) -> None:
+        created = self.create(key="create-legacy-exact-idempotency")
+        task_id = created.snapshot.task_id
+        plan, approval = self.persist_plan_and_approval(task_id)
+        self.assertEqual(self.raw_count("workbench_mutations"), 0)
+
+        bound_plan = self.service.persist_plan(
+            task_id=task_id,
+            plan=plan,
+            idempotency_key="bind-legacy-exact-plan",
+            **self.scope,
+        )
+        replayed_plan = self.service.persist_plan(
+            task_id=task_id,
+            plan=plan,
+            idempotency_key="bind-legacy-exact-plan",
+            **self.scope,
+        )
+        self.assertEqual(bound_plan.plan, plan)
+        self.assertEqual(replayed_plan, bound_plan)
+
+        conflicting_plan = copy.deepcopy(plan)
+        conflicting_plan["plan_id"] = "plan-idempotency-conflict"
+        conflicting_plan["plan_hash"] = compute_plan_hash(conflicting_plan)
+        with self.assertRaises(TaskIdempotencyConflict):
+            self.service.persist_plan(
+                task_id=task_id,
+                plan=conflicting_plan,
+                idempotency_key="bind-legacy-exact-plan",
+                **self.scope,
+            )
+
+        bound_approval = self.service.persist_approval(
+            task_id=task_id,
+            approval=approval,
+            idempotency_key="bind-legacy-exact-approval",
+            **self.scope,
+        )
+        replayed_approval = self.service.persist_approval(
+            task_id=task_id,
+            approval=approval,
+            idempotency_key="bind-legacy-exact-approval",
+            **self.scope,
+        )
+        self.assertEqual(bound_approval.approval, approval)
+        self.assertEqual(replayed_approval, bound_approval)
+
+        conflicting_approval = copy.deepcopy(approval)
+        conflicting_approval["approval_id"] = "approval-idempotency-conflict"
+        with self.assertRaises(TaskIdempotencyConflict):
+            self.service.persist_approval(
+                task_id=task_id,
+                approval=conflicting_approval,
+                idempotency_key="bind-legacy-exact-approval",
+                **self.scope,
+            )
+
+        self.assertEqual(self.raw_count("plans"), 1)
+        self.assertEqual(self.raw_count("approvals"), 1)
+        self.assertEqual(self.raw_count("workbench_mutations"), 2)
+
+    def test_hash_consistent_cross_operation_workbench_outcomes_fail_closed(
+        self,
+    ) -> None:
+        created = self.create(key="create-workbench-outcome-tamper")
+        task_id = created.snapshot.task_id
+        revision = copy.deepcopy(created.snapshot.draft)
+        revision["revision"] = 2
+        self.service.revise_draft(
+            task_id=task_id,
+            expected_revision=1,
+            draft=revision,
+            idempotency_key="outcome-schema-revise",
+            **self.scope,
+        )
+
+        plan = plan_graph()
+        plan["plan_id"] = "plan-outcome-schema"
+        plan["draft"] = {"draft_id": revision["draft_id"], "revision": 2}
+        plan["plan_hash"] = compute_plan_hash(plan)
+        self.service.persist_plan(
+            task_id=task_id,
+            plan=plan,
+            idempotency_key="outcome-schema-plan",
+            **self.scope,
+        )
+        approval = approval_decision(plan)
+        approval["approval_id"] = "approval-outcome-schema"
+        self.service.persist_approval(
+            task_id=task_id,
+            approval=approval,
+            idempotency_key="outcome-schema-approval",
+            **self.scope,
+        )
+        self.service.abandon_task(
+            task_id=task_id,
+            idempotency_key="outcome-schema-abandon",
+            **self.scope,
+        )
+        self.assertEqual(self.raw_count("workbench_mutations"), 4)
+
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT project_id, principal_id, operation, idempotency_key,
+                       request_hash
+                FROM workbench_mutations
+                ORDER BY operation
+                """
+            ).fetchall()
+            forged_outcomes = {
+                "revise_draft": {
+                    "task_id": task_id,
+                    "plan_id": "plan-forged",
+                    "plan_hash": "sha256:" + "a" * 64,
+                },
+                "persist_plan": {
+                    "task_id": task_id,
+                    "approval_id": "approval-forged",
+                    "decision": "approved",
+                },
+                "persist_approval": {
+                    "task_id": task_id,
+                    "status": "Cancelled",
+                },
+                "abandon_task": {
+                    "task_id": task_id,
+                    "draft_id": revision["draft_id"],
+                    "draft_revision": 2,
+                },
+            }
+            connection.execute("DROP TRIGGER workbench_mutations_are_immutable")
+            for row in rows:
+                outcome_json, outcome_hash = encode_document(
+                    forged_outcomes[row["operation"]]
+                )
+                connection.execute(
+                    """
+                    UPDATE workbench_mutations
+                    SET outcome_json = ?, outcome_hash = ?
+                    WHERE project_id = ? AND principal_id = ?
+                      AND operation = ? AND idempotency_key = ?
+                    """,
+                    (
+                        outcome_json,
+                        outcome_hash,
+                        row["project_id"],
+                        row["principal_id"],
+                        row["operation"],
+                        row["idempotency_key"],
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        for row in rows:
+            with self.subTest(operation=row["operation"]):
+                with self.assertRaisesRegex(
+                    TaskStoreCorruption, "workbench mutation outcome is invalid"
+                ):
+                    self.store.lookup_workbench_mutation(
+                        project_id=row["project_id"],
+                        principal_id=row["principal_id"],
+                        operation=row["operation"],
+                        idempotency_key=row["idempotency_key"],
+                        request_hash=row["request_hash"],
+                    )
 
     def test_p1_1_service_cannot_create_a_queued_task(self) -> None:
         queued_draft = task_draft()
@@ -1224,6 +1487,117 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
     ) -> TaskService:
         return TaskService(self.store, clock=clock, dispatcher=dispatcher)
 
+    def submitted_runtime(
+        self, *, key: str
+    ) -> tuple[str, dict, FakeDispatcher, TaskService]:
+        token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        draft = task_draft()
+        draft["draft_id"] = f"draft-{token}"
+        created = self.create(draft=draft, key=f"create-{key}")
+        task_id = created.snapshot.task_id
+        plan = plan_graph()
+        plan["plan_id"] = f"plan-{token}"
+        plan["draft"]["draft_id"] = draft["draft_id"]
+        plan["nodes"][0]["idempotency_key"] = f"node-{token}-submit"
+        plan["plan_hash"] = compute_plan_hash(plan)
+        self.service.persist_plan(task_id=task_id, plan=plan, **self.scope)
+        approval = approval_decision(plan)
+        approval["approval_id"] = f"approval-{token}"
+        self.service.persist_approval(
+            task_id=task_id, approval=approval, **self.scope
+        )
+        dispatcher = FakeDispatcher(self.store)
+        service = self.submit_service(dispatcher)
+        result = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key=f"submit-{key}",
+            **self.scope,
+        )
+        self.assertEqual(result.intent.state, "dispatched")
+        return task_id, plan, dispatcher, service
+
+    def artifact_pair(
+        self, task_id: str
+    ) -> tuple[list[dict], dict[str, bytes]]:
+        intent = self.store.get_dispatch_intent(task_id)
+        self.assertIsNotNone(intent)
+        self.assertIsNotNone(intent.handle)
+        expected_input = {
+            key: intent.request["dataset"][key]
+            for key in ("id", "version", "content_hash", "data_type")
+        }
+        payloads = {
+            "artifact-inverted-model": b"\x93NUMPY-test-inverted-model",
+            "artifact-loss-curve": b"iteration,loss\n1,1.0\n2,0.5\n",
+        }
+
+        def manifest(
+            *,
+            artifact_id: str,
+            port: str,
+            artifact_type: str,
+            media_type: str,
+            relative_path: str,
+            component: str,
+            order: int,
+        ) -> dict:
+            data = payloads[artifact_id]
+            return {
+                "schema_version": "1.0.0",
+                "artifact_id": artifact_id,
+                "task_id": task_id,
+                "node_id": intent.node_id,
+                "artifact_type": artifact_type,
+                "media_type": media_type,
+                "location": {
+                    "relative_path": f"{intent.handle['job_id']}/{relative_path}"
+                },
+                "content_hash": "sha256:" + hashlib.sha256(data).hexdigest(),
+                "size_bytes": len(data),
+                "created_at": "2026-07-15T03:05:00Z",
+                "metrics": {"initial_loss": 1.0, "final_loss": 0.5},
+                "display": {
+                    "component": component,
+                    "title": artifact_type,
+                    "order": order,
+                },
+                "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+                "lineage": {
+                    "plan_hash": intent.plan_hash,
+                    "algorithm": copy.deepcopy(intent.request["algorithm"]),
+                    "inputs": [expected_input],
+                },
+                "extensions": {
+                    "org.agent_rpc.adapter": {
+                        "output_port": port,
+                        "worker_job_id": intent.handle["job_id"],
+                    }
+                },
+            }
+
+        manifests = [
+            manifest(
+                artifact_id="artifact-inverted-model",
+                port="inverted_model",
+                artifact_type="inverted_velocity_model_2d",
+                media_type="application/x-npy",
+                relative_path="models/inverted.npy",
+                component="download",
+                order=0,
+            ),
+            manifest(
+                artifact_id="artifact-loss-curve",
+                port="loss",
+                artifact_type="loss_curve",
+                media_type="text/csv",
+                relative_path="loss.csv",
+                component="line_chart",
+                order=1,
+            ),
+        ]
+        return manifests, payloads
+
     def test_atomic_submit_consumes_budget_queues_and_dispatches_after_commit(
         self,
     ) -> None:
@@ -1719,6 +2093,346 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertTrue(replay.replayed)
         self.assertEqual(replay.intent.state, "dispatching")
         self.assertEqual(dispatcher.dispatch_calls, 1)
+
+    def test_pre_runtime_abandon_is_exactly_idempotent_and_not_runtime_cancel(
+        self,
+    ) -> None:
+        created = self.create(key="create-abandon-exact")
+        now = [NOW]
+        service = TaskService(self.store, clock=lambda: now[0])
+        first = service.abandon_task(
+            task_id=created.snapshot.task_id,
+            idempotency_key="abandon-exact-key",
+            **self.scope,
+        )
+        self.assertFalse(first.replayed)
+        self.assertEqual(first.snapshot.status, "Cancelled")
+        self.assertEqual(self.raw_count("task_abandonments"), 1)
+        self.assertEqual(self.raw_count("workbench_mutations"), 1)
+
+        now[0] = "2026-07-16T03:00:00Z"
+        replay = service.abandon_task(
+            task_id=created.snapshot.task_id,
+            idempotency_key="abandon-exact-key",
+            **self.scope,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.snapshot, first.snapshot)
+        self.assertEqual(self.raw_count("task_abandonments"), 1)
+
+        another_draft = task_draft()
+        another_draft["draft_id"] = "draft-abandon-conflict"
+        another = self.create(
+            draft=another_draft, key="create-abandon-conflict"
+        )
+        with self.assertRaises(TaskIdempotencyConflict):
+            service.abandon_task(
+                task_id=another.snapshot.task_id,
+                idempotency_key="abandon-exact-key",
+                **self.scope,
+            )
+        self.assertEqual(
+            self.store.get_task(another.snapshot.task_id).status,
+            "AwaitingApproval",
+        )
+
+        task_id, _, _, runtime_service = self.submitted_runtime(
+            key="abandon-after-dispatch"
+        )
+        with self.assertRaises(TaskConflict):
+            runtime_service.abandon_task(
+                task_id=task_id,
+                idempotency_key="abandon-is-not-cancel",
+                **self.scope,
+            )
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+        self.assertEqual(self.raw_count("task_abandonments"), 1)
+
+        forged = {
+            "schema_version": "1.0.0",
+            "task_id": task_id,
+            "previous_status": "AwaitingApproval",
+            "status": "Cancelled",
+            "reason": "user_discarded_draft",
+            "actor": {"type": "user", "id": PRINCIPAL_ID},
+            "abandoned_at": NOW,
+            "extensions": {},
+        }
+        forged_json, forged_hash = encode_document(forged)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO task_abandonments(
+                        task_id, project_id, principal_id, document_json,
+                        document_hash, abandoned_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        PROJECT_ID,
+                        PRINCIPAL_ID,
+                        forged_json,
+                        forged_hash,
+                        NOW,
+                    ),
+                )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_refresh_runtime_status_is_monotonic_and_poll_idempotent(self) -> None:
+        task_id, _, dispatcher, service = self.submitted_runtime(
+            key="status-lifecycle"
+        )
+        queued = service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(queued.snapshot.status, "Queued")
+        self.assertEqual(len(service.list_run_events(task_id, **self.scope)), 1)
+
+        dispatcher.adapter_status = {
+            "status": "Running",
+            "stage": "inversion",
+            "completed": 1,
+            "total": 2,
+            "message": "iteration 1 of 2",
+            "updated_at": "2026-07-15T03:02:00Z",
+            "terminal": False,
+        }
+        running = service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(running.snapshot.status, "Running")
+        events = service.list_run_events(task_id, **self.scope)
+        self.assertEqual(
+            [event["event_type"] for event in events],
+            ["task_queued", "node_started", "node_progress"],
+        )
+        self.assertEqual(events[-1]["progress"]["completed"], 1)
+
+        repeated = service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(repeated.snapshot.status, "Running")
+        self.assertEqual(len(service.list_run_events(task_id, **self.scope)), 3)
+
+        dispatcher.adapter_status.update(
+            {
+                "completed": 2,
+                "message": "iteration 2 of 2",
+                "updated_at": "2026-07-15T03:03:00Z",
+            }
+        )
+        service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(len(service.list_run_events(task_id, **self.scope)), 4)
+
+        dispatcher.adapter_status.update(
+            {
+                "completed": 1,
+                "message": "regressed progress",
+                "updated_at": "2026-07-15T03:04:00Z",
+            }
+        )
+        with self.assertRaises(TaskDispatchError) as raised:
+            service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(raised.exception.code, "ADAPTER_PROGRESS_REGRESSION")
+        self.assertEqual(len(service.list_run_events(task_id, **self.scope)), 4)
+
+        dispatcher.adapter_status = {
+            "status": "Succeeded",
+            "stage": "complete",
+            "completed": 2,
+            "total": 2,
+            "message": "complete",
+            "updated_at": "2026-07-15T03:05:00Z",
+            "terminal": True,
+        }
+        terminal = service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(terminal.snapshot.status, "Succeeded")
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            [
+                "task_queued",
+                "node_started",
+                "node_progress",
+                "node_progress",
+                "node_succeeded",
+            ],
+        )
+        service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(len(service.list_run_events(task_id, **self.scope)), 5)
+
+    def test_worker_timestamp_regression_fails_closed(self) -> None:
+        task_id, _, dispatcher, service = self.submitted_runtime(
+            key="status-worker-time-regression"
+        )
+        dispatcher.adapter_status = {
+            "status": "Running",
+            "stage": "inversion",
+            "completed": 1,
+            "total": 2,
+            "message": "iteration 1 of 2",
+            "updated_at": "2026-07-15T03:02:00Z",
+            "terminal": False,
+        }
+        running = service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(running.snapshot.status, "Running")
+        before = service.list_run_events(task_id, **self.scope)
+        self.assertEqual(len(before), 3)
+
+        dispatcher.adapter_status.update(
+            {
+                "message": "stale worker observation",
+                "updated_at": "2026-07-15T03:01:59Z",
+            }
+        )
+        with self.assertRaises(TaskDispatchError) as raised:
+            service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(raised.exception.code, "ADAPTER_STATUS_REGRESSION")
+        self.assertEqual(service.list_run_events(task_id, **self.scope), before)
+        self.assertEqual(
+            service.get_task(task_id, **self.scope).status,
+            "Running",
+        )
+
+    def test_refresh_supports_direct_success_and_failure_without_fake_states(
+        self,
+    ) -> None:
+        success_id, _, success_dispatcher, success_service = self.submitted_runtime(
+            key="status-direct-success"
+        )
+        success_dispatcher.adapter_status = {
+            "status": "Succeeded",
+            "stage": "complete",
+            "completed": 2,
+            "total": 2,
+            "message": "complete",
+            "updated_at": "2026-07-15T03:06:00Z",
+            "terminal": True,
+        }
+        success = success_service.refresh_runtime_status(success_id, **self.scope)
+        self.assertEqual(success.snapshot.status, "Succeeded")
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in success_service.list_run_events(success_id, **self.scope)
+            ],
+            ["task_queued", "node_started", "node_succeeded"],
+        )
+
+        failed_id, _, failed_dispatcher, failed_service = self.submitted_runtime(
+            key="status-direct-failure"
+        )
+        failed_dispatcher.adapter_status = {
+            "status": "Failed",
+            "stage": "failed",
+            "completed": 0,
+            "total": 2,
+            "message": "worker failed",
+            "updated_at": "2026-07-15T03:07:00Z",
+            "terminal": True,
+        }
+        failed = failed_service.refresh_runtime_status(failed_id, **self.scope)
+        self.assertEqual(failed.snapshot.status, "Failed")
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in failed_service.list_run_events(failed_id, **self.scope)
+            ],
+            ["task_queued", "node_failed"],
+        )
+        failed_service.refresh_runtime_status(failed_id, **self.scope)
+        self.assertEqual(
+            len(failed_service.list_run_events(failed_id, **self.scope)), 2
+        )
+
+    def test_terminal_artifacts_are_exact_pair_and_bound_to_runtime(self) -> None:
+        task_id, plan, dispatcher, service = self.submitted_runtime(
+            key="terminal-artifacts"
+        )
+        dispatcher.adapter_status = {
+            "status": "Succeeded",
+            "stage": "complete",
+            "completed": 2,
+            "total": 2,
+            "message": "complete",
+            "updated_at": "2026-07-15T03:08:00Z",
+            "terminal": True,
+        }
+        service.refresh_runtime_status(task_id, **self.scope)
+        manifests, payloads = self.artifact_pair(task_id)
+        dispatcher.manifests = manifests
+        dispatcher.artifact_data = payloads
+
+        collected = service.collect_artifacts(task_id, **self.scope)
+        self.assertEqual(
+            [(value["artifact_type"], value["media_type"]) for value in collected],
+            [
+                ("inverted_velocity_model_2d", "application/x-npy"),
+                ("loss_curve", "text/csv"),
+            ],
+        )
+        self.assertTrue(
+            all(value["lineage"]["plan_hash"] == plan["plan_hash"] for value in collected)
+        )
+        for manifest in collected:
+            returned, data = service.read_artifact(
+                task_id, manifest["artifact_id"], **self.scope
+            )
+            self.assertEqual(returned, manifest)
+            self.assertEqual(
+                "sha256:" + hashlib.sha256(data).hexdigest(),
+                manifest["content_hash"],
+            )
+
+        wrong_pair = copy.deepcopy(manifests)
+        wrong_pair[1]["artifact_type"] = "inverted_velocity_model_2d"
+        wrong_pair[1]["media_type"] = "application/x-npy"
+        wrong_pair[1]["extensions"]["org.agent_rpc.adapter"][
+            "output_port"
+        ] = "inverted_model"
+        dispatcher.manifests = wrong_pair
+        with self.assertRaises(TaskDispatchError) as raised:
+            service.collect_artifacts(task_id, **self.scope)
+        self.assertEqual(raised.exception.code, "ADAPTER_ARTIFACT_INVALID")
+
+        for label, mutate in (
+            ("task", lambda value: value.__setitem__("task_id", "task-other")),
+            (
+                "plan",
+                lambda value: value["lineage"].__setitem__(
+                    "plan_hash", "sha256:" + "f" * 64
+                ),
+            ),
+            (
+                "fingerprint",
+                lambda value: value["fingerprint"].__setitem__("seed", 9),
+            ),
+            (
+                "input",
+                lambda value: value["lineage"]["inputs"][0].__setitem__(
+                    "content_hash", "sha256:" + "e" * 64
+                ),
+            ),
+        ):
+            with self.subTest(binding=label):
+                tampered = copy.deepcopy(manifests)
+                mutate(tampered[0])
+                dispatcher.manifests = tampered
+                with self.assertRaises(TaskDispatchError) as raised:
+                    service.collect_artifacts(task_id, **self.scope)
+                self.assertEqual(
+                    raised.exception.code, "ADAPTER_ARTIFACT_INVALID"
+                )
+
+        dispatcher.manifests = manifests
+        dispatcher.artifact_data = copy.deepcopy(payloads)
+        dispatcher.artifact_data[manifests[0]["artifact_id"]] += b"tampered"
+        with self.assertRaises(TaskDispatchError) as raised:
+            service.read_artifact(
+                task_id, manifests[0]["artifact_id"], **self.scope
+            )
+        self.assertEqual(raised.exception.code, "ADAPTER_ARTIFACT_INVALID")
 
     def test_hash_consistent_dispatch_request_tampering_fails_closed(self) -> None:
         created = self.create()

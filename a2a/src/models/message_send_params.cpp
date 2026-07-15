@@ -1,4 +1,5 @@
 #include <a2a/models/message_send_params.hpp>
+#include <nlohmann/json.hpp>
 #include <sstream>
 
 namespace a2a {
@@ -22,6 +23,10 @@ std::string MessageSendParams::to_json() const {
 
     if (task_id_.has_value()) {
         oss << ",\"taskId\":\"" << *task_id_ << "\"";
+    }
+
+    if (!metadata_.empty()) {
+        oss << ",\"metadata\":" << nlohmann::json(metadata_).dump();
     }
 
     oss << "}";
@@ -75,6 +80,22 @@ MessageSendParams MessageSendParams::from_json(const std::string& json) {
         size_t start = json.find("\"", task_pos + 9) + 1;
         size_t end = json.find("\"", start);
         params.task_id_ = json.substr(start, end - start);
+    }
+
+    // Metadata values are strings at the RPC/A2A compatibility boundary.
+    // Parse this field with a JSON parser so escaping is preserved exactly.
+    try {
+        const auto root = nlohmann::json::parse(json);
+        const auto metadata = root.find("metadata");
+        if (metadata != root.end() && metadata->is_object()) {
+            for (auto item = metadata->begin(); item != metadata->end(); ++item) {
+                if (item.value().is_string()) {
+                    params.metadata_[item.key()] = item.value().get<std::string>();
+                }
+            }
+        }
+    } catch (const nlohmann::json::exception&) {
+        // Preserve the model's existing permissive parsing behavior.
     }
 
     return params;

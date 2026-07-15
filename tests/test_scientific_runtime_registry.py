@@ -92,8 +92,8 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_fresh_v2_has_both_migration_checksums(self) -> None:
-        self.assertEqual(self.store.migration_version(), 3)
+    def test_fresh_v4_has_all_migration_checksums(self) -> None:
+        self.assertEqual(self.store.migration_version(), 4)
         connection = sqlite3.connect(self.database_path)
         try:
             rows = connection.execute(
@@ -107,6 +107,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
                 (1, "0001_task_store.sql"),
                 (2, "0002_catalog_registry.sql"),
                 (3, "0003_submit_dispatch.sql"),
+                (4, "0004_workbench_runtime.sql"),
             ],
         )
         for version, name, checksum in rows:
@@ -856,10 +857,44 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def upgrade_fixture_to_v3(self) -> None:
+        self.upgrade_fixture_to_v2()
+        migration_path = (
+            Path(__file__).parents[1]
+            / "scientific_runtime"
+            / "migrations"
+            / "0003_submit_dispatch.sql"
+        )
+        migration_text = migration_path.read_text(encoding="utf-8")
+        connection = sqlite3.connect(self.database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            for statement in _migration_statements(migration_text):
+                connection.execute(statement)
+            connection.execute(
+                """
+                INSERT INTO schema_migrations(version, name, checksum, applied_at)
+                VALUES (3, ?, ?, ?)
+                """,
+                (
+                    migration_path.name,
+                    hashlib.sha256(migration_text.encode("utf-8")).hexdigest(),
+                    NOW,
+                ),
+            )
+            connection.execute("PRAGMA user_version = 3")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def test_v1_database_upgrades_in_place_and_backfills_approval_budget(self) -> None:
         task_id, approval = self.seed_v1_database()
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 3)
+        self.assertEqual(store.migration_version(), 4)
         snapshot = store.get_task(task_id)
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.approval, approval)
@@ -873,7 +908,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
         task_id, _ = self.seed_v1_database()
         self.upgrade_fixture_to_v2()
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 3)
+        self.assertEqual(store.migration_version(), 4)
         self.assertEqual(store.get_task(task_id).status, "AwaitingApproval")
         connection = sqlite3.connect(self.database_path)
         try:
@@ -893,6 +928,68 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
                 "submit_idempotency_links",
             }.issubset(tables)
         )
+
+    def test_v3_database_upgrades_to_v4_and_abandonment_tamper_fails_closed(
+        self,
+    ) -> None:
+        task_id, approval = self.seed_v1_database()
+        self.upgrade_fixture_to_v3()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertIsNone(
+                connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'task_abandonments'
+                    """
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+        store = SQLiteTaskStore(self.database_path)
+        self.assertEqual(store.migration_version(), 4)
+        snapshot = store.get_task(task_id)
+        self.assertEqual(snapshot.approval, approval)
+        abandoned = TaskService(store, clock=lambda: NOW).abandon_task(
+            task_id=task_id,
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            idempotency_key="v3-v4-abandon",
+        )
+        self.assertEqual(abandoned.snapshot.status, "Cancelled")
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    UPDATE workbench_mutations SET outcome_json = '{}'
+                    WHERE task_id = ?
+                    """,
+                    (task_id,),
+                )
+            connection.rollback()
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "DELETE FROM task_abandonments WHERE task_id = ?",
+                    (task_id,),
+                )
+            connection.rollback()
+            connection.execute("DROP TRIGGER task_abandonments_are_immutable")
+            connection.execute(
+                """
+                UPDATE task_abandonments SET document_json = '{}'
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(TaskStoreCorruption, "task abandonment hash"):
+            store.get_task(task_id)
 
     def test_v3_upgrade_rejects_unexplainable_v2_runtime_state_atomically(self) -> None:
         task_id, _ = self.seed_v1_database()
@@ -965,7 +1062,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(reopen, range(8)))
-        self.assertEqual(results, [(3, approval["approval_id"])] * 8)
+        self.assertEqual(results, [(4, approval["approval_id"])] * 8)
         connection = sqlite3.connect(self.database_path)
         try:
             self.assertEqual(

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "agent_message.hpp"
+#include <map>
 #include <optional>
+#include <string>
 
 namespace a2a {
 
@@ -20,12 +22,16 @@ public:
     const std::optional<int>& history_length() const { return history_length_; }
     const std::optional<std::string>& context_id() const { return context_id_; }
     const std::optional<std::string>& task_id() const { return task_id_; }
+    const std::map<std::string, std::string>& metadata() const { return metadata_; }
 
     // Setters
     void set_message(const AgentMessage& message) { message_ = message; }
     void set_history_length(int length) { history_length_ = length; }
     void set_context_id(const std::string& id) { context_id_ = id; }
     void set_task_id(const std::string& id) { task_id_ = id; }
+    void set_metadata(const std::string& key, const std::string& value) {
+        metadata_[key] = value;
+    }
 
     /**
      * @brief Serialize to JSON
@@ -67,11 +73,18 @@ public:
         return *this;
     }
 
+    MessageSendParams& with_metadata(const std::string& key,
+                                     const std::string& value) {
+        metadata_[key] = value;
+        return *this;
+    }
+
 private:
     AgentMessage message_;
     std::optional<int> history_length_;
     std::optional<std::string> context_id_;
     std::optional<std::string> task_id_;
+    std::map<std::string, std::string> metadata_;
 };
 
 /**

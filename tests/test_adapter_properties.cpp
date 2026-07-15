@@ -95,6 +95,34 @@ RC_GTEST_PROP(AdapterProperties, MessageRoundTrip_PreservesHistoryLength, ()) {
     RC_ASSERT(a2a_params.history_length().value() == history_length);
 }
 
+TEST(AdapterPropertiesTest, RequestMetadataSurvivesGrpcToA2ABoundary) {
+    agent_communication::AIQueryRequest original;
+    original.set_request_id("test-source-policy");
+    original.set_question("ordinary Web chat");
+    (*original.mutable_metadata())["allow_legacy_fwi_submit"] = "false";
+
+    agent_rpc::a2a_adapter::RequestAdapter request_adapter;
+    const auto a2a_params = request_adapter.convertToA2A(original);
+
+    ASSERT_EQ(a2a_params.metadata().size(), 1U);
+    EXPECT_EQ(a2a_params.metadata().at("allow_legacy_fwi_submit"), "false");
+
+    const auto round_trip = a2a::MessageSendParams::from_json(a2a_params.to_json());
+    ASSERT_EQ(round_trip.metadata().size(), 1U);
+    EXPECT_EQ(round_trip.metadata().at("allow_legacy_fwi_submit"), "false");
+}
+
+TEST(AdapterPropertiesTest, MissingRequestMetadataRemainsAbsentForOldClients) {
+    agent_communication::AIQueryRequest original;
+    original.set_request_id("test-old-client");
+    original.set_question("legacy client request");
+
+    agent_rpc::a2a_adapter::RequestAdapter request_adapter;
+    const auto a2a_params = request_adapter.convertToA2A(original);
+
+    EXPECT_TRUE(a2a_params.metadata().empty());
+}
+
 // ============================================================================
 // Property 7: Error Code Mapping Completeness
 // **Feature: a2a-integration, Property 7: Error Code Mapping Completeness**

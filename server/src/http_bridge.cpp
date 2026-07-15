@@ -371,6 +371,24 @@ private:
             return;
         }
 
+        bool disable_legacy_fwi_submit = false;
+        const auto legacy_submit_it = payload.find("allow_legacy_fwi_submit");
+        if (legacy_submit_it != payload.end()) {
+            if (!legacy_submit_it->is_boolean()) {
+                sendJsonRequestError(
+                    client_fd, "invalid_allow_legacy_fwi_submit",
+                    "'allow_legacy_fwi_submit' must be a boolean when provided");
+                return;
+            }
+            if (legacy_submit_it->get<bool>()) {
+                sendJsonRequestError(
+                    client_fd, "invalid_allow_legacy_fwi_submit",
+                    "'allow_legacy_fwi_submit' may only be false when provided");
+                return;
+            }
+            disable_legacy_fwi_submit = true;
+        }
+
         if (!grpc_stub_) {
             sendGrpcError(client_fd, grpc::StatusCode::UNAVAILABLE,
                           "AIQueryService gRPC client is not available");
@@ -385,6 +403,9 @@ private:
         request.set_context_id(context_id);
         request.set_history_length(10);
         request.set_timeout_seconds(60);
+        if (disable_legacy_fwi_submit) {
+            (*request.mutable_metadata())["allow_legacy_fwi_submit"] = "false";
+        }
 
         grpc::ClientContext grpc_context;
         grpc_context.set_deadline(

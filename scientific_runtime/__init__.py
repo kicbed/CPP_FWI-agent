@@ -33,6 +33,7 @@ from .registry_service import (
 )
 
 from .task_service import (
+    AbandonTaskResult,
     CreateTaskResult,
     SubmitTaskResult,
     TaskConflict,
@@ -41,6 +42,7 @@ from .task_service import (
     TaskNotFound,
     TaskService,
     TaskServiceError,
+    TaskRuntimeResult,
     TaskValidationError,
 )
 from .task_dispatcher import (
@@ -62,6 +64,14 @@ from .task_store import (
     TaskStoreError,
     TaskStoreUnavailable,
 )
+from .workbench_service import (
+    GuidedWorkbench,
+    WorkbenchConflict,
+    WorkbenchError,
+    WorkbenchNotFound,
+    WorkbenchRuntimeError,
+    WorkbenchValidationError,
+)
 
 __all__ = [
     "AdapterArtifactError",
@@ -76,6 +86,7 @@ __all__ = [
     "AdapterUnavailable",
     "AdapterValidation",
     "AdapterValidationError",
+    "AbandonTaskResult",
     "ApprovalBudget",
     "CreateTaskResult",
     "DeepwaveTaskDispatcher",
@@ -84,6 +95,7 @@ __all__ = [
     "DispatchIntentSnapshot",
     "DispatchPreparation",
     "FWIBaselineRegistration",
+    "GuidedWorkbench",
     "RegistryConflict",
     "RegistryCorruption",
     "RegistryNotFound",
@@ -102,6 +114,7 @@ __all__ = [
     "TaskNotFound",
     "TaskService",
     "TaskServiceError",
+    "TaskRuntimeResult",
     "TaskSnapshot",
     "TaskStore",
     "TaskStoreConflict",
@@ -110,6 +123,11 @@ __all__ = [
     "TaskStoreUnavailable",
     "SubmitTaskResult",
     "TaskValidationError",
+    "WorkbenchConflict",
+    "WorkbenchError",
+    "WorkbenchNotFound",
+    "WorkbenchRuntimeError",
+    "WorkbenchValidationError",
     "load_deepwave_manifest",
     "register_verified_fwi_baseline",
     "verified_marmousi_dataset_ref",

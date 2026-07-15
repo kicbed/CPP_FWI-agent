@@ -167,6 +167,7 @@ LOCAL_EMBEDDING_DEVICE=cpu
 cd /path/to/agent-communication-main-v2
 export FWI_VENV=/root/.venvs/cpp-fwi-agent
 export FWI_RUN_ROOT=/root/fwi-runs
+export SCIENTIFIC_RUNTIME_DB_PATH="$HOME/.local/state/cpp-fwi-agent/scientific-runtime/tasks.sqlite3"
 export ENABLE_MCP=true
 export WEB_HOST=127.0.0.1
 export WEB_PORT=8080
@@ -181,6 +182,10 @@ export WEB_PORT=8080
 `/root/.venvs/cpp-fwi-agent/bin/python`；`FWI_VENV`/`FWI_WORKER_PYTHON` 不能通过
 聊天、MCP 或 dotenv 改成其他可执行文件。`FWI_RUN_ROOT` 可以由部署管理员改为其他
 专用绝对结果目录，但不能是符号链接、仓库、HOME、系统敏感目录或它们的上级。
+P1 Guided Task Store 默认位于仓库外的
+`~/.local/state/cpp-fwi-agent/scientific-runtime/tasks.sqlite3`。
+`SCIENTIFIC_RUNTIME_DB_PATH` 只允许专用私有绝对路径：不得与 `FWI_RUN_ROOT` 重叠，不得位于
+仓库或系统敏感目录，现有父目录必须由当前用户所有且权限为 `0700`。
 
 可选 gRPC Server/Web bridge 也通过同一入口启动：
 
@@ -236,13 +241,16 @@ CONVERSATION_TTL_SECONDS=2592000
 
 ### 2.3 Web 环境变量
 
-- `WEB_HOST` 默认 `127.0.0.1`。只有在容器内部才设置为 `0.0.0.0`，并由 Docker 将
-  宿主机端口限制到 loopback。
+- `WEB_HOST` 默认 `127.0.0.1`。P1 Guided API 只在 `127.0.0.1`/`localhost` 绑定时
+  启用；`0.0.0.0` 只保留容器 legacy/static 兼容，Guided 路由返回 503。当前不应用
+  Compose 验收 Guided Runtime。
 - `WEB_PORT` 默认 `8080`；端口占用时启动会明确失败，不会静默切换端口。
 - 默认不发送 CORS 允许头。只有确需跨源访问时设置精确的
   `WEB_ALLOW_ORIGIN`，不要使用不受控的 `*`。
 - `FWI_RUN_ROOT` 默认 `/root/fwi-runs`。Web artifact 路由只允许该目录下受控的
   `.json`、`.csv` 和 `.png`；服务会拒绝将该 root 设为 `/`、HOME、仓库或系统敏感目录。
+- `SCIENTIFIC_RUNTIME_DB_PATH` 默认为上述仓库外 SQLite 文件；它不能位于
+  `FWI_RUN_ROOT` 内，避免被 legacy artifact 路由服务或与 Worker 输出碰撞。
 - `AGENT_BIND_HOST` 默认 `127.0.0.1`，宿主机运行时不要改成公网地址。容器内部显式
   使用 `0.0.0.0`，但 Compose 只把端口发布到宿主机 loopback。
 - `AGENT_CORS_ORIGIN` 默认 `http://127.0.0.1:8080`，用于 Web 跨端口访问 Agent；
@@ -279,6 +287,9 @@ export FWI_RUN_DIR=/root/fwi-runs
 
 不要把 key 写入 Dockerfile、`compose.yaml`、镜像标签、build args 或命令行。`.env` 和
 常见 dotenv 变体已被 `.dockerignore` 排除。
+
+当前 Compose 使用 `WEB_HOST=0.0.0.0`，因此只验收 legacy Web/MCP 链路，不创建或暴露
+P1 Guided Task Store/API。Guided 容器部署需要后续明确的认证/反向代理边界，不在 P1 内隐式开启。
 
 ### 3.2 默认 CPU 构建和启动
 

@@ -10,6 +10,7 @@ from .fwi_adapter import (
     ADAPTER_VERSION,
     LOGICAL_ENTRYPOINT,
     AdapterError,
+    AdapterHandle,
     DeepwaveAdapter,
 )
 from .task_store import DispatchIntentSnapshot, TaskSnapshot
@@ -40,6 +41,17 @@ class TaskDispatcher(Protocol):
         ...
 
     def dispatch(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
+        ...
+
+    def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
+        ...
+
+    def collect(self, intent: DispatchIntentSnapshot) -> list[dict[str, Any]]:
+        ...
+
+    def read_artifact(
+        self, intent: DispatchIntentSnapshot, artifact_id: str
+    ) -> tuple[dict[str, Any], bytes]:
         ...
 
 
@@ -149,3 +161,46 @@ class DeepwaveTaskDispatcher:
         if handle.fingerprint.get("normalized_config_hash") != normalized_config_hash:
             raise DispatchError("DISPATCH_FINGERPRINT_DRIFT")
         return handle.as_dict()
+
+    @staticmethod
+    def _handle_from_intent(intent: DispatchIntentSnapshot) -> AdapterHandle:
+        if (
+            intent.adapter_id != LOGICAL_ENTRYPOINT
+            or intent.adapter_version != ADAPTER_VERSION
+            or intent.state != "dispatched"
+            or intent.handle is None
+        ):
+            raise DispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+        try:
+            return AdapterHandle(**copy.deepcopy(intent.handle))
+        except (TypeError, ValueError) as error:
+            raise DispatchError("DISPATCH_RECEIPT_INVALID") from error
+
+    def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
+        handle = self._handle_from_intent(intent)
+        try:
+            return self._adapter.status(handle).as_dict()
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("ADAPTER_STATUS_UNAVAILABLE") from error
+
+    def collect(self, intent: DispatchIntentSnapshot) -> list[dict[str, Any]]:
+        handle = self._handle_from_intent(intent)
+        try:
+            return self._adapter.collect(handle)
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("ADAPTER_COLLECT_UNAVAILABLE") from error
+
+    def read_artifact(
+        self, intent: DispatchIntentSnapshot, artifact_id: str
+    ) -> tuple[dict[str, Any], bytes]:
+        handle = self._handle_from_intent(intent)
+        try:
+            return self._adapter.read_artifact(handle, artifact_id)
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("ADAPTER_ARTIFACT_UNAVAILABLE") from error

@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <regex>
+#include <stdexcept>
 #include <unordered_map>
 
 using json = nlohmann::json;
@@ -48,6 +49,32 @@ struct ToolCallResult {
 
 namespace detail {
 
+inline constexpr const char* kAllowLegacyFwiSubmitMetadata =
+    "allow_legacy_fwi_submit";
+
+/**
+ * Resolve the opt-out carried by the Web -> gRPC -> A2A request chain.
+ * Absence deliberately preserves legacy CLI/MCP/A2A behavior. If the key is
+ * present, only the adapter-produced string "false" is accepted.
+ */
+inline bool resolve_allow_legacy_fwi_submit(const json& params) {
+    if (!params.is_object()) {
+        throw std::invalid_argument("params must be an object");
+    }
+    const auto metadata = params.find("metadata");
+    if (metadata == params.end()) return true;
+    if (!metadata->is_object()) {
+        throw std::invalid_argument("params.metadata must be an object");
+    }
+    const auto value = metadata->find(kAllowLegacyFwiSubmitMetadata);
+    if (value == metadata->end()) return true;
+    if (!value->is_string() || value->get<std::string>() != "false") {
+        throw std::invalid_argument(
+            "metadata.allow_legacy_fwi_submit must be the string 'false' when provided");
+    }
+    return false;
+}
+
 inline bool contains_any(const std::string& text,
                          std::initializer_list<const char*> needles) {
     for (const char* needle : needles) {
@@ -61,6 +88,40 @@ inline std::string ascii_lower_copy(std::string text) {
         return static_cast<char>(std::tolower(c));
     });
     return text;
+}
+
+inline bool is_fwi_tool_call_allowed(const ToolCallResult& call,
+                                     bool allow_legacy_fwi_submit) {
+    return allow_legacy_fwi_submit || call.tool_name != "fwi_submit_demo";
+}
+
+inline bool contains_ascii_word(const std::string& lower_text,
+                                const std::string& lower_word) {
+    std::string::size_type position = 0;
+    const auto is_word_character = [](unsigned char character) {
+        return std::isalnum(character) != 0 || character == '_';
+    };
+    while ((position = lower_text.find(lower_word, position)) != std::string::npos) {
+        const bool left_boundary =
+            position == 0 ||
+            !is_word_character(static_cast<unsigned char>(lower_text[position - 1]));
+        const auto end = position + lower_word.size();
+        const bool right_boundary =
+            end == lower_text.size() ||
+            !is_word_character(static_cast<unsigned char>(lower_text[end]));
+        if (left_boundary && right_boundary) return true;
+        position = end;
+    }
+    return false;
+}
+
+inline bool contains_any_ascii_word(
+    const std::string& lower_text,
+    std::initializer_list<const char*> lower_words) {
+    return std::any_of(
+        lower_words.begin(), lower_words.end(), [&](const char* word) {
+            return contains_ascii_word(lower_text, word);
+        });
 }
 
 inline std::string extract_fwi_job_id(const std::string& text) {
@@ -87,29 +148,32 @@ inline bool has_fwi_negative_intent(const std::string& query) {
                 "不提交", "不启动", "不开始", "勿运行", "勿执行", "仅解释", "只解释",
                 "仅说明", "只说明", "只讲解"}) ||
         contains_any(lower_query, {"do not run", "don't run", "do not execute",
-                                   "do not submit", "do not start"}));
+                                   "don't execute", "do not submit", "don't submit",
+                                   "do not start", "don't start"}));
 }
 
 inline bool is_fwi_capability_query(const std::string& query) {
     if (!mentions_fwi_query(query)) return false;
+    const std::string lower_query = ascii_lower_copy(query);
     const bool fixed_phrase = contains_any(
         query, {"能否", "能不能", "是否能", "是否可以", "可以做", "能做", "支持吗",
                 "是否支持", "支不支持", "会不会", "能运行吗", "可以运行吗", "能执行吗",
-                "可以执行吗", "可以使用吗", "能用吗", "can you", "Can you",
-                "do you support", "Do you support", "is it possible", "Is it possible"});
+                "可以执行吗", "可以使用吗", "能用吗"}) ||
+        contains_any(lower_query, {"can you", "do you support", "is it possible"});
     const bool modal_question = contains_any(query, {"吗", "？", "?"}) &&
                                 contains_any(query, {"能", "可以", "支持"});
     return fixed_phrase || modal_question;
 }
 
 inline bool is_fwi_howto_query(const std::string& query) {
-    return mentions_fwi_query(query) && contains_any(
+    const std::string lower_query = ascii_lower_copy(query);
+    return mentions_fwi_query(query) && (contains_any(
         query, {"怎么启动", "如何启动", "怎样启动", "怎么运行", "如何运行", "怎样运行",
                 "怎么执行", "如何执行", "怎样执行", "怎么提交", "如何提交", "怎样提交",
                 "怎么开始", "如何开始", "怎样开始", "怎么使用", "如何使用", "怎样使用",
-                "怎么用", "如何用", "怎样用", "启动方式", "运行方式", "使用方式",
-                "how to run", "How to run", "how to start", "How to start",
-                "how to submit", "How to submit", "how to use", "How to use"});
+                "怎么用", "如何用", "怎样用", "启动方式", "运行方式", "使用方式"}) ||
+        contains_any(lower_query, {"how to run", "how to start", "how to execute",
+                                   "how to submit", "how to use"}));
 }
 
 /**
@@ -154,9 +218,11 @@ inline bool has_invalid_fwi_iteration_request(const std::string& query) {
 }
 
 inline bool is_fwi_theory_query(const std::string& query) {
+    const std::string lower_query = ascii_lower_copy(query);
     const bool asks_theory = contains_any(
         query, {"什么是", "解释", "理论", "原理", "公式", "为什么", "为何", "区别",
-                "如何", "怎么", "方法", "步骤", "what is", "What is"});
+                "如何", "怎么", "方法", "步骤"}) ||
+        contains_any(lower_query, {"what is", "why", "explain", "theory"});
     return mentions_fwi_query(query) && asks_theory;
 }
 
@@ -209,7 +275,7 @@ inline ToolCallResult plan_fwi_tool_call(const std::string& query,
     const std::string lower_query = ascii_lower_copy(query);
     const bool has_standard_run_action = contains_run_command_word(query) || contains_any(
         query, {"执行", "提交", "启动", "开始"}) ||
-        contains_any(lower_query, {"run", "execute", "submit", "start"});
+        contains_any_ascii_word(lower_query, {"run", "execute", "submit", "start"});
     // Users commonly say “做一下 Marmousi 的反演测试” without spelling out
     // either FWI or “运行”. Accept that wording only when the colloquial verb
     // is paired with a concrete inversion experiment noun; the model whitelist
@@ -309,6 +375,13 @@ public:
         return !detail::plan_fwi_tool_call(query, last_job_id).tool_name.empty();
     }
 
+    bool has_explicit_fwi_submission(const std::string& query,
+                                     const std::string& context_id = {}) {
+        const std::string last_job_id = last_fwi_job_for_context(context_id);
+        return detail::plan_fwi_tool_call(query, last_job_id).tool_name ==
+               "fwi_submit_demo";
+    }
+
     /** Seed or restore the latest FWI job for one conversation only. */
     void remember_fwi_job(const std::string& context_id,
                           const std::string& job_id) {
@@ -334,6 +407,9 @@ public:
     /**
      * @brief Process a query with tool calling
      * @param query User query
+     * @param context_id Conversation-scoped state key
+     * @param allow_legacy_fwi_submit Whether this source may invoke the legacy
+     *        asynchronous FWI submission tool. Defaults to true for old callers.
      * @return Tool result as string, or empty if no tool needed
      *
      * Flow:
@@ -343,18 +419,27 @@ public:
      * 4. Return result
      */
     std::string process(const std::string& query,
-                        const std::string& context_id = {}) {
+                        const std::string& context_id = {},
+                        bool allow_legacy_fwi_submit = true) {
         // Never let an FWI capability/how-to/negative/theory question reach
         // generic Tool-RAG. In particular, semantically similar knowledge
         // tools must not replace the honest runner guidance or launch a job.
         if (detail::is_fwi_guidance_query(query)) return "";
 
+        const std::string last_job_id = last_fwi_job_for_context(context_id);
+        const auto fwi_call = detail::plan_fwi_tool_call(query, last_job_id);
+        // This is the execution-boundary check. It is intentionally based on
+        // the actual deterministic plan, so a missed UI or intent
+        // classification cannot reach fwi_submit_demo.
+        if (!detail::is_fwi_tool_call_allowed(
+                fwi_call, allow_legacy_fwi_submit)) {
+            return "";
+        }
+
         if (!mcp_integration_ || !mcp_integration_->isAvailable()) {
             return "";
         }
 
-        const std::string last_job_id = last_fwi_job_for_context(context_id);
-        const auto fwi_call = detail::plan_fwi_tool_call(query, last_job_id);
         if (!fwi_call.tool_name.empty()) {
             auto result = execute_tool(fwi_call);
             if (result.success && fwi_call.tool_name == "fwi_submit_demo") {
@@ -385,6 +470,11 @@ public:
         // Step 2: LLM selects tool
         auto tool_call = select_tool(query, candidates);
         if (tool_call.tool_name.empty()) {
+            return "";
+        }
+
+        if (!detail::is_fwi_tool_call_allowed(
+                tool_call, allow_legacy_fwi_submit)) {
             return "";
         }
 

@@ -13,19 +13,46 @@ import socketserver
 import json
 import os
 import re
+import secrets
+import socket
 import sys
 import webbrowser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+WEB_DIR = Path(__file__).parent.resolve()
+PROJECT_ROOT = WEB_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    # ``python web/serve.py`` otherwise exposes only ``web/`` on sys.path.
+    # Resolve the trusted repository root from this file, never from cwd or a
+    # request value.
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scientific_runtime import (  # noqa: E402
+    DeepwaveAdapter,
+    DeepwaveTaskDispatcher,
+    RegistryService,
+    SQLiteTaskStore,
+    TaskService,
+    register_verified_fwi_baseline,
+)
+from scientific_runtime.workbench_service import GuidedWorkbench  # noqa: E402
+from web.workbench_api import (  # noqa: E402
+    API_PREFIX as WORKBENCH_API_PREFIX,
+    APIResponse,
+    MAX_JSON_BYTES as WORKBENCH_MAX_JSON_BYTES,
+    WorkbenchAPI,
+)
+
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8080
 HOST = os.environ.get("WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
 ALLOW_ORIGIN = os.environ.get("WEB_ALLOW_ORIGIN", "").strip()
-WEB_DIR = Path(__file__).parent.resolve()
 DEFAULT_FWI_RUN_ROOT = Path("/root/fwi-runs")
 FWI_ARTIFACT_PREFIX = "/fwi-artifacts/"
 EMBEDDING_HEALTH_PATH = "/api/embedding-health"
 MAX_EMBEDDING_HEALTH_BYTES = 32 * 1024
+HTTP_REQUEST_TIMEOUT_SECONDS = 10.0
+WORKBENCH_BODY_TIMEOUT_SECONDS = 5.0
 FWI_JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 FWI_CONTENT_TYPES = {
     ".json": "application/json; charset=utf-8",
@@ -48,6 +75,170 @@ CONTENT_SECURITY_POLICY = "; ".join(
         "frame-ancestors 'none'",
     )
 )
+
+# Set exactly once by ``main``. Importing this module for route tests remains
+# read-only and does not create a database or probe the numerical runtime.
+WORKBENCH_API = None
+
+
+def _workbench_error_response(status, code, message):
+    payload = json.dumps(
+        {"ok": False, "error": {"code": code, "message": message}},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return APIResponse(
+        status=int(status),
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Length": str(len(payload)),
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+        body=payload,
+    )
+
+
+def scientific_runtime_database_path():
+    """Return the server-owned durable task database path.
+
+    ``SQLiteTaskStore`` performs the authoritative no-symlink/private-parent
+    validation.  This server also rejects unsafe deployment overlap and
+    ownership before composing the store.  Browser requests can never select
+    the path.
+    """
+
+    default_state_home = Path.home() / ".local" / "state"
+    state_home = Path(os.environ.get("XDG_STATE_HOME", str(default_state_home))).expanduser()
+    default_path = state_home / "cpp-fwi-agent" / "scientific-runtime" / "tasks.sqlite3"
+    return Path(os.environ.get("SCIENTIFIC_RUNTIME_DB_PATH", str(default_path))).expanduser()
+
+
+def _paths_overlap(left, right):
+    left = Path(left)
+    right = Path(right)
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        pass
+    try:
+        right.relative_to(left)
+        return True
+    except ValueError:
+        return False
+
+
+def validated_scientific_runtime_database_path(run_root):
+    """Fail closed before TaskStore creation for direct-server launches."""
+
+    database_path = scientific_runtime_database_path()
+    if not database_path.is_absolute():
+        raise ValueError("SCIENTIFIC_RUNTIME_DB_PATH must be absolute")
+    canonical_database = database_path.resolve(strict=False)
+    canonical_run_root = Path(run_root).resolve(strict=True)
+    critical_roots = tuple(
+        Path(value)
+        for value in (
+            "/etc",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib32",
+            "/lib64",
+            "/boot",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+        )
+    )
+    if any(
+        canonical_database == root or root in canonical_database.parents
+        for root in critical_roots
+    ):
+        raise ValueError("SCIENTIFIC_RUNTIME_DB_PATH is inside a sensitive directory")
+    home = Path.home().resolve()
+    if (
+        _paths_overlap(canonical_database, PROJECT_ROOT)
+        or canonical_database == home
+        or canonical_database in home.parents
+        or canonical_database.parent == Path("/")
+        or canonical_database == Path("/var")
+        or canonical_database.parent == Path("/var")
+    ):
+        raise ValueError("SCIENTIFIC_RUNTIME_DB_PATH is not a dedicated state path")
+    if _paths_overlap(canonical_database, canonical_run_root):
+        raise ValueError("SCIENTIFIC_RUNTIME_DB_PATH cannot overlap FWI_RUN_ROOT")
+
+    owner_probe = canonical_database.parent
+    while not owner_probe.exists():
+        parent = owner_probe.parent
+        if parent == owner_probe:
+            break
+        owner_probe = parent
+    if owner_probe.exists():
+        owner_status = os.stat(owner_probe, follow_symlinks=False)
+        if owner_status.st_uid != os.geteuid() or owner_status.st_mode & 0o022:
+            raise ValueError(
+                "SCIENTIFIC_RUNTIME_DB_PATH must have a process-owned private parent"
+            )
+    return database_path
+
+
+def create_workbench_api():
+    """Compose the fixed local P1 Guided runtime and its HTTP boundary."""
+
+    if HOST not in {"127.0.0.1", "localhost"}:
+        raise ValueError("P1 Guided Workbench requires a loopback WEB_HOST")
+
+    run_root = fwi_run_root()
+    store = SQLiteTaskStore(validated_scientific_runtime_database_path(run_root))
+    registry = RegistryService(store)
+    project_id = "local-workbench"
+    principal_id = "local-user"
+    register_verified_fwi_baseline(
+        registry,
+        project_id=project_id,
+        principals=[principal_id],
+    )
+
+    def registry_snapshot_provider(
+        *, project_id, principal_id, dataset_id, dataset_version
+    ):
+        return registry.get_dataset(
+            project_id=project_id,
+            principal_id=principal_id,
+            dataset_id=dataset_id,
+            version=dataset_version,
+            permission="execute",
+        )
+
+    adapter = DeepwaveAdapter(
+        run_root=run_root,
+        registry_snapshot_provider=registry_snapshot_provider,
+    )
+    tasks = TaskService(store, dispatcher=DeepwaveTaskDispatcher(adapter))
+    application = GuidedWorkbench(
+        tasks,
+        registry,
+        project_id=project_id,
+        principal_id=principal_id,
+    )
+    browser_origin = os.environ.get(
+        "AGENT_CORS_ORIGIN", f"http://{HOST}:{PORT}"
+    ).strip()
+    try:
+        browser_host = urlsplit(browser_origin).netloc
+    except ValueError as error:
+        raise ValueError("AGENT_CORS_ORIGIN is not a valid Workbench origin") from error
+    return WorkbenchAPI(
+        application,
+        csrf_token=secrets.token_urlsafe(32),
+        allowed_hosts={browser_host},
+        allowed_origins={browser_origin},
+    )
 
 
 def local_embedding_enabled():
@@ -170,18 +361,26 @@ def is_within(path, parent):
         return False
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        # Bound slow request lines/headers as well as the stricter Guided body
+        # read below.  BaseHTTPRequestHandler closes cleanly on TimeoutError.
+        self.connection.settimeout(HTTP_REQUEST_TIMEOUT_SECONDS)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
     def end_headers(self):
         # Same-origin is sufficient for the Web UI and FWI artifacts. An
         # explicit origin can be enabled for a trusted development client.
-        if ALLOW_ORIGIN:
+        workbench_response = self._is_workbench_target()
+        if ALLOW_ORIGIN and not workbench_response:
             self.send_header("Access-Control-Allow-Origin", ALLOW_ORIGIN)
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header('Cache-Control', 'no-cache')
+        if not workbench_response:
+            self.send_header('Cache-Control', 'no-cache')
         self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -190,10 +389,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_OPTIONS(self):
+        if self._is_workbench_target():
+            self._serve_workbench("OPTIONS")
+            return
         self.send_response(200)
         self.end_headers()
 
     def do_GET(self):
+        if self._is_workbench_target():
+            self._serve_workbench("GET")
+            return
         request_path = urlsplit(self.path).path
         if request_path == EMBEDDING_HEALTH_PATH:
             self._serve_embedding_health(send_body=True)
@@ -204,6 +409,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_HEAD(self):
+        if self._is_workbench_target():
+            self._serve_workbench("HEAD", send_body=False)
+            return
         request_path = urlsplit(self.path).path
         if request_path == EMBEDDING_HEALTH_PATH:
             self._serve_embedding_health(send_body=False)
@@ -212,6 +420,100 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._serve_fwi_artifact(request_path, send_body=False)
             return
         super().do_HEAD()
+
+    def do_POST(self):
+        if self._is_workbench_target():
+            self._serve_workbench("POST")
+            return
+        self.send_error(http.HTTPStatus.NOT_FOUND)
+
+    def do_PUT(self):
+        if self._is_workbench_target():
+            self._serve_workbench("PUT")
+            return
+        self.send_error(http.HTTPStatus.NOT_FOUND)
+
+    def do_DELETE(self):
+        if self._is_workbench_target():
+            self._serve_workbench("DELETE")
+            return
+        self.send_error(http.HTTPStatus.NOT_IMPLEMENTED)
+
+    def do_PATCH(self):
+        if self._is_workbench_target():
+            self._serve_workbench("PATCH")
+            return
+        self.send_error(http.HTTPStatus.NOT_IMPLEMENTED)
+
+    def _is_workbench_target(self):
+        raw_path = getattr(self, "path", "").partition("?")[0]
+        return (
+            raw_path == WORKBENCH_API_PREFIX
+            or raw_path.startswith(WORKBENCH_API_PREFIX + "/")
+        )
+
+    def _workbench_body(self):
+        values = self.headers.get_all("Content-Length", failobj=[])
+        if len(values) != 1 or not values[0].isdigit():
+            return b""
+        length = int(values[0])
+        if length <= 0:
+            return b""
+        previous_timeout = self.connection.gettimeout()
+        self.connection.settimeout(WORKBENCH_BODY_TIMEOUT_SECONDS)
+        try:
+            # WorkbenchAPI.preflight has already rejected a declared overrun;
+            # keep the cap as defense in depth if this helper is reused.
+            return self.rfile.read(min(length, WORKBENCH_MAX_JSON_BYTES + 1))
+        finally:
+            self.connection.settimeout(previous_timeout)
+
+    def _send_workbench_response(self, response, send_body):
+        self.send_response(response.status)
+        for name, value in response.headers.items():
+            self.send_header(name, value)
+        self.end_headers()
+        if send_body:
+            self.wfile.write(response.body)
+
+    def _serve_workbench(self, method, send_body=True):
+        if WORKBENCH_API is None:
+            self.close_connection = True
+            self._send_workbench_response(
+                _workbench_error_response(
+                    http.HTTPStatus.SERVICE_UNAVAILABLE,
+                    "RUNTIME_UNAVAILABLE",
+                    "scientific runtime is temporarily unavailable",
+                ),
+                send_body,
+            )
+            return
+
+        early_response = WORKBENCH_API.preflight(
+            method, self.path, self.headers.items()
+        )
+        if early_response is not None:
+            # The body was deliberately not consumed.  Closing prevents any
+            # remaining bytes from being interpreted as a second request if
+            # the server protocol is upgraded from HTTP/1.0 in the future.
+            self.close_connection = True
+            self._send_workbench_response(early_response, send_body)
+            return
+        try:
+            body = self._workbench_body()
+        except socket.timeout:
+            self.close_connection = True
+            self._send_workbench_response(
+                _workbench_error_response(
+                    http.HTTPStatus.REQUEST_TIMEOUT,
+                    "BODY_TIMEOUT",
+                    "request body timed out",
+                ),
+                send_body,
+            )
+            return
+        response = WORKBENCH_API.dispatch(method, self.path, self.headers.items(), body)
+        self._send_workbench_response(response, send_body)
 
     def _serve_embedding_health(self, send_body):
         payload = json.dumps(embedding_health(), ensure_ascii=False,
@@ -323,8 +625,17 @@ class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
 def main():
     # Bind to loopback by default. Failing on a busy port is intentional: the
     # one-click launcher can then roll back instead of reporting the wrong URL.
+    global WORKBENCH_API
     fwi_run_root()
-    with ReusableThreadingTCPServer((HOST, PORT), Handler) as httpd:
+    # A wildcard bind is retained for legacy/static Compose deployments, but
+    # the unauthenticated P1 Guided runtime is never composed on that socket.
+    WORKBENCH_API = (
+        create_workbench_api() if HOST in {"127.0.0.1", "localhost"} else None
+    )
+    # Resolve the accepted localhost spelling ourselves so a resolver/NSS
+    # misconfiguration cannot turn the Guided bind into a non-loopback socket.
+    bind_host = "127.0.0.1" if HOST == "localhost" else HOST
+    with ReusableThreadingTCPServer((bind_host, PORT), Handler) as httpd:
         # Keep the browser Origin aligned with AGENT_CORS_ORIGIN. In
         # particular, do not rewrite 127.0.0.1 to localhost after startup.
         display_host = "127.0.0.1" if HOST == "0.0.0.0" else HOST

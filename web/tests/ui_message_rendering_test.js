@@ -101,6 +101,57 @@ function loadUiFunctions(options = {}) {
   return { api: sandbox.module.exports, sandbox };
 }
 
+function loadGuidedFunctions() {
+  const sandbox = {
+    module: { exports: {} },
+    document: {
+      createElement() {
+        return {
+          _text: '',
+          set textContent(value) { this._text = String(value); },
+          get innerHTML() {
+            return this._text
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;');
+          },
+        };
+      },
+    },
+  };
+  const names = [
+    'escapeHtml',
+    'isSafeGuidedOpaqueId',
+    'isSafeGuidedIdentifier',
+    'isSafeGuidedVersion',
+    'isSafeGuidedPlanHash',
+    'isSafeGuidedCsrfToken',
+    'boundedGuidedText',
+    'guidedApiPath',
+    'hasGuidedUnsupportedForwardIntent',
+    'guidedOverridesFromExecutionText',
+    'normalizeGuidedSession',
+    'normalizeGuidedCatalog',
+    'guidedIntegerValue',
+    'validateGuidedFwiForm',
+    'makeGuidedForm',
+    'normalizeGuidedTaskProjection',
+    'isGuidedReviewReady',
+    'isGuidedApprovedSubmitPending',
+    'normalizeGuidedArtifacts',
+    'guidedDispatchExplanation',
+    'renderGuidedArtifactsHtml',
+  ];
+  const source = [
+    "const GUIDED_API_PREFIX = '/api/scientific-runtime/v1';",
+    ...names.map(extractFunction),
+    `module.exports = { ${names.join(', ')} };`,
+  ].join('\n');
+  vm.runInNewContext(source, sandbox);
+  return sandbox.module.exports;
+}
+
 function loadSseParser() {
   const sandbox = {
     module: { exports: {} },
@@ -534,8 +585,52 @@ function testFwiExecutionWithoutReceiptIsReportedHonestly() {
     api.isFwiExecutionRequest('做一下marmousi的反演测试，迭代50次，完成后展示结果'),
     true,
   );
+  assert.equal(api.isFwiExecutionRequest('帮我做个 Marmousi FWI'), true);
+  assert.equal(api.isFwiExecutionRequest('请进行 Marmousi 反演'), true);
+  assert.equal(api.isFwiExecutionRequest('perform a Marmousi FWI'), true);
   assert.equal(api.isFwiExecutionRequest('帮我做一下 Marmousi 正演测试'), true);
+  for (const action of ['运行', '执行', '提交', '启动', '开始']) {
+    assert.equal(api.isFwiExecutionRequest(`${action} Marmousi FWI`), true, action);
+  }
+  for (const action of ['做一下', '做一个', '做个', '做一次', '进行', '开展']) {
+    assert.equal(
+      api.isFwiExecutionRequest(`${action} Marmousi 的反演实验`),
+      true,
+      action,
+    );
+  }
+  assert.equal(api.isFwiExecutionRequest('做一次 Marmousi 的反演实验'), true);
+  assert.equal(api.isFwiExecutionRequest('Run a Marmousi forward simulation'), true);
+  const legacySubmitParityCorpus = [
+    '介绍并运行 Marmousi FWI',
+    'run Marmousi FWI display model',
+    '运行 Marmousi FWI，分析模型',
+  ];
+  for (const request of legacySubmitParityCorpus) {
+    assert.equal(
+      api.isFwiExecutionRequest(request),
+      true,
+      `legacy submit parity must be intercepted: ${request}`,
+    );
+  }
   assert.equal(api.isFwiExecutionRequest('什么是 FWI？请解释其原理和公式'), false);
+  assert.equal(api.isFwiExecutionRequest('请解释如何运行 FWI'), false);
+  assert.equal(api.isFwiExecutionRequest('请解释 FWI 的运行原理'), false);
+  assert.equal(api.isFwiExecutionRequest('如何进行 Marmousi FWI？'), false);
+  assert.equal(api.isFwiExecutionRequest('How to perform a Marmousi FWI?'), false);
+  assert.equal(api.isFwiExecutionRequest('How does one perform FWI in theory?'), false);
+  assert.equal(api.isFwiExecutionRequest('你可以做 Marmousi FWI 反演吗？'), false);
+  assert.equal(api.isFwiExecutionRequest('Can you run a Marmousi FWI demo?'), false);
+  assert.equal(api.isFwiExecutionRequest('CAN YOU RUN Marmousi FWI?'), false);
+  assert.equal(api.isFwiExecutionRequest('HOW TO RUN Marmousi FWI'), false);
+  assert.equal(api.isFwiExecutionRequest('how to execute Marmousi FWI'), false);
+  assert.equal(api.isFwiExecutionRequest('不要运行 Marmousi FWI，只解释原理'), false);
+  assert.equal(api.isFwiExecutionRequest('查看 Marmousi FWI 的运行状态'), false);
+  assert.equal(api.isFwiExecutionRequest('显示 Marmousi FWI 的运行结果'), false);
+  assert.equal(api.isFwiExecutionRequest('Show the Marmousi FWI result'), false);
+  assert.equal(api.isFwiExecutionRequest('Marmousi FWI runtime configuration'), false);
+  assert.equal(api.isFwiExecutionRequest('Marmousi FWI startup guide'), false);
+  assert.equal(api.isFwiExecutionRequest('run a marmousi_94_288 FWI demo'), true);
   assert.equal(api.isFwiExecutionRequest('请解释 cycle skipping'), false);
 
   const warning = api.renderMissingFwiReceiptHtml();
@@ -551,9 +646,11 @@ function testFwiExecutionWithoutReceiptIsReportedHonestly() {
   assert.match(sidebarSource, /不要把代码回复当作执行成功/);
 
   const sendSource = extractFunction('sendMessage');
+  const interceptAt = sendSource.indexOf('isFwiExecutionRequest(text)');
+  const legacyDispatchAt = sendSource.indexOf("if (request.mode === 'http')");
+  assert.ok(interceptAt >= 0 && interceptAt < legacyDispatchAt);
+  assert.match(sendSource, /openGuidedFwi\(guidedOverridesFromExecutionText\(text\)\)/);
   assert.match(sendSource, /response\.fwiPayload/);
-  assert.match(sendSource, /isFwiExecutionRequest\(text\)/);
-  assert.match(sendSource, /renderMissingFwiReceiptHtml\(\)/);
   assert.match(extractFunction('parseSSE'), /extractFwiPayload\(event\)/);
   assert.match(extractFunction('sendGrpc'), /fwiPayload:\s*extractFwiPayload\(data\)/);
   assert.match(extractFunction('sendHttpStream'), /fwiPayload:\s*extractFwiPayload\(data\)/);
@@ -616,8 +713,10 @@ function testHonestFwiControlsAndNoPlaceholderFeatures() {
   assert.match(html, /Deepwave 2D Acoustic FWI/);
   assert.match(html, /最近 FWI 任务/);
   assert.match(html, /marmousi_94_288/);
-  assert.match(html, /运行两次迭代的二维声学 FWI smoke test/);
-  assert.match(html, /运行二维声学 FWI demo/);
+  assert.match(html, /id="guidedFwiPanel"/);
+  assert.match(html, /openGuidedFwi\(\{ preset: 'fwi_smoke', device: 'cuda', iterations: 2 \}\)/);
+  assert.match(html, /openGuidedFwi\(\{ preset: 'fwi_demo', device: 'cpu', iterations: 5 \}\)/);
+  assert.doesNotMatch(html, /onclick="sendQuick\(/);
   assert.match(html, /自定义迭代/);
   assert.match(html, /1–100 次/);
   assert.match(html, /运行 50 次迭代的 FWI/);
@@ -781,6 +880,77 @@ async function testHttpFailureIsNotAutomaticallyReplayed() {
   assert.equal(api.getStreamCalls(), 1);
 }
 
+async function testLegacyFwiSubmitIsDeniedByEveryChatTransport() {
+  let httpBody = null;
+  const httpSandbox = {
+    module: { exports: {} },
+    CONFIG: { http: { url: '/a2a' } },
+    fetch: async (_url, options) => {
+      httpBody = JSON.parse(options.body);
+      return {
+        ok: true,
+        headers: { get: () => 'application/json' },
+        json: async () => ({ result: { answer: 'ok' } }),
+      };
+    },
+    parseSSE: async () => { throw new Error('unexpected SSE'); },
+    updateRequestContext() {},
+    extractAnswer: () => 'ok',
+    extractFwiPayload: () => null,
+  };
+  vm.runInNewContext([
+    `async ${extractFunction('sendHttpStream')}`,
+    'module.exports = { sendHttpStream };',
+  ].join('\n'), httpSandbox);
+  await httpSandbox.module.exports.sendHttpStream('hello', {
+    requestId: 'request-http-deny',
+    contextId: 'context-http-deny',
+    controller: { signal: {} },
+  });
+  assert.equal(httpBody.params.metadata.allow_legacy_fwi_submit, 'false');
+  assert.equal(typeof httpBody.params.metadata.allow_legacy_fwi_submit, 'string');
+
+  let grpcBody = null;
+  const grpcSandbox = {
+    module: { exports: {} },
+    state: { grpcAvailable: true },
+    CONFIG: { grpc: { url: '/grpc-bridge' } },
+    bindRequestController() {},
+    fetch: async (_url, options) => {
+      grpcBody = JSON.parse(options.body);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({ status: 0, answer: 'ok' }),
+      };
+    },
+    switchMode() {},
+    updateRequestContext() {},
+    extractFwiPayload: () => null,
+    setStatus() {},
+    setGrpcAvailability() {},
+  };
+  vm.runInNewContext([
+    `async ${extractFunction('sendGrpc')}`,
+    'module.exports = { sendGrpc };',
+  ].join('\n'), grpcSandbox);
+  await grpcSandbox.module.exports.sendGrpc('hello', {
+    contextId: 'context-grpc-deny',
+    controller: { signal: {} },
+  });
+  assert.equal(grpcBody.allow_legacy_fwi_submit, false);
+  assert.equal(typeof grpcBody.allow_legacy_fwi_submit, 'boolean');
+  assert.equal(Object.hasOwn(grpcBody, 'metadata'), false);
+
+  assert.equal((html.match(/allow_legacy_fwi_submit/g) || []).length, 2);
+  assert.doesNotMatch(html, /id=["'][^"']*allow_legacy_fwi_submit/i);
+  assert.doesNotMatch(
+    html,
+    /allow_legacy_fwi_submit\s*[:=]\s*(?:state|document|localStorage|sessionStorage)/,
+  );
+}
+
 function testChatAndSystemTextAreEscaped() {
   const appendSource = extractFunction('appendMessage');
   assert.match(appendSource, /escapeHtml\(content\)/);
@@ -794,6 +964,396 @@ function testEmbeddingStatusUsesSameOriginHealthProxy() {
   assert.doesNotMatch(source, /localhost:6000|127\.0\.0\.1:6000/);
   assert.match(source, /未启用（FWI 知识库仍可用）/);
   assert.match(source, /health\.model_loaded === true/);
+}
+
+function makeGuidedTask(overrides = {}) {
+  const taskId = overrides.task_id || 'task-guided-1';
+  return {
+    task_id: taskId,
+    status: overrides.status || 'AwaitingApproval',
+    draft: {
+      draft_id: 'draft-guided-1',
+      revision: 1,
+      status: 'AwaitingApproval',
+      goal: '<img src=x onerror=alert(1)>',
+      dataset: { id: 'marmousi_94_288', version: '1.0.0' },
+      parameters: {
+        preset: 'fwi_smoke', device: 'cpu', iterations: 2, seed: 0,
+      },
+    },
+    plan: {
+      plan_id: 'plan-guided-1',
+      plan_hash: `sha256:${'a'.repeat(64)}`,
+      nodes: [{ node_id: 'invert' }],
+    },
+    approval: overrides.approval || null,
+    dispatch: overrides.dispatch || null,
+    runtime_status: overrides.adapter_status || null,
+  };
+}
+
+function makeGuidedManifest(type, id, overrides = {}) {
+  return {
+    schema_version: '1.0.0',
+    artifact_id: id,
+    task_id: 'task-guided-1',
+    node_id: 'invert',
+    artifact_type: type,
+    media_type: type === 'loss_curve' ? 'text/csv' : 'application/x-npy',
+    location: { relative_path: '../../../../etc/passwd' },
+    content_hash: `sha256:${'b'.repeat(64)}`,
+    size_bytes: 42,
+    display: {
+      component: type === 'loss_curve' ? 'line_chart' : 'download',
+      title: '<svg onload=alert(1)>',
+      order: type === 'loss_curve' ? 1 : 0,
+    },
+    ...overrides,
+  };
+}
+
+function testGuidedFormHasStrictBoundaries() {
+  const api = loadGuidedFunctions();
+  const base = {
+    goal: 'Marmousi FWI',
+    dataset_id: 'marmousi_94_288',
+    dataset_version: '1.0.0',
+    preset: 'fwi_smoke',
+    device: 'cpu',
+    iterations: 1,
+    seed: 0,
+  };
+  assert.equal(api.validateGuidedFwiForm(base).ok, true);
+  assert.equal(api.validateGuidedFwiForm({
+    ...base, preset: 'fwi_demo', device: 'cuda', iterations: 100, seed: 2147483647,
+  }).ok, true);
+  for (const patch of [
+    { iterations: 0 }, { iterations: 101 }, { iterations: 1.5 }, { iterations: '01' },
+    { seed: -1 }, { seed: 2147483648 }, { seed: '1.0' },
+    { preset: 'custom' }, { device: 'auto' }, { dataset_id: '../secret' },
+    { dataset_version: 'latest' }, { goal: '' }, { goal: 'x'.repeat(2001) },
+  ]) {
+    assert.equal(api.validateGuidedFwiForm({ ...base, ...patch }).ok, false, JSON.stringify(patch));
+  }
+  const normalized = api.validateGuidedFwiForm({ ...base, iterations: '2', seed: '7' });
+  assert.equal(normalized.ok, true);
+  assert.equal(normalized.value.iterations, 2);
+  assert.equal(normalized.value.seed, 7);
+  assert.deepEqual(Object.keys(normalized.value), [
+    'goal', 'dataset_id', 'dataset_version', 'preset', 'device', 'iterations', 'seed',
+  ]);
+  assert.equal(api.guidedOverridesFromExecutionText('请做 Marmousi FWI，迭代50次').iterations, '50');
+  assert.equal(api.guidedOverridesFromExecutionText('Marmousi FWI，50次迭代').iterations, '50');
+  assert.equal(api.guidedOverridesFromExecutionText('运行50轮 FWI').iterations, '50');
+  assert.equal(api.guidedOverridesFromExecutionText('Run Marmousi FWI for 10 iterations').iterations, '10');
+  assert.equal(api.guidedOverridesFromExecutionText('Run Marmousi FWI, iterations: 12').iterations, '12');
+  const negativeIterations = api.guidedOverridesFromExecutionText('运行 Marmousi FWI，迭代 -3 次');
+  assert.equal(negativeIterations.iterations, '-3');
+  const catalog = {
+    datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
+  };
+  assert.equal(api.makeGuidedForm(negativeIterations, catalog).iterations, '-3');
+  assert.equal(api.validateGuidedFwiForm({
+    ...base, iterations: negativeIterations.iterations,
+  }).ok, false);
+  const decimalIterations = api.guidedOverridesFromExecutionText('运行 Marmousi FWI，2.5 次迭代');
+  assert.equal(decimalIterations.iterations, '2.5');
+  assert.equal(api.makeGuidedForm(decimalIterations, catalog).iterations, '2.5');
+  assert.equal(api.validateGuidedFwiForm({
+    ...base, iterations: decimalIterations.iterations,
+  }).ok, false);
+  const forward = api.guidedOverridesFromExecutionText('运行 Marmousi 正演 / forward');
+  assert.equal(forward.unsupported_operation, 'forward');
+  assert.equal(forward.preset, 'forward');
+  assert.notEqual(forward.preset, 'fwi_smoke');
+  assert.equal(api.hasGuidedUnsupportedForwardIntent(forward.goal), true);
+  const rejectedForward = api.validateGuidedFwiForm({
+    ...base,
+    goal: forward.goal,
+    unsupported_operation: forward.unsupported_operation,
+  });
+  assert.equal(rejectedForward.ok, false);
+  assert.match(rejectedForward.errors.join('；'), /P1 Guided 当前不支持正演\/forward/);
+  assert.match(html, /id="guidedIterations"[^>]+min="1" max="100" step="1"/);
+  assert.match(html, /id="guidedSeed"[^>]+min="0" max="2147483647" step="1"/);
+}
+
+function testGuidedForwardIsExplicitlyBlocked() {
+  const unsupportedSource = extractFunction('renderGuidedUnsupportedForwardHtml');
+  assert.match(unsupportedSource, /P1 Guided 不支持正演 \/ forward/);
+  assert.match(unsupportedSource, /不会被静默改成反演/);
+  assert.match(unsupportedSource, /不会创建 Draft、Plan 或运行任务/);
+  assert.doesNotMatch(unsupportedSource, /submitGuidedDraft|approveGuidedFwi|method:\s*'POST'/);
+
+  const renderSource = extractFunction('renderGuidedFwi');
+  assert.match(renderSource, /phase === 'unsupported_forward'/);
+  assert.match(renderSource, /renderGuidedUnsupportedForwardHtml\(\)/);
+
+  const openSource = extractFunction('openGuidedFwi');
+  const blockAt = openSource.indexOf("overrides.unsupported_operation === 'forward'");
+  const sessionAt = openSource.indexOf("guidedApiPath('session')");
+  assert.ok(blockAt >= 0 && sessionAt > blockAt);
+  assert.match(openSource, /state\.guided\.phase = 'unsupported_forward'/);
+  assert.match(openSource, /return true/);
+
+  const readSource = extractFunction('readGuidedFwiForm');
+  assert.match(readSource, /unsupported_operation: state\.guided\.form\?\.unsupported_operation/);
+  const submitSource = extractFunction('submitGuidedDraft');
+  assert.ok(submitSource.indexOf('if (!validation.ok)') < submitSource.indexOf('guidedApiRequest(path'));
+}
+
+function testGuidedIdentifiersAndRoutesAreConstrained() {
+  const api = loadGuidedFunctions();
+  assert.equal(api.isSafeGuidedOpaqueId('task-safe:1'), true);
+  assert.equal(api.isSafeGuidedOpaqueId("task' onclick='alert(1)"), false);
+  assert.equal(api.isSafeGuidedIdentifier('marmousi_94_288'), true);
+  assert.equal(api.isSafeGuidedIdentifier('../marmousi'), false);
+  assert.equal(
+    api.guidedApiPath('artifact', 'task-safe:1', 'artifact-loss-1'),
+    '/api/scientific-runtime/v1/tasks/task-safe%3A1/artifacts/artifact-loss-1',
+  );
+  assert.equal(api.guidedApiPath('task', '../escape'), '');
+  assert.equal(api.guidedApiPath('artifact', 'task-1', "bad'id"), '');
+  assert.equal(api.guidedApiPath('unknown', 'task-1'), '');
+
+  const downloadSource = extractFunction('downloadGuidedArtifact');
+  assert.match(downloadSource, /guidedApiPath\('artifact', taskId, artifactId\)/);
+  assert.match(downloadSource, /'X-Workbench-CSRF': state\.guided\.csrfToken/);
+  assert.doesNotMatch(downloadSource, /location|relative_path|href\s*=\s*artifact/);
+}
+
+function testGuidedTaskAndCrashStatesAreHonest() {
+  const api = loadGuidedFunctions();
+  const catalog = {
+    datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.0.0' },
+  };
+  const reviewTask = api.normalizeGuidedTaskProjection(makeGuidedTask());
+  assert.equal(api.isGuidedReviewReady(reviewTask, catalog), true);
+  assert.equal(api.isGuidedApprovedSubmitPending(reviewTask, catalog), false);
+  const approvedSubmitPendingTask = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+  }));
+  assert.equal(api.isGuidedApprovedSubmitPending(approvedSubmitPendingTask, catalog), true);
+  assert.equal(api.isGuidedReviewReady({
+    ...reviewTask, plan: { ...reviewTask.plan, nodeCount: 2 },
+  }, catalog), false);
+  for (const dispatchState of ['pending', 'dispatching', 'dispatched', 'reconciliation_required']) {
+    const task = api.normalizeGuidedTaskProjection(makeGuidedTask({
+      status: 'Queued',
+      dispatch: { state: dispatchState, failure_code: dispatchState === 'reconciliation_required' ? 'DISPATCH_RECEIPT_INVALID' : '' },
+      adapter_status: {
+        status: dispatchState === 'dispatched' ? 'Running' : 'Queued',
+        stage: '<img onerror=alert(1)>', completed: 1, total: 2,
+        message: '<script>alert(1)</script>',
+      },
+    }));
+    assert.equal(task.dispatch.state, dispatchState);
+    assert.match(api.guidedDispatchExplanation(dispatchState), /派发|Adapter|reconciliation|SQLite/);
+    assert.equal(task.adapter.stage, '<img onerror=alert(1)>');
+  }
+  assert.match(api.guidedDispatchExplanation('pending'), /不会由浏览器重发/);
+  assert.match(api.guidedDispatchExplanation('reconciliation_required'), /不会重试/);
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask(), 'different-task'), null);
+  assert.equal(api.normalizeGuidedTaskProjection({ ...makeGuidedTask(), task_id: '../bad' }), null);
+  const taskSource = extractFunction('renderGuidedTaskHtml');
+  assert.match(taskSource, /SQLite status/);
+  assert.match(taskSource, /Adapter status/);
+  assert.match(taskSource, /escapeHtml\(adapter\.stage/);
+  assert.match(taskSource, /escapeHtml\(adapter\.message/);
+}
+
+function testGuidedArtifactManifestsUseControlledDownloads() {
+  const api = loadGuidedFunctions();
+  const raw = {
+    artifacts: [
+      makeGuidedManifest('inverted_velocity_model_2d', 'artifact-model-1'),
+      makeGuidedManifest('loss_curve', 'artifact-loss-1'),
+      makeGuidedManifest('loss_curve', "artifact'unsafe"),
+      makeGuidedManifest('loss_curve', 'artifact-other-task', { task_id: 'other-task' }),
+    ],
+  };
+  const artifacts = api.normalizeGuidedArtifacts(raw, 'task-guided-1');
+  assert.equal(artifacts.length, 2);
+  assert.equal(api.normalizeGuidedArtifacts(raw.artifacts.slice(0, 2), 'task-guided-1').length, 2);
+  const rendered = api.renderGuidedArtifactsHtml('task-guided-1', artifacts);
+  assert.equal((rendered.match(/data-guided-artifact=/g) || []).length, 2);
+  assert.match(rendered, /ArtifactManifest/);
+  assert.match(rendered, /downloadGuidedArtifact\('task-guided-1','artifact-model-1'\)/);
+  assert.doesNotMatch(rendered, /\.\.\/\.\.\/etc\/passwd|relative_path/);
+  assert.doesNotMatch(rendered, /<svg onload=alert\(1\)>/);
+  assert.match(rendered, /&lt;svg onload=alert\(1\)&gt;/);
+  const incomplete = api.renderGuidedArtifactsHtml('task-guided-1', artifacts.slice(0, 1));
+  assert.match(incomplete, /尚未就绪/);
+  assert.match(incomplete, /onclick="loadGuidedArtifacts\(\)"/);
+  assert.match(incomplete, /重新获取 artifacts（GET）/);
+  assert.match(incomplete, /不会重试 Worker 或创建新任务/);
+}
+
+function testGuidedCatalogProjectionDoesNotExposePaths() {
+  const api = loadGuidedFunctions();
+  const session = api.normalizeGuidedSession({
+    csrf_token: 'csrf-token-1234567890+/=',
+    mode: 'guided',
+    task_type: 'acoustic_fwi_2d',
+    features: { approval_required: true, running_cancel: false },
+  });
+  assert.equal(session.mode, 'guided');
+  assert.equal(session.taskType, 'acoustic_fwi_2d');
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(session.capabilities)),
+    ['approval_required:on', 'running_cancel:off'],
+  );
+  const catalog = api.normalizeGuidedCatalog({
+    datasets: [{
+      id: 'marmousi_94_288', version: '1.0.0', immutable: true,
+      content_hash: `sha256:${'c'.repeat(64)}`,
+      relative_path: '/root/private/model.npy',
+      metadata: {
+        shape: [94, 288], dtype: 'float32', units: 'm/s',
+        physics: '2d_acoustic_constant_density', parameter: 'vp',
+        grid_spacing_m: { dx: 10, dz: 10 }, value_range: { minimum: 1500, maximum: 4500 },
+        path: '/root/private/model.npy',
+      },
+    }],
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.0.0', entrypoint: '/root/run.py' },
+  });
+  assert.equal(catalog.datasets[0].metadata.path, undefined);
+  assert.equal(catalog.datasets[0].relative_path, undefined);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(catalog.algorithm)),
+    { id: 'deepwave.acoustic_fwi', version: '1.0.0' },
+  );
+  assert.doesNotMatch(extractFunction('renderGuidedCatalogPreview'), /relative_path|entrypoint|JSON\.stringify/);
+}
+
+function testGuidedApprovalCannotBeBypassedOrReplayedAutomatically() {
+  const quickActions = html.match(/onclick="openGuidedFwi\(/g) || [];
+  assert.equal(quickActions.length, 12);
+  assert.doesNotMatch(html, /onclick="sendQuick\(/);
+
+  const sendSource = extractFunction('sendMessage');
+  assert.ok(sendSource.indexOf('isFwiExecutionRequest(text)') < sendSource.indexOf('state.activeRequest = request'));
+  assert.match(sendSource, /openGuidedFwi\(guidedOverridesFromExecutionText\(text\)\)/);
+  assert.equal(loadUiFunctions().api.isFwiExecutionRequest('什么是 FWI？请解释原理'), false);
+
+  const approveSource = extractFunction('approveGuidedFwi');
+  assert.match(approveSource, /returnPhase === 'review'/);
+  assert.match(approveSource, /returnPhase === 'approval_incomplete'/);
+  assert.match(approveSource, /isGuidedReviewReady\(task, state\.guided\.catalog\)/);
+  assert.match(approveSource, /guidedMutationKey\('approve', body\)/);
+  const mutationKeySource = extractFunction('guidedMutationKey');
+  assert.match(mutationKeySource, /existing\.signature === signature/);
+  const continueSource = extractFunction('continueGuidedApprovedSubmit');
+  assert.match(continueSource, /phase !== 'approval_incomplete'/);
+  assert.match(continueSource, /return approveGuidedFwi\(\)/);
+  assert.doesNotMatch(continueSource, /guidedMutationKey|randomUUID|method:\s*'POST'/);
+
+  const requestSource = extractFunction('guidedApiRequest');
+  assert.match(requestSource, /headers\['X-Workbench-CSRF'\]/);
+  assert.match(requestSource, /headers\['Idempotency-Key'\]/);
+  assert.match(requestSource, /credentials: 'same-origin'/);
+  assert.match(requestSource, /error\.guidedOutcomeUnknown = mutation/);
+  assert.match(requestSource, /mutation && response\.status >= 500/);
+
+  assert.match(extractFunction('openGuidedFwi'), /\['outcome_unknown', 'approval_incomplete'\]/);
+  assert.match(extractFunction('closeGuidedFwi'), /\['outcome_unknown', 'approval_incomplete'\]/);
+
+  const refreshSource = extractFunction('refreshGuidedTask');
+  assert.match(refreshSource, /guidedApiPath\('task', taskId\)/);
+  assert.match(refreshSource, /approvedSubmitPending/);
+  assert.match(refreshSource, /state\.guided\.phase = 'approval_incomplete'/);
+  assert.doesNotMatch(refreshSource, /submitGuidedDraft|approveGuidedFwi|abandonGuidedFwi|method:\s*'POST'|method:\s*'PUT'/);
+  const approvalBranchStart = refreshSource.indexOf('if (approvedSubmitPending)');
+  const approvalBranchEnd = refreshSource.indexOf("} else if (task.status === 'Cancelled'", approvalBranchStart);
+  assert.ok(approvalBranchStart >= 0 && approvalBranchEnd > approvalBranchStart);
+  assert.doesNotMatch(refreshSource.slice(approvalBranchStart, approvalBranchEnd), /scheduleGuidedPoll/);
+  const unknownSource = extractFunction('renderGuidedFwi');
+  assert.match(unknownSource, /不会更换 Idempotency-Key 或自动重发/);
+  assert.match(unknownSource, /renderGuidedApprovedSubmitPendingHtml/);
+  assert.doesNotMatch(unknownSource, /cancelGuided|retryGuided|EventSource/);
+
+  const pendingSource = extractFunction('renderGuidedApprovedSubmitPendingHtml');
+  assert.match(pendingSource, /continueGuidedApprovedSubmit\(\)/);
+  assert.match(pendingSource, /复用原 Idempotency-Key/);
+  assert.match(pendingSource, /不是任务 retry/);
+
+  const artifactSource = extractFunction('loadGuidedArtifacts');
+  assert.match(artifactSource, /guidedApiPath\('artifacts', taskId\)/);
+  assert.match(artifactSource, /state\.guided\.error = ''/);
+  assert.doesNotMatch(artifactSource, /method:\s*'POST'|method:\s*'PUT'|approveGuidedFwi|submitGuidedDraft|retryGuided/);
+}
+
+async function testGuidedApprovedSubmitPendingStopsPolling() {
+  let scheduledPolls = 0;
+  let artifactLoads = 0;
+  const approvedTask = {
+    taskId: 'task-guided-1',
+    status: 'AwaitingApproval',
+    approval: { id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: '' },
+  };
+  const sandbox = {
+    module: { exports: {} },
+    state: {
+      guided: {
+        taskId: approvedTask.taskId,
+        pollInFlight: false,
+        generation: 7,
+        task: null,
+        catalog: {},
+        error: '',
+        outcomeUnknown: true,
+        phase: 'outcome_unknown',
+      },
+    },
+    isSafeGuidedOpaqueId: value => value === approvedTask.taskId,
+    clearGuidedPoll() {},
+    guidedApiPath: () => '/api/scientific-runtime/v1/tasks/task-guided-1',
+    guidedApiRequest: async () => ({ task_id: approvedTask.taskId }),
+    normalizeGuidedTaskProjection: () => approvedTask,
+    isGuidedApprovedSubmitPending: () => true,
+    loadGuidedArtifacts: async () => { artifactLoads += 1; },
+    scheduleGuidedPoll: () => { scheduledPolls += 1; },
+    renderGuidedFwi() {},
+  };
+  vm.runInNewContext([
+    `async ${extractFunction('refreshGuidedTask')}`,
+    'module.exports = { refreshGuidedTask };',
+  ].join('\n'), sandbox);
+
+  assert.equal(await sandbox.module.exports.refreshGuidedTask(), true);
+  assert.equal(sandbox.state.guided.phase, 'approval_incomplete');
+  assert.equal(sandbox.state.guided.outcomeUnknown, false);
+  assert.equal(sandbox.state.guided.pollInFlight, false);
+  assert.equal(scheduledPolls, 0);
+  assert.equal(artifactLoads, 0);
+
+  let generatedKeys = 0;
+  const keySandbox = {
+    module: { exports: {} },
+    state: { guided: { mutationKeys: Object.create(null) } },
+    createStableId: prefix => `${prefix}-${++generatedKeys}`,
+  };
+  vm.runInNewContext([
+    extractFunction('guidedMutationKey'),
+    'module.exports = { guidedMutationKey };',
+  ].join('\n'), keySandbox);
+  const firstKey = keySandbox.module.exports.guidedMutationKey('approve', {
+    plan_hash: `sha256:${'a'.repeat(64)}`,
+  });
+  const continuedKey = keySandbox.module.exports.guidedMutationKey('approve', {
+    plan_hash: `sha256:${'a'.repeat(64)}`,
+  });
+  assert.equal(continuedKey, firstKey);
+  assert.equal(generatedKeys, 1);
+}
+
+function testGuidedStateIsNotPersistedWithChats() {
+  const persistenceSource = extractFunction('persistChatState');
+  assert.doesNotMatch(persistenceSource, /guided/);
+  assert.match(html, /Scientific Runtime workflow state is deliberately session-memory only/);
+  assert.doesNotMatch(extractFunction('scheduleGuidedPoll'), /localStorage|sessionStorage/);
 }
 
 async function main() {
@@ -814,8 +1374,18 @@ async function main() {
   testHistoryUsesSafeDomAndDataAttributes();
   testRequestsAreBoundAndStreamFailuresAreNotReplayed();
   await testHttpFailureIsNotAutomaticallyReplayed();
+  await testLegacyFwiSubmitIsDeniedByEveryChatTransport();
   testChatAndSystemTextAreEscaped();
   testEmbeddingStatusUsesSameOriginHealthProxy();
+  testGuidedFormHasStrictBoundaries();
+  testGuidedForwardIsExplicitlyBlocked();
+  testGuidedIdentifiersAndRoutesAreConstrained();
+  testGuidedTaskAndCrashStatesAreHonest();
+  testGuidedArtifactManifestsUseControlledDownloads();
+  testGuidedCatalogProjectionDoesNotExposePaths();
+  testGuidedApprovalCannotBeBypassedOrReplayedAutomatically();
+  await testGuidedApprovedSubmitPendingStopsPolling();
+  testGuidedStateIsNotPersistedWithChats();
   console.log('ui message rendering tests passed');
 }
 

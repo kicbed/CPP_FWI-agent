@@ -4,7 +4,7 @@
 
 - 决策编号：`D-003`
 - 决策状态：**Accepted**
-- Runtime 实现状态：**Pending**
+- Runtime 实现状态：**P0 + P1 Verified；按用户要求停在 P2 之前**
 - 用户确认日期：2026-07-15
 - 实现分支：`feature/scientific-agent-runtime`
 - 基线分支：`feature/fwi-deepwave-2d-acoustic`
@@ -243,6 +243,10 @@ manifest 还必须描述参数与结果 Schema、输入输出类型/shape/dtype/
 `task_id`；重复请求不重复创建任务；重启后任务身份与已落库事件仍可查询；未经批准
 不创建 FWI job；现有 FWI 回归测试继续通过。进程身份 reconciliation、完整取消和
 checkpoint 恢复仍属于 P2，P1 不伪装已具备这些能力。
+
+实现与现场验证见
+`docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md`；P1 已达到上述完成标准，P2 仍为
+Pending，未因 Guided Web 状态轮询而提前实现恢复语义。
 
 ### P2：持久任务可靠性加固
 

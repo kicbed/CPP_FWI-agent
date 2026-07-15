@@ -27,6 +27,7 @@ required_files=(
     docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_FWI_ADAPTER.md
+    docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md
     docs/PROJECT_PROGRESS.md
@@ -39,12 +40,15 @@ required_files=(
     scientific_runtime/task_store.py
     scientific_runtime/task_service.py
     scientific_runtime/task_dispatcher.py
+    scientific_runtime/workbench_service.py
     scientific_runtime/migrations/0001_task_store.sql
     scientific_runtime/migrations/0002_catalog_registry.sql
     scientific_runtime/migrations/0003_submit_dispatch.sql
+    scientific_runtime/migrations/0004_workbench_runtime.sql
     tests/test_scientific_runtime_registry.py
     tests/test_scientific_runtime_fwi_adapter.py
     tests/test_scientific_runtime_task_service.py
+    tests/test_scientific_runtime_workbench.py
     contracts/scientific_runtime/v1/common.schema.json
     contracts/scientific_runtime/v1/dataset-ref.schema.json
     contracts/scientific_runtime/v1/algorithm-manifest.schema.json
@@ -54,6 +58,9 @@ required_files=(
     contracts/scientific_runtime/v1/run-event.schema.json
     contracts/scientific_runtime/v1/artifact-manifest.schema.json
     fwi_worker/adapter_probe.py
+    web/workbench_api.py
+    web/tests/test_workbench_api.py
+    web/tests/test_workbench_route.py
 )
 
 for file in "${required_files[@]}"; do
@@ -70,9 +77,9 @@ require_text docs/PROJECT_CONTINUITY.md '## D-004：'
 require_text docs/PROJECT_CONTINUITY.md '## D-005：'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
-require_text docs/PROJECT_CONTINUITY.md 'P0 + P1.1c atomic submit backend + P1.2a fixed Adapter Verified / P1 Guided Web pending'
+require_text docs/PROJECT_CONTINUITY.md 'P0 + P1 最小持久垂直切片 Verified / P2 Pending'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '<!-- scientific-agent-runtime-plan: v1 -->'
-require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '实现状态：**Pending**'
+require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md 'Runtime 实现状态：**P0 + P1 Verified；按用户要求停在 P2 之前**'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '<!-- scientific-runtime-p0-contracts: v1 -->'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'P1.1a TaskStore、P1.1b Registry 与 P1.2a 固定 Deepwave'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'submit/API/调度仍未实现'
@@ -88,10 +95,15 @@ require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_TASK_STORE.md '也没有开
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md '<!-- scientific-runtime-p1-submit: v1 -->'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md 'pending -> dispatching -> dispatched'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_SUBMIT.md '不自动重发、退款、取消或标记 task Failed'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '<!-- scientific-runtime-p1-guided-web: v1 -->'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '实现状态：**Verified**'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md 'Guided 路由 fail closed 为 503'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '仍属 Pending：运行中 cancel'
 require_text docs/PROJECT_PROGRESS.md '<!-- project-progress-schema: v1 -->'
-require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1（In progress；持久后端闭环 Verified，Guided Web Pending）**'
+require_text docs/PROJECT_PROGRESS.md '当前阶段：**P1 Verified；P2 Pending（按用户要求暂停）**'
 require_text docs/PROJECT_PROGRESS.md '| P0 最小 FWI 契约 | Verified |'
-require_text docs/PROJECT_PROGRESS.md '下一可执行切片：P1 Guided Web 闭环'
+require_text docs/PROJECT_PROGRESS.md '| P1 最小持久垂直切片 | Verified |'
+require_text docs/PROJECT_PROGRESS.md '停在 P2 之前'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'D-005` / **Proposed'

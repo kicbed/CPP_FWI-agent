@@ -547,6 +547,8 @@ private:
                 const std::string context_id = resolve_request_context_id(
                     message.context_id(), params_json);
                 const std::size_t history_limit = resolve_history_limit(params_json);
+                const bool allow_legacy_fwi_submit =
+                    detail::resolve_allow_legacy_fwi_submit(params_json);
                 message.set_context_id(context_id);
                 const auto session_mutex = conversation_mutex_for(context_id);
                 std::unique_lock<std::mutex> session_lock(*session_mutex);
@@ -555,6 +557,8 @@ private:
                 ctx.context_id = context_id;
                 ctx.task_id = context_id;
                 ctx.user_text = user_text;
+                ctx.metadata[detail::kAllowLegacyFwiSubmitMetadata] =
+                    allow_legacy_fwi_submit;
 
                 trace_logger_.log_request(ctx, user_text);
 
@@ -570,12 +574,15 @@ private:
                     tool_calling_engine_.has_fwi_guidance_request(user_text) ||
                     has_strong_local_fwi_knowledge_match(user_text)) {
                     trace_logger_.log_info(ctx, "ROUTING", "deterministic-fwi-handler");
-                    response_text = handle_fwi_query(user_text, context_id, history_limit);
+                    response_text = handle_fwi_query(
+                        user_text, context_id, history_limit,
+                        allow_legacy_fwi_submit);
                 } else if (orch_config_.routing_mode == RoutingMode::AGENT_RAG) {
                     // Agent-RAG 动态路由
                     trace_logger_.log_info(ctx, "ROUTING", "agent-rag mode");
                     response_text = route_with_agent_rag(user_text, context_id, ctx,
-                                                         history_limit);
+                                                         history_limit,
+                                                         allow_legacy_fwi_submit);
                 } else {
                     // 传统固定路由 (fixed mode)
                     trace_logger_.log_info(ctx, "ROUTING", "fixed mode");
@@ -595,7 +602,8 @@ private:
                             response_text.find("无法解析响应") != std::string::npos) {
                             trace_logger_.log_info(ctx, "FALLBACK", "math→general");
                             response_text = handle_general_query(user_text, context_id,
-                                                                 history_limit);
+                                                                 history_limit,
+                                                                 allow_legacy_fwi_submit);
                         }
 
                     } else if (intent == "code") {
@@ -608,18 +616,21 @@ private:
                             response_text.find("无法解析响应") != std::string::npos) {
                             trace_logger_.log_info(ctx, "FALLBACK", "code→general");
                             response_text = handle_general_query(user_text, context_id,
-                                                                 history_limit);
+                                                                 history_limit,
+                                                                 allow_legacy_fwi_submit);
                         }
 
                     } else if (intent == "fwi") {
                         trace_logger_.log_routing(ctx, "fwi-handler");
                         response_text = handle_fwi_query(user_text, context_id,
-                                                         history_limit);
+                                                         history_limit,
+                                                         allow_legacy_fwi_submit);
 
                     } else {
                         trace_logger_.log_routing(ctx, "general-handler");
                         response_text = handle_general_query(user_text, context_id,
-                                                             history_limit);
+                                                             history_limit,
+                                                             allow_legacy_fwi_submit);
                     }
                 }
 
@@ -692,12 +703,16 @@ private:
             const std::string context_id = resolve_request_context_id(
                 message.context_id(), params_json);
             const std::size_t history_limit = resolve_history_limit(params_json);
+            const bool allow_legacy_fwi_submit =
+                detail::resolve_allow_legacy_fwi_submit(params_json);
             message.set_context_id(context_id);
             const auto session_mutex = conversation_mutex_for(context_id);
             std::unique_lock<std::mutex> session_lock(*session_mutex);
 
             RequestContext stream_ctx = RequestContext::create(context_id);
             stream_ctx.user_text = user_text;
+            stream_ctx.metadata[detail::kAllowLegacyFwiSubmitMetadata] =
+                allow_legacy_fwi_submit;
             trace_logger_.log_request(stream_ctx, user_text);
 
             restore_fwi_job_context(context_id);
@@ -741,9 +756,13 @@ private:
             } else if (intent == "code") {
                 response_text = call_code_agent(user_text, context_id, history_limit);
             } else if (intent == "fwi") {
-                response_text = handle_fwi_query(user_text, context_id, history_limit);
+                response_text = handle_fwi_query(
+                    user_text, context_id, history_limit,
+                    allow_legacy_fwi_submit);
             } else {
-                response_text = handle_general_query(user_text, context_id, history_limit);
+                response_text = handle_general_query(
+                    user_text, context_id, history_limit,
+                    allow_legacy_fwi_submit);
             }
 
             // Persist the complete turn atomically before transport chunking.
@@ -847,7 +866,8 @@ private:
     std::string route_with_agent_rag(const std::string& query,
                                      const std::string& context_id,
                                      const RequestContext& ctx,
-                                     std::size_t history_limit) {
+                                     std::size_t history_limit,
+                                     bool allow_legacy_fwi_submit = true) {
         try {
             const auto routing_context = build_prompt_context(
                 context_id, std::min<std::size_t>(history_limit, 4));
@@ -864,7 +884,8 @@ private:
 
             if (candidates.empty()) {
                 trace_logger_.log_info(ctx, "FALLBACK", "no candidates → general");
-                return handle_general_query(query, context_id, history_limit);
+                return handle_general_query(
+                    query, context_id, history_limit, allow_legacy_fwi_submit);
             }
 
             // Log candidates
@@ -882,7 +903,8 @@ private:
 
             if (selected_agent_id.empty()) {
                 trace_logger_.log_info(ctx, "FALLBACK", "LLM selection failed → general");
-                return handle_general_query(query, context_id, history_limit);
+                return handle_general_query(
+                    query, context_id, history_limit, allow_legacy_fwi_submit);
             }
 
             // Step 3: Call the selected Agent
@@ -897,13 +919,15 @@ private:
 
             if (agent_url.empty()) {
                 trace_logger_.log_info(ctx, "FALLBACK", "Agent not found → general");
-                return handle_general_query(query, context_id, history_limit);
+                return handle_general_query(
+                    query, context_id, history_limit, allow_legacy_fwi_submit);
             }
 
             // Check if it's the Orchestrator itself (general handler)
             if (selected_agent_id == agent_id_) {
                 trace_logger_.log_info(ctx, "SELF", "handling locally");
-                return handle_general_query(query, context_id, history_limit);
+                return handle_general_query(
+                    query, context_id, history_limit, allow_legacy_fwi_submit);
             }
 
             // Call the Agent
@@ -915,14 +939,16 @@ private:
             if (response.find("服务暂时不可用") != std::string::npos ||
                 response.find("无法解析响应") != std::string::npos) {
                 trace_logger_.log_info(ctx, "FALLBACK", selected_agent_id + " unavailable → general");
-                return handle_general_query(query, context_id, history_limit);
+                return handle_general_query(
+                    query, context_id, history_limit, allow_legacy_fwi_submit);
             }
 
             return response;
 
         } catch (const std::exception& e) {
             trace_logger_.log_error(ctx, std::string("Agent-RAG error: ") + e.what());
-            return handle_general_query(query, context_id, history_limit);
+            return handle_general_query(
+                query, context_id, history_limit, allow_legacy_fwi_submit);
         }
     }
 
@@ -1086,14 +1112,16 @@ std::string analyze_intent(const std::string& text,
 
     std::string handle_general_query(const std::string& query,
                                      const std::string& context_id,
-                                     std::size_t history_limit) {
+                                     std::size_t history_limit,
+                                     bool allow_legacy_fwi_submit = true) {
         try {
             const auto context_window = build_prompt_context(context_id, history_limit);
 
             // Tool-RAG: Try to use tools if enabled
             std::string tool_context;
             if (orch_config_.tool_calling_mode == ToolCallingMode::LLM) {
-                tool_context = tool_calling_engine_.process(query, context_id);
+                tool_context = tool_calling_engine_.process(
+                    query, context_id, allow_legacy_fwi_submit);
             }
 
             std::string system_prompt =
@@ -1132,7 +1160,8 @@ std::string analyze_intent(const std::string& text,
      */
     std::string handle_fwi_query(const std::string& query,
                                  const std::string& context_id,
-                                 std::size_t history_limit) {
+                                 std::size_t history_limit,
+                                 bool allow_legacy_fwi_submit = true) {
         try {
             const bool is_negative = detail::has_fwi_negative_intent(query);
             const bool is_capability = detail::is_fwi_capability_query(query);
@@ -1150,6 +1179,18 @@ std::string analyze_intent(const std::string& text,
             }
 
             if (is_capability || is_howto) {
+                if (!allow_legacy_fwi_submit) {
+                    return
+                        "可以通过 P1 Guided Workbench 运行已注册的 Marmousi/Deepwave "
+                        "二维常密度声学 FWI。执行型 FWI 请求会先进入 Draft / Plan "
+                        "确认卡，可修改参数；只有批准当前 `plan_hash` 后才会提交。"
+                        "批准前不会创建 FWI job。\n\n"
+                        "P1 Guided 当前支持 `fwi_smoke` / `fwi_demo`、CPU 或 CUDA、"
+                        "1～100 次迭代；正演 / `forward` 暂不支持，也不会被静默改成反演。\n\n"
+                        "批准后页面会保留稳定 `task_id`，轮询持久化状态与事件；"
+                        "成功后只展示并提供受控下载的反演速度模型 NPY 和损失曲线 CSV "
+                        "artifacts。普通聊天通道不会调用旧 `fwi_submit_demo`。";
+                }
                 return
                     "可以，但当前是有明确边界的实验性 FWI MVP：使用 Deepwave 做二维常密度声学 "
                     "Vp 反演，固定模型为 `marmousi_94_288`，观测数据也是由同一数值后端合成的。"
@@ -1167,6 +1208,14 @@ std::string analyze_intent(const std::string& text,
             }
 
             if (has_invalid_iterations) {
+                if (!allow_legacy_fwi_submit) {
+                    return
+                        "Guided 表单已拒绝本次 FWI 请求：迭代数必须是 1～100 "
+                        "的整数，系统不会静默替换越界值。本次没有创建 `task_id` "
+                        "或 FWI job。\n\n"
+                        "请把迭代数改为 1～100 的整数，然后重新进入 Guided "
+                        "Draft / Plan 确认卡；只有批准当前 `plan_hash` 后才会提交。";
+                }
                 return
                     "本次未提交 FWI 任务：显式迭代数必须是 1～100 的正整数，"
                     "系统不会静默替换越界值。\n\n"
@@ -1181,7 +1230,26 @@ std::string analyze_intent(const std::string& text,
             // call the fixed whitelist MCP surface. A failed MCP call must not
             // silently fall back to a theoretical LLM answer.
             if (tool_calling_engine_.has_explicit_fwi_action(query, context_id)) {
-                std::string tool_result = tool_calling_engine_.process(query, context_id);
+                if (!allow_legacy_fwi_submit &&
+                    tool_calling_engine_.has_explicit_fwi_submission(
+                        query, context_id)) {
+                    if (detail::contains_any(query, {"正演"}) ||
+                        detail::ascii_lower_copy(query).find("forward") !=
+                            std::string::npos) {
+                        return
+                            "P1 Guided 当前不支持正演 / `forward`，"
+                            "也不会把它静默改成反演提交。"
+                            "本次请求没有创建 legacy FWI 作业。";
+                    }
+                    return
+                        "该 FWI 执行请求应进入 Guided Workbench 的 Draft / Plan 确认卡。"
+                        "请在检查或修改参数后批准当前 `plan_hash`；"
+                        "批准后使用稳定 `task_id` 查询状态和 artifacts。"
+                        "当前普通聊天通道不会调用旧 `fwi_submit_demo`，"
+                        "本次请求没有创建 legacy FWI 作业。";
+                }
+                std::string tool_result = tool_calling_engine_.process(
+                    query, context_id, allow_legacy_fwi_submit);
                 if (!tool_result.empty()) {
                     persist_fwi_job_context(context_id, tool_result);
                     return tool_result;

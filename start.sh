@@ -28,6 +28,7 @@ usage() {
 常用环境变量:
   FWI_RUN_ROOT        运行结果目录，默认 /root/fwi-runs
   WEB_HOST/WEB_PORT   Web 监听地址和端口，默认 127.0.0.1:8080
+  SCIENTIFIC_RUNTIME_DB_PATH  Guided task SQLite，默认 ~/.local/state/cpp-fwi-agent/scientific-runtime/tasks.sqlite3
   AGENT_BIND_HOST     Agent 监听地址，默认 127.0.0.1
   AGENT_CORS_ORIGIN   允许的 Web origin，默认 http://127.0.0.1:8080
   ENABLE_MCP          是否启用 MCP，默认 true
@@ -91,6 +92,7 @@ FWI_WORKER_PYTHON="$FIXED_FWI_WORKER_PYTHON"
 FWI_RUN_ROOT="${FWI_RUN_ROOT:-/root/fwi-runs}"
 WEB_HOST="${WEB_HOST:-127.0.0.1}"
 WEB_PORT="${WEB_PORT:-8080}"
+SCIENTIFIC_RUNTIME_DB_PATH="${SCIENTIFIC_RUNTIME_DB_PATH:-${XDG_STATE_HOME:-$HOME/.local/state}/cpp-fwi-agent/scientific-runtime/tasks.sqlite3}"
 AGENT_BIND_HOST="${AGENT_BIND_HOST:-127.0.0.1}"
 web_origin_host="$WEB_HOST"
 [[ "$web_origin_host" == 0.0.0.0 ]] && web_origin_host=127.0.0.1
@@ -184,6 +186,60 @@ validate_fwi_run_root() {
     printf '%s\n' "$resolved"
 }
 
+validate_scientific_runtime_db_path() {
+    local requested="$1" run_root="$2" resolved parent critical probe mode
+    local owner_probe owner owner_mode
+    [[ "$requested" == /* && "$requested" != *$'\r'* && "$requested" != *$'\n'* ]] || \
+        die "SCIENTIFIC_RUNTIME_DB_PATH 必须是无换行的绝对路径" || return
+    [[ ! -L "$requested" ]] || die "SCIENTIFIC_RUNTIME_DB_PATH 不能是符号链接" || return
+    resolved="$(realpath -m -- "$requested")"
+    parent="$(dirname -- "$resolved")"
+
+    for critical in / /etc /usr /bin /sbin /lib /lib32 /lib64 /boot /proc /sys /dev /run; do
+        if [[ "$resolved" == "$critical" || "$resolved" == "$critical/"* ]]; then
+            die "SCIENTIFIC_RUNTIME_DB_PATH 不能位于系统敏感目录: $critical" || return
+        fi
+    done
+    [[ "$parent" != / && "$resolved" != /var && "$parent" != /var ]] || \
+        die "SCIENTIFIC_RUNTIME_DB_PATH 必须位于专用的二级或更深目录" || return
+    if [[ "$resolved" == "$PROJECT_ROOT" || "$resolved" == "$PROJECT_ROOT/"* ||
+          "$PROJECT_ROOT" == "$resolved/"* || "$resolved" == "$HOME" ||
+          "$HOME" == "$resolved/"* ]]; then
+        die "SCIENTIFIC_RUNTIME_DB_PATH 不能是仓库/HOME 本身、其上级或仓库内路径" || return
+    fi
+    if [[ "$resolved" == "$run_root" || "$resolved" == "$run_root/"* ||
+          "$run_root" == "$resolved/"* ]]; then
+        die "SCIENTIFIC_RUNTIME_DB_PATH 不能与 FWI_RUN_ROOT 重叠" || return
+    fi
+
+    probe="$parent"
+    while [[ "$probe" != / ]]; do
+        [[ ! -L "$probe" ]] || \
+            die "SCIENTIFIC_RUNTIME_DB_PATH 不能穿越符号链接" || return
+        probe="$(dirname -- "$probe")"
+    done
+    if [[ -e "$resolved" ]]; then
+        [[ -f "$resolved" && ! -L "$resolved" ]] || \
+            die "SCIENTIFIC_RUNTIME_DB_PATH 必须是普通文件路径" || return
+    fi
+    if [[ -d "$parent" ]]; then
+        mode="$(stat -c '%a' "$parent")"
+        (( (8#$mode & 077) == 0 )) || \
+            die "SCIENTIFIC_RUNTIME_DB_PATH 的现有父目录必须是私有目录（权限 700）" || return
+    fi
+    owner_probe="$parent"
+    while [[ ! -e "$owner_probe" && "$owner_probe" != / ]]; do
+        owner_probe="$(dirname -- "$owner_probe")"
+    done
+    owner="$(stat -c '%u' "$owner_probe")"
+    (( owner == EUID )) || \
+        die "SCIENTIFIC_RUNTIME_DB_PATH 必须位于当前进程所有的私有目录下" || return
+    owner_mode="$(stat -c '%a' "$owner_probe")"
+    (( (8#$owner_mode & 022) == 0 )) || \
+        die "SCIENTIFIC_RUNTIME_DB_PATH 的现有上级目录不能被其他用户写入" || return
+    printf '%s\n' "$resolved"
+}
+
 [[ "$configured_fwi_venv" == "$FIXED_FWI_VENV" ]] || \
     die "FWI_VENV 必须使用固定隔离环境: $FIXED_FWI_VENV"
 [[ "$configured_fwi_python" == "$FIXED_FWI_WORKER_PYTHON" ]] || \
@@ -199,9 +255,12 @@ if [[ "$build_mode" != never ]]; then
 fi
 [[ -x "$FWI_WORKER_PYTHON" ]] || die "Python 环境不可用: $FWI_WORKER_PYTHON"
 FWI_RUN_ROOT="$(validate_fwi_run_root "$FWI_RUN_ROOT")"
+SCIENTIFIC_RUNTIME_DB_PATH="$(
+    validate_scientific_runtime_db_path "$SCIENTIFIC_RUNTIME_DB_PATH" "$FWI_RUN_ROOT"
+)"
 [[ "$WEB_PORT" =~ ^[0-9]+$ ]] && ((WEB_PORT >= 1 && WEB_PORT <= 65535)) || die "WEB_PORT 非法: $WEB_PORT"
 [[ "$WEB_HOST" == 127.0.0.1 || "$WEB_HOST" == localhost || "$WEB_HOST" == 0.0.0.0 ]] || \
-    die "WEB_HOST 仅允许 127.0.0.1、localhost 或 0.0.0.0"
+    die "WEB_HOST 仅允许 127.0.0.1、localhost 或容器内使用的 0.0.0.0"
 [[ "$AGENT_BIND_HOST" == 127.0.0.1 || "$AGENT_BIND_HOST" == 0.0.0.0 ]] || \
     die "AGENT_BIND_HOST 仅允许 127.0.0.1 或 0.0.0.0"
 [[ "$AGENT_CORS_ORIGIN" != *$'\r'* && "$AGENT_CORS_ORIGIN" != *$'\n'* ]] || \
@@ -396,6 +455,7 @@ trap 'rollback 130' INT
 trap 'rollback 143' TERM
 
 export FWI_VENV FWI_WORKER_PYTHON FWI_RUN_ROOT WEB_HOST WEB_PORT ENABLE_MCP ENABLE_GRPC
+export SCIENTIFIC_RUNTIME_DB_PATH
 export AGENT_BIND_HOST AGENT_CORS_ORIGIN
 export GRPC_BRIDGE_CORS_ORIGIN
 export REDIS_PERSISTENCE REDIS_DATA_DIR CONTEXT_MAX_MESSAGES CONTEXT_MAX_CHARS

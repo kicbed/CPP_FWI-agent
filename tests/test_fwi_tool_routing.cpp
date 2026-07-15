@@ -10,6 +10,8 @@ using agent_rpc::orchestrator::detail::has_fwi_negative_intent;
 using agent_rpc::orchestrator::detail::has_invalid_fwi_iteration_request;
 using agent_rpc::orchestrator::detail::is_fwi_capability_query;
 using agent_rpc::orchestrator::detail::is_fwi_howto_query;
+using agent_rpc::orchestrator::detail::is_fwi_tool_call_allowed;
+using agent_rpc::orchestrator::detail::resolve_allow_legacy_fwi_submit;
 using agent_rpc::orchestrator::ToolCallingEngine;
 
 constexpr const char* kLastJob = "fwi-20260714T120000Z-abcdef123456";
@@ -17,6 +19,49 @@ constexpr const char* kLastJob = "fwi-20260714T120000Z-abcdef123456";
 struct NoopLLM {
     std::string chat(const std::string&, const std::string&) { return {}; }
 };
+
+TEST(FWIToolRoutingTest, SourcePolicyDefaultsToLegacyCompatibility) {
+    EXPECT_TRUE(resolve_allow_legacy_fwi_submit(nlohmann::json::object()));
+    EXPECT_TRUE(resolve_allow_legacy_fwi_submit({
+        {"metadata", {{"unrelated", "value"}}}
+    }));
+}
+
+TEST(FWIToolRoutingTest, SourcePolicyAcceptsOnlyExactFalseString) {
+    EXPECT_FALSE(resolve_allow_legacy_fwi_submit({
+        {"metadata", {{"allow_legacy_fwi_submit", "false"}}}
+    }));
+
+    for (const auto& invalid : {
+             nlohmann::json(true),
+             nlohmann::json(false),
+             nlohmann::json("true"),
+             nlohmann::json("False"),
+             nlohmann::json(0),
+         }) {
+        const nlohmann::json params = {
+            {"metadata", {{"allow_legacy_fwi_submit", invalid}}}
+        };
+        EXPECT_THROW(resolve_allow_legacy_fwi_submit(params),
+                     std::invalid_argument);
+    }
+    EXPECT_THROW(resolve_allow_legacy_fwi_submit({{"metadata", "false"}}),
+                 std::invalid_argument);
+}
+
+TEST(FWIToolRoutingTest, SourcePolicyBlocksOnlyActualLegacySubmissionPlan) {
+    const auto submit = plan_fwi_tool_call(
+        "使用 marmousi_94_288 运行两次迭代的 FWI smoke test。",
+        kLastJob);
+    const auto status = plan_fwi_tool_call(
+        "查看刚才 FWI 任务的状态。", kLastJob);
+
+    ASSERT_EQ(submit.tool_name, "fwi_submit_demo");
+    ASSERT_EQ(status.tool_name, "fwi_get_status");
+    EXPECT_FALSE(is_fwi_tool_call_allowed(submit, false));
+    EXPECT_TRUE(is_fwi_tool_call_allowed(status, false));
+    EXPECT_TRUE(is_fwi_tool_call_allowed(submit, true));
+}
 
 TEST(FWIToolRoutingTest, RoutesChineseForwardDemo) {
     const auto call = plan_fwi_tool_call(
@@ -189,6 +234,8 @@ TEST(FWIToolRoutingTest, CapabilityQuestionDoesNotLaunchComputation) {
         "marmousi_94_288 的 FWI 能在 CUDA 上运行吗？", kLastJob).tool_name.empty());
     EXPECT_TRUE(plan_fwi_tool_call(
         "Can you run a marmousi_94_288 FWI demo?", kLastJob).tool_name.empty());
+    EXPECT_TRUE(plan_fwi_tool_call(
+        "CAN YOU RUN a marmousi_94_288 FWI demo?", kLastJob).tool_name.empty());
 }
 
 TEST(FWIToolRoutingTest, HowToQuestionDoesNotLaunchComputation) {
@@ -197,6 +244,10 @@ TEST(FWIToolRoutingTest, HowToQuestionDoesNotLaunchComputation) {
         "怎么启动一个 marmousi_94_288 FWI 反演呢？", kLastJob).tool_name.empty());
     EXPECT_TRUE(plan_fwi_tool_call(
         "How to run a marmousi_94_288 FWI demo?", kLastJob).tool_name.empty());
+    EXPECT_TRUE(plan_fwi_tool_call(
+        "HOW TO RUN a marmousi_94_288 FWI demo?", kLastJob).tool_name.empty());
+    EXPECT_TRUE(plan_fwi_tool_call(
+        "how to execute a marmousi_94_288 FWI demo?", kLastJob).tool_name.empty());
 }
 
 TEST(FWIToolRoutingTest, NegatedExecutionNeverLaunchesComputation) {
@@ -210,6 +261,30 @@ TEST(FWIToolRoutingTest, NegatedExecutionNeverLaunchesComputation) {
         "不执行 marmousi_94_288 的 FWI demo。", kLastJob).tool_name.empty());
     EXPECT_TRUE(plan_fwi_tool_call(
         "Do not run a marmousi_94_288 FWI demo.", kLastJob).tool_name.empty());
+    EXPECT_TRUE(plan_fwi_tool_call(
+        "DON'T EXECUTE a marmousi_94_288 FWI demo.", kLastJob).tool_name.empty());
+}
+
+TEST(FWIToolRoutingTest, EnglishActionsRequireWholeWords) {
+    EXPECT_TRUE(plan_fwi_tool_call(
+        "Marmousi FWI runtime configuration", kLastJob).tool_name.empty());
+    EXPECT_TRUE(plan_fwi_tool_call(
+        "Marmousi FWI startup guide", kLastJob).tool_name.empty());
+
+    const auto run = plan_fwi_tool_call(
+        "run a marmousi_94_288 FWI demo", kLastJob);
+    EXPECT_EQ(run.tool_name, "fwi_submit_demo");
+}
+
+TEST(FWIToolRoutingTest, MixedExecutionPhrasesRemainExplicitActions) {
+    for (const char* request : {
+             "介绍并运行 Marmousi FWI",
+             "run Marmousi FWI display model",
+             "运行 Marmousi FWI，分析模型",
+         }) {
+        EXPECT_EQ(plan_fwi_tool_call(request, kLastJob).tool_name,
+                  "fwi_submit_demo") << request;
+    }
 }
 
 TEST(FWIToolRoutingTest, LiveRouterBypassRecognizesActionButNotTheory) {
@@ -221,6 +296,10 @@ TEST(FWIToolRoutingTest, LiveRouterBypassRecognizesActionButNotTheory) {
         "使用 marmousi_94_288 运行两次迭代的 FWI smoke test。"));
     EXPECT_TRUE(engine.has_explicit_fwi_action(
         "做一下marmousi的反演测试，迭代50次，完成后展示结果"));
+    EXPECT_TRUE(engine.has_explicit_fwi_submission(
+        "做一下marmousi的反演测试，迭代50次，完成后展示结果"));
+    EXPECT_FALSE(engine.has_explicit_fwi_submission(
+        "查看刚才 FWI 任务的状态。"));
     EXPECT_FALSE(engine.has_explicit_fwi_action("什么是 FWI？"));
     EXPECT_FALSE(engine.has_explicit_fwi_action("你可以做 FWI 反演吗？"));
     EXPECT_FALSE(engine.has_explicit_fwi_action("不要运行 marmousi_94_288 FWI。"));

@@ -176,6 +176,24 @@ TEST_F(A2AIntegrationTest, MessageJsonPreservesStructuredToolText) {
     EXPECT_EQ(parsed.context_id().value_or(""), "ctx-fwi");
 }
 
+TEST_F(A2AIntegrationTest, MessageSendParamsMetadataRoundTrip) {
+    a2a::AgentMessage message;
+    message.set_message_id("msg-source-policy");
+    message.set_context_id("ctx-source-policy");
+    message.set_role(a2a::MessageRole::User);
+    message.add_text_part("ordinary Web chat");
+
+    a2a::MessageSendParams source(message);
+    source.set_context_id("ctx-source-policy");
+    source.set_metadata("allow_legacy_fwi_submit", "false");
+    source.set_metadata("escaped", "quoted \"value\"");
+
+    const auto parsed = a2a::MessageSendParams::from_json(source.to_json());
+    ASSERT_EQ(parsed.metadata().size(), 2U);
+    EXPECT_EQ(parsed.metadata().at("allow_legacy_fwi_submit"), "false");
+    EXPECT_EQ(parsed.metadata().at("escaped"), "quoted \"value\"");
+}
+
 TEST_F(A2AIntegrationTest, ModelInit_Artifact) {
     a2a::Artifact artifact;
     artifact.set_name("result.txt");

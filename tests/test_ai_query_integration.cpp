@@ -11,17 +11,26 @@
 #include <rapidcheck/gtest.h>
 
 #include "agent_rpc/server/ai_query_service.h"
+#include "agent_rpc/server/http_bridge.h"
 #include "agent_rpc/client/ai_query_client.h"
 #include "agent_rpc/a2a_adapter/a2a_adapter.h"
 #include "agent_rpc/a2a_adapter/a2a_config.h"
 #include "agent_rpc/a2a_adapter/a2a_metrics.h"
 #include "agent_rpc/a2a_adapter/retry_policy.h"
 
+#include "ai_query.grpc.pb.h"
 #include "ai_query.pb.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
 
 namespace agent_rpc {
 namespace tests {
@@ -40,6 +49,185 @@ protected:
     void TearDown() override {
     }
 };
+
+namespace {
+
+int reserveLoopbackPort() {
+    const int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd < 0) throw std::runtime_error("failed to create test socket");
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(0);
+    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+        close(socket_fd);
+        throw std::runtime_error("failed to reserve test port");
+    }
+
+    socklen_t address_length = sizeof(address);
+    if (getsockname(socket_fd, reinterpret_cast<sockaddr*>(&address),
+                    &address_length) < 0) {
+        close(socket_fd);
+        throw std::runtime_error("failed to read reserved test port");
+    }
+    const int port = ntohs(address.sin_port);
+    close(socket_fd);
+    return port;
+}
+
+std::string postJsonToBridge(int port, const std::string& body) {
+    const int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd < 0) throw std::runtime_error("failed to create HTTP socket");
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (connect(socket_fd, reinterpret_cast<sockaddr*>(&address),
+                sizeof(address)) < 0) {
+        close(socket_fd);
+        throw std::runtime_error("failed to connect to HTTP bridge");
+    }
+
+    const std::string request =
+        "POST /api/query HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    std::size_t sent = 0;
+    while (sent < request.size()) {
+        const ssize_t count = send(socket_fd, request.data() + sent,
+                                   request.size() - sent, MSG_NOSIGNAL);
+        if (count <= 0) {
+            close(socket_fd);
+            throw std::runtime_error("failed to send HTTP request");
+        }
+        sent += static_cast<std::size_t>(count);
+    }
+    shutdown(socket_fd, SHUT_WR);
+
+    std::string response;
+    char buffer[4096];
+    for (;;) {
+        const ssize_t count = recv(socket_fd, buffer, sizeof(buffer), 0);
+        if (count < 0) {
+            close(socket_fd);
+            throw std::runtime_error("failed to read HTTP response");
+        }
+        if (count == 0) break;
+        response.append(buffer, static_cast<std::size_t>(count));
+    }
+    close(socket_fd);
+    return response;
+}
+
+class CapturingAIQueryService final
+    : public agent_communication::AIQueryService::Service {
+public:
+    grpc::Status Query(
+        grpc::ServerContext*,
+        const agent_communication::AIQueryRequest* request,
+        agent_communication::AIQueryResponse* response) override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_request_ = *request;
+            ++calls_;
+        }
+        response->set_request_id(request->request_id());
+        response->set_answer("ok");
+        response->set_context_id(request->context_id());
+        response->mutable_status()->set_code(0);
+        return grpc::Status::OK;
+    }
+
+    agent_communication::AIQueryRequest lastRequest() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_request_;
+    }
+
+    int calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    agent_communication::AIQueryRequest last_request_;
+    int calls_ = 0;
+};
+
+class HttpBridgePolicyTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        grpc::ServerBuilder builder;
+        builder.AddListeningPort(
+            "127.0.0.1:0", grpc::InsecureServerCredentials(), &grpc_port_);
+        builder.RegisterService(&service_);
+        grpc_server_ = builder.BuildAndStart();
+        ASSERT_NE(grpc_server_, nullptr);
+        ASSERT_GT(grpc_port_, 0);
+
+        http_port_ = reserveLoopbackPort();
+        bridge_ = std::make_unique<agent_rpc::server::HttpBridge>();
+        ASSERT_TRUE(bridge_->start(
+            http_port_, "127.0.0.1:" + std::to_string(grpc_port_)));
+    }
+
+    void TearDown() override {
+        if (bridge_) bridge_->stop();
+        if (grpc_server_) {
+            grpc_server_->Shutdown();
+            grpc_server_->Wait();
+        }
+    }
+
+    CapturingAIQueryService service_;
+    std::unique_ptr<grpc::Server> grpc_server_;
+    std::unique_ptr<agent_rpc::server::HttpBridge> bridge_;
+    int grpc_port_ = 0;
+    int http_port_ = 0;
+};
+
+TEST_F(HttpBridgePolicyTest, FalseSourceSwitchBecomesGrpcMetadata) {
+    const std::string response = postJsonToBridge(
+        http_port_,
+        R"({"question":"ordinary Web chat","context_id":"ctx-web","allow_legacy_fwi_submit":false})");
+
+    EXPECT_NE(response.find("HTTP/1.1 200 OK"), std::string::npos);
+    ASSERT_EQ(service_.calls(), 1);
+    const auto captured = service_.lastRequest();
+    ASSERT_EQ(captured.metadata().count("allow_legacy_fwi_submit"), 1U);
+    EXPECT_EQ(captured.metadata().at("allow_legacy_fwi_submit"), "false");
+}
+
+TEST_F(HttpBridgePolicyTest, MissingSourceSwitchPreservesOldClientBehavior) {
+    const std::string response = postJsonToBridge(
+        http_port_,
+        R"({"question":"old HTTP client","context_id":"ctx-old"})");
+
+    EXPECT_NE(response.find("HTTP/1.1 200 OK"), std::string::npos);
+    ASSERT_EQ(service_.calls(), 1);
+    EXPECT_EQ(service_.lastRequest().metadata().count(
+                  "allow_legacy_fwi_submit"),
+              0U);
+}
+
+TEST_F(HttpBridgePolicyTest, ExplicitTrueOrWrongTypeIsRejectedBeforeGrpc) {
+    for (const char* body : {
+             R"({"question":"run FWI","allow_legacy_fwi_submit":true})",
+             R"({"question":"run FWI","allow_legacy_fwi_submit":"false"})",
+         }) {
+        const std::string response = postJsonToBridge(http_port_, body);
+        EXPECT_NE(response.find("HTTP/1.1 400 Bad Request"), std::string::npos);
+        EXPECT_NE(response.find("invalid_allow_legacy_fwi_submit"),
+                  std::string::npos);
+    }
+    EXPECT_EQ(service_.calls(), 0);
+}
+
+} // namespace
 
 // ============================================================================
 // A2A Adapter Tests

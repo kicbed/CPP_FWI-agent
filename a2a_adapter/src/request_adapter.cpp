@@ -37,6 +37,12 @@ a2a::MessageSendParams RequestAdapter::convertToA2A(
     if (rpc_request.history_length() > 0) {
         params.set_history_length(rpc_request.history_length());
     }
+
+    // Preserve request-source policy and other string metadata across the
+    // gRPC -> A2A boundary. Older callers simply have an empty map.
+    for (const auto& entry : rpc_request.metadata()) {
+        params.set_metadata(entry.first, entry.second);
+    }
     
     return params;
 }

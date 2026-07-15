@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
 import uuid
 from dataclasses import dataclass
@@ -107,6 +108,19 @@ class SubmitTaskResult:
     intent: DispatchIntentSnapshot
     replayed: bool
     dispatch_attempted: bool
+
+
+@dataclass(frozen=True)
+class AbandonTaskResult:
+    snapshot: TaskSnapshot
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class TaskRuntimeResult:
+    snapshot: TaskSnapshot
+    intent: DispatchIntentSnapshot | None
+    adapter_status: dict[str, Any] | None
 
 
 def _utc_now() -> str:
@@ -324,6 +338,36 @@ class TaskService:
         errors = schema_errors(name, value)
         if errors:
             raise TaskValidationError("SCHEMA_INVALID", errors)
+
+    def _lookup_workbench_replay(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        operation: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> TaskSnapshot | None:
+        try:
+            replay = self._store.lookup_workbench_mutation(
+                project_id=project_id,
+                principal_id=principal_id,
+                operation=operation,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        if replay is None:
+            return None
+        if replay.task_id != task_id:
+            raise TaskIdempotencyConflict(
+                "idempotency key identifies another task"
+            )
+        return self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
 
     def _validate_registered_draft(
         self,
@@ -588,13 +632,38 @@ class TaskService:
         principal_id: str,
         expected_revision: int,
         draft: Mapping[str, Any],
+        idempotency_key: str | None = None,
     ) -> TaskSnapshot:
         _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
         if not isinstance(expected_revision, int) or isinstance(expected_revision, bool):
             raise TaskValidationError(
                 "INVALID_REVISION", ["expected_revision must be an integer"]
             )
         self._validate_schema("task-draft.schema.json", draft)
+        request_hash = None
+        if idempotency_key is not None:
+            _validate_idempotency_key(idempotency_key)
+            _, request_hash = encode_document(
+                {
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "principal_id": principal_id,
+                    "expected_revision": expected_revision,
+                    "draft": dict(draft),
+                }
+            )
+            replay = self._lookup_workbench_replay(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                operation="revise_draft",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if replay is not None:
+                return replay
         current = self.get_task(
             task_id, project_id=project_id, principal_id=principal_id
         )
@@ -615,7 +684,13 @@ class TaskService:
                 expected_revision=expected_revision,
                 draft=draft,
                 now=self._clock(),
+                project_id=project_id if idempotency_key is not None else None,
+                principal_id=principal_id if idempotency_key is not None else None,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
             )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
 
@@ -626,8 +701,11 @@ class TaskService:
         project_id: str,
         principal_id: str,
         plan: Mapping[str, Any],
+        idempotency_key: str | None = None,
     ) -> TaskSnapshot:
         _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
         self._validate_schema("plan-graph.schema.json", plan)
         try:
             expected_hash = compute_plan_hash(plan)
@@ -637,6 +715,27 @@ class TaskService:
             raise TaskValidationError(
                 "PLAN_HASH_INVALID", ["plan_hash does not match canonical plan content"]
             )
+        request_hash = None
+        if idempotency_key is not None:
+            _validate_idempotency_key(idempotency_key)
+            _, request_hash = encode_document(
+                {
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "principal_id": principal_id,
+                    "plan": dict(plan),
+                }
+            )
+            replay = self._lookup_workbench_replay(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                operation="persist_plan",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if replay is not None:
+                return replay
         current = self.get_task(
             task_id, project_id=project_id, principal_id=principal_id
         )
@@ -656,8 +755,16 @@ class TaskService:
         self._validate_registered_plan(plan, manifest)
         try:
             return self._store.store_plan(
-                task_id=task_id, plan=plan, now=self._clock()
+                task_id=task_id,
+                plan=plan,
+                now=self._clock(),
+                project_id=project_id if idempotency_key is not None else None,
+                principal_id=principal_id if idempotency_key is not None else None,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
             )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
 
@@ -668,12 +775,36 @@ class TaskService:
         project_id: str,
         principal_id: str,
         approval: Mapping[str, Any],
+        idempotency_key: str | None = None,
     ) -> TaskSnapshot:
         _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        self._validate_schema("approval-decision.schema.json", approval)
+        request_hash = None
+        if idempotency_key is not None:
+            _validate_idempotency_key(idempotency_key)
+            _, request_hash = encode_document(
+                {
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "principal_id": principal_id,
+                    "approval": dict(approval),
+                }
+            )
+            replay = self._lookup_workbench_replay(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                operation="persist_approval",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+            if replay is not None:
+                return replay
         current = self.get_task(
             task_id, project_id=project_id, principal_id=principal_id
         )
-        self._validate_schema("approval-decision.schema.json", approval)
         if approval["actor"]["type"] != "user":
             raise TaskValidationError(
                 "DELEGATED_APPROVAL_UNSUPPORTED",
@@ -695,10 +826,82 @@ class TaskService:
             raise TaskConflict("approval does not bind the current plan hash")
         try:
             return self._store.store_approval(
-                task_id=task_id, approval=approval, now=self._clock()
+                task_id=task_id,
+                approval=approval,
+                now=self._clock(),
+                project_id=project_id if idempotency_key is not None else None,
+                principal_id=principal_id if idempotency_key is not None else None,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
             )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
+
+    def abandon_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+    ) -> AbandonTaskResult:
+        """Persist a user discard without activating P2 runtime cancellation."""
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        _validate_idempotency_key(idempotency_key)
+        _, request_hash = encode_document(
+            {
+                "task_id": task_id,
+                "project_id": project_id,
+                "principal_id": principal_id,
+                "action": "user_discarded_draft",
+            }
+        )
+        replay = self._lookup_workbench_replay(
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            operation="abandon_task",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        if replay is not None:
+            return AbandonTaskResult(snapshot=replay, replayed=True)
+        current = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if current.status not in {"Draft", "NeedsInput", "AwaitingApproval"}:
+            raise TaskConflict("only a pre-runtime task can be abandoned")
+        now = self._clock()
+        abandonment = {
+            "schema_version": "1.0.0",
+            "task_id": task_id,
+            "previous_status": current.status,
+            "status": "Cancelled",
+            "reason": "user_discarded_draft",
+            "actor": {"type": "user", "id": principal_id},
+            "abandoned_at": now,
+            "extensions": {},
+        }
+        try:
+            snapshot, replayed = self._store.abandon_task(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                abandonment=abandonment,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                now=now,
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        return AbandonTaskResult(snapshot=snapshot, replayed=replayed)
 
     @staticmethod
     def _parse_gate_time(value: str) -> datetime:
@@ -1184,3 +1387,365 @@ class TaskService:
             )
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
+
+    @staticmethod
+    def _validated_adapter_status(
+        intent: DispatchIntentSnapshot, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        required = {
+            "job_id",
+            "task_id",
+            "node_id",
+            "status",
+            "stage",
+            "completed",
+            "total",
+            "message",
+            "updated_at",
+            "terminal",
+        }
+        result = copy.deepcopy(dict(value))
+        status = result.get("status")
+        if (
+            set(result) != required
+            or intent.handle is None
+            or result.get("job_id") != intent.handle.get("job_id")
+            or result.get("task_id") != intent.task_id
+            or result.get("node_id") != intent.node_id
+            or status not in {"Queued", "Running", "Succeeded", "Failed"}
+            or type(result.get("completed")) is not int
+            or type(result.get("total")) is not int
+            or result["completed"] < 0
+            or result["total"] < 0
+            or result["completed"] > result["total"]
+            or result["total"]
+            != intent.request.get("parameters", {}).get("iterations")
+            or not isinstance(result.get("stage"), str)
+            or not isinstance(result.get("message"), str)
+            or len(result["message"]) > 1000
+            or type(result.get("terminal")) is not bool
+            or result["terminal"] != (status in {"Succeeded", "Failed"})
+        ):
+            raise TaskDispatchError("ADAPTER_STATUS_INVALID")
+        try:
+            TaskService._parse_gate_time(result.get("updated_at"))
+        except TaskDispatchError as error:
+            raise TaskDispatchError("ADAPTER_STATUS_INVALID") from error
+        return result
+
+    @staticmethod
+    def _adapter_event(
+        *,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        adapter_status: Mapping[str, Any],
+        event_type: str,
+        sequence: int,
+    ) -> dict[str, Any]:
+        if intent.handle is None:
+            raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+        target_status = {
+            "node_started": "Running",
+            "node_progress": "Running",
+            "node_succeeded": "Succeeded",
+            "node_failed": "Failed",
+        }[event_type]
+        _, identity_hash = encode_document(
+            {
+                "task_id": snapshot.task_id,
+                "node_id": intent.node_id,
+                "job_id": adapter_status["job_id"],
+                "event_type": event_type,
+                "worker_updated_at": adapter_status["updated_at"],
+                "stage": adapter_status["stage"],
+                "completed": adapter_status["completed"],
+                "total": adapter_status["total"],
+            }
+        )
+        event: dict[str, Any] = {
+            "schema_version": "1.0.0",
+            "event_id": "event-" + identity_hash.removeprefix("sha256:")[:32],
+            "sequence": sequence,
+            "task_id": snapshot.task_id,
+            "node_id": intent.node_id,
+            "event_type": event_type,
+            "task_status": target_status,
+            "occurred_at": adapter_status["updated_at"],
+            "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+            "extensions": {
+                "org.agent_rpc.adapter_status": {
+                    "job_id": adapter_status["job_id"],
+                    "stage": adapter_status["stage"],
+                    "worker_updated_at": adapter_status["updated_at"],
+                }
+            },
+        }
+        if event_type == "node_progress":
+            event["progress"] = {
+                "completed": adapter_status["completed"],
+                "total": adapter_status["total"],
+                "unit": "iterations",
+                "message": adapter_status["message"],
+            }
+        elif event_type == "node_failed":
+            event["error"] = {
+                "code": "worker_failed",
+                "message": "FWI Worker reported a failure",
+                "retryable": False,
+            }
+        return event
+
+    def refresh_runtime_status(
+        self, task_id: str, *, project_id: str, principal_id: str
+    ) -> TaskRuntimeResult:
+        """Observe one trusted Adapter receipt and advance SQLite monotonically."""
+
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        intent = self._store.get_dispatch_intent(task_id)
+        if intent is None:
+            if snapshot.status in {
+                "Draft",
+                "NeedsInput",
+                "AwaitingApproval",
+                "Cancelled",
+            }:
+                return TaskRuntimeResult(snapshot, None, None)
+            raise TaskConflict("runtime task has no dispatch intent")
+        if intent.state != "dispatched":
+            return TaskRuntimeResult(snapshot, intent, None)
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        try:
+            observed = self._dispatcher.status(intent)
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("ADAPTER_STATUS_UNAVAILABLE") from error
+        adapter_status = self._validated_adapter_status(intent, observed)
+        target = adapter_status["status"]
+
+        for _ in range(8):
+            snapshot = self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            events = self.list_run_events(
+                task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                limit=1000,
+            )
+            event_ids = {event["event_id"] for event in events}
+            previous_worker_time = next(
+                (
+                    event.get("extensions", {})
+                    .get("org.agent_rpc.adapter_status", {})
+                    .get("worker_updated_at")
+                    for event in reversed(events)
+                    if isinstance(
+                        event.get("extensions", {}).get(
+                            "org.agent_rpc.adapter_status"
+                        ),
+                        Mapping,
+                    )
+                    and isinstance(
+                        event["extensions"]["org.agent_rpc.adapter_status"].get(
+                            "worker_updated_at"
+                        ),
+                        str,
+                    )
+                ),
+                None,
+            )
+            if (
+                previous_worker_time is not None
+                and self._parse_gate_time(adapter_status["updated_at"])
+                < self._parse_gate_time(previous_worker_time)
+            ):
+                raise TaskDispatchError("ADAPTER_STATUS_REGRESSION")
+
+            if target == "Queued":
+                if snapshot.status != "Queued":
+                    raise TaskDispatchError("ADAPTER_STATUS_REGRESSION")
+                return TaskRuntimeResult(snapshot, intent, adapter_status)
+
+            if snapshot.status in {"Succeeded", "Failed", "Cancelled"}:
+                if snapshot.status != target:
+                    raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
+                return TaskRuntimeResult(snapshot, intent, adapter_status)
+
+            if snapshot.status == "Queued" and target in {"Running", "Succeeded"}:
+                event_type = "node_started"
+            elif target == "Running" and snapshot.status == "Running":
+                previous_progress = [
+                    event
+                    for event in events
+                    if event.get("event_type") == "node_progress"
+                    and event.get("node_id") == intent.node_id
+                ]
+                if previous_progress:
+                    completed = previous_progress[-1]["progress"]["completed"]
+                    if adapter_status["completed"] < completed:
+                        raise TaskDispatchError("ADAPTER_PROGRESS_REGRESSION")
+                event_type = "node_progress"
+            elif target == "Succeeded" and snapshot.status == "Running":
+                event_type = "node_succeeded"
+            elif target == "Failed" and snapshot.status in {"Queued", "Running"}:
+                event_type = "node_failed"
+            else:
+                raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
+
+            event = self._adapter_event(
+                snapshot=snapshot,
+                intent=intent,
+                adapter_status=adapter_status,
+                event_type=event_type,
+                sequence=len(events) + 1,
+            )
+            if event["event_id"] in event_ids:
+                return TaskRuntimeResult(snapshot, intent, adapter_status)
+            try:
+                self.record_run_event(
+                    task_id=task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    expected_status=snapshot.status,
+                    event=event,
+                )
+            except TaskConflict:
+                # Another status poll may have committed the same monotonic
+                # observation.  Re-read and prove convergence before failing.
+                continue
+            if event_type == "node_progress":
+                current = self.get_task(
+                    task_id, project_id=project_id, principal_id=principal_id
+                )
+                return TaskRuntimeResult(current, intent, adapter_status)
+        raise TaskConflict("concurrent Adapter status updates did not converge")
+
+    @staticmethod
+    def _validate_collected_artifacts(
+        intent: DispatchIntentSnapshot, manifests: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if intent.handle is None:
+            raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+        identifiers: set[str] = set()
+        observed_outputs: set[tuple[str, str, str]] = set()
+        validated: list[dict[str, Any]] = []
+        expected_input = {
+            key: intent.request["dataset"][key]
+            for key in ("id", "version", "content_hash", "data_type")
+        }
+        for manifest in manifests:
+            errors = schema_errors("artifact-manifest.schema.json", manifest)
+            artifact_id = manifest.get("artifact_id")
+            extensions = manifest.get("extensions")
+            adapter_extension = (
+                extensions.get("org.agent_rpc.adapter")
+                if isinstance(extensions, Mapping)
+                else None
+            )
+            output_port = (
+                adapter_extension.get("output_port")
+                if isinstance(adapter_extension, Mapping)
+                else None
+            )
+            if errors:
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            if (
+                artifact_id in identifiers
+                or manifest.get("task_id") != intent.task_id
+                or manifest.get("node_id") != intent.node_id
+                or manifest.get("fingerprint") != intent.handle.get("fingerprint")
+                or manifest.get("lineage", {}).get("plan_hash") != intent.plan_hash
+                or manifest.get("lineage", {}).get("algorithm")
+                != intent.request.get("algorithm")
+                or manifest.get("lineage", {}).get("inputs") != [expected_input]
+                or not isinstance(output_port, str)
+            ):
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            identifiers.add(artifact_id)
+            observed_outputs.add(
+                (
+                    output_port,
+                    manifest["artifact_type"],
+                    manifest["media_type"],
+                )
+            )
+            validated.append(copy.deepcopy(manifest))
+        if len(validated) != 2 or observed_outputs != {
+            (
+                "inverted_model",
+                "inverted_velocity_model_2d",
+                "application/x-npy",
+            ),
+            ("loss", "loss_curve", "text/csv"),
+        }:
+            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+        return sorted(validated, key=lambda item: item["display"]["order"])
+
+    def collect_artifacts(
+        self, task_id: str, *, project_id: str, principal_id: str
+    ) -> list[dict[str, Any]]:
+        runtime = self.refresh_runtime_status(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if runtime.snapshot.status != "Succeeded" or runtime.intent is None:
+            raise TaskDispatchError("RESULT_NOT_READY")
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        try:
+            manifests = self._dispatcher.collect(runtime.intent)
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("ADAPTER_COLLECT_UNAVAILABLE") from error
+        if not isinstance(manifests, list) or not all(
+            isinstance(value, dict) for value in manifests
+        ):
+            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+        return self._validate_collected_artifacts(runtime.intent, manifests)
+
+    def read_artifact(
+        self,
+        task_id: str,
+        artifact_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+    ) -> tuple[dict[str, Any], bytes]:
+        _validate_opaque_id(artifact_id, field="artifact_id")
+        manifests = self.collect_artifacts(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        expected = next(
+            (value for value in manifests if value["artifact_id"] == artifact_id),
+            None,
+        )
+        if expected is None:
+            raise TaskNotFound("artifact does not exist in the requested task")
+        intent = self.get_dispatch_intent(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if intent is None or self._dispatcher is None:
+            raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+        try:
+            manifest, data = self._dispatcher.read_artifact(intent, artifact_id)
+        except DispatchError as error:
+            if error.code == "ARTIFACT_NOT_FOUND":
+                raise TaskNotFound(
+                    "artifact does not exist in the requested task"
+                ) from error
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("ADAPTER_ARTIFACT_UNAVAILABLE") from error
+        if (
+            manifest != expected
+            or not isinstance(data, bytes)
+            or len(data) != expected["size_bytes"]
+            or "sha256:" + hashlib.sha256(data).hexdigest()
+            != expected["content_hash"]
+        ):
+            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+        return copy.deepcopy(manifest), data
