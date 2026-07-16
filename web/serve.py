@@ -14,9 +14,13 @@ import json
 import os
 import re
 import secrets
+import signal
 import socket
 import sys
+import threading
+import time
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -33,6 +37,7 @@ from scientific_runtime import (  # noqa: E402
     DeepwaveTaskDispatcher,
     RegistryService,
     RuntimeRecoveryResult,
+    RuntimeSupervisor,
     SQLiteTaskStore,
     TaskService,
     register_verified_fwi_baseline,
@@ -54,7 +59,9 @@ EMBEDDING_HEALTH_PATH = "/api/embedding-health"
 MAX_EMBEDDING_HEALTH_BYTES = 32 * 1024
 HTTP_REQUEST_TIMEOUT_SECONDS = 10.0
 WORKBENCH_BODY_TIMEOUT_SECONDS = 5.0
+HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS = 10.0
 FWI_JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+STABLE_RUNTIME_FAILURE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 FWI_CONTENT_TYPES = {
     ".json": "application/json; charset=utf-8",
     ".csv": "text/csv; charset=utf-8",
@@ -80,6 +87,26 @@ CONTENT_SECURITY_POLICY = "; ".join(
 # Set exactly once by ``main``. Importing this module for route tests remains
 # read-only and does not create a database or probe the numerical runtime.
 WORKBENCH_API = None
+
+
+@dataclass(frozen=True)
+class WorkbenchRuntime:
+    """Composed HTTP facade and its side-effect-free supervisor handle."""
+
+    api: WorkbenchAPI
+    supervisor: RuntimeSupervisor
+
+
+class _TerminationRequested(BaseException):
+    """Unwind the main server loop without being caught as an app failure."""
+
+
+@dataclass
+class _ShutdownSignalState:
+    """Previous handlers plus a latch that makes cleanup non-interruptible."""
+
+    previous: dict
+    cleaning: bool = False
 
 
 def _workbench_error_response(status, code, message):
@@ -188,8 +215,8 @@ def validated_scientific_runtime_database_path(run_root):
     return database_path
 
 
-def create_workbench_api():
-    """Compose the fixed local P1 Guided runtime and its HTTP boundary."""
+def create_workbench_runtime():
+    """Compose the local Guided API and an unstarted fenced supervisor."""
 
     if HOST not in {"127.0.0.1", "localhost"}:
         raise ValueError("P1 Guided Workbench requires a loopback WEB_HOST")
@@ -240,11 +267,23 @@ def create_workbench_api():
         allowed_hosts={browser_host},
         allowed_origins={browser_origin},
     )
+    supervisor = RuntimeSupervisor(
+        tasks,
+        project_id=project_id,
+        principal_id=principal_id,
+        owner_id=f"supervisor-{secrets.token_hex(16)}",
+    )
     # Validate the complete HTTP boundary before receipt adoption can mutate
     # SQLite, but finish recovery before the composed API is returned or served.
     recovery = application.recover_runtime_on_startup(max_tasks=10000)
     report_runtime_recovery(recovery)
-    return api
+    return WorkbenchRuntime(api=api, supervisor=supervisor)
+
+
+def create_workbench_api():
+    """Backward-compatible composition helper used by route-level tests."""
+
+    return create_workbench_runtime().api
 
 
 def report_runtime_recovery(recovery):
@@ -523,7 +562,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(response.body)
 
     def _serve_workbench(self, method, send_body=True):
-        if WORKBENCH_API is None:
+        # One handler owns one stable facade even while the main thread drains
+        # requests during shutdown.  Never read the publication global twice.
+        api = WORKBENCH_API
+        if api is None:
             self.close_connection = True
             self._send_workbench_response(
                 _workbench_error_response(
@@ -535,7 +577,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             )
             return
 
-        early_response = WORKBENCH_API.preflight(
+        early_response = api.preflight(
             method, self.path, self.headers.items()
         )
         if early_response is not None:
@@ -558,7 +600,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 send_body,
             )
             return
-        response = WORKBENCH_API.dispatch(method, self.path, self.headers.items(), body)
+        response = api.dispatch(method, self.path, self.headers.items(), body)
         self._send_workbench_response(response, send_body)
 
     def _serve_embedding_health(self, send_body):
@@ -662,14 +704,103 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
 class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
-    """Allow a clean stop/start cycle without waiting for TCP TIME_WAIT."""
+    """Track request threads, close listening separately, and fail closed."""
 
     allow_reuse_address = True
-    daemon_threads = True
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, *args, **kwargs):
+        self.runtime_supervisor = None
+        super().__init__(*args, **kwargs)
+
+    def service_actions(self):
+        super().service_actions()
+        threads = vars(self).get("_threads")
+        if threads is not None:
+            threads.reap()
+        supervisor = self.runtime_supervisor
+        if supervisor is not None and not supervisor.healthy:
+            raise RuntimeError(
+                supervisor.failure_code or "RUNTIME_SUPERVISOR_STOPPED"
+            )
+
+    def close_listener(self):
+        """Close the listening socket without waiting on application handlers."""
+
+        socketserver.TCPServer.server_close(self)
+
+    def drain_request_threads(self, timeout=HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS):
+        """Bound the cooperative drain while retaining non-daemon safety."""
+
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout < 0
+        ):
+            raise ValueError("request drain timeout must be non-negative")
+        deadline = time.monotonic() + float(timeout)
+        # ThreadingMixIn exposes a non-iterable class-level _NoThreads sentinel
+        # until its first request. Only an instance collection contains work.
+        threads = tuple(vars(self).get("_threads", ()))
+        for thread in threads:
+            if thread is threading.current_thread():
+                return False
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return not any(thread.is_alive() for thread in threads)
+
+    def server_close(self):
+        """Compatibility close with the same bounded drain policy."""
+
+        self.close_listener()
+        return self.drain_request_threads()
+
+
+def _install_shutdown_signal_handlers():
+    """Translate TERM/INT into one cleanup-safe main-thread unwind."""
+
+    if threading.current_thread() is not threading.main_thread():
+        return _ShutdownSignalState(previous={})
+    state = _ShutdownSignalState(previous={})
+
+    def request_shutdown(signum, _frame):
+        # Once either signal starts the unwind, both must be inert so a
+        # different second signal cannot interrupt lease cleanup.
+        for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(shutdown_signal, signal.SIG_IGN)
+        if state.cleaning:
+            return
+        raise _TerminationRequested()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        state.previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_shutdown)
+    return state
+
+
+def _begin_shutdown_cleanup(state):
+    """Latch cleanup before making both shutdown signals inert."""
+
+    state.cleaning = True
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(signum, signal.SIG_IGN)
+        except (OSError, ValueError):
+            # The latch still makes an already-entered handler return normally.
+            pass
+
+
+def _restore_shutdown_signal_handlers(state):
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum, handler in state.previous.items():
+        signal.signal(signum, handler)
 
 
 def serve_workbench():
-    """Bind first, then recover the runtime before accepting HTTP requests."""
+    """Bind, recover, fence, publish, then cooperatively stop with hard fallback."""
 
     global WORKBENCH_API
     # Never retain a previously composed API across a failed restart attempt.
@@ -678,9 +809,15 @@ def serve_workbench():
     # Resolve the accepted localhost spelling ourselves so a resolver/NSS
     # misconfiguration cannot turn the Guided bind into a non-loopback socket.
     bind_host = "127.0.0.1" if HOST == "localhost" else HOST
-    with ReusableThreadingTCPServer(
-        (bind_host, PORT), Handler, bind_and_activate=False
-    ) as httpd:
+    shutdown_signals = _install_shutdown_signal_handlers()
+    httpd = None
+    supervisor = None
+    primary_error = None
+    graceful_stop = False
+    try:
+        httpd = ReusableThreadingTCPServer(
+            (bind_host, PORT), Handler, bind_and_activate=False
+        )
         # Bind first to prove that the configured port is available, but do
         # not listen yet: clients cannot connect while recovery is running.
         httpd.server_bind()
@@ -688,40 +825,126 @@ def serve_workbench():
         # adopt a receipt. No handler can run until activation and serve_forever.
         # Wildcard binds retain legacy/static Compose behavior but never
         # compose the unauthenticated Guided runtime on that socket.
-        api = (
-            create_workbench_api()
+        runtime = (
+            create_workbench_runtime()
             if HOST in {"127.0.0.1", "localhost"}
             else None
         )
+        supervisor = None if runtime is None else runtime.supervisor
+        if supervisor is not None:
+            if not supervisor.start():
+                raise RuntimeError(
+                    supervisor.failure_code
+                    or "RUNTIME_SUPERVISOR_START_FAILED"
+                )
+            httpd.runtime_supervisor = supervisor
         # Recovery has completed. Only now activate the listening socket and
         # publish the API that handlers will see. If either step raises, the
         # context closes the socket and this global remains fail-closed.
         httpd.server_activate()
-        WORKBENCH_API = api
+        WORKBENCH_API = None if runtime is None else runtime.api
         # Keep the browser Origin aligned with AGENT_CORS_ORIGIN. In
         # particular, do not rewrite 127.0.0.1 to localhost after startup.
         display_host = "127.0.0.1" if HOST == "0.0.0.0" else HOST
         url = f"http://{display_host}:{PORT}"
+        print(f"\033[1;36m┌─────────────────────────────────────────┐\033[0m")
+        print(f"\033[1;36m│\033[0m  🌐 Lab Agent Workbench 已启动          \033[1;36m│\033[0m")
+        print(f"\033[1;36m│\033[0m  📍 {url:<33} \033[1;36m│\033[0m")
+        print(f"\033[1;36m│\033[0m  按 Ctrl+C 停止                         \033[1;36m│\033[0m")
+        print(f"\033[1;36m└─────────────────────────────────────────┘\033[0m")
+
         try:
-            print(f"\033[1;36m┌─────────────────────────────────────────┐\033[0m")
-            print(f"\033[1;36m│\033[0m  🌐 Lab Agent Workbench 已启动          \033[1;36m│\033[0m")
-            print(f"\033[1;36m│\033[0m  📍 {url:<33} \033[1;36m│\033[0m")
-            print(f"\033[1;36m│\033[0m  按 Ctrl+C 停止                         \033[1;36m│\033[0m")
-            print(f"\033[1;36m└─────────────────────────────────────────┘\033[0m")
+            webbrowser.open(url)
+        except Exception:
+            pass
 
+        httpd.serve_forever()
+    except (KeyboardInterrupt, _TerminationRequested):
+        graceful_stop = True
+    except BaseException as error:
+        primary_error = error
+    finally:
+        _begin_shutdown_cleanup(shutdown_signals)
+        cleanup_codes = []
+        cleanup_causes = []
+        if httpd is not None:
+            # Stop accepting first, but never let an application handler block
+            # the supervisor's cooperative stop and lease release.
             try:
-                webbrowser.open(url)
-            except Exception:
-                pass
-
+                httpd.close_listener()
+            except BaseException as error:
+                cleanup_codes.append("HTTP_LISTENER_CLOSE_FAILED")
+                cleanup_causes.append(error)
+        if supervisor is not None:
             try:
-                httpd.serve_forever()
-            except KeyboardInterrupt:
-                print("\n\033[1;33mWeb UI 服务器已停止\033[0m")
-        finally:
-            # P2-004 has no background supervisor to stop. Removing the HTTP
-            # publication before server_close is the complete cleanup.
-            WORKBENCH_API = None
+                if not supervisor.stop():
+                    failure_code = supervisor.failure_code
+                    cleanup_codes.append(
+                        failure_code
+                        if isinstance(failure_code, str)
+                        and STABLE_RUNTIME_FAILURE_CODE.fullmatch(failure_code)
+                        else "RUNTIME_SUPERVISOR_STOP_FAILED"
+                    )
+            except BaseException as error:
+                failure_code = getattr(error, "code", None)
+                cleanup_codes.append(
+                    failure_code
+                    if isinstance(failure_code, str)
+                    and STABLE_RUNTIME_FAILURE_CODE.fullmatch(failure_code)
+                    else "RUNTIME_SUPERVISOR_STOP_FAILED"
+                )
+                cleanup_causes.append(error)
+        if httpd is not None:
+            # The API remains published during this bounded drain. A handler
+            # that outlives it is non-daemon and therefore still cannot be
+            # silently abandoned; stop_system.sh retains a forced-KILL bound.
+            try:
+                drained = httpd.drain_request_threads(
+                    HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS
+                )
+                if not drained:
+                    cleanup_codes.append("HTTP_HANDLER_DRAIN_TIMEOUT")
+            except BaseException as error:
+                cleanup_codes.append("HTTP_HANDLER_DRAIN_FAILED")
+                cleanup_causes.append(error)
+        WORKBENCH_API = None
+        try:
+            _restore_shutdown_signal_handlers(shutdown_signals)
+        except BaseException as error:
+            cleanup_codes.append("SHUTDOWN_SIGNAL_RESTORE_FAILED")
+            cleanup_causes.append(error)
+        if graceful_stop:
+            print("\n\033[1;33mWeb UI 服务器已停止\033[0m")
+        if primary_error is not None:
+            if cleanup_codes:
+                try:
+                    primary_error.workbench_cleanup_codes = tuple(cleanup_codes)
+                except (AttributeError, TypeError):
+                    pass
+                if hasattr(primary_error, "add_note"):
+                    primary_error.add_note(
+                        "workbench cleanup: " + ",".join(cleanup_codes)
+                    )
+                try:
+                    print(
+                        "scientific runtime cleanup "
+                        + json.dumps(
+                            {"failure_codes": cleanup_codes},
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        ),
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
+            raise primary_error
+        if cleanup_codes:
+            cleanup_error = RuntimeError(
+                "WORKBENCH_CLEANUP_FAILED:" + ",".join(cleanup_codes)
+            )
+            if cleanup_causes:
+                raise cleanup_error from cleanup_causes[0]
+            raise cleanup_error
 
 
 def main():

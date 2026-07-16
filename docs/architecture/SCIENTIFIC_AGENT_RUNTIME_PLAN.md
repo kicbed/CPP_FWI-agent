@@ -5,7 +5,8 @@
 - 决策编号：`D-003`
 - 决策状态：**Accepted**
 - Runtime 实现状态：**P0 + P1 Verified；P2.1 任务发现/重开、P2.2 可恢复回收站、P2.3
-  本地结果永久删除、P2.4 启动 receipt 收养/状态追赶均为有界 Verified；完整 P2 仍 Pending**
+  本地结果永久删除、P2.4 启动 receipt 收养/状态追赶与 P2.5A 控制面 fenced lease/持续状态泵
+  均为有界 Verified；完整 P2 仍 Pending**
 - 用户确认日期：2026-07-15
 - 实现分支：`feature/scientific-agent-runtime`
 - 基线分支：`feature/fwi-deepwave-2d-acoustic`
@@ -264,7 +265,7 @@ Pending，未因 Guided Web 状态轮询而提前实现恢复语义。后续 D-0
 - SSE 任务事件和浏览器刷新恢复；
 - 多任务列表，不再每个对话只保留一个 FWI job。
 
-当前有四个有界先行切片；它们不改变完整 P2 的出口条件。
+当前有五个有界先行切片；它们不改变完整 P2 的出口条件。
 
 **P2.1 任务发现/重开**：
 
@@ -314,6 +315,28 @@ active task 的 scope-bound 全分页扫描。dispatching 只按 immutable inten
 Scientific Runtime 201/201、Web 36/36 与全量回归通过；本切片不猜 PID、不创建 watcher，也不
 实现 fenced capacity、lease/heartbeat、持续 supervisor、cancel/timeout/retry 或 SSE，因此
 完整 P2 仍为 **Pending**。
+
+继续 D-003 后实现的有界 **P2.5A 控制面 fenced lease 与持续状态泵** 在 SQLite v8 增加
+`(project_id, principal_id)` scope 的单一当前 lease、连续递增 fencing term、append-only
+term/closure 以及 supervised RunEvent commit audit。acquire/heartbeat/release 和受监督写入都在
+SQLite 写事务内采样时间；旧 term、过期 term、时钟回退、ABA 和 takeover 后迟到写 fail closed。
+这只围栏后台 Supervisor 的状态提交：startup recovery 和浏览器 GET 仍保留既有无租约的单调
+CAS 路径，不能据此宣称所有控制面写入都由唯一 owner 独占。
+
+Runtime Supervisor 构造无副作用，在 Web bind 和 P2.4 recovery 成功后、listen/publish 前取得
+lease 并 ready。它只对 active 视图中 Queued/Running 且 durable dispatch outcome 精确为
+`dispatched` 的 task 持续调用 status bridge；pending、dispatching、missing、
+`reconciliation_required` 均 deferred，终态直接跳过、不观察。Supervisor 没有
+dispatch/launcher 能力，不扫描 run root，不猜 PID；lease loss 只使控制面自我隔离，不改变
+Worker 生命周期或容量。Web 关闭
+先 close listener，再 cooperative stop/release Supervisor，定界等待已有 Handler，最后 unpublish；
+非 daemon 线程、外层 30 秒 KILL 与 lease expiry 保留任意阻塞 I/O 的最终边界。Scientific Runtime
+226/226、Worker 28/28、Web 45/45 与完整回归通过，未运行真实 FWI/CUDA。
+
+P2.5A 明确不是 Worker lease/heartbeat 或 fenced capacity。下一子窗口必须先给固定 Adapter
+增加可恢复的 staged launch protocol、唯一 attempt fence、跨进程 capacity lease 和独立 Worker
+heartbeat，证明崩溃与接管不会重复启动；之后才能安全处理 pending/no-record 首次派发、取消、
+超时和 retry。完整 reconciliation 与 SSE 仍后置，因此完整 P2 仍为 **Pending**。
 
 完成标准：重复请求不重复建任务；控制面重启后恢复或明确终结任务；取消能到达 Worker；
 已提交任务不依赖浏览器连接存活。
@@ -417,3 +440,4 @@ Scientific Runtime 201/201、Web 36/36 与全量回归通过；本切片不猜 P
 | 2026-07-15 | 增加 D-008 Conversation/Task 可选引用、浏览器本地无级联删除、当前 1.4 六图结果维护与 P2.2 有界可恢复任务回收站；永久 purge 和完整 P2 继续延期 | 用户明确要求理清对话与任务、保留删除场景并恢复 FWI 图片展示 |
 | 2026-07-15 | 增加 D-009/P2.3 有界回收站永久删除：SQLite 两阶段墓碑、受控本地 Worker 目录清理、强确认与无级联；完整 P2 继续延期 | 用户明确要求回收站支持删除且本地文件随之删除，并要求不要重复耗时实验 |
 | 2026-07-16 | 实现 P2.4 有界启动 receipt 收养/状态追赶：安全审查后禁止 startup 首次派发，采用 bind 后 current 1.4 launched-record 只读 lookup、严格相同 handle 收敛、一次 status 追赶；fenced capacity/lease/cancel/SSE 继续延期 | 用户要求继续 D-003；沿既有 P2 reconciliation 方向推进首个可证明不重启 Worker 的子窗口 |
+| 2026-07-16 | 实现 P2.5A 控制面 fenced lease/持续状态泵：SQLite v8 term/closure/commit fence、observation-only Supervisor 和 lease-before-listen 生命周期；Worker staged launch/capacity/heartbeat 继续延期 | 用户继续 D-003；先关闭浏览器连接依赖，同时保持绝不首次派发或重启 Worker 的安全边界 |

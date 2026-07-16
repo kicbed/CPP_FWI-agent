@@ -27,9 +27,12 @@ from .fwi_registry import (
 from .task_dispatcher import DispatchError, DispatchPreparation, TaskDispatcher
 from .task_store import (
     ALLOWED_TRANSITIONS,
-    IdempotencyConflict,
     TASK_STATUSES,
     DispatchIntentSnapshot,
+    IdempotencyConflict,
+    RuntimeSupervisorLease,
+    RuntimeSupervisorLeaseAcquisition,
+    RuntimeSupervisorLeaseLost,
     SubmitGateContext,
     TaskSnapshot,
     TaskSnapshotPage,
@@ -100,6 +103,15 @@ class TaskDispatchError(TaskServiceError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+class TaskSupervisorLeaseLost(TaskServiceError):
+    """The background supervisor no longer owns its exact fenced term."""
+
+    code = "RUNTIME_SUPERVISOR_LEASE_LOST"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
 
 
 @dataclass(frozen=True)
@@ -1485,6 +1497,27 @@ class TaskService:
         return parsed.astimezone(timezone.utc)
 
     @staticmethod
+    def _validate_runtime_supervisor_lease_seconds(lease_seconds: int) -> None:
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600:
+            raise TaskValidationError(
+                "INVALID_RUNTIME_SUPERVISOR_LEASE",
+                ["lease_seconds must be an integer from 1 to 3600"],
+            )
+
+    def _runtime_supervisor_clock(self) -> str:
+        """Return canonical UTC when called inside the Store write transaction."""
+
+        value = self._clock()
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as error:
+            raise TaskDispatchError("RUNTIME_SUPERVISOR_CLOCK_INVALID") from error
+        if parsed.tzinfo is None:
+            raise TaskDispatchError("RUNTIME_SUPERVISOR_CLOCK_INVALID")
+        parsed = parsed.astimezone(timezone.utc)
+        return parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    @staticmethod
     def _expected_dispatch_request(snapshot: TaskSnapshot) -> dict[str, Any]:
         plan = snapshot.plan
         if plan is None or len(plan.get("nodes", [])) != 1:
@@ -1998,6 +2031,76 @@ class TaskService:
             dispatch_attempted=True,
         )
 
+    def acquire_runtime_supervisor_lease(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        owner_id: str,
+        lease_seconds: int,
+    ) -> RuntimeSupervisorLeaseAcquisition:
+        """Acquire or exactly replay one scope-local supervisor term."""
+
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        _validate_opaque_id(owner_id, field="owner_id")
+        self._validate_runtime_supervisor_lease_seconds(lease_seconds)
+        try:
+            return self._store.acquire_runtime_supervisor_lease(
+                project_id=project_id,
+                principal_id=principal_id,
+                owner_id=owner_id,
+                lease_seconds=lease_seconds,
+                clock=self._runtime_supervisor_clock,
+            )
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+
+    def heartbeat_runtime_supervisor_lease(
+        self,
+        lease: RuntimeSupervisorLease,
+        *,
+        lease_seconds: int,
+    ) -> RuntimeSupervisorLease:
+        """Extend only the exact current, unexpired supervisor term."""
+
+        if not isinstance(lease, RuntimeSupervisorLease):
+            raise TaskValidationError(
+                "INVALID_RUNTIME_SUPERVISOR_LEASE",
+                ["lease must be a durable runtime supervisor lease"],
+            )
+        self._validate_runtime_supervisor_lease_seconds(lease_seconds)
+        try:
+            return self._store.heartbeat_runtime_supervisor_lease(
+                lease=lease,
+                lease_seconds=lease_seconds,
+                clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+
+    def release_runtime_supervisor_lease(
+        self, lease: RuntimeSupervisorLease
+    ) -> RuntimeSupervisorLease:
+        """Close only the exact current supervisor term; never a Worker."""
+
+        if not isinstance(lease, RuntimeSupervisorLease):
+            raise TaskValidationError(
+                "INVALID_RUNTIME_SUPERVISOR_LEASE",
+                ["lease must be a durable runtime supervisor lease"],
+            )
+        try:
+            return self._store.release_runtime_supervisor_lease(
+                lease=lease,
+                clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+
     def recover_runtime_on_startup(
         self,
         project_id: str,
@@ -2151,6 +2254,7 @@ class TaskService:
         principal_id: str,
         expected_status: str,
         event: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease | None = None,
     ) -> TaskSnapshot:
         """Persist a validated post-queue event with its state transition.
 
@@ -2182,6 +2286,12 @@ class TaskService:
         current = self.get_task(
             task_id, project_id=project_id, principal_id=principal_id
         )
+        if supervisor_lease is not None and (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
         if current.status in {"Draft", "NeedsInput", "AwaitingApproval"}:
             raise TaskConflict("runtime events cannot be recorded before validated submission")
         if current.status != expected_status:
@@ -2220,8 +2330,16 @@ class TaskService:
                 task_id=task_id,
                 expected_status=expected_status,
                 event=event,
-                now=self._clock(),
+                now=None if supervisor_lease is not None else self._clock(),
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=(
+                    self._runtime_supervisor_clock
+                    if supervisor_lease is not None
+                    else None
+                ),
             )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
 
@@ -2333,13 +2451,24 @@ class TaskService:
         return event
 
     def refresh_runtime_status(
-        self, task_id: str, *, project_id: str, principal_id: str
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease | None = None,
     ) -> TaskRuntimeResult:
         """Observe one trusted Adapter receipt and advance SQLite monotonically."""
 
         snapshot = self.get_task(
             task_id, project_id=project_id, principal_id=principal_id
         )
+        if supervisor_lease is not None and (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
         intent = self._store.get_dispatch_intent(task_id)
         if intent is None:
             if snapshot.status in {
@@ -2468,6 +2597,7 @@ class TaskService:
                     principal_id=principal_id,
                     expected_status=snapshot.status,
                     event=event,
+                    supervisor_lease=supervisor_lease,
                 )
             except TaskConflict:
                 # Another status poll may have committed the same monotonic

@@ -15,6 +15,7 @@ import sqlite3
 import stat
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -90,6 +91,10 @@ class TaskStoreCorruption(TaskStoreError):
 
 class TaskStoreUnavailable(TaskStoreError):
     """The durable store could not acquire its bounded SQLite lock."""
+
+
+class RuntimeSupervisorLeaseLost(TaskStoreConflict):
+    """A supervisor write no longer owns the exact active fenced lease."""
 
 
 @dataclass(frozen=True)
@@ -223,6 +228,28 @@ class TaskPurgeRecord:
     purge_id: str
     outcome: dict[str, Any] | None
     replayed: bool
+
+
+@dataclass(frozen=True)
+class RuntimeSupervisorLease:
+    """Current durable control-plane supervisor term for one exact scope."""
+
+    project_id: str
+    principal_id: str
+    fencing_token: int
+    owner_id: str
+    state: str
+    acquired_at: str
+    heartbeat_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class RuntimeSupervisorLeaseAcquisition:
+    """Atomic result showing whether this exact owner acquired or replayed."""
+
+    lease: RuntimeSupervisorLease
+    acquired: bool
 
 
 @dataclass(frozen=True)
@@ -494,13 +521,48 @@ class TaskStore(Protocol):
     ) -> tuple[TaskSnapshot, bool]:
         ...
 
+    def acquire_runtime_supervisor_lease(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        owner_id: str,
+        lease_seconds: int,
+        clock: Callable[[], str],
+    ) -> RuntimeSupervisorLeaseAcquisition:
+        ...
+
+    def heartbeat_runtime_supervisor_lease(
+        self,
+        *,
+        lease: RuntimeSupervisorLease,
+        lease_seconds: int,
+        clock: Callable[[], str],
+    ) -> RuntimeSupervisorLease:
+        ...
+
+    def release_runtime_supervisor_lease(
+        self,
+        *,
+        lease: RuntimeSupervisorLease,
+        clock: Callable[[], str],
+    ) -> RuntimeSupervisorLease:
+        ...
+
+    def get_runtime_supervisor_lease(
+        self, *, project_id: str, principal_id: str
+    ) -> RuntimeSupervisorLease | None:
+        ...
+
     def commit_runtime_transition(
         self,
         *,
         task_id: str,
         expected_status: str,
         event: Mapping[str, Any],
-        now: str,
+        now: str | None,
+        supervisor_lease: RuntimeSupervisorLease | None = None,
+        supervisor_clock: Callable[[], str] | None = None,
     ) -> TaskSnapshot:
         ...
 
@@ -532,6 +594,54 @@ def encode_document(value: Mapping[str, Any]) -> tuple[str, str]:
         raise TaskStoreConflict(f"document is not finite JSON: {error}") from error
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return text, f"sha256:{digest}"
+
+
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _runtime_timestamp(value: str) -> tuple[str, int]:
+    """Normalize a trusted RFC3339 instant and return integer microseconds."""
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as error:
+        raise TaskStoreConflict("runtime supervisor timestamp is invalid") from error
+    if parsed.tzinfo is None:
+        raise TaskStoreConflict("runtime supervisor timestamp is invalid")
+    parsed = parsed.astimezone(timezone.utc)
+    delta = parsed - _UNIX_EPOCH
+    microseconds = (
+        delta.days * 86_400_000_000
+        + delta.seconds * 1_000_000
+        + delta.microseconds
+    )
+    if microseconds < 0:
+        raise TaskStoreConflict("runtime supervisor timestamp is invalid")
+    canonical = parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return canonical, microseconds
+
+
+def _runtime_lease_window(
+    clock: Callable[[], str], lease_seconds: int
+) -> tuple[str, int, str, int]:
+    """Sample a lease clock only after the caller owns its write transaction."""
+
+    if type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600:
+        raise TaskStoreConflict("runtime supervisor lease window is invalid")
+    if not callable(clock):
+        raise TaskStoreConflict("runtime supervisor clock is invalid")
+    now, now_us = _runtime_timestamp(clock())
+    try:
+        expires = (
+            _UNIX_EPOCH
+            + timedelta(microseconds=now_us)
+            + timedelta(seconds=lease_seconds)
+        )
+    except OverflowError as error:
+        raise TaskStoreConflict("runtime supervisor lease window is invalid") from error
+    expires_at = expires.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    expires_at_us = now_us + lease_seconds * 1_000_000
+    return now, now_us, expires_at, expires_at_us
 
 
 def _request_hash_set(values: str | Sequence[str]) -> frozenset[str]:
@@ -4729,13 +4839,516 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    @staticmethod
+    def _load_runtime_supervisor_lease(
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        principal_id: str,
+    ) -> RuntimeSupervisorLease | None:
+        row = connection.execute(
+            """
+            SELECT lease.*,
+                   term.initial_expires_at,
+                   term.initial_expires_at_us,
+                   closure.reason AS closure_reason,
+                   closure.final_heartbeat_at,
+                   closure.final_heartbeat_at_us,
+                   closure.final_expires_at,
+                   closure.final_expires_at_us,
+                   closure.closed_at,
+                   closure.closed_at_us
+            FROM runtime_supervisor_leases AS lease
+            JOIN runtime_supervisor_terms AS term
+              ON term.project_id = lease.project_id
+             AND term.principal_id = lease.principal_id
+             AND term.fencing_token = lease.fencing_token
+             AND term.owner_id = lease.owner_id
+             AND term.acquired_at = lease.acquired_at
+             AND term.acquired_at_us = lease.acquired_at_us
+            LEFT JOIN runtime_supervisor_term_closures AS closure
+              ON closure.project_id = lease.project_id
+             AND closure.principal_id = lease.principal_id
+             AND closure.fencing_token = lease.fencing_token
+            WHERE lease.project_id = ? AND lease.principal_id = ?
+            """,
+            (project_id, principal_id),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            fencing_token = row["fencing_token"]
+            if type(fencing_token) is not int or fencing_token < 1:
+                raise ValueError("invalid fencing token")
+            for name in ("project_id", "principal_id", "owner_id"):
+                if not isinstance(row[name], str) or not row[name]:
+                    raise ValueError(f"invalid {name}")
+            normalized: dict[str, tuple[str, int]] = {}
+            for name in (
+                "acquired_at",
+                "heartbeat_at",
+                "expires_at",
+                "initial_expires_at",
+            ):
+                canonical, microseconds = _runtime_timestamp(row[name])
+                if canonical != row[name] or microseconds != row[f"{name}_us"]:
+                    raise ValueError(f"inconsistent {name}")
+                normalized[name] = canonical, microseconds
+            acquired_us = normalized["acquired_at"][1]
+            heartbeat_us = normalized["heartbeat_at"][1]
+            expires_us = normalized["expires_at"][1]
+            initial_expires_us = normalized["initial_expires_at"][1]
+            if (
+                heartbeat_us < acquired_us
+                or initial_expires_us <= acquired_us
+                or expires_us <= heartbeat_us
+                or expires_us < initial_expires_us
+            ):
+                raise ValueError("lease time order is invalid")
+            state = "active"
+            if row["closure_reason"] is not None:
+                if row["closure_reason"] != "released":
+                    raise ValueError("current term has an invalid closure")
+                for name, expected in (
+                    ("final_heartbeat_at", normalized["heartbeat_at"]),
+                    ("final_expires_at", normalized["expires_at"]),
+                    ("closed_at", None),
+                ):
+                    canonical, microseconds = _runtime_timestamp(row[name])
+                    if canonical != row[name] or microseconds != row[f"{name}_us"]:
+                        raise ValueError(f"inconsistent {name}")
+                    if expected is not None and (canonical, microseconds) != expected:
+                        raise ValueError(f"closure differs at {name}")
+                if row["closed_at_us"] < heartbeat_us:
+                    raise ValueError("closure precedes the heartbeat")
+                state = "released"
+        except (TaskStoreConflict, TypeError, ValueError) as error:
+            raise TaskStoreCorruption(
+                "runtime supervisor lease is inconsistent"
+            ) from error
+        return RuntimeSupervisorLease(
+            project_id=row["project_id"],
+            principal_id=row["principal_id"],
+            fencing_token=fencing_token,
+            owner_id=row["owner_id"],
+            state=state,
+            acquired_at=normalized["acquired_at"][0],
+            heartbeat_at=normalized["heartbeat_at"][0],
+            expires_at=normalized["expires_at"][0],
+        )
+
+    @staticmethod
+    def _runtime_supervisor_identity_matches(
+        current: RuntimeSupervisorLease, supplied: RuntimeSupervisorLease
+    ) -> bool:
+        return (
+            isinstance(supplied, RuntimeSupervisorLease)
+            and supplied.project_id == current.project_id
+            and supplied.principal_id == current.principal_id
+            and supplied.fencing_token == current.fencing_token
+            and supplied.owner_id == current.owner_id
+            and supplied.acquired_at == current.acquired_at
+        )
+
+    @staticmethod
+    def _insert_runtime_supervisor_term(
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        principal_id: str,
+        fencing_token: int,
+        owner_id: str,
+        now: str,
+        now_us: int,
+        expires_at: str,
+        expires_at_us: int,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO runtime_supervisor_terms(
+                project_id, principal_id, fencing_token, owner_id,
+                acquired_at, acquired_at_us,
+                initial_expires_at, initial_expires_at_us
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id, principal_id, fencing_token, owner_id,
+                now, now_us, expires_at, expires_at_us,
+            ),
+        )
+
+    @staticmethod
+    def _close_runtime_supervisor_term(
+        connection: sqlite3.Connection,
+        *,
+        lease: RuntimeSupervisorLease,
+        reason: str,
+        closed_at: str,
+        closed_at_us: int,
+    ) -> None:
+        _, heartbeat_at_us = _runtime_timestamp(lease.heartbeat_at)
+        _, expires_at_us = _runtime_timestamp(lease.expires_at)
+        connection.execute(
+            """
+            INSERT INTO runtime_supervisor_term_closures(
+                project_id, principal_id, fencing_token, reason,
+                final_heartbeat_at, final_heartbeat_at_us,
+                final_expires_at, final_expires_at_us,
+                closed_at, closed_at_us
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                lease.project_id, lease.principal_id, lease.fencing_token,
+                reason, lease.heartbeat_at, heartbeat_at_us,
+                lease.expires_at, expires_at_us, closed_at, closed_at_us,
+            ),
+        )
+
+    def get_runtime_supervisor_lease(
+        self, *, project_id: str, principal_id: str
+    ) -> RuntimeSupervisorLease | None:
+        connection = self._connect()
+        try:
+            return self._load_runtime_supervisor_lease(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+            )
+        finally:
+            connection.close()
+
+    def acquire_runtime_supervisor_lease(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        owner_id: str,
+        lease_seconds: int,
+        clock: Callable[[], str],
+    ) -> RuntimeSupervisorLeaseAcquisition:
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600:
+            raise TaskStoreConflict("runtime supervisor lease window is invalid")
+        if not callable(clock):
+            raise TaskStoreConflict("runtime supervisor clock is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            now, now_us, expires_at, expires_at_us = _runtime_lease_window(
+                clock, lease_seconds
+            )
+            current = self._load_runtime_supervisor_lease(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+            )
+            if current is None:
+                fencing_token = 1
+                self._insert_runtime_supervisor_term(
+                    connection,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    fencing_token=fencing_token,
+                    owner_id=owner_id,
+                    now=now,
+                    now_us=now_us,
+                    expires_at=expires_at,
+                    expires_at_us=expires_at_us,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO runtime_supervisor_leases(
+                        project_id, principal_id, fencing_token, owner_id,
+                        acquired_at, acquired_at_us,
+                        heartbeat_at, heartbeat_at_us,
+                        expires_at, expires_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_id, principal_id, fencing_token, owner_id,
+                        now, now_us, now, now_us, expires_at, expires_at_us,
+                    ),
+                )
+            else:
+                _, heartbeat_at_us = _runtime_timestamp(current.heartbeat_at)
+                _, current_expires_at_us = _runtime_timestamp(current.expires_at)
+                if current.state == "active" and now_us < current_expires_at_us:
+                    if current.owner_id == owner_id and now_us < heartbeat_at_us:
+                        raise TaskStoreConflict(
+                            "runtime supervisor acquisition clock regressed"
+                        )
+                    connection.commit()
+                    return RuntimeSupervisorLeaseAcquisition(
+                        lease=current,
+                        acquired=current.owner_id == owner_id,
+                    )
+                temporal_floor_us = heartbeat_at_us
+                if current.state == "released":
+                    closure = connection.execute(
+                        """
+                        SELECT closed_at_us
+                        FROM runtime_supervisor_term_closures
+                        WHERE project_id = ? AND principal_id = ?
+                          AND fencing_token = ? AND reason = 'released'
+                        """,
+                        (
+                            current.project_id,
+                            current.principal_id,
+                            current.fencing_token,
+                        ),
+                    ).fetchone()
+                    if closure is None:
+                        raise TaskStoreCorruption(
+                            "released runtime supervisor term has no closure"
+                        )
+                    temporal_floor_us = int(closure["closed_at_us"])
+                if now_us < temporal_floor_us:
+                    raise TaskStoreConflict(
+                        "runtime supervisor acquisition clock regressed"
+                    )
+                if current.fencing_token >= 9_223_372_036_854_775_807:
+                    raise TaskStoreCorruption(
+                        "runtime supervisor fencing token is exhausted"
+                    )
+                if current.state == "active":
+                    self._close_runtime_supervisor_term(
+                        connection,
+                        lease=current,
+                        reason="expired_takeover",
+                        closed_at=now,
+                        closed_at_us=now_us,
+                    )
+                fencing_token = current.fencing_token + 1
+                self._insert_runtime_supervisor_term(
+                    connection,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    fencing_token=fencing_token,
+                    owner_id=owner_id,
+                    now=now,
+                    now_us=now_us,
+                    expires_at=expires_at,
+                    expires_at_us=expires_at_us,
+                )
+                connection.execute(
+                    """
+                    UPDATE runtime_supervisor_leases
+                    SET fencing_token = ?, owner_id = ?,
+                        acquired_at = ?, acquired_at_us = ?,
+                        heartbeat_at = ?, heartbeat_at_us = ?,
+                        expires_at = ?, expires_at_us = ?
+                    WHERE project_id = ? AND principal_id = ?
+                    """,
+                    (
+                        fencing_token, owner_id, now, now_us,
+                        now, now_us, expires_at, expires_at_us,
+                        project_id, principal_id,
+                    ),
+                )
+            stored = self._load_runtime_supervisor_lease(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+            )
+            if stored is None or stored.state != "active" or stored.owner_id != owner_id:
+                raise TaskStoreCorruption(
+                    "acquired runtime supervisor lease cannot be read"
+                )
+            connection.commit()
+            return RuntimeSupervisorLeaseAcquisition(lease=stored, acquired=True)
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "runtime supervisor acquisition conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def heartbeat_runtime_supervisor_lease(
+        self,
+        *,
+        lease: RuntimeSupervisorLease,
+        lease_seconds: int,
+        clock: Callable[[], str],
+    ) -> RuntimeSupervisorLease:
+        if not isinstance(lease, RuntimeSupervisorLease):
+            raise TaskStoreConflict("runtime supervisor lease is invalid")
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600:
+            raise TaskStoreConflict("runtime supervisor lease window is invalid")
+        if not callable(clock):
+            raise TaskStoreConflict("runtime supervisor clock is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            now, now_us, expires_at, expires_at_us = _runtime_lease_window(
+                clock, lease_seconds
+            )
+            current = self._load_runtime_supervisor_lease(
+                connection,
+                project_id=lease.project_id,
+                principal_id=lease.principal_id,
+            )
+            if (
+                current is None
+                or current.state != "active"
+                or not self._runtime_supervisor_identity_matches(current, lease)
+            ):
+                raise RuntimeSupervisorLeaseLost(
+                    "runtime supervisor lease is no longer current"
+                )
+            _, heartbeat_at_us = _runtime_timestamp(current.heartbeat_at)
+            _, current_expires_at_us = _runtime_timestamp(current.expires_at)
+            if now_us < heartbeat_at_us or now_us >= current_expires_at_us:
+                raise RuntimeSupervisorLeaseLost(
+                    "runtime supervisor lease expired or clock regressed"
+                )
+            if expires_at_us < current_expires_at_us:
+                raise TaskStoreConflict(
+                    "runtime supervisor expiry cannot regress"
+                )
+            connection.execute(
+                """
+                UPDATE runtime_supervisor_leases
+                SET heartbeat_at = ?, heartbeat_at_us = ?,
+                    expires_at = ?, expires_at_us = ?
+                WHERE project_id = ? AND principal_id = ?
+                  AND fencing_token = ? AND owner_id = ?
+                """,
+                (
+                    now, now_us, expires_at, expires_at_us,
+                    current.project_id, current.principal_id,
+                    current.fencing_token, current.owner_id,
+                ),
+            )
+            stored = self._load_runtime_supervisor_lease(
+                connection,
+                project_id=current.project_id,
+                principal_id=current.principal_id,
+            )
+            if (
+                stored is None
+                or stored.state != "active"
+                or not self._runtime_supervisor_identity_matches(stored, current)
+            ):
+                raise TaskStoreCorruption(
+                    "runtime supervisor heartbeat cannot be read"
+                )
+            connection.commit()
+            return stored
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise RuntimeSupervisorLeaseLost(
+                "runtime supervisor heartbeat conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def release_runtime_supervisor_lease(
+        self,
+        *,
+        lease: RuntimeSupervisorLease,
+        clock: Callable[[], str],
+    ) -> RuntimeSupervisorLease:
+        if not isinstance(lease, RuntimeSupervisorLease):
+            raise TaskStoreConflict("runtime supervisor lease is invalid")
+        if not callable(clock):
+            raise TaskStoreConflict("runtime supervisor clock is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            now, now_us = _runtime_timestamp(clock())
+            current = self._load_runtime_supervisor_lease(
+                connection,
+                project_id=lease.project_id,
+                principal_id=lease.principal_id,
+            )
+            if current is None or not self._runtime_supervisor_identity_matches(
+                current, lease
+            ):
+                raise RuntimeSupervisorLeaseLost(
+                    "runtime supervisor lease is no longer current"
+                )
+            if current.state == "released":
+                connection.commit()
+                return current
+            _, heartbeat_at_us = _runtime_timestamp(current.heartbeat_at)
+            if now_us < heartbeat_at_us:
+                raise RuntimeSupervisorLeaseLost(
+                    "runtime supervisor release clock regressed"
+                )
+            self._close_runtime_supervisor_term(
+                connection,
+                lease=current,
+                reason="released",
+                closed_at=now,
+                closed_at_us=now_us,
+            )
+            stored = self._load_runtime_supervisor_lease(
+                connection,
+                project_id=current.project_id,
+                principal_id=current.principal_id,
+            )
+            if stored is None or stored.state != "released":
+                raise TaskStoreCorruption(
+                    "released runtime supervisor lease cannot be read"
+                )
+            connection.commit()
+            return stored
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise RuntimeSupervisorLeaseLost(
+                "runtime supervisor release conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def commit_runtime_transition(
         self,
         *,
         task_id: str,
         expected_status: str,
         event: Mapping[str, Any],
-        now: str,
+        now: str | None,
+        supervisor_lease: RuntimeSupervisorLease | None = None,
+        supervisor_clock: Callable[[], str] | None = None,
     ) -> TaskSnapshot:
         """Atomically update status and append an already validated RunEvent.
 
@@ -4749,14 +5362,61 @@ class SQLiteTaskStore:
         _, fingerprint_hash = encode_document(event["fingerprint"])
         node_id = event.get("node_id")
         new_status = event["task_status"]
+        supervised_recorded_at: str | None = None
+        supervised_recorded_at_us: int | None = None
+        if supervisor_lease is not None:
+            if not isinstance(supervisor_lease, RuntimeSupervisorLease):
+                raise TaskStoreConflict("runtime supervisor lease is invalid")
+            if not callable(supervisor_clock):
+                raise TaskStoreConflict("runtime supervisor clock is invalid")
+        elif supervisor_clock is not None:
+            raise TaskStoreConflict("runtime supervisor clock has no lease")
+        elif not isinstance(now, str):
+            raise TaskStoreConflict("runtime transition clock is invalid")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if supervisor_lease is not None:
+                if supervisor_clock is None:
+                    raise TaskStoreCorruption(
+                        "runtime supervisor clock is unavailable"
+                    )
+                supervised_recorded_at, supervised_recorded_at_us = (
+                    _runtime_timestamp(supervisor_clock())
+                )
+                now = supervised_recorded_at
             task = connection.execute(
-                "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
+                """
+                SELECT status, project_id, principal_id
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
             ).fetchone()
             if task is None:
                 raise TaskStoreConflict("task does not exist")
+            if supervisor_lease is not None:
+                current_lease = self._load_runtime_supervisor_lease(
+                    connection,
+                    project_id=task["project_id"],
+                    principal_id=task["principal_id"],
+                )
+                if (
+                    current_lease is None
+                    or current_lease.state != "active"
+                    or supervisor_lease.project_id != task["project_id"]
+                    or supervisor_lease.principal_id != task["principal_id"]
+                    or not self._runtime_supervisor_identity_matches(
+                        current_lease, supervisor_lease
+                    )
+                    or supervised_recorded_at_us is None
+                    or _runtime_timestamp(current_lease.heartbeat_at)[1]
+                    > supervised_recorded_at_us
+                    or _runtime_timestamp(current_lease.expires_at)[1]
+                    <= supervised_recorded_at_us
+                ):
+                    raise RuntimeSupervisorLeaseLost(
+                        "runtime transition lost its supervisor lease"
+                    )
             if task["status"] != expected_status:
                 raise TaskStoreConflict("task status precondition failed")
             if expected_status in {"Draft", "NeedsInput", "AwaitingApproval"}:
@@ -4811,6 +5471,53 @@ class SQLiteTaskStore:
                     now,
                 ),
             )
+            if supervisor_lease is not None:
+                if (
+                    supervised_recorded_at is None
+                    or supervised_recorded_at_us is None
+                ):
+                    raise TaskStoreCorruption(
+                        "supervised runtime timestamp is unavailable"
+                    )
+                heartbeat = connection.execute(
+                    """
+                    UPDATE runtime_supervisor_leases
+                    SET heartbeat_at = ?, heartbeat_at_us = ?
+                    WHERE project_id = ? AND principal_id = ?
+                      AND fencing_token = ? AND owner_id = ?
+                      AND acquired_at = ?
+                    """,
+                    (
+                        supervised_recorded_at,
+                        supervised_recorded_at_us,
+                        task["project_id"],
+                        task["principal_id"],
+                        supervisor_lease.fencing_token,
+                        supervisor_lease.owner_id,
+                        supervisor_lease.acquired_at,
+                    ),
+                )
+                if heartbeat.rowcount != 1:
+                    raise RuntimeSupervisorLeaseLost(
+                        "runtime transition lost its supervisor lease"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO supervised_run_event_commits(
+                        task_id, sequence, project_id, principal_id,
+                        fencing_token, recorded_at, recorded_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        event["sequence"],
+                        task["project_id"],
+                        task["principal_id"],
+                        supervisor_lease.fencing_token,
+                        supervised_recorded_at,
+                        supervised_recorded_at_us,
+                    ),
+                )
             connection.execute(
                 "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
                 (new_status, now, task_id),
@@ -4831,6 +5538,13 @@ class SQLiteTaskStore:
         except sqlite3.IntegrityError as error:
             if connection.in_transaction:
                 connection.rollback()
+            if (
+                supervisor_lease is not None
+                and "supervised run event requires the active term" in str(error)
+            ):
+                raise RuntimeSupervisorLeaseLost(
+                    "runtime transition lost its supervisor lease"
+                ) from error
             raise TaskStoreConflict("run event conflicts with durable state") from error
         except Exception:
             if connection.in_transaction:

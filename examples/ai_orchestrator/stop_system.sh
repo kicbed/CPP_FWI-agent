@@ -71,7 +71,7 @@ process_matches() {
 }
 
 stop_one() {
-    local name="$1" pid_file pid attempt
+    local name="$1" pid_file pid attempt max_attempts=50
     pid_file="$PID_DIR/$name.pid"
     [[ -e "$pid_file" ]] || return 0
 
@@ -99,7 +99,12 @@ stop_one() {
 
     log "停止 $name (PID $pid)"
     kill -TERM "$pid" 2>/dev/null || true
-    for ((attempt = 0; attempt < 50; ++attempt)); do
+    # Web first closes its listener, cooperatively stops the runtime supervisor,
+    # then gives request threads a bounded drain.  Allow margin for that drain,
+    # the supervisor join, and SQLite's bounded busy timeout; KILL remains the
+    # final process bound when application I/O cannot stop cooperatively.
+    [[ "$name" == web ]] && max_attempts=300
+    for ((attempt = 0; attempt < max_attempts; ++attempt)); do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
     done

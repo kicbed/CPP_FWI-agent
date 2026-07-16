@@ -6,11 +6,12 @@
 - 活跃决策：`D-003`、`D-004`、`D-006`、`D-007`、`D-008`、`D-009`；`D-005` 仍为 Proposed
 - 活跃分支：`feature/scientific-agent-runtime`
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
-- 总体状态：**P0 + P1（含 P1-008）已验证；P2-001 有界发现/重开已验证、P2-002 回收站、
-  P2-003 有界永久删除与 P2-004 有界启动 receipt 收养/状态追赶均已验证；完整 P2 Pending**
-- 当前阶段：**P2-004 有界启动 receipt 收养与一次状态追赶已验证；完整 P2 继续进行**
-- 下一动作：设计带 fencing 的 lease/heartbeat 与持续 Runtime Supervisor；随后才在新的
-  进程身份/控制收据边界上实现 cancel/timeout，retry 和 SSE 继续后置
+- 总体状态：**P0 + P1（含 P1-008）已验证；P2-001 有界发现/重开已验证，P2-002 回收站、
+  P2-003 永久删除、P2-004 启动 receipt 收养与 P2-005A 控制面 Supervisor lease/连续状态泵
+  均为有界 Verified；完整 P2 Pending**
+- 当前阶段：**P2-005A 控制面 fenced lease 与 observation-only 持续状态泵已验证；完整 P2 继续进行**
+- 下一动作：先设计可分阶段持久化的 Worker 启动协议、attempt fence、跨进程容量 lease 与独立
+  Worker heartbeat；证明不会重复启动后，才处理 pending/no-record 调度与 cancel/timeout
 - 当前阻塞：无
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
 
@@ -25,7 +26,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
 | P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 31/31；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
 | P1 最小持久垂直切片 | Verified | 既有 P1 Task Store/Registry/Adapter/atomic submit/Guided Web 全闭环及 D-006/D-007；D-008/P1-008 增加 Conversation/Task 可选引用、无级联本地对话删除和当前 Algorithm/Adapter 1.4 的 2 数值 + 6 PNG 结果画廊 | Runtime 165/165、Worker 28/28、Web 29/29、Embedding 6/6、CTest 39/39、MCP 1/1 及 UI/治理 PASS；fresh v6 CUDA 10 events、8 artifacts/6 PNG、数值更新和重启不变性 PASS | —（P1 及当前维护切片完成） |
-| P2 持久可靠性加固 | In progress（P2-001–P2-004 有界切片 Verified；完整 P2 Pending） | 既有发现/重开、回收站、永久删除之外，P2-004 只读收养 Adapter 已持久 `launched` 但 SQLite outcome 丢失的 receipt，并做一次状态追赶 | TaskService 80/80、Adapter 27/27、Runtime 201/201、Worker 28/28、Web 36/36、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI 与治理检查 PASS | fenced capacity/lease/heartbeat、pending/no-record 调度、持续 supervisor、取消、超时、重试、完整 reconciliation 与 SSE |
+| P2 持久可靠性加固 | In progress（P2-001–P2-005A 有界切片 Verified；完整 P2 Pending） | 既有发现/重开、回收站、永久删除和启动 receipt 收养之外，P2-005A 增加 SQLite v8 scope-level fenced 控制面 lease，并在 Web 存活期间持续、只读观察已有 `dispatched` task 的状态 | TaskService 80/80、Adapter 27/27、Runtime 226/226、Worker 28/28、Web 45/45、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI 与治理检查 PASS | Worker attempt/capacity lease 与 heartbeat、分阶段启动、pending/no-record 调度、取消、超时、重试、完整 reconciliation 与 SSE |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
 | P5 算法 SDK | Pending | 无 | 无 | 去噪→QC→FWI 多算法流程通过 |
@@ -45,7 +46,9 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   approval budget、固定 FWI Adapter、atomic submit/one-shot dispatch 和同源 Guided Web/API 接成最小
   闭环。P2-004 只收敛“Adapter 已 durable launched、SQLite receipt outcome 丢失”这一
   dispatching 子窗口；pending、无 Adapter record 与 preparing/launching 均保持 deferred。
-  当前仍无 DAG、运行中取消、fenced capacity、lease/retry/SSE 或持续后台监督。
+  P2-005A 只增加控制面 scope lease 和已有 dispatched task 的持续状态观察；它不是 Worker
+  capacity/attempt lease 或 heartbeat。当前仍无 DAG、运行中取消、fenced Worker capacity、
+  retry/SSE 或安全的后台首次派发。
 - D-006/P1-006 已把固定 FWI 的显式整数上限扩展为 10000；该 checkpoint 使用
   Algorithm/Adapter `1.1.0`。D-007 的 `1.2.0` 是不可变六参数历史快照，`1.3.0` 是已验证
   checkpoint；D-008 当前新提交使用 `1.4.0`，旧 `1.0.0`–`1.3.0` manifest、persisted Plan
@@ -65,6 +68,13 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   `reconciliation_required` 不重试。dispatched task 只追赶一次 status/RunEvent；事件历史跨过
   1000 条仍分页读取；单任务 status 脱敏错误/CAS 冲突不阻断其他任务，receipt 分歧仍硬失败。
   随后才 activate、发布 API 和 serve。
+- P2-005A 已验证：SQLite v8 为 `(project_id, principal_id)` 保存单一当前控制面 lease、连续递增
+  fencing token、append-only term/closure 和受 term 约束的 supervisor RunEvent commit。租约时间
+  在取得 SQLite 写事务后采样；过期接管、ABA、时钟回退、heartbeat/release 与写入围栏均
+  fail closed。Workbench 在 recovery 后、listen/publish 前取得 lease 并启动非 daemon
+  Runtime Supervisor；它只扫描 active 视图，只为 intent outcome 精确为 `dispatched` 的
+  Queued/Running task 调用现有 status bridge。pending/dispatching/reconciliation/missing 均
+  deferred，绝不调用 launcher。lease 丢失会自我隔离且不修改 Worker 状态或容量。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
 - 2026-07-15 用户的风险评估已收紧顺序：最小 FWI Schema 先行，最小 SQLite TaskService
   提前到首个垂直切片，Redis 不作为任务事实源，P4 Agent Planner 后置。
@@ -77,12 +87,14 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   认证，只在 loopback 绑定时启用，不是容器/远程多用户部署方案；
 - P1.1c 已实现后端 submit 幂等、预算消费、durable intent 与 Queued；P2-004 只在启动时收养
   已有 exact launched receipt，不 claim pending，也不首次派发 dispatching/no-record。既有
-  immutable `reconciliation_required` outcome、退款、持续监督、重试和通用进程恢复仍未解决；
+  immutable `reconciliation_required` outcome、退款、重试和通用进程恢复仍未解决；
 - Deepwave Adapter 只覆盖固定 `acoustic_fwi_2d` 单节点，尚未成为通用 Algorithm SDK；旧
   forward 因输出语义不匹配而未接入标准 Adapter；
-- P2-001 仍只有任务列表发现和由用户点击重开；P2-004 的启动 pass 之后没有带 lease 的后台
-  status pump，因此浏览器关闭后的新进度要到下一次启动或现有 GET 才进入 SQLite。取消、
-  lease/heartbeat/retry、完整 reconciliation/SSE、P3 DAG 和 P4 Agent Planner 仍未实现。
+- P2-005A 已让 Web 进程在 scope-level fenced 控制面 lease 下持续把已有 dispatched task 的新
+  状态写入 SQLite，不依赖浏览器 GET；现有 startup recovery 和浏览器单任务 GET 仍是无该 lease
+  的精确 CAS 路径，因此不能声称所有状态写入由唯一 supervisor 独占。Worker capacity/attempt
+  lease、Worker heartbeat、分阶段启动、pending/no-record 调度、取消、超时、retry、完整
+  reconciliation/SSE、P3 DAG 和 P4 Agent Planner 仍未实现。
 - P2-002 的普通“删除”仍只是可恢复 visibility Trash/Restore；D-009/P2-003 另提供强确认的
   本地 Worker 目录/result purge，但不硬删 Draft、Plan、Approval、RunEvent、幂等记录或
   SQLite 审计历史，也不清除备份/外部副本。服务器 transcript 永久删除仍未实现。
@@ -396,15 +408,48 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
   malformed/divergent receipt、重复/并发启动、51 task 跨页、scope/limit、1000+ events、status
   错误继续、终态追赶、bind 顺序/忙端口/失败清理与脱敏 summary。没有运行真实 FWI/CUDA。
 
+### P2-005A 控制面 fenced lease 与持续状态泵（2026-07-16）
+
+- SQLite v8 增加 scope-level `runtime_supervisor_terms`、当前 lease projection、append-only
+  term closure 和 supervised RunEvent commit audit。`BEGIN IMMEDIATE` 内采样数据库操作时间，
+  同 owner replay、外部持有者、精确到期接管、释放后新 term、时钟回退与 ABA 均使用
+  `(project_id, principal_id, fencing_token, owner_id)` fail closed；fencing token 只能连续递增。
+- Supervisor status commit 在一个事务内确认当前 term 尚未关闭且写入时间位于 heartbeat/expiry
+  窗口，非延长地推进活动水位，再原子写 RunEvent、task projection 和监督审计。旧 term、过期
+  term 或接管后的迟到写入统一拒绝。startup recovery、浏览器 GET 等既有无租约路径继续走
+  单调 CAS，故本切片不把控制面 lease 误报为所有状态写入的全局独占锁。
+- `RuntimeSupervisor` 构造无副作用；`start()` 取得 scope lease 后，由一个非 daemon 线程先完成
+  heartbeat/ready，再进入循环。每轮先对 active task 做有界全分页预扫描，超过 10000 在任何 status
+  observation 前拒绝；只为 Queued/Running 且 durable dispatch outcome 精确为 `dispatched` 的
+  task 调用现有 status bridge。pending、dispatching、`reconciliation_required` 与 missing
+  deferred，终态直接跳过、不观察；模块没有 dispatch/launcher 接口，不扫描 `FWI_RUN_ROOT`，
+  也不猜 Worker PID。
+  稳定的单任务 status 错误相互隔离；Task Store/未知错误或 lease loss 使循环自我隔离。
+- Web 生命周期为 bind → startup recovery → supervisor acquire/ready → listen → publish → serve。
+  另一进程持有同 scope lease 时在监听/发布前失败。关闭先钝化 SIGINT/SIGTERM 并关闭 listener，
+  再 cooperative stop/release supervisor、定界等待已有 Handler、最后取消 API 发布和恢复信号。
+  任意底层 I/O 仍可能超过进程内 join；Handler/Supervisor 均非 daemon，外层 `stop_system.sh`
+  给予 Web 30 秒后才 KILL，lease expiry 是崩溃后的接管边界，不能描述为无条件优雅退出。
+- session capability 明示 `continuous_status_supervision=true` 与 `supervisor_leases=true`；既有
+  `startup_dispatch_recovery=false`、`automatic_reconciliation=false` 等能力保持不变。这两个
+  true 仅表示 Web 控制面的 observation-only 状态泵及其写入 fence，不表示 Worker
+  capacity/attempt lease、Worker heartbeat、首次派发或自动 reconciliation。
+- 本项为 **Verified**：TaskService 80/80、Adapter 27/27、Scientific Runtime 226/226、Worker
+  28/28、Web 45/45、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI 与治理检查 PASS。新增专项
+  覆盖 SQLite v8 migration/trigger、并发 acquire、精确 expiry、时钟回退/事务等待、stale ABA、
+  supervised commit 原子围栏、Supervisor empty/多页/error/self-fence、Web 启停/信号/零请求与
+  bounded drain。按切片范围未运行真实 FWI/CUDA，也未启动或重新启动任何 Worker。
+
 ### 完整 P2 仍 Pending
 
 P1 的既有必需交付与退出测试仍为 Verified。用户后续明确授权的 P2-001 任务发现/重开与
 P2-002 可恢复任务回收站、P2-003 本地结果永久删除和本次 P2-004 有界 receipt 收养/状态追赶
-均已 Verified。P2-004 只关闭“Adapter 已 durable launched、SQLite outcome 丢失”的一个
-dispatching 子窗口；pending/no-record/preparing/launching 仍 deferred。它没有 fenced capacity、
-lease/heartbeat、持续 supervisor、`reconciliation_required` resolution、cancel、timeout、task
-retry 或 SSE。服务器 transcript 永久删除、SQLite 审计历史硬删除和备份/外部副本清理仍
-Pending。D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
+以及 P2-005A 控制面 Supervisor 均已 Verified。P2-004 只关闭“Adapter 已 durable launched、
+SQLite outcome 丢失”的一个 dispatching 子窗口；P2-005A 只持续观察已有 dispatched task，
+pending/no-record/preparing/launching 仍 deferred。它没有 Worker fenced capacity/attempt lease、
+Worker heartbeat、分阶段启动、`reconciliation_required` resolution、cancel、timeout、task retry
+或 SSE。服务器 transcript 永久删除、SQLite 审计历史硬删除和备份/外部副本清理仍 Pending。
+D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 
 ## 新会话恢复协议
 
@@ -445,6 +490,7 @@ Pending。D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 | 2026-07-16 | P2-004 | Pending → In progress；完整 P2 仍 Pending | 初始探索启动时处理既有 pending/dispatching 并追赶一次状态，不扫描 run root | 修改前 Runtime 180/180 现场复验 PASS；真实 Adapter 终审发现 process-local capacity 与 bind-before-side-effect 风险 | 禁止 startup 首次派发；收紧为只读 launched receipt 收养，并把 bind 提到 recovery 前 |
 | 2026-07-16 | P2-004 | In progress（安全范围收紧） | pending/no-record 全部 deferred；只 lookup current 1.4 exact launched record；bind→recovery→activate→publish→serve | 三项以上 pending 零派发、真实 Adapter replacement launcher 零调用、忙端口零 recovery、不同 receipt 硬失败 | 完成全量回归并更新准确计数 |
 | 2026-07-16 | P2-004 | In progress → Verified；完整 P2 仍 Pending | scope/limit pre-scan、只读 launched receipt 收养、共享严格 receipt、相同 handle 并发收敛、1000+ event 分页与一次 status 追赶、安全 server 编排/脱敏 summary | TaskService 80/80、Adapter 27/27、Runtime 201/201、Worker 28/28、Web 36/36、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；未运行真实 FWI/CUDA | 下一步先做 fenced capacity/lease/heartbeat 与持续 supervisor；随后才处理 pending/no-record、cancel/timeout；retry/完整 reconciliation/SSE 仍 Pending |
+| 2026-07-16 | P2-005A | Pending → Implemented → Verified；完整 P2 仍 Pending | SQLite v8 scope-level fenced 控制面 lease/term/closure/supervised commit audit；observation-only Runtime Supervisor；bind→recovery→lease/ready→listen/publish；cooperative stop 与硬退出边界 | Runtime 226/226、Worker 28/28、Web 45/45、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；并发/expiry/ABA/事务内时钟/迟到写、self-fence、信号/零请求/drain 覆盖；未运行真实 FWI/CUDA | 下一步设计 staged Worker launch、attempt fence、跨进程 capacity lease 与独立 heartbeat；pending/no-record、cancel/timeout/retry/reconciliation/SSE 仍 Pending |
 
 记录规则：
 

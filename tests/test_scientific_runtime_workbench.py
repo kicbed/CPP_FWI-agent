@@ -258,6 +258,10 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertFalse(capabilities["features"]["startup_dispatch_recovery"])
         self.assertTrue(capabilities["features"]["startup_receipt_recovery"])
         self.assertTrue(capabilities["features"]["startup_status_catchup"])
+        self.assertTrue(
+            capabilities["features"]["continuous_status_supervision"]
+        )
+        self.assertTrue(capabilities["features"]["supervisor_leases"])
         self.assertEqual(
             capabilities["form"]["iterations"], {"minimum": 1, "maximum": 10000}
         )
@@ -298,6 +302,8 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                 "startup_dispatch_recovery": False,
                 "startup_receipt_recovery": True,
                 "startup_status_catchup": True,
+                "continuous_status_supervision": True,
+                "supervisor_leases": True,
                 "automatic_reconciliation": False,
                 "dag": False,
             },

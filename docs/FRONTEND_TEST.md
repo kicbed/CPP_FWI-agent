@@ -2,7 +2,8 @@
 
 本文给第一次运行项目的使用者一条可执行的验收路径：配置本地 secret、核对固定模型、一键启动，
 优先走完 P1 Guided 的确认/修改/批准/状态/八项结果闭环，验证对话与任务独立、任务回收站和
-有界永久删除、六张标准图片，再可选检查旧 MCP/FWI Result 兼容性，最后一键关闭。
+有界永久删除、六张标准图片及 P2-005A 无浏览器依赖的持续状态追赶，再可选检查旧 MCP/FWI
+Result 兼容性，最后一键关闭。
 
 只在受信任的本机或受控容器中执行。当前 Web 没有用户认证，不要把 8080 或 5000 端口暴露到公网；不要在终端、截图、聊天、Issue 或日志粘贴内容中输出 API Key。
 
@@ -149,7 +150,9 @@ curl --fail --silent http://127.0.0.1:50052/health
 
 预期出现 Guided FWI 表单，而不是旧 `fwi_job_submitted` 结果或一段示例代码。表单应显示：
 
-- session scope 与 P1 capability；
+- session scope 与 capability；其中 `continuous_status_supervision=true`、
+  `supervisor_leases=true` 只表示 Web 控制面的 observation-only 状态泵，
+  `startup_dispatch_recovery=false`、`automatic_reconciliation=false` 仍应为 false；
 - 固定 `marmousi_94_288@1.0.0` 数据和当前 `deepwave.acoustic_fwi@1.4.0` 算法；
 - 只有实验目标、注册数据、preset、device、iterations、seed、optimizer 和 learning rate
   等受控字段，没有服务器
@@ -229,6 +232,11 @@ retry 或完成时间保证。
    task-scoped 受控 endpoint，不使用 `/fwi-artifacts/<job_id>/...` 路径，也不显示 Worker job ID；
 5. 单张图片加载失败时只在该卡显示错误，其余结果仍可查看；关闭或切换任务后 Blob URL 被释放。
 
+P2-005A 启用后，页面 GET 不再是运行中 task 状态进入 SQLite 的唯一触发源。可关闭任务卡或
+停止页面轮询，等待超过一个 Supervisor poll 周期后再重开：已有 `dispatched` task 的新状态仍应
+已写入 SQLite。这个检查不得创建 pending/no-record task 来期待后台首次派发；Supervisor 没有
+launcher/dispatch 能力。
+
 如 approval 已持久化但 submit 预检失败，页面应停止自动轮询，显示
 **继续已批准提交（复用原 Idempotency-Key）**。这是由用户显式重放同一 approve/submit
 mutation，不是 P2 task retry。approve 即使返回结构化 4xx，只要没有合法成功 projection，
@@ -252,8 +260,10 @@ SQLite 发现 task，而不是从聊天记录或 `localStorage` 猜测。
 事件和 artifact 仍可查询。P2-004 还会在 socket bind 成功但 API 可用前，只读收养 Adapter
 已 durable `launched` 但 SQLite outcome 丢失的 current 1.4 exact receipt，并对 dispatched task
 做一次状态追赶；pending/no-record/preparing/launching 不首次派发，已有
-`reconciliation_required` 仍只读 fail closed。这不代表 fenced capacity、持续 supervisor、
-cancel、retry、lease/heartbeat、完整 reconciliation 或 SSE 已实现。
+`reconciliation_required` 仍只读 fail closed。P2-005A 会在 recovery 后、listen/publish 前取得
+scope-level fenced 控制面 lease；另一存活 Web owner 已持有该 scope 时，新 Web 应在提供 API 前
+失败。lease 只围栏后台 status commit，不是 Worker fenced capacity/attempt lease 或 heartbeat，
+也不代表 cancel、retry、pending 调度、完整 reconciliation 或 SSE 已实现。
 
 ### 5.7 验证对话、任务引用与删除边界
 
@@ -298,9 +308,10 @@ python3 -m unittest discover -s web/tests -p 'test_*.py' -v
 node web/tests/ui_message_rendering_test.js
 ```
 
-当前预期为 Web Python 36/36 PASS，UI Node 输出
+当前预期为 Web Python 45/45 PASS，UI Node 输出
 `ui message rendering tests passed`。这组测试同时证明执行型文本先进入 Guided、纯理论文本仍
-走聊天、旧结果不会把无合法回执的说明或代码误标成已提交，并覆盖旧 artifact 路径/后缀边界。
+走聊天、旧结果不会把无合法回执的说明或代码误标成已提交，并覆盖旧 artifact 路径/后缀边界，
+以及 Web 的 lease-before-listen、Supervisor 自我隔离、信号清理、零请求关闭和 bounded drain。
 如要人工查看旧 Worker 目录、六张 PNG 或 `metrics.json`，只使用已经由兼容 MCP 或 Worker
 CLI 创建的已知 `job_id`；这不是 P1 Guided 的验收结果。当前 Guided 页面通过任务作用域
 ArtifactManifest 展示标准 NPY/CSV 和六张 PNG，不复用 legacy URL。
@@ -421,5 +432,10 @@ else
   printf 'Web 已停止\n'
 fi
 ```
+
+Web 停止流程先关闭 listener，再 cooperative stop/release Supervisor，随后最多定界等待已有
+Handler；脚本为 Web 预留 30 秒，超时后以 KILL 作为最终边界。任意底层 I/O 阻塞时不能假设
+进程一定完成优雅 drain；异常退出后由 lease expiry 允许后继 owner 接管。KILL 不会取消或重启
+Worker，也不会释放所谓 Worker 容量，因为 P2-005A 尚未实现这类 Worker lease。
 
 运行结果保留在 `/root/fwi-runs`，不会因停止服务而删除。清理结果前先确认 job 不再需要；不要删除或覆盖 `/root/fwi-data/models` 中的原始模型。

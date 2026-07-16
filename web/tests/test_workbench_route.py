@@ -272,13 +272,14 @@ class WorkbenchRouteTest(unittest.TestCase):
         application = mock.Mock()
 
         def recover_runtime_on_startup(*, max_tasks):
-            self.assertEqual(order, [("api",)])
+            self.assertEqual(order, [("api",), ("supervisor",)])
             order.append(("recover", max_tasks))
 
         application.recover_runtime_on_startup.side_effect = (
             recover_runtime_on_startup
         )
         composed_api = mock.sentinel.composed_api
+        composed_supervisor = mock.sentinel.composed_supervisor
 
         def compose_api(
             composed_application,
@@ -294,6 +295,15 @@ class WorkbenchRouteTest(unittest.TestCase):
             self.assertEqual(allowed_origins, {"http://127.0.0.1:8080"})
             order.append(("api",))
             return composed_api
+
+        def compose_supervisor(tasks, **kwargs):
+            self.assertIs(tasks, mock.sentinel.tasks)
+            self.assertEqual(kwargs["project_id"], "local-workbench")
+            self.assertEqual(kwargs["principal_id"], "local-user")
+            self.assertRegex(kwargs["owner_id"], r"^supervisor-[0-9a-f]{32}$")
+            self.assertEqual(order, [("api",)])
+            order.append(("supervisor",))
+            return composed_supervisor
 
         with mock.patch.object(serve, "HOST", "127.0.0.1"), mock.patch.object(
             serve, "PORT", 8080
@@ -326,6 +336,8 @@ class WorkbenchRouteTest(unittest.TestCase):
             serve.secrets, "token_urlsafe", return_value="composition-csrf-token"
         ), mock.patch.object(
             serve, "WorkbenchAPI", side_effect=compose_api
+        ), mock.patch.object(
+            serve, "RuntimeSupervisor", side_effect=compose_supervisor
         ):
             result = serve.create_workbench_api()
 
@@ -333,7 +345,10 @@ class WorkbenchRouteTest(unittest.TestCase):
         application.recover_runtime_on_startup.assert_called_once_with(
             max_tasks=10000
         )
-        self.assertEqual(order, [("api",), ("recover", 10000)])
+        self.assertEqual(
+            order,
+            [("api",), ("supervisor",), ("recover", 10000)],
+        )
 
     def _create_workbench_api_with_mocked_runtime(
         self, application, *, api_side_effect=None
@@ -437,17 +452,30 @@ class WorkbenchRouteTest(unittest.TestCase):
         order = []
         composed_api = mock.sentinel.bound_composed_api
 
+        class Supervisor:
+            healthy = True
+            failure_code = None
+
+            def start(self):
+                self.assert_private()
+                order.append(("supervisor_started",))
+                return True
+
+            def stop(self):
+                order.append(("supervisor_stopped", serve.WORKBENCH_API))
+                return True
+
+            @staticmethod
+            def assert_private():
+                if serve.WORKBENCH_API is not None:
+                    raise AssertionError("API published before supervisor readiness")
+
+        supervisor = Supervisor()
+
         class BoundServer:
             def __init__(self, address, handler, *, bind_and_activate):
                 order.append(("constructed", address, handler, bind_and_activate))
-
-            def __enter__(self):
-                order.append(("entered",))
-                return self
-
-            def __exit__(self, exc_type, exc, traceback):
-                order.append(("closed", exc_type))
-                return False
+                self.runtime_supervisor = None
 
             def server_bind(self):
                 order.append(("bound",))
@@ -458,16 +486,22 @@ class WorkbenchRouteTest(unittest.TestCase):
             def serve_forever(self):
                 order.append(("served", serve.WORKBENCH_API))
 
+            def close_listener(self):
+                order.append(("listener_closed", serve.WORKBENCH_API))
+
+            def drain_request_threads(self, timeout):
+                order.append(("handlers_drained", serve.WORKBENCH_API, timeout))
+                return True
+
         def compose_after_bind():
             self.assertEqual(
                 order[0][:2], ("constructed", ("127.0.0.1", 8080))
             )
             self.assertFalse(order[0][3])
-            self.assertEqual(order[1], ("entered",))
-            self.assertEqual(order[2], ("bound",))
+            self.assertEqual(order[1], ("bound",))
             self.assertIsNone(serve.WORKBENCH_API)
             order.append(("recovered",))
-            return composed_api
+            return serve.WorkbenchRuntime(composed_api, supervisor)
 
         previous_api = serve.WORKBENCH_API
         serve.WORKBENCH_API = mock.sentinel.stale_api
@@ -479,7 +513,7 @@ class WorkbenchRouteTest(unittest.TestCase):
             ), mock.patch.object(
                 serve, "ReusableThreadingTCPServer", BoundServer
             ), mock.patch.object(
-                serve, "create_workbench_api", side_effect=compose_after_bind
+                serve, "create_workbench_runtime", side_effect=compose_after_bind
             ), mock.patch.object(
                 serve.webbrowser, "open", return_value=False
             ), mock.patch("builtins.print"):
@@ -492,16 +526,393 @@ class WorkbenchRouteTest(unittest.TestCase):
             [item[0] for item in order],
             [
                 "constructed",
-                "entered",
                 "bound",
                 "recovered",
+                "supervisor_started",
                 "activated",
                 "served",
-                "closed",
+                "listener_closed",
+                "supervisor_stopped",
+                "handlers_drained",
             ],
         )
         self.assertIs(order[5][1], composed_api)
-        self.assertIsNone(order[6][1])
+        self.assertIs(order[6][1], composed_api)
+        self.assertIs(order[7][1], composed_api)
+        self.assertIs(order[8][1], composed_api)
+        self.assertEqual(order[8][2], serve.HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS)
+
+    def test_supervisor_start_failure_closes_socket_without_publishing(self):
+        order = []
+
+        class Supervisor:
+            failure_code = "RUNTIME_SUPERVISOR_LEASE_HELD"
+
+            def start(self):
+                order.append(("supervisor_start_failed", serve.WORKBENCH_API))
+                return False
+
+            def stop(self):
+                order.append(("supervisor_stopped", serve.WORKBENCH_API))
+                return True
+
+        class BoundServer:
+            def __init__(self, address, handler, *, bind_and_activate):
+                order.append(("constructed", address, bind_and_activate))
+                self.runtime_supervisor = None
+
+            def server_bind(self):
+                order.append(("bound",))
+
+            def server_activate(self):
+                order.append(("activated",))
+
+            def serve_forever(self):
+                order.append(("served",))
+
+            def close_listener(self):
+                order.append(("listener_closed", serve.WORKBENCH_API))
+
+            def drain_request_threads(self, timeout):
+                order.append(("handlers_drained", serve.WORKBENCH_API, timeout))
+                return True
+
+        runtime = serve.WorkbenchRuntime(mock.sentinel.api, Supervisor())
+        previous_api = serve.WORKBENCH_API
+        serve.WORKBENCH_API = mock.sentinel.stale_api
+        try:
+            with mock.patch.object(serve, "HOST", "127.0.0.1"), mock.patch.object(
+                serve, "PORT", 8080
+            ), mock.patch.object(serve, "fwi_run_root"), mock.patch.object(
+                serve, "ReusableThreadingTCPServer", BoundServer
+            ), mock.patch.object(
+                serve, "create_workbench_runtime", return_value=runtime
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "RUNTIME_SUPERVISOR_LEASE_HELD"
+                ):
+                    serve.serve_workbench()
+        finally:
+            self.assertIsNone(serve.WORKBENCH_API)
+            serve.WORKBENCH_API = previous_api
+
+        self.assertEqual(
+            order,
+            [
+                ("constructed", ("127.0.0.1", 8080), False),
+                ("bound",),
+                ("supervisor_start_failed", None),
+                ("listener_closed", None),
+                ("supervisor_stopped", None),
+                ("handlers_drained", None, serve.HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS),
+            ],
+        )
+
+    def test_activation_failure_stops_started_supervisor_before_publication(self):
+        order = []
+
+        class Supervisor:
+            healthy = True
+            failure_code = None
+
+            def start(self):
+                order.append(("supervisor_started", serve.WORKBENCH_API))
+                return True
+
+            def stop(self):
+                order.append(("supervisor_stopped", serve.WORKBENCH_API))
+                return True
+
+        class BoundServer:
+            def __init__(self, address, handler, *, bind_and_activate):
+                order.append(("constructed", address, bind_and_activate))
+                self.runtime_supervisor = None
+
+            def server_bind(self):
+                order.append(("bound",))
+
+            def server_activate(self):
+                order.append(("activation_failed", serve.WORKBENCH_API))
+                raise OSError("activation failed")
+
+            def serve_forever(self):
+                order.append(("served",))
+
+            def close_listener(self):
+                order.append(("listener_closed", serve.WORKBENCH_API))
+
+            def drain_request_threads(self, timeout):
+                order.append(("handlers_drained", serve.WORKBENCH_API, timeout))
+                return True
+
+        runtime = serve.WorkbenchRuntime(mock.sentinel.api, Supervisor())
+        previous_api = serve.WORKBENCH_API
+        try:
+            with mock.patch.object(serve, "HOST", "127.0.0.1"), mock.patch.object(
+                serve, "PORT", 8080
+            ), mock.patch.object(serve, "fwi_run_root"), mock.patch.object(
+                serve, "ReusableThreadingTCPServer", BoundServer
+            ), mock.patch.object(
+                serve, "create_workbench_runtime", return_value=runtime
+            ):
+                with self.assertRaisesRegex(OSError, "activation failed"):
+                    serve.serve_workbench()
+        finally:
+            self.assertIsNone(serve.WORKBENCH_API)
+            serve.WORKBENCH_API = previous_api
+
+        self.assertEqual(
+            [item[0] for item in order],
+            [
+                "constructed",
+                "bound",
+                "supervisor_started",
+                "activation_failed",
+                "listener_closed",
+                "supervisor_stopped",
+                "handlers_drained",
+            ],
+        )
+        self.assertTrue(all(item[1] is None for item in order[2:]))
+
+    def test_serve_error_remains_primary_when_close_fails_and_supervisor_stops(self):
+        order = []
+        composed_api = mock.sentinel.composed_api
+
+        class Supervisor:
+            healthy = True
+            failure_code = None
+
+            def start(self):
+                order.append(("supervisor_started", serve.WORKBENCH_API))
+                return True
+
+            def stop(self):
+                order.append(("supervisor_stopped", serve.WORKBENCH_API))
+                return True
+
+        class BoundServer:
+            def __init__(self, address, handler, *, bind_and_activate):
+                order.append(("constructed",))
+                self.runtime_supervisor = None
+
+            def server_bind(self):
+                order.append(("bound",))
+
+            def server_activate(self):
+                order.append(("activated", serve.WORKBENCH_API))
+
+            def serve_forever(self):
+                order.append(("serve_failed", serve.WORKBENCH_API))
+                raise RuntimeError("serve loop failed")
+
+            def close_listener(self):
+                order.append(("close_failed", serve.WORKBENCH_API))
+                raise OSError("close failed")
+
+            def drain_request_threads(self, timeout):
+                order.append(("handlers_drained", serve.WORKBENCH_API, timeout))
+                return True
+
+        runtime = serve.WorkbenchRuntime(composed_api, Supervisor())
+        previous_api = serve.WORKBENCH_API
+        try:
+            with mock.patch.object(serve, "HOST", "127.0.0.1"), mock.patch.object(
+                serve, "PORT", 8080
+            ), mock.patch.object(serve, "fwi_run_root"), mock.patch.object(
+                serve, "ReusableThreadingTCPServer", BoundServer
+            ), mock.patch.object(
+                serve, "create_workbench_runtime", return_value=runtime
+            ), mock.patch.object(
+                serve.webbrowser, "open", return_value=False
+            ), mock.patch("builtins.print"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "serve loop failed"
+                ) as raised:
+                    serve.serve_workbench()
+        finally:
+            self.assertIsNone(serve.WORKBENCH_API)
+            serve.WORKBENCH_API = previous_api
+
+        self.assertEqual(
+            [item[0] for item in order],
+            [
+                "constructed",
+                "bound",
+                "supervisor_started",
+                "activated",
+                "serve_failed",
+                "close_failed",
+                "supervisor_stopped",
+                "handlers_drained",
+            ],
+        )
+        self.assertIsNone(order[2][1])
+        self.assertIsNone(order[3][1])
+        for item in order[4:]:
+            self.assertIs(item[1], composed_api)
+        self.assertEqual(
+            getattr(raised.exception, "workbench_cleanup_codes", ()),
+            ("HTTP_LISTENER_CLOSE_FAILED",),
+        )
+
+    def test_handler_keeps_one_api_facade_during_shutdown_publication_race(self):
+        handler = object.__new__(serve.Handler)
+        handler.path = "/api/scientific-runtime/v1/session"
+        handler.headers = mock.Mock()
+        handler.headers.items.return_value = (("Host", "127.0.0.1"),)
+        handler._workbench_body = mock.Mock(return_value=b"")
+        handler._send_workbench_response = mock.Mock()
+        first_api = mock.Mock()
+        second_api = mock.Mock()
+        response = mock.sentinel.response
+
+        def replace_publication(*_args):
+            serve.WORKBENCH_API = second_api
+            return None
+
+        first_api.preflight.side_effect = replace_publication
+        first_api.dispatch.return_value = response
+        previous_api = serve.WORKBENCH_API
+        serve.WORKBENCH_API = first_api
+        try:
+            handler._serve_workbench("GET")
+        finally:
+            serve.WORKBENCH_API = previous_api
+
+        first_api.dispatch.assert_called_once()
+        second_api.dispatch.assert_not_called()
+        handler._send_workbench_response.assert_called_once_with(response, True)
+
+    def test_server_service_actions_fails_when_supervisor_self_fences(self):
+        server = object.__new__(serve.ReusableThreadingTCPServer)
+        finished = threading.Thread(target=lambda: None)
+        finished.start()
+        finished.join()
+        server._threads = serve.socketserver._Threads()
+        server._threads.append(finished)
+        self.assertEqual(len(server._threads), 1)
+        server.runtime_supervisor = mock.Mock(
+            healthy=False, failure_code="RUNTIME_SUPERVISOR_LEASE_LOST"
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "RUNTIME_SUPERVISOR_LEASE_LOST"
+        ):
+            server.service_actions()
+        self.assertEqual(len(server._threads), 0)
+
+        server.runtime_supervisor = mock.Mock(healthy=True, failure_code=None)
+        server.service_actions()
+
+    def test_supervisor_stop_failure_still_drains_and_unpublishes(self):
+        order = []
+        composed_api = mock.sentinel.stop_failure_api
+        supervisor = mock.Mock(
+            healthy=True,
+            failure_code="RUNTIME_SUPERVISOR_STOP_TIMEOUT",
+        )
+        supervisor.start.return_value = True
+        supervisor.stop.side_effect = lambda: order.append(
+            ("supervisor_stop_failed", serve.WORKBENCH_API)
+        ) or False
+        server = mock.Mock()
+        server.close_listener.side_effect = lambda: order.append(
+            ("listener_closed", serve.WORKBENCH_API)
+        )
+        server.drain_request_threads.side_effect = lambda timeout: order.append(
+            ("handlers_drained", serve.WORKBENCH_API, timeout)
+        ) or True
+
+        previous_api = serve.WORKBENCH_API
+        try:
+            with mock.patch.object(serve, "HOST", "127.0.0.1"), mock.patch.object(
+                serve, "PORT", 8080
+            ), mock.patch.object(serve, "fwi_run_root"), mock.patch.object(
+                serve, "ReusableThreadingTCPServer", return_value=server
+            ), mock.patch.object(
+                serve,
+                "create_workbench_runtime",
+                return_value=serve.WorkbenchRuntime(composed_api, supervisor),
+            ), mock.patch.object(
+                serve.webbrowser, "open", return_value=False
+            ), mock.patch("builtins.print"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "RUNTIME_SUPERVISOR_STOP_TIMEOUT"
+                ):
+                    serve.serve_workbench()
+        finally:
+            self.assertIsNone(serve.WORKBENCH_API)
+            serve.WORKBENCH_API = previous_api
+
+        self.assertEqual(
+            order,
+            [
+                ("listener_closed", composed_api),
+                ("supervisor_stop_failed", composed_api),
+                (
+                    "handlers_drained",
+                    composed_api,
+                    serve.HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS,
+                ),
+            ],
+        )
+
+    def test_server_listener_close_and_request_drain_are_separate_and_bounded(self):
+        server = object.__new__(serve.ReusableThreadingTCPServer)
+        server.socket = mock.Mock()
+        request_thread = mock.Mock()
+        request_thread.is_alive.return_value = True
+        server._threads = [request_thread]
+
+        server.close_listener()
+        self.assertFalse(server.drain_request_threads(0.001))
+
+        server.socket.close.assert_called_once_with()
+        request_thread.join.assert_called_once()
+        self.assertLessEqual(request_thread.join.call_args.args[0], 0.001)
+        self.assertFalse(server.daemon_threads)
+        self.assertTrue(server.block_on_close)
+
+    def test_real_server_with_no_requests_closes_without_thread_sentinel_error(self):
+        server = serve.ReusableThreadingTCPServer(
+            ("127.0.0.1", 0), serve.Handler
+        )
+        try:
+            self.assertNotIn("_threads", vars(server))
+            server.close_listener()
+            self.assertEqual(server.socket.fileno(), -1)
+            self.assertTrue(server.drain_request_threads(0.01))
+        finally:
+            if server.socket.fileno() >= 0:
+                server.server_close()
+
+    def test_shutdown_signal_ignores_both_signals_before_unwinding(self):
+        installed = {}
+        previous = {
+            serve.signal.SIGINT: mock.sentinel.previous_int,
+            serve.signal.SIGTERM: mock.sentinel.previous_term,
+        }
+
+        def install(signum, handler):
+            installed[signum] = handler
+
+        with mock.patch.object(
+            serve.signal, "getsignal", side_effect=lambda signum: previous[signum]
+        ), mock.patch.object(serve.signal, "signal", side_effect=install):
+            captured = serve._install_shutdown_signal_handlers()
+            term_handler = installed[serve.signal.SIGTERM]
+            with self.assertRaises(serve._TerminationRequested):
+                term_handler(serve.signal.SIGTERM, None)
+            self.assertIs(installed[serve.signal.SIGINT], serve.signal.SIG_IGN)
+            self.assertIs(installed[serve.signal.SIGTERM], serve.signal.SIG_IGN)
+            serve._begin_shutdown_cleanup(captured)
+            term_handler(serve.signal.SIGTERM, None)
+            serve._restore_shutdown_signal_handlers(captured)
+
+        self.assertEqual(captured.previous, previous)
+        self.assertTrue(captured.cleaning)
+        self.assertIs(installed[serve.signal.SIGINT], previous[serve.signal.SIGINT])
+        self.assertIs(installed[serve.signal.SIGTERM], previous[serve.signal.SIGTERM])
 
     def test_busy_port_fails_before_runtime_recovery(self):
         previous_api = serve.WORKBENCH_API
@@ -517,7 +928,7 @@ class WorkbenchRouteTest(unittest.TestCase):
                 ), mock.patch.object(
                     serve, "fwi_run_root"
                 ), mock.patch.object(
-                    serve, "create_workbench_api", recovery
+                    serve, "create_workbench_runtime", recovery
                 ):
                     with self.assertRaises(OSError):
                         serve.serve_workbench()
@@ -532,14 +943,7 @@ class WorkbenchRouteTest(unittest.TestCase):
         class BoundServer:
             def __init__(self, address, handler, *, bind_and_activate):
                 order.append(("constructed", address, bind_and_activate))
-
-            def __enter__(self):
-                order.append(("entered",))
-                return self
-
-            def __exit__(self, exc_type, exc, traceback):
-                order.append(("closed", exc_type))
-                return False
+                self.runtime_supervisor = None
 
             def server_bind(self):
                 order.append(("bound",))
@@ -549,6 +953,13 @@ class WorkbenchRouteTest(unittest.TestCase):
 
             def serve_forever(self):
                 order.append(("served",))
+
+            def close_listener(self):
+                order.append(("listener_closed",))
+
+            def drain_request_threads(self, timeout):
+                order.append(("handlers_drained", timeout))
+                return True
 
         def fail_recovery():
             self.assertIsNone(serve.WORKBENCH_API)
@@ -565,7 +976,7 @@ class WorkbenchRouteTest(unittest.TestCase):
             ), mock.patch.object(
                 serve, "ReusableThreadingTCPServer", BoundServer
             ), mock.patch.object(
-                serve, "create_workbench_api", side_effect=fail_recovery
+                serve, "create_workbench_runtime", side_effect=fail_recovery
             ):
                 with self.assertRaisesRegex(RuntimeError, "bounded recovery failed"):
                     serve.serve_workbench()
@@ -577,10 +988,10 @@ class WorkbenchRouteTest(unittest.TestCase):
             order,
             [
                 ("constructed", ("127.0.0.1", 8080), False),
-                ("entered",),
                 ("bound",),
                 ("recovery_failed",),
-                ("closed", RuntimeError),
+                ("listener_closed",),
+                ("handlers_drained", serve.HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS),
             ],
         )
 

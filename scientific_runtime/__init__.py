@@ -46,6 +46,7 @@ from .task_service import (
     TaskPurgeResult,
     TaskService,
     TaskServiceError,
+    TaskSupervisorLeaseLost,
     TaskRuntimeResult,
     TaskValidationError,
 )
@@ -60,6 +61,9 @@ from .task_store import (
     DispatchIntentSnapshot,
     RegistrySnapshots,
     RegistryWriteRecord,
+    RuntimeSupervisorLease,
+    RuntimeSupervisorLeaseAcquisition,
+    RuntimeSupervisorLeaseLost,
     SQLiteTaskStore,
     TaskSnapshot,
     TaskSnapshotPage,
@@ -69,6 +73,10 @@ from .task_store import (
     TaskStoreCorruption,
     TaskStoreError,
     TaskStoreUnavailable,
+)
+from .runtime_supervisor import (
+    RuntimeSupervisor,
+    RuntimeSupervisorCycleResult,
 )
 from .workbench_service import (
     GuidedWorkbench,
@@ -114,6 +122,11 @@ __all__ = [
     "RegistryValidationError",
     "RegistryWriteRecord",
     "RuntimeRecoveryResult",
+    "RuntimeSupervisor",
+    "RuntimeSupervisorCycleResult",
+    "RuntimeSupervisorLease",
+    "RuntimeSupervisorLeaseAcquisition",
+    "RuntimeSupervisorLeaseLost",
     "SafeSubprocessWorkerLauncher",
     "SQLiteTaskStore",
     "TaskConflict",
@@ -125,6 +138,7 @@ __all__ = [
     "TaskPurgeResult",
     "TaskService",
     "TaskServiceError",
+    "TaskSupervisorLeaseLost",
     "TaskRuntimeResult",
     "TaskSnapshot",
     "TaskSnapshotPage",

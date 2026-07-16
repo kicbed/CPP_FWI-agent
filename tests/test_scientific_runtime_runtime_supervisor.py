@@ -1,0 +1,614 @@
+from __future__ import annotations
+
+import threading
+import tempfile
+import unittest
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable
+
+from scientific_runtime.runtime_supervisor import (
+    FATAL,
+    LEASE_HELD,
+    LEASE_LOST,
+    LEASE_RELEASE_FAILED,
+    STOP_TIMEOUT,
+    TASK_LIMIT_EXCEEDED,
+    RuntimeSupervisor,
+)
+from scientific_runtime.task_service import TaskService
+from scientific_runtime.task_store import (
+    RuntimeSupervisorLeaseLost,
+    SQLiteTaskStore,
+)
+
+
+PROJECT_ID = "project-1"
+PRINCIPAL_ID = "user-1"
+OWNER_ID = "workbench-1"
+
+
+@dataclass(frozen=True)
+class FakeLease:
+    project_id: str
+    principal_id: str
+    fencing_token: int
+    owner_id: str
+    state: str = "active"
+    acquired_at: str = "2026-07-16T00:00:00Z"
+    heartbeat_at: str = "2026-07-16T00:00:00Z"
+    expires_at: str = "2026-07-16T00:00:30Z"
+
+
+@dataclass(frozen=True)
+class FakeAcquisition:
+    lease: FakeLease
+    acquired: bool
+
+
+@dataclass(frozen=True)
+class FakeSnapshot:
+    task_id: str
+    project_id: str
+    principal_id: str
+    status: str
+
+
+@dataclass(frozen=True)
+class FakeIntent:
+    task_id: str
+    state: str
+
+
+@dataclass(frozen=True)
+class FakePage:
+    snapshots: tuple[FakeSnapshot, ...]
+    next_cursor: str | None
+
+
+class FakeStatusError(RuntimeError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+class StepClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+        self.lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self.lock:
+            self.value += 1.0
+            return self.value
+
+
+class FakeTaskService:
+    def __init__(
+        self,
+        snapshots: list[FakeSnapshot] | None = None,
+        intents: dict[str, FakeIntent | Exception | None] | None = None,
+    ) -> None:
+        self.snapshots = list(snapshots or [])
+        self.intents = dict(intents or {})
+        self.calls: list[str] = []
+        self.acquire_calls = 0
+        self.heartbeat_calls = 0
+        self.release_calls = 0
+        self.list_calls = 0
+        self.intent_calls: list[str] = []
+        self.refresh_calls: list[str] = []
+        self.dispatch_calls = 0
+        self.lease_held = False
+        self.lose_on_heartbeat = False
+        self.list_error: Exception | None = None
+        self.refresh_failures: dict[str, Exception] = {}
+        self.refresh_hook: Callable[[str], None] | None = None
+        self.release_failures_remaining = 0
+        self.active_lease: FakeLease | None = None
+        self.lock = threading.Lock()
+
+    def acquire_runtime_supervisor_lease(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        owner_id: str,
+        lease_seconds: int,
+    ) -> FakeAcquisition:
+        del lease_seconds
+        with self.lock:
+            self.calls.append("acquire")
+            self.acquire_calls += 1
+            if self.lease_held:
+                return FakeAcquisition(
+                    FakeLease(project_id, principal_id, 7, "other-owner"),
+                    acquired=False,
+                )
+            lease = FakeLease(project_id, principal_id, 8, owner_id)
+            self.active_lease = lease
+            return FakeAcquisition(lease, acquired=True)
+
+    def heartbeat_runtime_supervisor_lease(
+        self, lease: FakeLease, *, lease_seconds: int
+    ) -> FakeLease:
+        del lease_seconds
+        with self.lock:
+            self.calls.append("heartbeat")
+            self.heartbeat_calls += 1
+            if self.lose_on_heartbeat or lease != self.active_lease:
+                self.active_lease = None
+                raise RuntimeSupervisorLeaseLost("simulated fenced lease loss")
+            assert self.active_lease is not None
+            updated = replace(
+                self.active_lease,
+                heartbeat_at=f"heartbeat-{self.heartbeat_calls}",
+                expires_at=f"expiry-{self.heartbeat_calls}",
+            )
+            self.active_lease = updated
+            return updated
+
+    def release_runtime_supervisor_lease(self, lease: FakeLease) -> FakeLease:
+        with self.lock:
+            self.calls.append("release")
+            self.release_calls += 1
+            if self.release_failures_remaining:
+                self.release_failures_remaining -= 1
+                raise RuntimeError("simulated transient release failure")
+            if lease != self.active_lease:
+                raise RuntimeSupervisorLeaseLost("simulated stale release")
+            self.active_lease = None
+            return replace(lease, state="released")
+
+    def list_tasks(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        cursor: str | None = None,
+        limit: int = 20,
+        view: str = "active",
+    ) -> FakePage:
+        with self.lock:
+            self.calls.append("list")
+            self.list_calls += 1
+        if self.list_error is not None:
+            raise self.list_error
+        assert view == "active"
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        start = 0
+        if cursor is not None:
+            start = next(
+                index + 1
+                for index, snapshot in enumerate(self.snapshots)
+                if snapshot.task_id == cursor
+            )
+        values = self.snapshots[start : start + limit]
+        has_more = start + len(values) < len(self.snapshots)
+        next_cursor = values[-1].task_id if values and has_more else None
+        return FakePage(tuple(values), next_cursor)
+
+    def get_dispatch_intent(
+        self, task_id: str, *, project_id: str, principal_id: str
+    ) -> FakeIntent | None:
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        with self.lock:
+            self.calls.append("intent")
+            self.intent_calls.append(task_id)
+        value = self.intents.get(task_id)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def refresh_runtime_status(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: FakeLease,
+    ) -> object:
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        with self.lock:
+            if supervisor_lease != self.active_lease:
+                raise RuntimeSupervisorLeaseLost("simulated stale status write")
+            self.calls.append("refresh")
+            self.refresh_calls.append(task_id)
+        if self.refresh_hook is not None:
+            self.refresh_hook(task_id)
+        failure = self.refresh_failures.get(task_id)
+        if failure is not None:
+            raise failure
+        return object()
+
+    def dispatch(self) -> None:
+        self.dispatch_calls += 1
+        raise AssertionError("the observation-only supervisor must not dispatch")
+
+
+def snapshot(task_id: str, status: str) -> FakeSnapshot:
+    return FakeSnapshot(task_id, PROJECT_ID, PRINCIPAL_ID, status)
+
+
+def supervisor(
+    service: FakeTaskService,
+    **overrides: object,
+) -> RuntimeSupervisor:
+    arguments: dict[str, object] = {
+        "project_id": PROJECT_ID,
+        "principal_id": PRINCIPAL_ID,
+        "owner_id": OWNER_ID,
+        "lease_seconds": 30,
+        "heartbeat_interval_seconds": 10,
+        "poll_interval_seconds": 10,
+        "start_timeout_seconds": 1,
+        "join_timeout_seconds": 1,
+    }
+    arguments.update(overrides)
+    return RuntimeSupervisor(service, **arguments)  # type: ignore[arg-type]
+
+
+class RuntimeSupervisorTests(unittest.TestCase):
+    def test_real_sqlite_empty_cycle_acquires_heartbeats_and_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteTaskStore(Path(directory) / "runtime.sqlite3")
+            runtime = RuntimeSupervisor(
+                TaskService(store),
+                project_id=PROJECT_ID,
+                principal_id=PRINCIPAL_ID,
+                owner_id="workbench-real-sqlite",
+                lease_seconds=2,
+                heartbeat_interval_seconds=0.25,
+                poll_interval_seconds=0.01,
+                start_timeout_seconds=1,
+                join_timeout_seconds=1,
+            )
+
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            active = store.get_runtime_supervisor_lease(
+                project_id=PROJECT_ID,
+                principal_id=PRINCIPAL_ID,
+            )
+            self.assertIsNotNone(active)
+            self.assertEqual(active.state, "active")
+            self.assertEqual(active.owner_id, "workbench-real-sqlite")
+            self.assertTrue(runtime.stop())
+
+            released = store.get_runtime_supervisor_lease(
+                project_id=PROJECT_ID,
+                principal_id=PRINCIPAL_ID,
+            )
+            self.assertIsNotNone(released)
+            self.assertEqual(released.state, "released")
+            self.assertEqual(released.fencing_token, active.fencing_token)
+
+    def test_constructor_is_side_effect_free_and_held_lease_starts_no_thread(
+        self,
+    ) -> None:
+        service = FakeTaskService()
+        runtime = supervisor(service)
+
+        self.assertEqual(service.calls, [])
+        self.assertIsNone(runtime.thread)
+        self.assertFalse(runtime.running)
+        service.lease_held = True
+
+        self.assertFalse(runtime.start())
+        self.assertEqual(runtime.failure_code, LEASE_HELD)
+        self.assertFalse(runtime.healthy)
+        self.assertIsNone(runtime.thread)
+        self.assertEqual(service.acquire_calls, 1)
+        self.assertEqual(service.release_calls, 0)
+        self.assertTrue(runtime.stop())
+        self.assertEqual(service.release_calls, 0)
+
+    def test_start_waits_ready_and_stop_is_idempotent_without_thread_leak(
+        self,
+    ) -> None:
+        service = FakeTaskService()
+        runtime = supervisor(service)
+
+        self.assertTrue(runtime.start())
+        worker = runtime.thread
+        self.assertIsNotNone(worker)
+        assert worker is not None
+        self.assertTrue(worker.is_alive())
+        self.assertFalse(worker.daemon)
+        self.assertTrue(runtime.healthy)
+        self.assertGreaterEqual(service.heartbeat_calls, 1)
+        self.assertEqual(service.calls[:2], ["acquire", "heartbeat"])
+        self.assertTrue(runtime.wait_for_cycle(timeout=1))
+
+        self.assertTrue(runtime.stop())
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(runtime.running)
+        self.assertFalse(runtime.healthy)
+        self.assertIsNone(runtime.failure_code)
+        self.assertEqual(service.release_calls, 1)
+        self.assertIsNone(service.active_lease)
+        self.assertTrue(runtime.stop())
+        self.assertEqual(service.release_calls, 1)
+
+    def test_only_observes_active_dispatched_queued_or_running_tasks(self) -> None:
+        snapshots = [
+            snapshot("queued-dispatched", "Queued"),
+            snapshot("running-dispatched", "Running"),
+            snapshot("queued-pending", "Queued"),
+            snapshot("queued-dispatching", "Queued"),
+            snapshot("queued-reconcile", "Queued"),
+            snapshot("terminal", "Succeeded"),
+            snapshot("draft", "Draft"),
+        ]
+        service = FakeTaskService(
+            snapshots,
+            {
+                "queued-dispatched": FakeIntent("queued-dispatched", "dispatched"),
+                "running-dispatched": FakeIntent(
+                    "running-dispatched", "dispatched"
+                ),
+                "queued-pending": FakeIntent("queued-pending", "pending"),
+                "queued-dispatching": FakeIntent(
+                    "queued-dispatching", "dispatching"
+                ),
+                "queued-reconcile": FakeIntent(
+                    "queued-reconcile", "reconciliation_required"
+                ),
+                "terminal": FakeIntent("terminal", "dispatched"),
+            },
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(
+                cycle.scanned_task_ids,
+                (
+                    "queued-dispatched",
+                    "running-dispatched",
+                    "queued-pending",
+                    "queued-dispatching",
+                    "queued-reconcile",
+                ),
+            )
+            self.assertEqual(
+                cycle.refreshed_task_ids,
+                ("queued-dispatched", "running-dispatched"),
+            )
+            self.assertEqual(
+                cycle.deferred,
+                (
+                    ("queued-pending", "DISPATCH_PENDING"),
+                    ("queued-dispatching", "DISPATCHING"),
+                    ("queued-reconcile", "RECONCILIATION_REQUIRED"),
+                ),
+            )
+            self.assertEqual(cycle.task_failures, ())
+            self.assertEqual(
+                service.intent_calls,
+                [
+                    "queued-dispatched",
+                    "running-dispatched",
+                    "queued-pending",
+                    "queued-dispatching",
+                    "queued-reconcile",
+                ],
+            )
+            self.assertEqual(
+                service.refresh_calls,
+                ["queued-dispatched", "running-dispatched"],
+            )
+            self.assertEqual(service.dispatch_calls, 0)
+        finally:
+            runtime.stop()
+
+    def test_one_task_failure_is_contained_and_later_task_is_refreshed(self) -> None:
+        service = FakeTaskService(
+            [snapshot("first", "Queued"), snapshot("second", "Running")],
+            {
+                "first": FakeIntent("first", "dispatched"),
+                "second": FakeIntent("second", "dispatched"),
+            },
+        )
+        service.refresh_failures["first"] = FakeStatusError(
+            "ADAPTER_STATUS_UNAVAILABLE"
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            self.assertTrue(runtime.healthy)
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(cycle.refreshed_task_ids, ("second",))
+            self.assertEqual(
+                cycle.task_failures,
+                (("first", "ADAPTER_STATUS_UNAVAILABLE"),),
+            )
+            self.assertEqual(service.refresh_calls, ["first", "second"])
+        finally:
+            runtime.stop()
+
+    def test_unclassified_programming_failure_is_fatal(self) -> None:
+        service = FakeTaskService(
+            [snapshot("first", "Queued"), snapshot("second", "Running")],
+            {
+                "first": FakeIntent("first", "dispatched"),
+                "second": FakeIntent("second", "dispatched"),
+            },
+        )
+        service.refresh_failures["first"] = TypeError("simulated API mismatch")
+        runtime = supervisor(service)
+        try:
+            runtime.start()
+            self.assertTrue(runtime.wait_until_stopped(timeout=1))
+            self.assertEqual(runtime.failure_code, FATAL)
+            self.assertFalse(runtime.healthy)
+            self.assertEqual(service.refresh_calls, ["first"])
+        finally:
+            self.assertTrue(runtime.stop())
+
+    def test_lease_loss_is_fatal_and_stale_lease_is_not_released(self) -> None:
+        service = FakeTaskService([snapshot("task-1", "Queued")])
+        service.intents["task-1"] = FakeIntent("task-1", "dispatched")
+        service.lose_on_heartbeat = True
+        runtime = supervisor(
+            service,
+            lease_seconds=3,
+            heartbeat_interval_seconds=0.5,
+            monotonic=StepClock(),
+        )
+
+        runtime.start()
+        self.assertTrue(runtime.wait_until_stopped(timeout=1))
+        self.assertEqual(runtime.failure_code, LEASE_LOST)
+        self.assertFalse(runtime.healthy)
+        self.assertIsNone(runtime.lease)
+        self.assertGreaterEqual(service.heartbeat_calls, 1)
+        self.assertTrue(runtime.stop())
+        self.assertEqual(service.release_calls, 0)
+        self.assertEqual(service.refresh_calls, [])
+
+    def test_max_tasks_fails_before_any_task_observation(self) -> None:
+        values = [snapshot(f"task-{index}", "Queued") for index in range(3)]
+        service = FakeTaskService(
+            values,
+            {item.task_id: FakeIntent(item.task_id, "dispatched") for item in values},
+        )
+        runtime = supervisor(service, max_tasks=2)
+        try:
+            runtime.start()
+            self.assertTrue(runtime.wait_until_stopped(timeout=1))
+            self.assertEqual(runtime.failure_code, TASK_LIMIT_EXCEEDED)
+            self.assertEqual(service.intent_calls, [])
+            self.assertEqual(service.refresh_calls, [])
+            self.assertFalse(runtime.healthy)
+        finally:
+            self.assertTrue(runtime.stop())
+        self.assertEqual(service.release_calls, 1)
+
+    def test_exactly_max_tasks_completes_the_bounded_cycle(self) -> None:
+        values = [snapshot(f"task-{index}", "Queued") for index in range(2)]
+        service = FakeTaskService(
+            values,
+            {item.task_id: FakeIntent(item.task_id, "dispatched") for item in values},
+        )
+        runtime = supervisor(service, max_tasks=2)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            self.assertIsNone(runtime.failure_code)
+            self.assertEqual(service.refresh_calls, ["task-0", "task-1"])
+        finally:
+            self.assertTrue(runtime.stop())
+
+    def test_lease_loss_during_status_refresh_self_fences_before_next_task(
+        self,
+    ) -> None:
+        service = FakeTaskService(
+            [snapshot("first", "Queued"), snapshot("second", "Queued")],
+            {
+                "first": FakeIntent("first", "dispatched"),
+                "second": FakeIntent("second", "dispatched"),
+            },
+        )
+        service.refresh_failures["first"] = FakeStatusError(LEASE_LOST)
+        runtime = supervisor(service)
+
+        runtime.start()
+        self.assertTrue(runtime.wait_until_stopped(timeout=1))
+        self.assertEqual(runtime.failure_code, LEASE_LOST)
+        self.assertIsNone(runtime.lease)
+        self.assertEqual(service.refresh_calls, ["first"])
+        self.assertTrue(runtime.stop())
+        self.assertEqual(service.release_calls, 0)
+
+    def test_stop_during_cycle_prevents_observing_the_next_task(self) -> None:
+        service = FakeTaskService(
+            [snapshot("first", "Queued"), snapshot("second", "Queued")],
+            {
+                "first": FakeIntent("first", "dispatched"),
+                "second": FakeIntent("second", "dispatched"),
+            },
+        )
+        entered = threading.Event()
+        release_refresh = threading.Event()
+
+        def block_first(task_id: str) -> None:
+            if task_id == "first":
+                entered.set()
+                self.assertTrue(release_refresh.wait(1))
+
+        service.refresh_hook = block_first
+        runtime = supervisor(service)
+        self.assertTrue(runtime.start())
+        self.assertTrue(entered.wait(1))
+        stop_result: list[bool] = []
+        stopper = threading.Thread(target=lambda: stop_result.append(runtime.stop()))
+        stopper.start()
+        try:
+            self.assertTrue(runtime._stop_event.wait(1))
+        finally:
+            release_refresh.set()
+        stopper.join(1)
+
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(stop_result, [True])
+        self.assertEqual(service.refresh_calls, ["first"])
+        self.assertEqual(service.release_calls, 1)
+        self.assertIsNone(runtime.failure_code)
+
+    def test_stop_timeout_does_not_release_a_lease_still_used_by_thread(self) -> None:
+        service = FakeTaskService([snapshot("blocked", "Queued")])
+        service.intents["blocked"] = FakeIntent("blocked", "dispatched")
+        entered = threading.Event()
+        release_refresh = threading.Event()
+
+        def block(_: str) -> None:
+            entered.set()
+            release_refresh.wait(1)
+
+        service.refresh_hook = block
+        runtime = supervisor(service, join_timeout_seconds=0.02)
+        self.assertTrue(runtime.start())
+        self.assertTrue(entered.wait(1))
+        try:
+            self.assertFalse(runtime.stop())
+            self.assertEqual(runtime.failure_code, STOP_TIMEOUT)
+            self.assertEqual(service.release_calls, 0)
+            self.assertIsNotNone(runtime.lease)
+            self.assertFalse(runtime.start())
+        finally:
+            release_refresh.set()
+        self.assertTrue(runtime.wait_until_stopped(timeout=1))
+        self.assertTrue(runtime.stop())
+        self.assertEqual(service.release_calls, 1)
+
+    def test_transient_release_failure_retains_lease_for_idempotent_retry(self) -> None:
+        service = FakeTaskService()
+        service.release_failures_remaining = 1
+        runtime = supervisor(service)
+        self.assertTrue(runtime.start())
+        self.assertTrue(runtime.wait_for_cycle(timeout=1))
+
+        self.assertFalse(runtime.stop())
+        self.assertEqual(runtime.failure_code, LEASE_RELEASE_FAILED)
+        self.assertIsNotNone(runtime.lease)
+        self.assertIsNotNone(service.active_lease)
+        self.assertEqual(service.release_calls, 1)
+
+        self.assertTrue(runtime.stop())
+        self.assertIsNone(runtime.lease)
+        self.assertIsNone(service.active_lease)
+        self.assertEqual(service.release_calls, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

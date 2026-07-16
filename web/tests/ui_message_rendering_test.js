@@ -1836,6 +1836,8 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       startup_dispatch_recovery: false,
       startup_receipt_recovery: true,
       startup_status_catchup: true,
+      continuous_status_supervision: true,
+      supervisor_leases: true,
       automatic_reconciliation: false,
     },
   });
@@ -1843,7 +1845,12 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
   assert.equal(session.taskType, 'acoustic_fwi_2d');
   assert.deepEqual(
     JSON.parse(JSON.stringify(session.capabilities)),
-    ['startup_receipt_recovery', 'startup_status_catchup'],
+    [
+      'startup_receipt_recovery',
+      'startup_status_catchup',
+      'continuous_status_supervision',
+      'supervisor_leases',
+    ],
   );
   const catalog = api.normalizeGuidedCatalog({
     datasets: [{
