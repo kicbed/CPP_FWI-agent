@@ -52,6 +52,7 @@ from .task_service import (
 )
 from .task_dispatcher import (
     DeepwaveTaskDispatcher,
+    DispatchDeferred,
     DispatchError,
     DispatchPreparation,
     TaskDispatcher,
@@ -106,6 +107,7 @@ __all__ = [
     "ApprovalBudget",
     "CreateTaskResult",
     "DeepwaveTaskDispatcher",
+    "DispatchDeferred",
     "DeepwaveAdapter",
     "DispatchError",
     "DispatchIntentSnapshot",

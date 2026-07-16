@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -47,8 +48,13 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 
 def prepare_run_dir(
-    requested: str | Path | None, configured_job_id: str | None
+    requested: str | Path | None,
+    configured_job_id: str | None,
+    *,
+    managed_launch: bool = False,
 ) -> tuple[Path, str]:
+    if type(managed_launch) is not bool:
+        raise ValueError("managed_launch must be a boolean")
     root = configured_run_root()
     root.mkdir(parents=True, exist_ok=True)
     root_resolved = root.resolve(strict=True)
@@ -83,10 +89,27 @@ def prepare_run_dir(
             raise ValueError(
                 "existing run directory is only reusable for its matching queued job"
             )
-        allowed_entries = {"status.json", "config.original.json", "run.log"}
-        unexpected = sorted(
-            entry.name for entry in run_dir.iterdir() if entry.name not in allowed_entries
-        )
+        allowed_entries = {
+            "status.json",
+            "config.original.json",
+            "run.log",
+        }
+        managed_control_entries = {
+            ".worker-launch.json",
+            ".worker-ready.json",
+            ".worker-heartbeat.json",
+        }
+        if managed_launch:
+            # Only the private bootstrap sets this flag, after validating the
+            # exact ticket and both inherited kernel leases.  The legacy CLI
+            # therefore cannot enter an Adapter-managed queued directory.
+            allowed_entries.update(managed_control_entries)
+        present_entries = {entry.name for entry in run_dir.iterdir()}
+        if managed_launch and not managed_control_entries.issubset(present_entries):
+            raise ValueError(
+                "managed queued run is missing private launch evidence"
+            )
+        unexpected = sorted(present_entries - allowed_entries)
         if unexpected:
             raise ValueError(
                 "queued run directory contains unexpected pre-existing artifacts: "
@@ -97,6 +120,17 @@ def prepare_run_dir(
                 raise ValueError(
                     f"queued run directory entry cannot be a symbolic link: {entry.name}"
                 )
+            if entry.name in managed_control_entries:
+                value = entry.lstat()
+                if (
+                    not stat.S_ISREG(value.st_mode)
+                    or value.st_uid != os.geteuid()
+                    or value.st_nlink != 1
+                    or stat.S_IMODE(value.st_mode) & 0o077
+                ):
+                    raise ValueError(
+                        "managed Worker control entry is not a private regular file"
+                    )
         original_config = run_dir / "config.original.json"
         if not original_config.is_file():
             raise ValueError(

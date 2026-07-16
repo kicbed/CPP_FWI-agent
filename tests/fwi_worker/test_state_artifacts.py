@@ -71,6 +71,59 @@ class StateAndArtifactsTest(unittest.TestCase):
             self.assertEqual(run_dir, queued)
             self.assertTrue((queued / "models").is_dir())
 
+    def test_only_managed_bootstrap_accepts_private_launch_sidecars(self) -> None:
+        control_names = (
+            ".worker-launch.json",
+            ".worker-ready.json",
+            ".worker-heartbeat.json",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            queued = Path(root) / "managed-job"
+            queued.mkdir()
+            (queued / "status.json").write_text(
+                json.dumps({"job_id": "managed-job", "status": "queued"}),
+                encoding="utf-8",
+            )
+            (queued / "config.original.json").write_text("{}", encoding="utf-8")
+            for name in control_names:
+                path = queued / name
+                path.write_text("{}", encoding="utf-8")
+                path.chmod(0o600)
+            with patch.dict(os.environ, {"FWI_RUN_ROOT": root}):
+                with self.assertRaisesRegex(ValueError, "unexpected pre-existing"):
+                    prepare_run_dir(str(queued), "managed-job")
+                run_dir, job_id = prepare_run_dir(
+                    str(queued), "managed-job", managed_launch=True
+                )
+            self.assertEqual((run_dir, job_id), (queued, "managed-job"))
+
+        for unsafe_kind in ("symlink", "fifo", "permissions"):
+            with self.subTest(unsafe_kind=unsafe_kind), tempfile.TemporaryDirectory() as root:
+                queued = Path(root) / "managed-job"
+                queued.mkdir()
+                (queued / "status.json").write_text(
+                    json.dumps({"job_id": "managed-job", "status": "queued"}),
+                    encoding="utf-8",
+                )
+                (queued / "config.original.json").write_text(
+                    "{}", encoding="utf-8"
+                )
+                control = queued / ".worker-launch.json"
+                if unsafe_kind == "symlink":
+                    outside = Path(root) / "outside.json"
+                    outside.write_text("{}", encoding="utf-8")
+                    control.symlink_to(outside)
+                elif unsafe_kind == "fifo":
+                    os.mkfifo(control, mode=0o600)
+                else:
+                    control.write_text("{}", encoding="utf-8")
+                    control.chmod(0o644)
+                with patch.dict(os.environ, {"FWI_RUN_ROOT": root}):
+                    with self.assertRaises(ValueError):
+                        prepare_run_dir(
+                            str(queued), "managed-job", managed_launch=True
+                        )
+
     def test_existing_succeeded_directory_cannot_be_reused(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             succeeded = Path(root) / "done-job"

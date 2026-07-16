@@ -23,6 +23,7 @@ from PIL import Image
 
 from scientific_runtime import (
     DeepwaveTaskDispatcher,
+    DispatchDeferred,
     DispatchError,
     DispatchIntentSnapshot,
     RegistryService,
@@ -33,10 +34,18 @@ from scientific_runtime import (
     TaskStoreConflict,
 )
 from scientific_runtime.fwi_adapter import (
+    AdapterUnavailable,
     DeepwaveAdapter,
     SafeSubprocessWorkerLauncher,
 )
 from scientific_runtime_contracts import compute_plan_hash, schema_errors
+from worker_launch_control import (
+    LaunchAttemptBinding,
+    ParentLaunchLease,
+    WorkerHeartbeat,
+    binding_from_submission_record,
+    stage_launch_attempt,
+)
 from tests.test_scientific_runtime_contracts import (
     approval_decision as contract_approval_decision,
     optimizer_plan_graph as contract_optimizer_plan_graph,
@@ -874,6 +883,49 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 self.assertEqual(self.root_snapshot(), before_lookup)
                 self.assertEqual(replacement_launcher.calls, [])
 
+    def test_lookup_promotes_only_the_exact_fenced_ready_attempt(self) -> None:
+        request = self.submit_kwargs(
+            task_id="task-fenced-ready",
+            idempotency_key="task-fenced-ready:invert:0001",
+        )
+        launched = self.adapter.submit(**copy.deepcopy(request))
+        record_path = self.submission_record_path(launched)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["launch_state"] = "launching"
+        self.adapter._write_submission(record_path, record)
+        binding = binding_from_submission_record(record)
+        run_dir = self.run_root / launched.job_id
+
+        lease = ParentLaunchLease.acquire(
+            self.run_root, run_dir, max_active=2
+        )
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.run_root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        try:
+            replacement_launcher = FakeLauncher()
+            reopened = self.make_adapter(launcher=replacement_launcher)
+            recovered = reopened.lookup_existing_handle(
+                **copy.deepcopy(request)
+            )
+            self.assertEqual(_plain(recovered), _plain(launched))
+            self.assertEqual(replacement_launcher.calls, [])
+            promoted = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(promoted["launch_state"], "launched")
+            self.assertEqual(
+                promoted["launch_attempt"], record["launch_attempt"]
+            )
+        finally:
+            heartbeat.stop("succeeded")
+
     def test_lookup_existing_handle_rejects_malformed_and_symlink_records(self) -> None:
         replacement_launcher = FakeLauncher()
         reopened = self.make_adapter(launcher=replacement_launcher)
@@ -1049,6 +1101,33 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             bridge.dispatch(invalid)
         self.assertEqual(raised.exception.code, "DISPATCH_INTENT_INVALID")
 
+        with patch.object(
+            self.adapter,
+            "submit",
+            side_effect=AdapterUnavailable("ADAPTER_CONCURRENCY_LIMIT"),
+        ), self.assertRaises(DispatchDeferred) as deferred:
+            bridge.dispatch(intent)
+        self.assertEqual(deferred.exception.code, "ADAPTER_CONCURRENCY_LIMIT")
+        with patch.object(
+            self.adapter,
+            "submit",
+            side_effect=AdapterUnavailable("SUBMISSION_LAUNCH_PENDING"),
+        ), self.assertRaises(DispatchDeferred) as deferred:
+            bridge.dispatch(intent)
+        self.assertEqual(deferred.exception.code, "SUBMISSION_LAUNCH_PENDING")
+        with patch.object(
+            self.adapter,
+            "submit",
+            side_effect=AdapterUnavailable(
+                "SUBMISSION_RECONCILIATION_REQUIRED"
+            ),
+        ), self.assertRaises(DispatchError) as legacy:
+            bridge.dispatch(intent)
+        self.assertNotIsInstance(legacy.exception, DispatchDeferred)
+        self.assertEqual(
+            legacy.exception.code, "SUBMISSION_RECONCILIATION_REQUIRED"
+        )
+
     def test_task_service_startup_adopts_real_adapter_lost_receipt(self) -> None:
         database_path = self.base / "receipt-recovery.sqlite3"
         store = SQLiteTaskStore(database_path)
@@ -1190,6 +1269,33 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             encoding="utf-8",
         )
 
+        # Recreate the narrower controller-crash window: the child crossed its
+        # inherited fence/ready barrier, but the Adapter record still says
+        # ``launching`` and SQLite has no receipt.
+        record_path = next(
+            (self.run_root / fwi_adapter_module.CONTROL_DIRECTORY / "submissions").glob(
+                "*.json"
+            )
+        )
+        private_record = json.loads(record_path.read_text(encoding="utf-8"))
+        private_record["launch_state"] = "launching"
+        initial_adapter._write_submission(record_path, private_record)
+        launch_binding = binding_from_submission_record(private_record)
+        launch_lease = ParentLaunchLease.acquire(
+            self.run_root, run_dir, max_active=2
+        )
+        launch_lease.mark_spawned(os.getpid())
+        recovery_heartbeat = WorkerHeartbeat(
+            run_root=self.run_root,
+            run_dir=run_dir,
+            attempt_id=launch_binding.attempt_id,
+            attempt_fd=os.dup(launch_lease.attempt_fd),
+            capacity_fd=os.dup(launch_lease.capacity_fd),
+            interval_seconds=0.02,
+        )
+        launch_lease.close_parent()
+        recovery_heartbeat.start()
+
         reopened_store = SQLiteTaskStore(database_path)
         reopened_registry = RegistryService(reopened_store, clock=lambda: NOW)
         replacement_launcher = FakeLauncher()
@@ -1200,9 +1306,12 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 registered_adapter(reopened_registry, replacement_launcher)
             ),
         )
-        recovered = reopened_service.recover_runtime_on_startup(
-            "project-1", "user-1"
-        )
+        try:
+            recovered = reopened_service.recover_runtime_on_startup(
+                "project-1", "user-1"
+            )
+        finally:
+            recovery_heartbeat.stop("succeeded")
 
         self.assertEqual(
             recovered.receipt_recovery_attempted_task_ids, (task_id,)
@@ -1527,6 +1636,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 record["request_hash"] = fwi_adapter_module._sha256_document(
                     self.adapter._record_request_payload(record)
                 )
+                # Historical receipts predate the staged launch-control
+                # schema.  Keep the fixture byte-shape faithful instead of
+                # carrying a stale current-attempt binding into old versions.
+                record["schema_version"] = "1.0.0"
+                record.pop("launch_attempt")
                 self.adapter._write_submission(record_path, record)
                 legacy_handle = self.adapter._handle_from_record(record)
 
@@ -1604,6 +1718,34 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             self.adapter._read_submission(last_record_path)
         with self.assertRaisesRegex(RuntimeError, "ADAPTER_HANDLE_INVALID"):
             self.adapter.status(mixed_handle)
+
+    def test_current_v1_4_receipt_reopens_private_schema_v1_0(self) -> None:
+        request = self.submit_kwargs(
+            task_id="task-current-private-v1",
+            idempotency_key="task-current-private-v1:invert:0001",
+        )
+        handle = self.adapter.submit(**copy.deepcopy(request))
+        run_dir = self.launcher.calls[-1]["run_dir"]
+        self.write_success_artifacts(run_dir)
+        record_path = self.submission_record_path(handle)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["adapter_version"], "1.4.0")
+        record["schema_version"] = "1.0.0"
+        record.pop("launch_attempt")
+        self.adapter._write_submission(record_path, record)
+
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        recovered = reopened.lookup_existing_handle(**copy.deepcopy(request))
+        self.assertEqual(recovered.as_dict(), handle.as_dict())
+        self.assertEqual(reopened.status(recovered).status, "Succeeded")
+        artifacts = reopened.collect(recovered)
+        self.assertEqual(len(artifacts), 8)
+        self.assertEqual(
+            sum(artifact["artifact_type"] == "figure" for artifact in artifacts),
+            6,
+        )
+        self.assertEqual(replacement_launcher.calls, [])
 
     def test_cancel_is_a_stable_p1_noop(self) -> None:
         handle, _ = self.submit_and_run_dir()
@@ -1928,12 +2070,27 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        launch_binding = LaunchAttemptBinding(
+            submission_id="submission-" + "1" * 64,
+            attempt_id="attempt-" + "2" * 32,
+            attempt_number=1,
+            job_id=run_dir.name,
+            request_hash="sha256:" + "3" * 64,
+            created_at=NOW,
+        )
+        stage_launch_attempt(launcher_root, run_dir, launch_binding)
+
+        allow_exit = threading.Event()
 
         class SyntheticProcess:
             pid = 4321
 
             def wait(self) -> int:
+                allow_exit.wait(1.0)
                 return 0
+
+            def poll(self) -> None:
+                return None
 
             def terminate(self) -> None:
                 return None
@@ -1951,38 +2108,55 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         ), patch(
             "scientific_runtime.fwi_adapter.subprocess.Popen",
             return_value=SyntheticProcess(),
-        ) as popen:
+        ) as popen, patch(
+            "scientific_runtime.fwi_adapter.worker_attempt_started",
+            return_value=True,
+        ) as started:
             launcher.launch(
                 command="invert",
                 config_path=config_path,
                 run_dir=run_dir,
                 run_root=launcher_root,
             )
-        argv = popen.call_args.args[0]
-        options = popen.call_args.kwargs
-        self.assertEqual(
-            argv,
-            [
-                "/usr/bin/python3",
-                "-m",
-                "fwi_worker",
-                "invert",
-                "--config",
-                str(config_path),
-                "--run-dir",
-                str(run_dir),
-            ],
-        )
-        self.assertIs(options["shell"], False)
-        self.assertNotIn("ADAPTER_TEST_SECRET", options["env"])
-        self.assertEqual(options["env"]["CUDA_VISIBLE_DEVICES"], "0")
-        for _ in range(100):
-            current = json.loads(
-                (run_dir / "status.json").read_text(encoding="utf-8")
+            argv = popen.call_args.args[0]
+            options = popen.call_args.kwargs
+            attempt_fd, capacity_fd = options["pass_fds"]
+            self.assertEqual(
+                argv,
+                [
+                    "/usr/bin/python3",
+                    "-m",
+                    "worker_launch_bootstrap",
+                    "--command",
+                    "invert",
+                    "--config",
+                    str(config_path),
+                    "--run-dir",
+                    str(run_dir),
+                    "--run-root",
+                    str(launcher_root),
+                    "--launch-attempt-id",
+                    launch_binding.attempt_id,
+                    "--launch-attempt-fd",
+                    str(attempt_fd),
+                    "--capacity-lease-fd",
+                    str(capacity_fd),
+                ],
             )
-            if current.get("stage") == "worker_exit":
-                break
-            time.sleep(0.005)
+            self.assertIs(options["shell"], False)
+            self.assertIs(options["close_fds"], True)
+            self.assertEqual(len(options["pass_fds"]), 2)
+            self.assertNotIn("ADAPTER_TEST_SECRET", options["env"])
+            self.assertEqual(options["env"]["CUDA_VISIBLE_DEVICES"], "0")
+            self.assertEqual(started.call_count, 1)
+            allow_exit.set()
+            for _ in range(100):
+                current = json.loads(
+                    (run_dir / "status.json").read_text(encoding="utf-8")
+                )
+                if current.get("stage") == "worker_exit":
+                    break
+                time.sleep(0.005)
         self.assertEqual(current.get("stage"), "worker_exit")
         current.update(
             {
@@ -2030,6 +2204,182 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         ), self.assertRaisesRegex((ValueError, RuntimeError), "RUN_ROOT_INVALID"):
             fwi_adapter_module._validate_run_root(race_root, create=False)
         self.assertTrue(swapped)
+
+    def test_launcher_timeout_stays_ambiguous_without_second_evidence_read(self) -> None:
+        launcher_root = self.base / "ambiguous-launcher-runs"
+        launcher_root.mkdir(mode=0o700)
+        run_dir = launcher_root / "fwi-20260715T060001Z-abcdef123456"
+        run_dir.mkdir(mode=0o700)
+        config_path = run_dir / "config.original.json"
+        config_path.write_text("{}", encoding="utf-8")
+        (run_dir / "status.json").write_text(
+            json.dumps(
+                {
+                    "job_id": run_dir.name,
+                    "status": "queued",
+                    "stage": "queued",
+                    "iteration": 0,
+                    "total_iterations": 1,
+                    "message": "queued",
+                    "updated_at": NOW,
+                }
+            ),
+            encoding="utf-8",
+        )
+        binding = LaunchAttemptBinding(
+            submission_id="submission-" + "4" * 64,
+            attempt_id="attempt-" + "5" * 32,
+            attempt_number=1,
+            job_id=run_dir.name,
+            request_hash="sha256:" + "6" * 64,
+            created_at=NOW,
+        )
+        stage_launch_attempt(launcher_root, run_dir, binding)
+        allow_exit = threading.Event()
+
+        class SyntheticProcess:
+            pid = 5432
+            terminated = False
+
+            def wait(self) -> int:
+                allow_exit.wait(1.0)
+                return 0
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+        process = SyntheticProcess()
+        launcher = SafeSubprocessWorkerLauncher(
+            python_executable=fwi_adapter_module.DEFAULT_WORKER_PYTHON,
+            start_timeout_seconds=0.01,
+        )
+        with patch(
+            "scientific_runtime.fwi_adapter.subprocess.Popen",
+            return_value=process,
+        ), patch(
+            "scientific_runtime.fwi_adapter.worker_attempt_started",
+            return_value=False,
+        ) as started, patch(
+            "scientific_runtime.fwi_adapter.time.monotonic",
+            side_effect=(0.0, 1.0),
+        ), self.assertRaisesRegex(
+            RuntimeError, "SUBMISSION_LAUNCH_PENDING"
+        ):
+            launcher.launch(
+                command="invert",
+                config_path=config_path,
+                run_dir=run_dir,
+                run_root=launcher_root,
+            )
+        self.assertEqual(started.call_count, 1)
+        self.assertFalse(process.terminated)
+        allow_exit.set()
+        for _ in range(100):
+            with SafeSubprocessWorkerLauncher._state_lock:
+                if SafeSubprocessWorkerLauncher._process_active == 0:
+                    break
+            time.sleep(0.005)
+        self.assertEqual(SafeSubprocessWorkerLauncher._process_active, 0)
+
+    def test_launcher_releases_local_slot_when_abort_cleanup_fails(self) -> None:
+        launcher_root = self.base / "abort-failure-runs"
+        launcher_root.mkdir(mode=0o700)
+        run_dir = launcher_root / "fwi-20260715T060002Z-abcdef123456"
+        run_dir.mkdir(mode=0o700)
+        config_path = run_dir / "config.original.json"
+        config_path.write_text("{}", encoding="utf-8")
+
+        class FailingAbortLease:
+            child_arguments: list[str] = []
+            pass_fds: tuple[int, ...] = ()
+
+            def abort(self) -> None:
+                raise RuntimeError("synthetic abort failure")
+
+        launcher = SafeSubprocessWorkerLauncher(
+            python_executable=Path("/usr/bin/python3")
+        )
+        with patch(
+            "scientific_runtime.fwi_adapter.ParentLaunchLease.acquire",
+            return_value=FailingAbortLease(),
+        ), patch(
+            "scientific_runtime.fwi_adapter.subprocess.Popen",
+            side_effect=OSError("synthetic Popen failure"),
+        ), self.assertRaisesRegex(OSError, "synthetic Popen failure"):
+            launcher.launch(
+                command="invert",
+                config_path=config_path,
+                run_dir=run_dir,
+                run_root=launcher_root,
+            )
+        self.assertEqual(SafeSubprocessWorkerLauncher._process_active, 0)
+
+    def test_adapter_timeout_keeps_launching_record_and_queued_status(self) -> None:
+        allow_exit = threading.Event()
+
+        class SyntheticProcess:
+            pid = 6543
+
+            def wait(self) -> int:
+                allow_exit.wait(1.0)
+                return 0
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                raise AssertionError("ambiguous timeout must not terminate child")
+
+        launcher = SafeSubprocessWorkerLauncher(
+            python_executable=fwi_adapter_module.DEFAULT_WORKER_PYTHON,
+            start_timeout_seconds=0.01,
+        )
+        adapter = self.make_adapter(launcher=launcher)
+        request = self.submit_kwargs(
+            task_id="task-launch-pending",
+            idempotency_key="task-launch-pending:invert:0001",
+        )
+        with patch(
+            "scientific_runtime.fwi_adapter.subprocess.Popen",
+            return_value=SyntheticProcess(),
+        ), patch(
+            "scientific_runtime.fwi_adapter.worker_attempt_started",
+            return_value=False,
+        ) as started, patch(
+            "scientific_runtime.fwi_adapter.time.monotonic",
+            side_effect=(0.0, 1.0),
+        ), self.assertRaisesRegex(
+            RuntimeError, "SUBMISSION_LAUNCH_PENDING"
+        ):
+            adapter.submit(**copy.deepcopy(request))
+        self.assertEqual(started.call_count, 1)
+
+        record_path = next(
+            (
+                self.run_root
+                / fwi_adapter_module.CONTROL_DIRECTORY
+                / "submissions"
+            ).glob("*.json")
+        )
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["launch_state"], "launching")
+        run_dir = self.run_root / record["job_id"]
+        status = json.loads(
+            (run_dir / "status.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["status"], "queued")
+        self.assertEqual(status["stage"], "queued")
+
+        allow_exit.set()
+        for _ in range(100):
+            with SafeSubprocessWorkerLauncher._state_lock:
+                if SafeSubprocessWorkerLauncher._process_active == 0:
+                    break
+            time.sleep(0.005)
+        self.assertEqual(SafeSubprocessWorkerLauncher._process_active, 0)
 
     def test_default_fixed_venv_probe_is_path_free_and_read_only(self) -> None:
         before = self.root_snapshot()

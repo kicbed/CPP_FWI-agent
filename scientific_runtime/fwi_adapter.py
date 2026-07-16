@@ -17,6 +17,7 @@ reconciliation design rather than being launched again speculatively.
 from __future__ import annotations
 
 import copy
+import contextlib
 import csv
 import fcntl
 import hashlib
@@ -25,6 +26,7 @@ import json
 import math
 import os
 import re
+import secrets
 import selectors
 import stat
 import subprocess
@@ -39,6 +41,17 @@ from jsonschema import Draft7Validator
 from PIL import Image
 
 from scientific_runtime_contracts import schema_errors
+from worker_launch_control import (
+    CONTROL_DIRECTORY,
+    LaunchAttemptBinding,
+    ParentLaunchLease,
+    WorkerControlError,
+    binding_from_submission_record,
+    hold_idle_execution_fence,
+    mark_launch_failed,
+    stage_launch_attempt,
+    worker_attempt_started,
+)
 
 from .fwi_registry import (
     DEEPWAVE_ALGORITHM_ID,
@@ -70,7 +83,6 @@ BOUND_MANIFEST_HASH = (
 GRADIENT_CLIP_QUANTILE = 0.98
 ADAM_LEARNING_RATE_MILLI_RANGE = (100, 100_000)
 SGD_LEARNING_RATE_MILLI_RANGE = (100_000_000, 1_000_000_000_000)
-CONTROL_DIRECTORY = ".scientific-runtime-adapter-v1"
 MAX_JSON_BYTES = 8 * 1024 * 1024
 # The only standard P1 output is a 94 x 288 float32 array (~106 KiB).  Keep
 # enough room for the NPY header without permitting a Worker-controlled shape
@@ -220,6 +232,10 @@ class AdapterPurgeError(AdapterError):
 
 class AdapterUnavailable(AdapterError):
     """A trusted runtime dependency or launch operation is unavailable."""
+
+
+class _AdapterLaunchAmbiguous(AdapterUnavailable):
+    """A child may exist but has not crossed the fenced ready barrier."""
 
 
 @dataclass(frozen=True)
@@ -850,11 +866,15 @@ def _read_json_file(
 
 
 class SafeSubprocessWorkerLauncher:
-    """Fixed argv, secret-minimizing, process-local two-job launcher.
+    """Fixed argv launcher with inherited attempt and capacity fences.
 
-    The active counter is intentionally described as a P1 process-local bound,
-    not a global scheduler.  P2 will own durable process identity, cancellation,
-    lease and restart reconciliation.
+    The in-process counter remains a cheap local guard.  The authoritative
+    Adapter-managed, same-host capacity boundary is a set of private ``flock``
+    slots beneath the run root.  Both the selected slot and the unique attempt
+    lock are inherited by the Worker, so a control-process exit cannot free
+    Adapter capacity or permit a duplicate managed launch while the numerical
+    process is still alive.  Standalone and legacy MCP jobs remain outside this
+    deliberately bounded slice.
     """
 
     _state_lock = threading.Lock()
@@ -866,6 +886,7 @@ class SafeSubprocessWorkerLauncher:
         python_executable: Path | None = None,
         project_root: Path = PROJECT_ROOT,
         max_active: int = 2,
+        start_timeout_seconds: float = 15.0,
     ) -> None:
         self._python = Path(python_executable or DEFAULT_WORKER_PYTHON)
         self._project_root = Path(project_root).resolve(strict=True)
@@ -877,9 +898,16 @@ class SafeSubprocessWorkerLauncher:
             raise AdapterUnavailable(
                 "WORKER_PYTHON_UNAVAILABLE: configured Python is not executable"
             )
-        if max_active < 1:
-            raise ValueError("max_active must be positive")
+        if type(max_active) is not int or not 1 <= max_active <= 64:
+            raise ValueError("max_active must be an integer from 1 to 64")
+        if (
+            isinstance(start_timeout_seconds, bool)
+            or not isinstance(start_timeout_seconds, (int, float))
+            or not 0 < float(start_timeout_seconds) <= 300.0
+        ):
+            raise ValueError("start_timeout_seconds must be from 0 to 300 seconds")
         self._max_active = max_active
+        self._start_timeout_seconds = float(start_timeout_seconds)
 
     @property
     def python_executable(self) -> Path:
@@ -903,7 +931,23 @@ class SafeSubprocessWorkerLauncher:
         return _sanitized_worker_environment(self._python, run_root=run_root)
 
     @staticmethod
-    def _mark_unexpected_exit(run_dir: Path, return_code: int) -> None:
+    def _mark_unexpected_exit(
+        run_dir: Path,
+        return_code: int,
+        *,
+        run_root: Path | None = None,
+        launch_binding: LaunchAttemptBinding | None = None,
+    ) -> None:
+        if run_root is not None or launch_binding is not None:
+            if run_root is None or launch_binding is None:
+                return
+            try:
+                if not worker_attempt_started(run_root, run_dir, launch_binding):
+                    return
+            except WorkerControlError:
+                # A stale/corrupt attempt must never let an old reaper mutate a
+                # newer attempt's status evidence.
+                return
         status_path = run_dir / "status.json"
         try:
             value = _read_json_file(status_path, code="WORKER_STATUS_INVALID")
@@ -926,6 +970,27 @@ class SafeSubprocessWorkerLauncher:
             # replaced with invented success evidence.
             return
 
+    @staticmethod
+    def _terminate_before_ready(process: subprocess.Popen[Any]) -> bool:
+        """Return true only after proving the pre-ready child has exited."""
+
+        try:
+            if process.poll() is not None:
+                return True
+            process.terminate()
+            try:
+                process.wait(timeout=5.0)
+                return True
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5.0)
+                return True
+        except Exception:
+            try:
+                return process.poll() is not None
+            except Exception:
+                return False
+
     def launch(
         self,
         *,
@@ -940,6 +1005,9 @@ class SafeSubprocessWorkerLauncher:
                 ["the standard P1 Adapter launches only inversion"],
             )
         self._reserve()
+        lease: ParentLaunchLease | None = None
+        process: subprocess.Popen[Any] | None = None
+        launch_binding: LaunchAttemptBinding | None = None
         log_path = run_dir / "run.log"
         flags = (
             os.O_WRONLY
@@ -952,6 +1020,11 @@ class SafeSubprocessWorkerLauncher:
         descriptor = -1
         directory_descriptor = -1
         try:
+            lease = ParentLaunchLease.acquire(
+                run_root,
+                run_dir,
+                max_active=self._max_active,
+            )
             candidate, directory_descriptor = _safe_parent_fd(log_path)
             descriptor = os.open(
                 candidate.name, flags, 0o600, dir_fd=directory_descriptor
@@ -959,12 +1032,16 @@ class SafeSubprocessWorkerLauncher:
             argv = [
                 str(self._python),
                 "-m",
-                "fwi_worker",
+                "worker_launch_bootstrap",
+                "--command",
                 "invert",
                 "--config",
                 str(config_path),
                 "--run-dir",
                 str(run_dir),
+                "--run-root",
+                str(run_root),
+                *lease.child_arguments,
             ]
             process = subprocess.Popen(
                 argv,
@@ -974,10 +1051,36 @@ class SafeSubprocessWorkerLauncher:
                 cwd=str(self._project_root),
                 env=self._child_environment(run_root),
                 close_fds=True,
+                pass_fds=lease.pass_fds,
                 shell=False,
             )
-        except Exception:
-            self._release()
+            try:
+                lease.mark_spawned(int(process.pid))
+            except Exception as error:
+                if not self._terminate_before_ready(process):
+                    lease.close_parent()
+                    lease = None
+                    raise _AdapterLaunchAmbiguous(
+                        "SUBMISSION_LAUNCH_PENDING: spawned Worker could not be stopped safely"
+                    ) from error
+                raise
+            launch_binding = lease.binding
+            lease.close_parent()
+            lease = None
+        except Exception as error:
+            try:
+                if lease is not None:
+                    try:
+                        lease.abort()
+                    except Exception:
+                        # abort() closes both parent descriptors in its own
+                        # finally block.  Preserve the initiating failure while
+                        # always releasing the cheap process-local reservation.
+                        pass
+            finally:
+                self._release()
+            if isinstance(error, WorkerControlError):
+                raise AdapterUnavailable(error.code) from error
             raise
         finally:
             if descriptor >= 0:
@@ -985,20 +1088,74 @@ class SafeSubprocessWorkerLauncher:
             if directory_descriptor >= 0:
                 os.close(directory_descriptor)
 
+        if process is None:
+            self._release()
+            raise AdapterUnavailable(
+                "WORKER_LAUNCH_FAILED: subprocess did not return a process"
+            )
+        if launch_binding is None:
+            stopped = self._terminate_before_ready(process)
+            self._release()
+            if not stopped:
+                raise _AdapterLaunchAmbiguous(
+                    "SUBMISSION_LAUNCH_PENDING: Worker identity is uncertain"
+                )
+            raise AdapterUnavailable(
+                "WORKER_LAUNCH_FAILED: staged launch binding was lost"
+            )
+
+        deadline = time.monotonic() + self._start_timeout_seconds
+        ready = False
+        while True:
+            try:
+                if worker_attempt_started(run_root, run_dir, launch_binding):
+                    ready = True
+                    break
+            except WorkerControlError as error:
+                stopped = self._terminate_before_ready(process)
+                self._release()
+                if not stopped:
+                    raise _AdapterLaunchAmbiguous(
+                        "SUBMISSION_LAUNCH_PENDING: Worker evidence is uncertain"
+                    ) from error
+                raise AdapterUnavailable(error.code) from error
+            return_code = process.poll()
+            if return_code is not None:
+                self._mark_unexpected_exit(run_dir, int(return_code))
+                self._release()
+                raise AdapterUnavailable(
+                    "WORKER_LAUNCH_FAILED: Worker exited before fenced readiness"
+                )
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+
         def reap() -> None:
             try:
                 return_code = process.wait()
-                self._mark_unexpected_exit(run_dir, return_code)
+                self._mark_unexpected_exit(
+                    run_dir,
+                    return_code,
+                    run_root=run_root,
+                    launch_binding=launch_binding,
+                )
             finally:
                 self._release()
 
         try:
             threading.Thread(target=reap, name="fwi-adapter-reaper", daemon=True).start()
-        except Exception:
-            process.terminate()
-            process.wait()
+        except Exception as error:
+            stopped = self._terminate_before_ready(process)
             self._release()
+            if not stopped:
+                raise _AdapterLaunchAmbiguous(
+                    "SUBMISSION_LAUNCH_PENDING: Worker reaper could not be established"
+                ) from error
             raise
+        if not ready:
+            raise _AdapterLaunchAmbiguous(
+                "SUBMISSION_LAUNCH_PENDING: Worker readiness is not yet durable"
+            )
         return int(process.pid)
 
 
@@ -1762,6 +1919,9 @@ class DeepwaveAdapter:
             "launch_state",
             "record_hash",
         }
+        schema_version = value.get("schema_version")
+        if schema_version == "1.1.0":
+            required.add("launch_attempt")
         launch_state = value.get("launch_state")
         if launch_state in {"purging", "purged"}:
             required.add("purge_id")
@@ -1770,7 +1930,7 @@ class DeepwaveAdapter:
                 "ADAPTER_SUBMISSION_INVALID: private record fields are inconsistent"
             )
         if (
-            value["schema_version"] != "1.0.0"
+            schema_version not in {"1.0.0", "1.1.0"}
             or not is_supported_receipt_binding(
                 value["algorithm"],
                 value["adapter_version"],
@@ -1780,6 +1940,13 @@ class DeepwaveAdapter:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private record version is unsupported"
             )
+        if schema_version == "1.1.0":
+            try:
+                binding_from_submission_record(value)
+            except WorkerControlError as error:
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: launch attempt binding is invalid"
+                ) from error
         if launch_state not in {
             "preparing",
             "launching",
@@ -1874,12 +2041,14 @@ class DeepwaveAdapter:
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
     ) -> AdapterHandle:
-        """Read one exact current-version launched receipt without submitting.
+        """Read or fence-adopt one exact current-version Worker receipt.
 
         This path derives the private record name from immutable request
         identity and serializes with ``submit`` on the already-existing lock.
-        It does not create control state, inspect job directories, evaluate
-        runtime readiness, or call the Worker launcher.
+        A legacy or ordinary launched record is read without side effects.  A
+        v1.1 ``launching`` record is promoted only after the exact inherited-
+        fence Worker has written its first heartbeat.  The path never calls the
+        Worker launcher and never guesses a PID or scans the run root.
         """
 
         self._validate_submit_identity(
@@ -1960,6 +2129,22 @@ class DeepwaveAdapter:
                     "ADAPTER_SUBMISSION_PREPARING: Worker launch was not reached"
                 )
             if launch_state == "launching":
+                if record["schema_version"] == "1.1.0":
+                    try:
+                        binding = binding_from_submission_record(record)
+                        started = worker_attempt_started(
+                            self._run_root,
+                            self._run_root / record["job_id"],
+                            binding,
+                        )
+                    except WorkerControlError as error:
+                        raise AdapterHandleError(
+                            "ADAPTER_SUBMISSION_INVALID: Worker attempt evidence is invalid"
+                        ) from error
+                    if started:
+                        record["launch_state"] = "launched"
+                        self._write_submission(index_path, record)
+                        return self._handle_from_record(record)
                 raise AdapterUnavailable(
                     "ADAPTER_SUBMISSION_LAUNCH_AMBIGUOUS: Worker launch outcome is unknown"
                 )
@@ -2111,8 +2296,16 @@ class DeepwaveAdapter:
                     "FINGERPRINT_INVALID: live validation returned no fingerprint"
                 )
             fingerprint = copy.deepcopy(validated.fingerprint)
+            launch_binding = LaunchAttemptBinding(
+                submission_id=submission_id,
+                attempt_id=f"attempt-{secrets.token_hex(16)}",
+                attempt_number=1,
+                job_id=job_id,
+                request_hash=request_hash,
+                created_at=created_at,
+            )
             record: dict[str, Any] = {
-                "schema_version": "1.0.0",
+                "schema_version": "1.1.0",
                 **request_payload,
                 "job_id": job_id,
                 "request_hash": request_hash,
@@ -2120,6 +2313,7 @@ class DeepwaveAdapter:
                 "worker_config": copy.deepcopy(validated.worker_config),
                 "fingerprint": fingerprint,
                 "created_at": created_at,
+                "launch_attempt": launch_binding.record(),
                 "launch_state": "preparing",
             }
             self._write_submission(index_path, record)
@@ -2134,6 +2328,19 @@ class DeepwaveAdapter:
                 raise AdapterUnavailable(
                     "JOB_DIRECTORY_INVALID: job directory escaped the run root"
                 )
+            # Publish the managed marker before queued status/config make this
+            # directory reusable.  The legacy CLI rejects the sidecar, closing
+            # the interval in which it could accidentally enter this job.
+            try:
+                stage_launch_attempt(
+                    self._run_root,
+                    job_dir,
+                    launch_binding,
+                )
+            except WorkerControlError as error:
+                record["launch_state"] = "failed"
+                self._write_submission(index_path, record)
+                raise AdapterUnavailable(error.code) from error
             worker_config = {"job_id": job_id, **validated.worker_config}
             _atomic_write_json(job_dir / "config.original.json", worker_config)
             _atomic_write_json(
@@ -2148,16 +2355,34 @@ class DeepwaveAdapter:
                     "updated_at": created_at,
                 },
             )
-            record["launch_state"] = "launching"
-            self._write_submission(index_path, record)
             try:
+                record["launch_state"] = "launching"
+                self._write_submission(index_path, record)
                 self._launcher.launch(
                     command=validated.command,
                     config_path=job_dir / "config.original.json",
                     run_dir=job_dir,
                     run_root=self._run_root,
                 )
+            except _AdapterLaunchAmbiguous as error:
+                # Popen may have succeeded and the child retains both kernel
+                # fences.  Keep the durable state at ``launching`` so startup
+                # recovery can adopt only after the exact ready receipt exists.
+                raise AdapterUnavailable(str(error)) from error
             except Exception as error:
+                if (
+                    isinstance(error, AdapterUnavailable)
+                    and error.code == "ADAPTER_CONCURRENCY_LIMIT"
+                ):
+                    record["launch_state"] = "preparing"
+                    self._write_submission(index_path, record)
+                    raise
+                try:
+                    mark_launch_failed(job_dir, launch_binding)
+                except WorkerControlError:
+                    # The submission record below remains the fail-closed
+                    # authority for the Adapter launch outcome.
+                    pass
                 record["launch_state"] = "failed"
                 self._write_submission(index_path, record)
                 _atomic_write_json(
@@ -2452,24 +2677,39 @@ class DeepwaveAdapter:
                         local_run_state="deleted",
                         replayed=True,
                     )
-            else:
-                observed = self._status_for_record(record)
-                if not observed.terminal or observed.status not in {
-                    "Succeeded",
-                    "Failed",
-                }:
-                    raise AdapterPurgeError(
-                        "PURGE_REQUIRES_TERMINAL_STATUS: Worker is not succeeded or failed"
-                    )
-                record["launch_state"] = "purging"
-                record["purge_id"] = purge_id
-                self._write_submission(index_path, record)
+            try:
+                fence = contextlib.nullcontext()
+                if record["schema_version"] == "1.1.0":
+                    binding = binding_from_submission_record(record)
+                    fence = hold_idle_execution_fence(self._run_root, binding)
+                with fence:
+                    if launch_state == "launched":
+                        observed = self._status_for_record(record)
+                        if not observed.terminal or observed.status not in {
+                            "Succeeded",
+                            "Failed",
+                        }:
+                            raise AdapterPurgeError(
+                                "PURGE_REQUIRES_TERMINAL_STATUS: Worker is not succeeded or failed"
+                            )
+                        record["launch_state"] = "purging"
+                        record["purge_id"] = purge_id
+                        self._write_submission(index_path, record)
 
-            # A missing directory is accepted only after the durable purging
-            # tombstone exists.  This closes the delete-before-receipt crash gap.
-            self._purge_job_directory(record)
-            record["launch_state"] = "purged"
-            self._write_submission(index_path, record)
+                    # A missing directory is accepted only after the durable
+                    # purging tombstone exists.  Holding the stable execution
+                    # fence prevents a terminal heartbeat from racing delete.
+                    self._purge_job_directory(record)
+                    record["launch_state"] = "purged"
+                    self._write_submission(index_path, record)
+            except WorkerControlError as error:
+                if error.code == "WORKER_ATTEMPT_BUSY":
+                    raise AdapterPurgeError(
+                        "PURGE_WORKER_STILL_ACTIVE: fenced Worker has not released its execution lease"
+                    ) from error
+                raise AdapterPurgeError(
+                    "PURGE_WORKER_FENCE_INVALID: execution fence is unavailable"
+                ) from error
             return AdapterPurgeResult(
                 task_id=handle.task_id,
                 purge_id=purge_id,

@@ -26,6 +26,18 @@ class DispatchError(RuntimeError):
         super().__init__(code)
 
 
+class DispatchDeferred(DispatchError):
+    """No terminal dispatch outcome is known; keep the intent recoverable."""
+
+
+DEFERRED_DISPATCH_CODES = frozenset(
+    {
+        "ADAPTER_CONCURRENCY_LIMIT",
+        "SUBMISSION_LAUNCH_PENDING",
+    }
+)
+
+
 @dataclass(frozen=True)
 class DispatchPreparation:
     """Side-effect-free Adapter evidence derived from a durable task view."""
@@ -167,6 +179,8 @@ class DeepwaveTaskDispatcher:
         try:
             handle = self._adapter.submit(**request)
         except AdapterError as error:
+            if error.code in DEFERRED_DISPATCH_CODES:
+                raise DispatchDeferred(error.code) from error
             raise DispatchError(error.code) from error
         except Exception as error:
             raise DispatchError("DISPATCH_UNAVAILABLE") from error

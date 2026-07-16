@@ -46,6 +46,8 @@ required_files=(
     scientific_runtime/task_service.py
     scientific_runtime/task_dispatcher.py
     scientific_runtime/workbench_service.py
+    worker_launch_bootstrap.py
+    worker_launch_control.py
     scientific_runtime/migrations/0001_task_store.sql
     scientific_runtime/migrations/0002_catalog_registry.sql
     scientific_runtime/migrations/0003_submit_dispatch.sql
@@ -59,6 +61,7 @@ required_files=(
     tests/test_scientific_runtime_task_purge_store.py
     tests/test_scientific_runtime_task_service.py
     tests/test_scientific_runtime_workbench.py
+    tests/test_worker_launch_control.py
     contracts/scientific_runtime/v1/common.schema.json
     contracts/scientific_runtime/v1/dataset-ref.schema.json
     contracts/scientific_runtime/v1/algorithm-manifest.schema.json
@@ -68,7 +71,12 @@ required_files=(
     contracts/scientific_runtime/v1/run-event.schema.json
     contracts/scientific_runtime/v1/artifact-manifest.schema.json
     fwi_worker/adapter_probe.py
+    fwi_worker/__main__.py
+    fwi_worker/artifacts.py
+    tests/fwi_worker/test_state_artifacts.py
+    web/serve.py
     web/workbench_api.py
+    web/tests/test_artifact_route.py
     web/tests/test_workbench_api.py
     web/tests/test_workbench_route.py
 )
@@ -107,7 +115,7 @@ require_text docs/PROJECT_CONTINUITY.md '## D-010：'
 require_text docs/PROJECT_CONTINUITY.md '低 token 自动接续与 CodeGraph 导航'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
-require_text docs/PROJECT_CONTINUITY.md 'P2.1 有界切片'
+require_text docs/PROJECT_CONTINUITY.md 'P2.1–P2.5B 有界切片'
 require_text docs/PROJECT_CONTINUITY.md '完整 P2 Pending'
 require_text docs/PROJECT_CONTINUITY.md '精确历史七个 form 字段'
 require_text docs/PROJECT_CONTINUITY.md '当前 Algorithm/Adapter `deepwave.acoustic_fwi@1.4.0`/`1.4.0`'

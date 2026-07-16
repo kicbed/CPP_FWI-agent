@@ -5,8 +5,8 @@
 - 决策编号：`D-003`
 - 决策状态：**Accepted**
 - Runtime 实现状态：**P0 + P1 Verified；P2.1 任务发现/重开、P2.2 可恢复回收站、P2.3
-  本地结果永久删除、P2.4 启动 receipt 收养/状态追赶与 P2.5A 控制面 fenced lease/持续状态泵
-  均为有界 Verified；完整 P2 仍 Pending**
+  本地结果永久删除、P2.4 启动 receipt 收养/状态追赶、P2.5A 控制面 fenced lease/持续状态泵与
+  P2.5B 固定 Adapter 托管 Worker launch fence 均为有界 Verified；完整 P2 仍 Pending**
 - 用户确认日期：2026-07-15
 - 实现分支：`feature/scientific-agent-runtime`
 - 基线分支：`feature/fwi-deepwave-2d-acoustic`
@@ -333,10 +333,28 @@ Worker 生命周期或容量。Web 关闭
 非 daemon 线程、外层 30 秒 KILL 与 lease expiry 保留任意阻塞 I/O 的最终边界。Scientific Runtime
 226/226、Worker 28/28、Web 45/45 与完整回归通过，未运行真实 FWI/CUDA。
 
-P2.5A 明确不是 Worker lease/heartbeat 或 fenced capacity。下一子窗口必须先给固定 Adapter
-增加可恢复的 staged launch protocol、唯一 attempt fence、跨进程 capacity lease 和独立 Worker
-heartbeat，证明崩溃与接管不会重复启动；之后才能安全处理 pending/no-record 首次派发、取消、
-超时和 retry。完整 reconciliation 与 SSE 仍后置，因此完整 P2 仍为 **Pending**。
+继续 D-003 后实现的有界 **P2.5B 固定 Adapter 托管 Worker staged launch fence** 为 current
+1.4 私有 submission 增加独立 control schema 1.1 的唯一 attempt binding 与 managed ticket。
+固定 launcher 在 `Popen` 前取得 stable per-submission execution `flock` 和固定策略下的 capacity
+slot `flock`，两个 FD 跨 exec 由 Worker 持有；父控制器退出不能释放子进程的执行权或容量。
+轻量 bootstrap 在导入 Torch/Deepwave 前验证 ticket/FD/inode/slot generation/PID，启动独立
+heartbeat thread 并写 immutable ready 后才进入数值 Worker；子进程可补齐父控制器遗漏的
+`leased → spawned`。heartbeat 只提供 exact attempt 健康证据，不能凭 TTL/过期替换仍持锁的
+Worker，内核锁才是本切片的安全权威。
+
+Safe launcher 只有在 ready/heartbeat 与 attempt 全绑定时才返回；已确认 pre-ready 退出可失败，
+任何 post-Popen 未确认结果保持 `launching`/deferred。P2.4 lookup 可精确收养已经 ready 的
+`launching` receipt，capacity 满也不写 immutable dispatch outcome。purge 必须在整个删除期间
+持有空闲 submission fence；managed sidecar 的临时原子文件不进入 artifact 目录，legacy CLI
+拒绝托管目录，Web 拒绝所有 hidden artifact component。current 1.4 历史 private schema 1.0
+继续严格读取；Algorithm/Adapter 1.4 的科学输出合同不因内部 launch-control schema 改变。
+
+P2.5B 仍不是 SQLite TaskStore Worker lease 或 scheduler：attempt/ready/heartbeat 尚未投影到
+Task Store，standalone CLI/C++ MCP 不在该 Adapter capacity pool，pending/no-record 不会首次
+派发，也没有 heartbeat takeover、cancel、timeout 或 retry。下一子窗口应先让 fenced
+Supervisor/scheduler 消费持久 Worker attempt/heartbeat 投影并证明调度接管不重复启动，之后才
+安全推进 pending/no-record、取消和超时；完整 reconciliation 与 SSE 继续后置，因此完整 P2
+仍为 **Pending**。
 
 完成标准：重复请求不重复建任务；控制面重启后恢复或明确终结任务；取消能到达 Worker；
 已提交任务不依赖浏览器连接存活。
@@ -441,3 +459,4 @@ heartbeat，证明崩溃与接管不会重复启动；之后才能安全处理 p
 | 2026-07-15 | 增加 D-009/P2.3 有界回收站永久删除：SQLite 两阶段墓碑、受控本地 Worker 目录清理、强确认与无级联；完整 P2 继续延期 | 用户明确要求回收站支持删除且本地文件随之删除，并要求不要重复耗时实验 |
 | 2026-07-16 | 实现 P2.4 有界启动 receipt 收养/状态追赶：安全审查后禁止 startup 首次派发，采用 bind 后 current 1.4 launched-record 只读 lookup、严格相同 handle 收敛、一次 status 追赶；fenced capacity/lease/cancel/SSE 继续延期 | 用户要求继续 D-003；沿既有 P2 reconciliation 方向推进首个可证明不重启 Worker 的子窗口 |
 | 2026-07-16 | 实现 P2.5A 控制面 fenced lease/持续状态泵：SQLite v8 term/closure/commit fence、observation-only Supervisor 和 lease-before-listen 生命周期；Worker staged launch/capacity/heartbeat 继续延期 | 用户继续 D-003；先关闭浏览器连接依赖，同时保持绝不首次派发或重启 Worker 的安全边界 |
+| 2026-07-16 | 实现 P2.5B 固定 Adapter 托管 Worker staged launch fence：exec-inherited submission/capacity locks、pre-import ready/heartbeat、exact adoption、post-Popen deferred 与 purge fence；SQLite Worker scheduler 继续延期 | 用户继续 D-003；沿已接受的 Worker 分阶段启动方向关闭控制器崩溃重复启动窗口，同时不扩大到 pending/no-record 首次派发 |

@@ -640,6 +640,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not FWI_JOB_ID_PATTERN.fullmatch(job_id):
             self.send_error(http.HTTPStatus.FORBIDDEN, "Invalid FWI job id")
             return
+        # Hidden files are private implementation/control state, never Web
+        # artifacts.  This is checked after decoding so encoded leading dots
+        # cannot expose present or future Worker sidecars.
+        if any(part.startswith(".") for part in relative_parts):
+            self.send_error(http.HTTPStatus.FORBIDDEN, "Private artifact path")
+            return
 
         suffix = Path(relative_parts[-1]).suffix.lower()
         content_type = FWI_CONTENT_TYPES.get(suffix)

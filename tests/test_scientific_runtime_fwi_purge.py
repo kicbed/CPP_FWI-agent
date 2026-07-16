@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -19,6 +20,11 @@ from scientific_runtime.fwi_adapter import (
 )
 from scientific_runtime.task_dispatcher import DeepwaveTaskDispatcher, DispatchError
 from scientific_runtime.task_store import DispatchIntentSnapshot
+from worker_launch_control import (
+    ParentLaunchLease,
+    WorkerHeartbeat,
+    binding_from_submission_record,
+)
 
 
 NOW = "2026-07-15T13:00:00Z"
@@ -172,9 +178,20 @@ class ScientificRuntimeFWIPurgeTest(unittest.TestCase):
             },
         }
 
-    def submit(self, task_id: str = "task-purge-1") -> tuple[Any, Path]:
+    def submit(
+        self,
+        task_id: str = "task-purge-1",
+        *,
+        initialize_fence: bool = True,
+    ) -> tuple[Any, Path]:
         handle = self.adapter.submit(**self.request(task_id))
-        return handle, self.launcher.calls[-1]["run_dir"]
+        run_dir = self.launcher.calls[-1]["run_dir"]
+        if initialize_fence:
+            lease = ParentLaunchLease.acquire(
+                self.run_root, run_dir, max_active=1
+            )
+            lease.abort()
+        return handle, run_dir
 
     def record_path(self, handle: Any) -> Path:
         name = handle.submission_id.removeprefix("submission-") + ".json"
@@ -285,6 +302,22 @@ class ScientificRuntimeFWIPurgeTest(unittest.TestCase):
         self.assertEqual(second, first | {"replayed": True})
         with self.assertRaisesRegex(RuntimeError, "PURGE_IDEMPOTENCY_CONFLICT"):
             self.adapter.purge(handle, purge_id="purge-operation-2")
+
+    def test_current_v1_4_private_schema_v1_0_remains_purgeable(self) -> None:
+        handle, run_dir = self.make_terminal_tree(
+            task_id="task-purge-current-private-v1"
+        )
+        record_path = self.record_path(handle)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["adapter_version"], "1.4.0")
+        record["schema_version"] = "1.0.0"
+        record.pop("launch_attempt")
+        self.adapter._write_submission(record_path, record)
+        result = self.adapter.purge(
+            handle, purge_id="purge-current-private-v1"
+        ).as_dict()
+        self.assertEqual(result["local_run_state"], "deleted")
+        self.assertFalse(run_dir.exists())
 
     def test_failed_is_terminal_but_queued_running_and_missing_are_rejected(self) -> None:
         failed, failed_dir = self.make_terminal_tree(
@@ -398,6 +431,49 @@ class ScientificRuntimeFWIPurgeTest(unittest.TestCase):
         self.assertFalse(run_dir.exists())
         self.assertEqual(sum(not item["replayed"] for item in results), 1)
         self.assertTrue(all(item["local_run_state"] == "deleted" for item in results))
+
+    def test_purge_waits_for_terminal_worker_to_release_execution_fence(self) -> None:
+        handle, run_dir = self.submit(
+            "task-purge-active", initialize_fence=False
+        )
+        self.write_status(run_dir, "succeeded")
+        record = json.loads(
+            self.record_path(handle).read_text(encoding="utf-8")
+        )
+        binding = binding_from_submission_record(record)
+        lease = ParentLaunchLease.acquire(
+            self.run_root, run_dir, max_active=1
+        )
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.run_root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError, "PURGE_WORKER_STILL_ACTIVE"
+            ):
+                self.adapter.purge(handle, purge_id="purge-active")
+            self.assertTrue(run_dir.is_dir())
+            current = json.loads(
+                self.record_path(handle).read_text(encoding="utf-8")
+            )
+            self.assertEqual(current["launch_state"], "launched")
+        finally:
+            heartbeat.stop("succeeded")
+
+        result = self.adapter.purge(
+            handle, purge_id="purge-active"
+        ).as_dict()
+        self.assertEqual(result["local_run_state"], "deleted")
+        time.sleep(0.05)
+        self.assertFalse(run_dir.exists())
 
     def test_dispatcher_accepts_only_durable_bound_dispatched_intent(self) -> None:
         handle, run_dir = self.make_terminal_tree(task_id="task-purge-dispatch")

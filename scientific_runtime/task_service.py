@@ -24,7 +24,12 @@ from .fwi_registry import (
     DEEPWAVE_ALGORITHM_VERSION,
     load_deepwave_manifest,
 )
-from .task_dispatcher import DispatchError, DispatchPreparation, TaskDispatcher
+from .task_dispatcher import (
+    DispatchDeferred,
+    DispatchError,
+    DispatchPreparation,
+    TaskDispatcher,
+)
 from .task_store import (
     ALLOWED_TRANSITIONS,
     TASK_STATUSES,
@@ -1833,6 +1838,12 @@ class TaskService:
             raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
         try:
             handle = self._dispatcher.dispatch(intent)
+        except DispatchDeferred:
+            # Capacity pressure or a post-Popen ambiguity has no trustworthy
+            # terminal outcome.  Preserve ``dispatching`` so exact startup
+            # recovery can adopt a later fenced ready receipt without a second
+            # launch.  Scheduling/retry policy remains a later P2 slice.
+            return intent
         except DispatchError as error:
             return self._record_dispatch_reconciliation(
                 intent=intent, failure_code=error.code

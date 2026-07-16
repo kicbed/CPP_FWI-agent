@@ -14,6 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from scientific_runtime import (
+    DispatchDeferred,
     DispatchError,
     DispatchPreparation,
     RegistryService,
@@ -2583,6 +2584,42 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(result.intent.state, "reconciliation_required")
         self.assertEqual(result.intent.failure_code, "DISPATCH_RECEIPT_INVALID")
         self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+
+    def test_deferred_dispatch_keeps_claim_recoverable_without_outcome(self) -> None:
+        created = self.create_executable()
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_executable_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+
+        def deferred_dispatch(intent):
+            self.assertEqual(intent.state, "dispatching")
+            dispatcher.dispatch_calls += 1
+            raise DispatchDeferred("ADAPTER_CONCURRENCY_LIMIT")
+
+        dispatcher.dispatch = deferred_dispatch
+        service = self.submit_service(dispatcher)
+        result = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-capacity-deferred",
+            **self.scope,
+        )
+        self.assertTrue(result.dispatch_attempted)
+        self.assertEqual(result.snapshot.status, "Queued")
+        self.assertEqual(result.intent.state, "dispatching")
+        self.assertIsNone(result.intent.failure_code)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
+
+        replay = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-capacity-deferred",
+            **self.scope,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertFalse(replay.dispatch_attempted)
+        self.assertEqual(replay.intent.state, "dispatching")
+        self.assertEqual(dispatcher.dispatch_calls, 1)
 
     def test_submit_exact_replay_precedes_expiry_budget_and_preflight(self) -> None:
         created = self.create_executable()

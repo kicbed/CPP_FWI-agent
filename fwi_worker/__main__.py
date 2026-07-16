@@ -139,7 +139,13 @@ def _save_arrays(
         save_npy(run_dir / relative, value.astype(np.float32, copy=False))
 
 
-def run_worker(command: str, config_path: str, requested_run_dir: str | None) -> dict[str, Any]:
+def run_worker(
+    command: str,
+    config_path: str,
+    requested_run_dir: str | None,
+    *,
+    managed_launch: bool = False,
+) -> dict[str, Any]:
     raw, config = load_config(config_path)
     if command == "forward":
         config = config.model_copy(update={"iterations": 0})
@@ -154,7 +160,11 @@ def run_worker(command: str, config_path: str, requested_run_dir: str | None) ->
             raise ValueError(
                 "an existing queued run must use its own config.original.json"
             )
-    run_dir, job_id = prepare_run_dir(requested_run_dir, config.job_id)
+    run_dir, job_id = prepare_run_dir(
+        requested_run_dir,
+        config.job_id,
+        managed_launch=managed_launch,
+    )
     config = config.model_copy(update={"job_id": job_id})
     state = JobState(run_dir, job_id)
     start = time.perf_counter()

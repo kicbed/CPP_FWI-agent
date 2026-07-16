@@ -41,6 +41,13 @@ class ArtifactRouteTest(unittest.TestCase):
         )
         (cls.job_dir / "loss.csv").write_text("iteration,loss\n0,1.0\n", encoding="utf-8")
         (cls.job_dir / "forbidden.txt").write_text("not served", encoding="utf-8")
+        cls.private_sentinel = b"PRIVATE-WORKER-CONTROL-SENTINEL"
+        for name in (
+            ".worker-launch.json",
+            ".worker-ready.json",
+            ".worker-heartbeat.json",
+        ):
+            (cls.job_dir / name).write_bytes(cls.private_sentinel)
 
         cls.outside_dir = Path(cls.temp_dir.name) / "outside"
         cls.outside_dir.mkdir()
@@ -132,6 +139,20 @@ class ArtifactRouteTest(unittest.TestCase):
 
         status, _, _ = self.request("/root/.env")
         self.assertEqual(status, 404)
+
+    def test_private_worker_control_sidecars_are_never_served(self):
+        paths = [
+            f"/fwi-artifacts/{self.job_id}/.worker-launch.json",
+            f"/fwi-artifacts/{self.job_id}/.worker-ready.json",
+            f"/fwi-artifacts/{self.job_id}/.worker-heartbeat.json",
+            f"/fwi-artifacts/{self.job_id}/%2eworker-ready.json",
+        ]
+        for method in ("GET", "HEAD"):
+            for path in paths:
+                with self.subTest(method=method, path=path):
+                    status, _, body = self.request(path, method=method)
+                    self.assertEqual(status, 403)
+                    self.assertNotIn(self.private_sentinel, body)
 
     def test_symlink_escape_and_symlink_job_are_rejected(self):
         status, _, _ = self.request(
