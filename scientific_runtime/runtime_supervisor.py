@@ -88,6 +88,16 @@ class RuntimeSupervisorTaskService(Protocol):
     ) -> Any:
         ...
 
+    def reconcile_runtime_dispatch(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: Any,
+    ) -> Any:
+        ...
+
     def refresh_runtime_status(
         self,
         task_id: str,
@@ -136,6 +146,7 @@ class RuntimeSupervisorCycleResult:
     timeout_armed_task_ids: tuple[str, ...] = ()
     timeout_processed_task_ids: tuple[str, ...] = ()
     timeout_resolved_task_ids: tuple[str, ...] = ()
+    reconciled_task_ids: tuple[str, ...] = ()
 
 
 class _SupervisorFailure(RuntimeError):
@@ -615,8 +626,10 @@ class RuntimeSupervisor:
         timeout_armed: list[str] = []
         timeout_processed: list[str] = []
         timeout_resolved: list[str] = []
+        reconciled: list[str] = []
         deferred: list[tuple[str, str]] = []
         failures: list[tuple[str, str]] = []
+        reconciliation_probe_used = False
         for snapshot in snapshots:
             if self._stop_event.is_set():
                 break
@@ -735,7 +748,128 @@ class RuntimeSupervisor:
                 continue
             intent_state = getattr(intent, "state", None)
             schedule_projected = False
-            if intent_state in {"pending", "dispatching"}:
+            force_reconciliation_projection = False
+            if intent_state == "reconciliation_required":
+                if reconciliation_probe_used:
+                    deferred.append((task_id, "RECONCILIATION_CYCLE_LIMIT"))
+                    continue
+                if not self._worker_projection_due(task_id):
+                    deferred.append((task_id, "RECONCILIATION_PROBE_NOT_DUE"))
+                    continue
+                reconciliation_probe_used = True
+                lease, next_heartbeat = self._heartbeat_if_due(
+                    lease, next_heartbeat
+                )
+                try:
+                    reconciliation = (
+                        self._task_service.reconcile_runtime_dispatch(
+                            task_id,
+                            project_id=self._project_id,
+                            principal_id=self._principal_id,
+                            supervisor_lease=lease,
+                        )
+                    )
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    # A positive resolution may have committed immediately
+                    # before timeout arming or result delivery failed.  Do not
+                    # let this probe consume the normal projection cadence;
+                    # the next cycle must inspect a possibly managed receipt.
+                    self._worker_projection_deadlines.pop(task_id, None)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "RECONCILIATION_PROBE_FAILED"
+                            ),
+                        )
+                    )
+                    continue
+                reconciled_intent = getattr(reconciliation, "intent", None)
+                reconciled_state = getattr(reconciled_intent, "state", None)
+                evidence_kind = getattr(
+                    reconciliation, "evidence_kind", None
+                )
+                authorized_flag = getattr(
+                    reconciliation, "authorized", None
+                )
+                authorization_replayed = getattr(
+                    reconciliation, "authorization_replayed", None
+                )
+                probe_attempted = getattr(
+                    reconciliation, "probe_attempted", None
+                )
+                reconciled_projected = getattr(
+                    reconciliation, "projected", None
+                )
+                reconciled_adopted = getattr(
+                    reconciliation, "adopted", None
+                )
+                reconciliation_timeout_armed = getattr(
+                    reconciliation, "timeout_armed", False
+                )
+                deferred_code = getattr(
+                    reconciliation, "deferred_code", None
+                )
+                if (
+                    getattr(reconciled_intent, "task_id", None) != task_id
+                    or reconciled_state
+                    not in {"reconciliation_required", "dispatched"}
+                    or evidence_kind
+                    not in {
+                        None,
+                        "managed_worker_receipt",
+                        "private_receipt",
+                    }
+                    or type(authorized_flag) is not bool
+                    or type(authorization_replayed) is not bool
+                    or type(probe_attempted) is not bool
+                    or type(reconciled_projected) is not bool
+                    or type(reconciled_adopted) is not bool
+                    or type(reconciliation_timeout_armed) is not bool
+                    or (probe_attempted and not authorized_flag)
+                    or (reconciled_projected and evidence_kind != "managed_worker_receipt")
+                    or (
+                        reconciled_adopted
+                        and reconciled_state != "dispatched"
+                    )
+                    or (
+                        reconciled_state == "dispatched"
+                        and deferred_code is not None
+                    )
+                    or (
+                        deferred_code is not None
+                        and (
+                            not isinstance(deferred_code, str)
+                            or _STABLE_CODE.fullmatch(deferred_code) is None
+                        )
+                    )
+                ):
+                    raise _SupervisorFailure(FATAL)
+                if reconciled_state != "dispatched":
+                    deferred.append(
+                        (
+                            task_id,
+                            deferred_code or "RECONCILIATION_ACTION_REQUIRED",
+                        )
+                    )
+                    continue
+                reconciled.append(task_id)
+                dispatched.append(task_id)
+                if reconciled_projected:
+                    projected.append(task_id)
+                if reconciled_adopted:
+                    adopted.append(task_id)
+                if reconciliation_timeout_armed:
+                    timeout_armed.append(task_id)
+                intent = reconciled_intent
+                intent_state = "dispatched"
+                schedule_projected = reconciled_projected
+                force_reconciliation_projection = (
+                    evidence_kind == "managed_worker_receipt"
+                    and not reconciled_projected
+                )
+            elif intent_state in {"pending", "dispatching"}:
                 lease, next_heartbeat = self._heartbeat_if_due(
                     lease, next_heartbeat
                 )
@@ -824,8 +958,10 @@ class RuntimeSupervisor:
                 }.get(intent_state, "DISPATCH_INTENT_UNSUPPORTED")
                 deferred.append((task_id, code))
                 continue
-            projection_due = (
-                not schedule_projected and self._worker_projection_due(task_id)
+            if force_reconciliation_projection:
+                self._worker_projection_deadlines.pop(task_id, None)
+            projection_due = not schedule_projected and self._worker_projection_due(
+                task_id
             )
             if projection_due:
                 lease, next_heartbeat = self._heartbeat_if_due(
@@ -963,6 +1099,7 @@ class RuntimeSupervisor:
                 timeout_armed_task_ids=tuple(dict.fromkeys(timeout_armed)),
                 timeout_processed_task_ids=tuple(timeout_processed),
                 timeout_resolved_task_ids=tuple(timeout_resolved),
+                reconciled_task_ids=tuple(reconciled),
             ),
             lease,
             next_heartbeat,

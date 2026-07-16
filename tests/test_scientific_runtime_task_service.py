@@ -33,7 +33,10 @@ from scientific_runtime import (
 from scientific_runtime_contracts import compute_plan_hash, schema_errors
 from scientific_runtime.fwi_registry import load_deepwave_manifest
 from scientific_runtime.fwi_adapter import AdapterManagedTimeoutProof
-from scientific_runtime.task_dispatcher import DeepwaveTaskDispatcher
+from scientific_runtime.task_dispatcher import (
+    DeepwaveTaskDispatcher,
+    DispatchReceiptProbe,
+)
 from scientific_runtime.task_store import APPLICATION_ID, encode_document
 from tests.test_scientific_runtime_contracts import (
     append_second_plan_node,
@@ -189,6 +192,10 @@ class FakeDispatcher:
         self.worker_observation_calls = 0
         self.worker_observation: dict | None = None
         self.worker_observation_failure_code: str | None = None
+        self.reconciliation_probe_calls = 0
+        self.reconciliation_probe_barrier: threading.Barrier | None = None
+        self.reconciliation_probe_failure_code: str | None = None
+        self.reconciliation_probe_result: DispatchReceiptProbe | None = None
         self.status_calls = 0
         self.exact_cancel_supported = True
         self.exact_cancel_barrier: threading.Barrier | None = None
@@ -335,6 +342,31 @@ class FakeDispatcher:
         if self.worker_observation is None:
             raise DispatchError("ADAPTER_SUBMISSION_NOT_FOUND")
         return copy.deepcopy(self.worker_observation)
+
+    def probe_existing_dispatch_receipt(self, intent):
+        del intent
+        with self.lock:
+            self.reconciliation_probe_calls += 1
+        if self.reconciliation_probe_barrier is not None:
+            self.reconciliation_probe_barrier.wait(timeout=5)
+        if self.reconciliation_probe_failure_code is not None:
+            raise DispatchDeferred(self.reconciliation_probe_failure_code)
+        if self.reconciliation_probe_result is not None:
+            return copy.deepcopy(self.reconciliation_probe_result)
+        observed = self.worker_observation
+        if (
+            not isinstance(observed, dict)
+            or not isinstance(observed.get("handle"), dict)
+            or not isinstance(observed.get("evidence"), dict)
+        ):
+            raise DispatchDeferred("DISPATCH_RECEIPT_NOT_READY")
+        return DispatchReceiptProbe(
+            evidence_kind="managed_worker_receipt",
+            handle=copy.deepcopy(observed["handle"]),
+            evidence=copy.deepcopy(observed["evidence"]),
+            private_schema_version="1.1.0",
+            receipt_record_hash=None,
+        )
 
     def status(self, intent):
         with self.lock:
@@ -672,7 +704,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 12)
+        self.assertEqual(self.store.migration_version(), 13)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -688,7 +720,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 12)
+        self.assertEqual(reopened.migration_version(), 13)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -775,12 +807,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 12)] * 8)
+        self.assertEqual(results, [("wal", 13)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 13")
+            connection.execute("PRAGMA user_version = 14")
             connection.commit()
         finally:
             connection.close()
@@ -4520,6 +4552,178 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             "reconciliation_required",
         )
         self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+
+    def test_reconciliation_adopts_managed_receipt_and_arms_timeout(self) -> None:
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="managed-reconciliation-positive"
+        )
+        claimed = self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-managed-reconciliation-positive",
+            launch=True,
+        )
+        original = self.store.record_dispatch_reconciliation(
+            intent_id=claimed.intent_id,
+            failure_code="SUBMISSION_RECONCILIATION_REQUIRED",
+            now=NOW,
+        )
+        dispatcher.exact_timeout_supported = True
+        dispatcher.adapter_status = {
+            "status": "Running",
+            "stage": "invert",
+            "completed": 1,
+            "total": 2,
+            "message": "synthetic reconciled progress",
+            "updated_at": NOW,
+            "terminal": False,
+        }
+        lease = service.acquire_runtime_supervisor_lease(
+            owner_id="managed-reconciliation-owner",
+            lease_seconds=30,
+            **self.scope,
+        ).lease
+        try:
+            resolved = service.reconcile_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            refreshed = service.refresh_runtime_status(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(original.state, "reconciliation_required")
+        self.assertEqual(resolved.intent.state, "dispatched")
+        self.assertEqual(
+            resolved.intent.reconciliation.evidence_kind,
+            "managed_worker_receipt",
+        )
+        self.assertTrue(resolved.projected)
+        self.assertTrue(resolved.adopted)
+        self.assertTrue(resolved.timeout_armed)
+        self.assertEqual(refreshed.snapshot.status, "Running")
+        self.assertIsNotNone(refreshed.snapshot.timeout)
+        self.assertTrue(service.can_cancel_task(task_id, **self.scope))
+        self.assertEqual(dispatcher.reconciliation_probe_calls, 1)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(dispatcher.status_calls, 1)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            outcome = connection.execute(
+                "SELECT outcome FROM dispatch_outcomes WHERE intent_id = ?",
+                (claimed.intent_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(outcome, "reconciliation_required")
+
+    def test_reconciliation_adopts_private_v1_receipt_without_worker_projection(
+        self,
+    ) -> None:
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="private-reconciliation-positive"
+        )
+        claimed = self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-private-reconciliation-positive",
+            launch=True,
+        )
+        assert dispatcher.worker_observation is not None
+        handle = dispatcher.worker_observation["handle"]
+        dispatcher.reconciliation_probe_result = DispatchReceiptProbe(
+            evidence_kind="private_receipt",
+            handle=copy.deepcopy(handle),
+            evidence=None,
+            private_schema_version="1.0.0",
+            receipt_record_hash="sha256:" + "b" * 64,
+        )
+        self.store.record_dispatch_reconciliation(
+            intent_id=claimed.intent_id,
+            failure_code="SUBMISSION_RECONCILIATION_REQUIRED",
+            now=NOW,
+        )
+        lease = service.acquire_runtime_supervisor_lease(
+            owner_id="private-reconciliation-owner",
+            lease_seconds=30,
+            **self.scope,
+        ).lease
+        try:
+            resolved = service.reconcile_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(resolved.intent.state, "dispatched")
+        self.assertEqual(resolved.evidence_kind, "private_receipt")
+        self.assertFalse(resolved.projected)
+        self.assertTrue(resolved.adopted)
+        self.assertFalse(resolved.timeout_armed)
+        self.assertFalse(service.can_cancel_task(task_id, **self.scope))
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(dispatcher.reconciliation_probe_calls, 1)
+
+    def test_same_term_concurrent_reconciliation_converges_without_redispatch(
+        self,
+    ) -> None:
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="concurrent-reconciliation-positive"
+        )
+        claimed = self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-concurrent-reconciliation-positive",
+            launch=True,
+        )
+        self.store.record_dispatch_reconciliation(
+            intent_id=claimed.intent_id,
+            failure_code="SUBMISSION_RECONCILIATION_REQUIRED",
+            now=NOW,
+        )
+        dispatcher.reconciliation_probe_barrier = threading.Barrier(2)
+        lease = service.acquire_runtime_supervisor_lease(
+            owner_id="concurrent-reconciliation-owner",
+            lease_seconds=30,
+            **self.scope,
+        ).lease
+
+        def reconcile(_: int):
+            return service.reconcile_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(reconcile, range(2)))
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(
+            [result.intent.state for result in results],
+            ["dispatched", "dispatched"],
+        )
+        self.assertEqual(sum(result.adopted for result in results), 1)
+        self.assertEqual(dispatcher.reconciliation_probe_calls, 2)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        stored = self.store.get_dispatch_intent(task_id)
+        self.assertEqual(stored.state, "dispatched")
+        self.assertEqual(stored.reconciliation.state, "resolved")
 
     def test_startup_inventory_ignores_divergent_receipt_callback(self) -> None:
         task_id, approval, dispatcher, service = self.approved_runtime(

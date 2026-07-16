@@ -36,6 +36,7 @@ from scientific_runtime import (
     TaskStoreConflict,
 )
 from scientific_runtime.fwi_adapter import (
+    AdapterExistingDispatchReceiptProof,
     AdapterIdempotencyConflict,
     AdapterManagedCancelProof,
     AdapterManagedTimeoutProof,
@@ -487,6 +488,34 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             state="dispatched",
             handle=handle.as_dict(),
             failure_code=None,
+            created_at=NOW,
+            dispatch_claimed_at=NOW,
+            outcome_recorded_at=NOW,
+        )
+
+    def reconciliation_intent(
+        self, handle: Any, request: dict[str, Any]
+    ) -> DispatchIntentSnapshot:
+        durable_request = copy.deepcopy(request)
+        durable_request["normalized_config_hash"] = handle.fingerprint[
+            "normalized_config_hash"
+        ]
+        return DispatchIntentSnapshot(
+            intent_id=f"dispatch-{handle.task_id}",
+            task_id=handle.task_id,
+            plan_id=f"plan-{handle.task_id}",
+            plan_hash=handle.plan_hash,
+            approval_id=f"approval-{handle.task_id}",
+            node_id=handle.node_id,
+            node_idempotency_key=handle.idempotency_key,
+            adapter_id="fwi.deepwave_adapter",
+            adapter_version=handle.adapter_version,
+            request=durable_request,
+            request_hash="sha256:" + "e" * 64,
+            queue_fingerprint=copy.deepcopy(handle.fingerprint),
+            state="reconciliation_required",
+            handle=None,
+            failure_code="SUBMISSION_RECONCILIATION_REQUIRED",
             created_at=NOW,
             dispatch_claimed_at=NOW,
             outcome_recorded_at=NOW,
@@ -1003,6 +1032,152 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             )
         finally:
             heartbeat.stop("succeeded")
+
+    def test_reconciliation_probe_promotes_managed_ready_without_launch(
+        self,
+    ) -> None:
+        request = self.submit_kwargs(
+            task_id="task-reconcile-managed-ready",
+            idempotency_key="task-reconcile-managed-ready:invert:0001",
+        )
+        handle = self.adapter.submit(**copy.deepcopy(request))
+        record_path = self.submission_record_path(handle)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["launch_state"] = "launching"
+        self.adapter._write_submission(record_path, record)
+        run_dir = self.run_root / handle.job_id
+        _, heartbeat = self.start_exact_worker(handle, run_dir)
+        try:
+            replacement_launcher = FakeLauncher()
+            dispatcher = DeepwaveTaskDispatcher(
+                self.make_adapter(launcher=replacement_launcher)
+            )
+            intent = self.reconciliation_intent(handle, request)
+            before_record = record_path.read_bytes()
+            before_paths = self.root_snapshot()
+
+            proof = dispatcher.probe_existing_dispatch_receipt(intent)
+
+            self.assertEqual(proof.evidence_kind, "managed_worker_receipt")
+            self.assertEqual(proof.handle, handle.as_dict())
+            self.assertEqual(proof.private_schema_version, "1.1.0")
+            self.assertIsNone(proof.receipt_record_hash)
+            self.assertIsNotNone(proof.evidence)
+            assert proof.evidence is not None
+            self.assertEqual(proof.evidence["ticket"]["state"], "spawned")
+            self.assertIsNotNone(proof.evidence["ready"])
+            self.assertIsNotNone(proof.evidence["heartbeat"])
+            promoted = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(record_path.read_bytes(), before_record)
+            self.assertEqual(promoted["launch_state"], "launched")
+            self.assertEqual(promoted["launch_attempt"], record["launch_attempt"])
+            self.assertEqual(self.root_snapshot(), before_paths)
+            self.assertEqual(replacement_launcher.calls, [])
+        finally:
+            heartbeat.stop("succeeded")
+
+    def test_reconciliation_probe_reads_only_launched_private_v1_receipt(
+        self,
+    ) -> None:
+        request = self.submit_kwargs(
+            task_id="task-reconcile-private-v1",
+            idempotency_key="task-reconcile-private-v1:invert:0001",
+        )
+        handle = self.adapter.submit(**copy.deepcopy(request))
+        record_path = self.submission_record_path(handle)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["schema_version"] = "1.0.0"
+        record.pop("launch_attempt")
+        self.adapter._write_submission(record_path, record)
+        replacement_launcher = FakeLauncher()
+        dispatcher = DeepwaveTaskDispatcher(
+            self.make_adapter(launcher=replacement_launcher)
+        )
+        intent = self.reconciliation_intent(handle, request)
+        before_record = record_path.read_bytes()
+        before_paths = self.root_snapshot()
+
+        proof = dispatcher.probe_existing_dispatch_receipt(intent)
+
+        self.assertEqual(proof.evidence_kind, "private_receipt")
+        self.assertEqual(proof.handle, handle.as_dict())
+        self.assertIsNone(proof.evidence)
+        self.assertEqual(proof.private_schema_version, "1.0.0")
+        self.assertEqual(proof.receipt_record_hash, record["record_hash"])
+        self.assertEqual(record_path.read_bytes(), before_record)
+        self.assertEqual(self.root_snapshot(), before_paths)
+        self.assertEqual(replacement_launcher.calls, [])
+
+    def test_reconciliation_probe_defers_nonpositive_evidence_without_launch(
+        self,
+    ) -> None:
+        request = self.submit_kwargs(
+            task_id="task-reconcile-staged",
+            idempotency_key="task-reconcile-staged:invert:0001",
+        )
+        handle = self.adapter.submit(**copy.deepcopy(request))
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        dispatcher = DeepwaveTaskDispatcher(reopened)
+        intent = self.reconciliation_intent(handle, request)
+        record_path = self.submission_record_path(handle)
+        before_record = record_path.read_bytes()
+        before_paths = self.root_snapshot()
+
+        with self.assertRaises(DispatchDeferred) as staged:
+            dispatcher.probe_existing_dispatch_receipt(intent)
+        self.assertEqual(staged.exception.code, "DISPATCH_RECEIPT_NOT_READY")
+        self.assertEqual(record_path.read_bytes(), before_record)
+        self.assertEqual(self.root_snapshot(), before_paths)
+
+        with patch.object(
+            reopened,
+            "probe_existing_dispatch_receipt",
+            side_effect=AdapterUnavailable(
+                "ADAPTER_SUBMISSION_BUSY: submission lock is held"
+            ),
+        ), self.assertRaises(DispatchDeferred) as busy:
+            dispatcher.probe_existing_dispatch_receipt(intent)
+        self.assertEqual(busy.exception.code, "ADAPTER_SUBMISSION_BUSY")
+
+        stopped_evidence = {
+            "ticket": {"state": "spawned"},
+            "ready": {"record_hash": "sha256:" + "a" * 64},
+            "heartbeat": {"state": "stopped"},
+            "submission_id": handle.submission_id,
+            "job_id": handle.job_id,
+            "request_hash": handle.request_hash,
+        }
+        with patch.object(
+            reopened,
+            "probe_existing_dispatch_receipt",
+            return_value=AdapterExistingDispatchReceiptProof(
+                evidence_kind="managed_worker_receipt",
+                handle=handle,
+                private_schema_version="1.1.0",
+                receipt_record_hash=None,
+                worker_evidence=stopped_evidence,
+            ),
+        ), self.assertRaises(DispatchDeferred) as stopped:
+            dispatcher.probe_existing_dispatch_receipt(intent)
+        self.assertEqual(stopped.exception.code, "DISPATCH_RECEIPT_PROBE_INVALID")
+
+        resolved = dataclasses.replace(
+            intent,
+            state="dispatched",
+            handle=handle.as_dict(),
+            failure_code=None,
+        )
+        with patch.object(
+            reopened,
+            "probe_existing_dispatch_receipt",
+        ) as adapter_probe, self.assertRaises(DispatchDeferred) as history:
+            dispatcher.probe_existing_dispatch_receipt(resolved)
+        self.assertEqual(
+            history.exception.code, "DISPATCH_RECEIPT_PROBE_UNSUPPORTED"
+        )
+        adapter_probe.assert_not_called()
+        self.assertEqual(replacement_launcher.calls, [])
 
     def test_preparing_observation_does_not_recreate_a_missing_job_directory(
         self,

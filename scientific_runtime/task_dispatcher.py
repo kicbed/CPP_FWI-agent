@@ -5,13 +5,14 @@ from __future__ import annotations
 import copy
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol
 
 from .fwi_adapter import (
     ADAPTER_VERSION,
     LOGICAL_ENTRYPOINT,
     SUPPORTED_ADAPTER_VERSIONS,
     AdapterError,
+    AdapterExistingDispatchReceiptProof,
     AdapterHandle,
     AdapterManagedCancelProof,
     AdapterManagedTimeoutProof,
@@ -56,8 +57,19 @@ class DispatchPreparation:
     queue_fingerprint: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class DispatchReceiptProbe:
+    """Bounded positive result from a zero-launch reconciliation probe."""
+
+    evidence_kind: Literal["managed_worker_receipt", "private_receipt"]
+    handle: dict[str, Any]
+    evidence: dict[str, Any] | None
+    private_schema_version: str
+    receipt_record_hash: str | None
+
+
 class TaskDispatcher(Protocol):
-    """Fixed dispatcher with supervised submit and read-only receipt paths."""
+    """Fixed dispatcher with supervised submit and zero-relaunch receipt paths."""
 
     def prepare(self, snapshot: TaskSnapshot) -> DispatchPreparation:
         ...
@@ -86,6 +98,11 @@ class TaskDispatcher(Protocol):
     def observe_existing_worker_attempt(
         self, intent: DispatchIntentSnapshot
     ) -> dict[str, Any]:
+        ...
+
+    def probe_existing_dispatch_receipt(
+        self, intent: DispatchIntentSnapshot
+    ) -> DispatchReceiptProbe:
         ...
 
     def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
@@ -344,6 +361,115 @@ class DeepwaveTaskDispatcher:
         """Prove a current receipt that predates managed Worker evidence."""
 
         return self._recover_existing_receipt(intent, private_proof=True)
+
+    def probe_existing_dispatch_receipt(
+        self, intent: DispatchIntentSnapshot
+    ) -> DispatchReceiptProbe:
+        """Recognize one exact positive receipt without launching a Worker."""
+
+        if (
+            intent.adapter_id != LOGICAL_ENTRYPOINT
+            or intent.adapter_version != ADAPTER_VERSION
+            or intent.state != "reconciliation_required"
+            or intent.handle is not None
+            or not isinstance(intent.request, Mapping)
+            or not isinstance(intent.queue_fingerprint, Mapping)
+        ):
+            raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_UNSUPPORTED")
+        request = copy.deepcopy(dict(intent.request))
+        normalized_config_hash = request.pop("normalized_config_hash", None)
+        expected = {
+            "task_id",
+            "node_id",
+            "plan_hash",
+            "idempotency_key",
+            "project_id",
+            "principal_id",
+            "algorithm",
+            "dataset",
+            "task_type",
+            "parameters",
+            "resources",
+        }
+        if (
+            set(request) != expected
+            or not isinstance(normalized_config_hash, str)
+            or request["task_id"] != intent.task_id
+            or request["node_id"] != intent.node_id
+            or request["plan_hash"] != intent.plan_hash
+            or request["idempotency_key"] != intent.node_idempotency_key
+            or intent.queue_fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+        ):
+            raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_UNSUPPORTED")
+        try:
+            proof = self._adapter.probe_existing_dispatch_receipt(**request)
+        except AdapterError as error:
+            raise DispatchDeferred(error.code) from error
+        except Exception as error:
+            raise DispatchDeferred(
+                "DISPATCH_RECEIPT_PROBE_UNAVAILABLE"
+            ) from error
+        if not isinstance(proof, AdapterExistingDispatchReceiptProof):
+            raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_INVALID")
+        handle = proof.handle
+        if (
+            handle.adapter_version != ADAPTER_VERSION
+            or handle.task_id != intent.task_id
+            or handle.node_id != intent.node_id
+            or handle.plan_hash != intent.plan_hash
+            or handle.idempotency_key != intent.node_idempotency_key
+            or handle.fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+            or handle.algorithm != request["algorithm"]
+            or not is_supported_receipt_binding(
+                handle.algorithm,
+                handle.adapter_version,
+                handle.fingerprint,
+            )
+        ):
+            raise DispatchDeferred("DISPATCH_FINGERPRINT_DRIFT")
+
+        evidence = proof.worker_evidence
+        if proof.evidence_kind == "managed_worker_receipt":
+            ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
+            ready = evidence.get("ready") if isinstance(evidence, Mapping) else None
+            heartbeat = (
+                evidence.get("heartbeat") if isinstance(evidence, Mapping) else None
+            )
+            if (
+                proof.private_schema_version != "1.1.0"
+                or proof.receipt_record_hash is not None
+                or not isinstance(ticket, Mapping)
+                or ticket.get("state") != "spawned"
+                or not isinstance(ready, Mapping)
+                or not isinstance(heartbeat, Mapping)
+                or heartbeat.get("state")
+                not in {"running", "succeeded", "failed"}
+                or evidence.get("submission_id") != handle.submission_id
+                or evidence.get("job_id") != handle.job_id
+                or evidence.get("request_hash") != handle.request_hash
+            ):
+                raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_INVALID")
+        elif proof.evidence_kind == "private_receipt":
+            if (
+                proof.private_schema_version != "1.0.0"
+                or evidence is not None
+                or not isinstance(proof.receipt_record_hash, str)
+                or _SHA256.fullmatch(proof.receipt_record_hash) is None
+            ):
+                raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_INVALID")
+        else:
+            raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_INVALID")
+        return DispatchReceiptProbe(
+            evidence_kind=proof.evidence_kind,
+            handle=handle.as_dict(),
+            evidence=(
+                None if evidence is None else copy.deepcopy(dict(evidence))
+            ),
+            private_schema_version=proof.private_schema_version,
+            receipt_record_hash=proof.receipt_record_hash,
+        )
 
     def observe_existing_worker_attempt(
         self, intent: DispatchIntentSnapshot

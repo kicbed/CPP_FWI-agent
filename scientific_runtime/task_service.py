@@ -28,6 +28,7 @@ from .task_dispatcher import (
     DispatchDeferred,
     DispatchError,
     DispatchPreparation,
+    DispatchReceiptProbe,
     TaskDispatcher,
 )
 from .task_store import (
@@ -188,6 +189,21 @@ class TaskScheduleResult:
     authorized: bool
     authorization_replayed: bool
     dispatch_attempted: bool
+    projected: bool
+    adopted: bool
+    deferred_code: str | None = None
+    timeout_armed: bool = False
+
+
+@dataclass(frozen=True)
+class TaskDispatchReconciliationResult:
+    """One bounded, zero-launch reconciliation observation pass."""
+
+    intent: DispatchIntentSnapshot
+    evidence_kind: str | None
+    authorized: bool
+    authorization_replayed: bool
+    probe_attempted: bool
     projected: bool
     adopted: bool
     deferred_code: str | None = None
@@ -2160,6 +2176,25 @@ class TaskService:
             task_id, project_id=project_id, principal_id=principal_id
         )
         if current.status != "AwaitingApproval":
+            # A same-key submit may commit after the initial replay lookup but
+            # before this snapshot read.  Recheck the durable idempotency row
+            # before treating the now-Queued task as a conflicting request.
+            try:
+                late_replay = self._store.lookup_submit_task(
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                )
+            except IdempotencyConflict as error:
+                raise TaskIdempotencyConflict(str(error)) from error
+            if late_replay is not None:
+                return SubmitTaskResult(
+                    snapshot=self._require_not_purged(late_replay.snapshot),
+                    intent=late_replay.intent,
+                    replayed=True,
+                    dispatch_attempted=False,
+                )
             raise TaskConflict("task is not awaiting approval")
         if (
             current.approval is None
@@ -2293,6 +2328,324 @@ class TaskService:
             "spawned": "WORKER_ATTEMPT_STARTING",
             "failed": "WORKER_ATTEMPT_FAILED",
         }.get(state, "WORKER_ATTEMPT_STARTING" if evidence is not None else None)
+
+    def reconcile_runtime_dispatch(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskDispatchReconciliationResult:
+        """Resolve one exact positive receipt without launching a Worker."""
+
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        intent = self._store.get_dispatch_intent(task_id)
+        if intent is None:
+            raise TaskConflict("runtime task has no dispatch intent")
+        reconciliation = getattr(intent, "reconciliation", None)
+        if intent.state == "dispatched" and getattr(
+            reconciliation, "state", None
+        ) == "resolved":
+            return TaskDispatchReconciliationResult(
+                intent=intent,
+                evidence_kind=getattr(reconciliation, "evidence_kind", None),
+                authorized=False,
+                authorization_replayed=False,
+                probe_attempted=False,
+                projected=False,
+                adopted=False,
+            )
+        if intent.state != "reconciliation_required":
+            return TaskDispatchReconciliationResult(
+                intent=intent,
+                evidence_kind=None,
+                authorized=False,
+                authorization_replayed=False,
+                probe_attempted=False,
+                projected=False,
+                adopted=False,
+                deferred_code="RECONCILIATION_NOT_REQUIRED",
+            )
+        if snapshot.status != "Queued":
+            return TaskDispatchReconciliationResult(
+                intent=intent,
+                evidence_kind=None,
+                authorized=False,
+                authorization_replayed=False,
+                probe_attempted=False,
+                projected=False,
+                adopted=False,
+                deferred_code="RECONCILIATION_TASK_NOT_QUEUED",
+            )
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        probe = getattr(
+            self._dispatcher, "probe_existing_dispatch_receipt", None
+        )
+        if not callable(probe):
+            return TaskDispatchReconciliationResult(
+                intent=intent,
+                evidence_kind=None,
+                authorized=False,
+                authorization_replayed=False,
+                probe_attempted=False,
+                projected=False,
+                adopted=False,
+                deferred_code="RECONCILIATION_PROBE_UNSUPPORTED",
+            )
+
+        authorizations = []
+        for evidence_kind in (
+            "managed_worker_receipt",
+            "private_receipt",
+        ):
+            try:
+                authorization = (
+                    self._store.authorize_supervised_dispatch_reconciliation(
+                        intent_id=intent.intent_id,
+                        evidence_kind=evidence_kind,
+                        supervisor_lease=supervisor_lease,
+                        supervisor_clock=self._runtime_supervisor_clock,
+                    )
+                )
+            except RuntimeSupervisorLeaseLost as error:
+                raise TaskSupervisorLeaseLost() from error
+            except TaskStoreConflict:
+                current = self._store.get_dispatch_intent(task_id)
+                current_reconciliation = getattr(
+                    current, "reconciliation", None
+                )
+                if (
+                    current is not None
+                    and current.state == "dispatched"
+                    and getattr(current_reconciliation, "state", None)
+                    == "resolved"
+                ):
+                    return TaskDispatchReconciliationResult(
+                        intent=current,
+                        evidence_kind=getattr(
+                            current_reconciliation, "evidence_kind", None
+                        ),
+                        authorized=bool(authorizations),
+                        authorization_replayed=bool(authorizations)
+                        and all(value.replayed for value in authorizations),
+                        probe_attempted=False,
+                        projected=False,
+                        adopted=False,
+                    )
+                return TaskDispatchReconciliationResult(
+                    intent=current or intent,
+                    evidence_kind=None,
+                    authorized=bool(authorizations),
+                    authorization_replayed=bool(authorizations)
+                    and all(value.replayed for value in authorizations),
+                    probe_attempted=False,
+                    projected=False,
+                    adopted=False,
+                    deferred_code="RECONCILIATION_AUTHORIZATION_CONFLICT",
+                )
+            if (
+                authorization.intent.intent_id != intent.intent_id
+                or authorization.evidence_kind != evidence_kind
+                or type(authorization.replayed) is not bool
+            ):
+                raise TaskDispatchError("RECONCILIATION_AUTHORIZATION_INVALID")
+            authorizations.append(authorization)
+            authorized_reconciliation = getattr(
+                authorization.intent, "reconciliation", None
+            )
+            if (
+                authorization.intent.state == "dispatched"
+                and getattr(authorized_reconciliation, "state", None)
+                == "resolved"
+            ):
+                return TaskDispatchReconciliationResult(
+                    intent=authorization.intent,
+                    evidence_kind=getattr(
+                        authorized_reconciliation, "evidence_kind", None
+                    ),
+                    authorized=True,
+                    authorization_replayed=all(
+                        value.replayed for value in authorizations
+                    ),
+                    probe_attempted=False,
+                    projected=False,
+                    adopted=False,
+                )
+            if authorization.intent.state != "reconciliation_required":
+                raise TaskDispatchError("RECONCILIATION_AUTHORIZATION_INVALID")
+
+        authorization_replayed = all(
+            value.replayed for value in authorizations
+        )
+        try:
+            positive = probe(intent)
+        except (DispatchDeferred, DispatchError) as error:
+            return TaskDispatchReconciliationResult(
+                intent=self._store.get_dispatch_intent(task_id) or intent,
+                evidence_kind=None,
+                authorized=True,
+                authorization_replayed=authorization_replayed,
+                probe_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code=error.code,
+            )
+        except Exception:
+            return TaskDispatchReconciliationResult(
+                intent=self._store.get_dispatch_intent(task_id) or intent,
+                evidence_kind=None,
+                authorized=True,
+                authorization_replayed=authorization_replayed,
+                probe_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code="RECONCILIATION_PROBE_UNAVAILABLE",
+            )
+        if not isinstance(positive, DispatchReceiptProbe):
+            return TaskDispatchReconciliationResult(
+                intent=intent,
+                evidence_kind=None,
+                authorized=True,
+                authorization_replayed=authorization_replayed,
+                probe_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code="RECONCILIATION_PROBE_INVALID",
+            )
+        try:
+            validated_handle = self._validate_dispatch_receipt(
+                snapshot=snapshot,
+                intent=intent,
+                handle=positive.handle,
+            )
+        except TaskValidationError:
+            return TaskDispatchReconciliationResult(
+                intent=intent,
+                evidence_kind=positive.evidence_kind,
+                authorized=True,
+                authorization_replayed=authorization_replayed,
+                probe_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code="RECONCILIATION_PROBE_INVALID",
+            )
+
+        try:
+            if positive.evidence_kind == "managed_worker_receipt":
+                if not isinstance(positive.evidence, Mapping):
+                    raise TaskValidationError(
+                        "RECONCILIATION_PROBE_INVALID",
+                        ["managed receipt requires exact Worker evidence"],
+                    )
+                completion = self._store.record_supervised_worker_observation(
+                    intent_id=intent.intent_id,
+                    evidence=positive.evidence,
+                    handle=validated_handle,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+                resolved = completion.intent
+                projected = True
+                adopted = completion.adopted
+            elif positive.evidence_kind == "private_receipt":
+                if (
+                    positive.evidence is not None
+                    or positive.private_schema_version != "1.0.0"
+                    or not isinstance(positive.receipt_record_hash, str)
+                ):
+                    raise TaskValidationError(
+                        "RECONCILIATION_PROBE_INVALID",
+                        ["private receipt proof is incomplete"],
+                    )
+                completion = self._store.record_supervised_private_receipt_adoption(
+                    intent_id=intent.intent_id,
+                    handle=validated_handle,
+                    private_schema_version=positive.private_schema_version,
+                    receipt_record_hash=positive.receipt_record_hash,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+                resolved = completion.intent
+                projected = False
+                adopted = completion.adopted
+            else:
+                raise TaskValidationError(
+                    "RECONCILIATION_PROBE_INVALID",
+                    ["receipt proof kind is unsupported"],
+                )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except (TaskValidationError, TaskStoreConflict):
+            current = self._store.get_dispatch_intent(task_id)
+            current_reconciliation = getattr(current, "reconciliation", None)
+            if (
+                current is not None
+                and current.state == "dispatched"
+                and getattr(current_reconciliation, "state", None) == "resolved"
+            ):
+                return TaskDispatchReconciliationResult(
+                    intent=current,
+                    evidence_kind=getattr(
+                        current_reconciliation, "evidence_kind", None
+                    ),
+                    authorized=True,
+                    authorization_replayed=authorization_replayed,
+                    probe_attempted=True,
+                    projected=False,
+                    adopted=False,
+                )
+            return TaskDispatchReconciliationResult(
+                intent=current or intent,
+                evidence_kind=positive.evidence_kind,
+                authorized=True,
+                authorization_replayed=authorization_replayed,
+                probe_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code="RECONCILIATION_ADOPTION_CONFLICT",
+            )
+        resolved_reconciliation = getattr(resolved, "reconciliation", None)
+        if (
+            resolved.state != "dispatched"
+            or resolved.handle != validated_handle
+            or getattr(resolved_reconciliation, "state", None) != "resolved"
+            or getattr(resolved_reconciliation, "result", None) != "dispatched"
+            or getattr(resolved_reconciliation, "evidence_kind", None)
+            != positive.evidence_kind
+            or type(adopted) is not bool
+        ):
+            raise TaskDispatchError("RECONCILIATION_OUTCOME_INVALID")
+        timeout_armed = False
+        if positive.evidence_kind == "managed_worker_receipt":
+            assert isinstance(positive.evidence, Mapping)
+            timeout_armed = self._arm_projected_worker_timeout(
+                task_id=task_id,
+                snapshot=snapshot,
+                intent=resolved,
+                evidence=positive.evidence,
+                attempt_id=completion.attempt_id,
+                supervisor_lease=supervisor_lease,
+            )
+        return TaskDispatchReconciliationResult(
+            intent=resolved,
+            evidence_kind=positive.evidence_kind,
+            authorized=True,
+            authorization_replayed=authorization_replayed,
+            probe_attempted=True,
+            projected=projected,
+            adopted=adopted,
+            timeout_armed=timeout_armed,
+        )
 
     def schedule_runtime_dispatch(
         self,
@@ -2606,6 +2959,82 @@ class TaskService:
             deferred_code=None,
         )
 
+    def _arm_projected_worker_timeout(
+        self,
+        *,
+        task_id: str,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        evidence: Mapping[str, Any],
+        attempt_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> bool:
+        """Arm the first exact running-attempt timeout from existing evidence."""
+
+        ticket = evidence.get("ticket")
+        ready = evidence.get("ready")
+        heartbeat = evidence.get("heartbeat")
+        timeout_capable = (
+            getattr(snapshot, "timeout", None) is None
+            and intent.state == "dispatched"
+            and isinstance(ticket, Mapping)
+            and ticket.get("state") == "spawned"
+            and isinstance(ready, Mapping)
+            and isinstance(heartbeat, Mapping)
+            and heartbeat.get("state") == "running"
+        )
+        if not timeout_capable:
+            return False
+        timeout_probe = getattr(
+            self._dispatcher, "supports_exact_timeout", None
+        )
+        capability_proof = None
+        if callable(timeout_probe):
+            try:
+                capability_proof = timeout_probe(
+                    intent, attempt_id=attempt_id
+                )
+            except DispatchError as error:
+                raise TaskDispatchError(error.code) from error
+            except Exception as error:
+                raise TaskDispatchError(
+                    "ADAPTER_TIMEOUT_CAPABILITY_UNAVAILABLE"
+                ) from error
+        if capability_proof is None:
+            return False
+        try:
+            timeout_record = self._store.arm_worker_attempt_timeout(
+                intent_id=intent.intent_id,
+                attempt_id=attempt_id,
+                capability_proof=capability_proof,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        armed_timeout = getattr(timeout_record, "timeout", None)
+        replayed = getattr(timeout_record, "replayed", None)
+        armed_snapshot = getattr(timeout_record, "snapshot", None)
+        if (
+            getattr(armed_snapshot, "task_id", None) != task_id
+            or getattr(armed_timeout, "intent_id", None) != intent.intent_id
+            or getattr(armed_timeout, "attempt_id", None) != attempt_id
+            or getattr(armed_timeout, "state", None)
+            not in {
+                "armed",
+                "requested",
+                "timed_out",
+                "superseded",
+                "not_triggered",
+                "suppressed",
+            }
+            or type(replayed) is not bool
+        ):
+            raise TaskDispatchError("TIMEOUT_WINDOW_INVALID")
+        return not replayed
+
     def project_worker_attempt(
         self,
         task_id: str,
@@ -2696,72 +3125,15 @@ class TaskService:
             raise TaskSupervisorLeaseLost() from error
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
-        timeout_armed = False
         projected_intent = projection.intent
-        ticket = evidence.get("ticket")
-        ready = evidence.get("ready")
-        heartbeat = evidence.get("heartbeat")
-        timeout_snapshot = getattr(snapshot, "timeout", None)
-        timeout_capable = (
-            timeout_snapshot is None
-            and projected_intent.state == "dispatched"
-            and isinstance(ticket, Mapping)
-            and ticket.get("state") == "spawned"
-            and isinstance(ready, Mapping)
-            and isinstance(heartbeat, Mapping)
-            and heartbeat.get("state") == "running"
+        timeout_armed = self._arm_projected_worker_timeout(
+            task_id=task_id,
+            snapshot=snapshot,
+            intent=projected_intent,
+            evidence=evidence,
+            attempt_id=projection.attempt_id,
+            supervisor_lease=supervisor_lease,
         )
-        if timeout_capable:
-            timeout_probe = getattr(
-                self._dispatcher, "supports_exact_timeout", None
-            )
-            capability_proof = None
-            if callable(timeout_probe):
-                try:
-                    capability_proof = timeout_probe(
-                        projected_intent, attempt_id=projection.attempt_id
-                    )
-                except DispatchError as error:
-                    raise TaskDispatchError(error.code) from error
-                except Exception as error:
-                    raise TaskDispatchError(
-                        "ADAPTER_TIMEOUT_CAPABILITY_UNAVAILABLE"
-                    ) from error
-            if capability_proof is not None:
-                try:
-                    timeout_record = self._store.arm_worker_attempt_timeout(
-                        intent_id=projected_intent.intent_id,
-                        attempt_id=projection.attempt_id,
-                        capability_proof=capability_proof,
-                        supervisor_lease=supervisor_lease,
-                        supervisor_clock=self._runtime_supervisor_clock,
-                    )
-                except RuntimeSupervisorLeaseLost as error:
-                    raise TaskSupervisorLeaseLost() from error
-                except TaskStoreConflict as error:
-                    raise TaskConflict(str(error)) from error
-                armed_timeout = getattr(timeout_record, "timeout", None)
-                replayed = getattr(timeout_record, "replayed", None)
-                armed_snapshot = getattr(timeout_record, "snapshot", None)
-                if (
-                    getattr(armed_snapshot, "task_id", None) != task_id
-                    or getattr(armed_timeout, "intent_id", None)
-                    != projected_intent.intent_id
-                    or getattr(armed_timeout, "attempt_id", None)
-                    != projection.attempt_id
-                    or getattr(armed_timeout, "state", None)
-                    not in {
-                        "armed",
-                        "requested",
-                        "timed_out",
-                        "superseded",
-                        "not_triggered",
-                        "suppressed",
-                    }
-                    or type(replayed) is not bool
-                ):
-                    raise TaskDispatchError("TIMEOUT_WINDOW_INVALID")
-                timeout_armed = not replayed
         return TaskWorkerProjectionResult(
             intent=projected_intent,
             evidence=copy.deepcopy(dict(evidence)),

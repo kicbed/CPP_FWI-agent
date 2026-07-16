@@ -22,10 +22,13 @@
   receipt 的受 fence 收养；P2-007 增加 SQLite v11 durable user-cancel admission、active-term
   delivery、exact Worker self-cancel 证明和 Guided Web 取消状态；P2-008 增加 SQLite v12
   immutable timeout window/active-term authorization/outcome、Worker v2 exact-stop 自停止和
-  Guided Web 有界只读 timeout 投影。
-- 当前阶段：P2-008 exact-attempt wall-time timeout 有界切片已 Verified；完整 P2 仍在进行，
+  Guided Web 有界只读 timeout 投影；P2-009A 增加 SQLite v13 append-only positive receipt
+  resolution/effective dispatch、current-term managed/private adoption、每周期最多一次 probe、同周期
+  timeout/status catch-up 和 Guided Web 六字段只读 reconciliation 投影。
+- 当前阶段：P2-009A positive receipt resolution/adoption 有界切片已 Verified；完整 P2 仍在进行，
   上述 P2 子项不得表述为完整 P2 已完成。
-- 下一安全方向：处理有限 retry 与 `reconciliation_required` resolution，SSE 继续后置。
+- 下一安全方向：先请用户确认 finite retry 的次数、最坏预算和可重试失败边界，再推进 P2-009B；
+  负向/不确定 reconciliation 与 SSE 继续后置。
 - 当前阻塞：无。工作树中的未提交内容可能属于另一个活跃窗口，必须现场检查并保护。
 - 已接受 D-011：继续保留逐切片开发，但采用弹性中等粒度；约十余个剩余切片只是估算，允许
   按真实风险小幅增加，不为 migration/字段/单项测试制造路线切片，也不得无说明膨胀成几十个。
@@ -86,6 +89,19 @@
   signal；旧 Worker/历史任务保持 fail-closed。Workbench 只读投影精确包含 `state`、
   `wall_time_seconds`、`started_at`、`deadline_at`、`resolved_at`、`failure_code`、
   `terminal_status` 七个字段，不暴露 ID/hash/PID/path，也不存在 `POST /timeout` mutation。
+- P2-009A 已验证：只对 immutable `reconciliation_required` 的 current Algorithm/Adapter 1.4
+  接受两类 exact positive receipt：managed `spawned + ready + heartbeat`（仅 `running`、
+  `succeeded`、`failed`）或 current Adapter 下 legacy-private schema 1.0 exact launched receipt。
+  active fenced Supervisor term 才能追加 authorization/adoption/resolution；原 outcome 字节/hash
+  不变，downstream cancel/timeout/trash 统一消费 effective dispatch。缺失、staged、部分、歧义、
+  损坏、不匹配、launch/ticket failed、`stopped` 或公共 Adapter 1.0–1.3 均保持
+  `action_required`。每个 Supervisor 周期最多执行一次 receipt probe；managed running 同周期
+  arm timeout，terminal receipt 同周期刷新 task status。该路径不新建/替换 Worker、不扫描 run
+  root、不按 PID/heartbeat age 推断、不退款或 retry。Workbench 只投影 `failure_code`、
+  `recorded_at`、`state`、`result`、`evidence_kind`、`resolved_at`，不暴露 handle/hash/PID/path，
+  也不存在 reconcile/retry/timeout POST mutation。该 checkpoint 的整体验证还修复了 same-key
+  approve/submit 在首次 replay lookup 后由并发调用先入队的 late-replay race；不同 key/request
+  hash 仍保持冲突。
 - 不读取、打印或提交 `.env`、API Key、凭证、私有 prompt、模型、运行 artifact、数据库、
   日志、构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开报告；科学结论只限实际实验边界。

@@ -490,11 +490,17 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertEqual(response.headers["Allow"], "POST")
         self.assertEqual(len(self.application.calls), previous_calls)
 
-        previous_calls = len(self.application.calls)
-        response = self.mutation("POST", f"{task_path}/timeout", {})
-        self.assertEqual(response.status, 404)
-        self.assertEqual(self.decode(response)["error"]["code"], "NOT_FOUND")
-        self.assertEqual(len(self.application.calls), previous_calls)
+        for absent_mutation in ("timeout", "reconcile", "reconciliation", "retry"):
+            with self.subTest(absent_mutation=absent_mutation):
+                previous_calls = len(self.application.calls)
+                response = self.mutation(
+                    "POST", f"{task_path}/{absent_mutation}", {}
+                )
+                self.assertEqual(response.status, 404)
+                self.assertEqual(
+                    self.decode(response)["error"]["code"], "NOT_FOUND"
+                )
+                self.assertEqual(len(self.application.calls), previous_calls)
 
         response = self.mutation(
             "POST", f"{task_path}/trash", {"expected_visibility_revision": 0}

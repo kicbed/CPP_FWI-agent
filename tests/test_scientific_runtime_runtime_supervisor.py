@@ -114,6 +114,19 @@ class FakeSchedule:
 
 
 @dataclass(frozen=True)
+class FakeReconciliation:
+    intent: FakeIntent
+    evidence_kind: str | None
+    authorized: bool
+    authorization_replayed: bool
+    probe_attempted: bool
+    projected: bool
+    adopted: bool
+    deferred_code: str | None = None
+    timeout_armed: bool = False
+
+
+@dataclass(frozen=True)
 class FakePage:
     snapshots: tuple[FakeSnapshot, ...]
     next_cursor: str | None
@@ -160,6 +173,7 @@ class FakeTaskService:
         self.intent_calls: list[str] = []
         self.projection_calls: list[str] = []
         self.schedule_calls: list[str] = []
+        self.reconciliation_calls: list[str] = []
         self.refresh_calls: list[str] = []
         self.cancel_calls: list[str] = []
         self.timeout_calls: list[str] = []
@@ -172,6 +186,8 @@ class FakeTaskService:
         self.projection_results: dict[str, FakeProjection] = {}
         self.schedule_failures: dict[str, Exception] = {}
         self.schedule_results: dict[str, FakeSchedule] = {}
+        self.reconciliation_failures: dict[str, Exception] = {}
+        self.reconciliation_results: dict[str, FakeReconciliation] = {}
         self.cancel_failures: dict[str, Exception] = {}
         self.cancel_results: dict[str, FakeCancelProcess] = {}
         self.timeout_failures: dict[str, Exception] = {}
@@ -373,6 +389,43 @@ class FakeTaskService:
             projected=projection.projected,
             adopted=projection.adopted,
             deferred_code=deferred_code,
+        )
+
+    def reconcile_runtime_dispatch(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: FakeLease,
+    ) -> FakeReconciliation:
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        with self.lock:
+            if supervisor_lease != self.active_lease:
+                raise RuntimeSupervisorLeaseLost(
+                    "simulated stale reconciliation write"
+                )
+            self.calls.append("reconcile")
+            self.reconciliation_calls.append(task_id)
+        failure = self.reconciliation_failures.get(task_id)
+        if failure is not None:
+            raise failure
+        configured = self.reconciliation_results.get(task_id)
+        if configured is not None:
+            self.intents[task_id] = configured.intent
+            return configured
+        intent = self.intents.get(task_id)
+        assert isinstance(intent, FakeIntent)
+        return FakeReconciliation(
+            intent=intent,
+            evidence_kind=None,
+            authorized=True,
+            authorization_replayed=False,
+            probe_attempted=True,
+            projected=False,
+            adopted=False,
+            deferred_code="RECONCILIATION_REQUIRED",
         )
 
     def refresh_runtime_status(
@@ -809,6 +862,123 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertEqual(service.dispatch_calls, 0)
         finally:
             runtime.stop()
+
+    def test_reconciliation_positive_receipt_is_refreshed_in_same_cycle(self) -> None:
+        task_id = "reconciliation-ready"
+        service = FakeTaskService(
+            [snapshot(task_id, "Queued")],
+            {task_id: FakeIntent(task_id, "reconciliation_required")},
+        )
+        service.reconciliation_results[task_id] = FakeReconciliation(
+            intent=FakeIntent(task_id, "dispatched"),
+            evidence_kind="managed_worker_receipt",
+            authorized=True,
+            authorization_replayed=False,
+            probe_attempted=True,
+            projected=True,
+            adopted=True,
+            timeout_armed=True,
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(cycle.reconciled_task_ids, (task_id,))
+            self.assertEqual(cycle.projected_task_ids, (task_id,))
+            self.assertEqual(cycle.adopted_task_ids, (task_id,))
+            self.assertEqual(cycle.dispatched_task_ids, (task_id,))
+            self.assertEqual(cycle.timeout_armed_task_ids, (task_id,))
+            self.assertEqual(cycle.refreshed_task_ids, (task_id,))
+            self.assertEqual(cycle.deferred, ())
+            self.assertEqual(service.reconciliation_calls, [task_id])
+            self.assertEqual(service.schedule_calls, [])
+            self.assertEqual(service.projection_calls, [])
+            self.assertEqual(service.refresh_calls, [task_id])
+        finally:
+            runtime.stop()
+
+    def test_concurrent_managed_resolution_is_projected_in_same_cycle(self) -> None:
+        task_id = "reconciliation-concurrent-managed"
+        service = FakeTaskService(
+            [snapshot(task_id, "Queued")],
+            {task_id: FakeIntent(task_id, "reconciliation_required")},
+        )
+        dispatched = FakeIntent(task_id, "dispatched")
+        service.reconciliation_results[task_id] = FakeReconciliation(
+            intent=dispatched,
+            evidence_kind="managed_worker_receipt",
+            authorized=False,
+            authorization_replayed=False,
+            probe_attempted=False,
+            projected=False,
+            adopted=False,
+        )
+        service.projection_results[task_id] = FakeProjection(
+            intent=dispatched,
+            evidence={"ticket": {"state": "spawned"}},
+            projected=True,
+            adopted=False,
+            replayed=False,
+            timeout_armed=True,
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(cycle.reconciled_task_ids, (task_id,))
+            self.assertEqual(cycle.projected_task_ids, (task_id,))
+            self.assertEqual(cycle.timeout_armed_task_ids, (task_id,))
+            self.assertEqual(cycle.refreshed_task_ids, (task_id,))
+            self.assertEqual(service.reconciliation_calls, [task_id])
+            self.assertEqual(service.projection_calls, [task_id])
+            self.assertEqual(service.refresh_calls, [task_id])
+        finally:
+            runtime.stop()
+
+    def test_reconciliation_probe_is_bounded_to_one_task_per_cycle(self) -> None:
+        task_ids = ["reconcile-1", "reconcile-2", "reconcile-3"]
+        values = [snapshot(task_id, "Queued") for task_id in task_ids]
+        service = FakeTaskService(
+            values,
+            {
+                task_id: FakeIntent(task_id, "reconciliation_required")
+                for task_id in task_ids
+            },
+        )
+        clock = ManualClock()
+        runtime = supervisor(
+            service,
+            monotonic=clock,
+            worker_projection_interval_seconds=60,
+        )
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        first, _, _ = runtime._observe_tasks(values, lease, float("inf"))
+        second, _, _ = runtime._observe_tasks(values, lease, float("inf"))
+        third, _, _ = runtime._observe_tasks(values, lease, float("inf"))
+
+        self.assertEqual(
+            service.reconciliation_calls,
+            task_ids,
+        )
+        self.assertEqual(
+            [
+                sum(
+                    code == "RECONCILIATION_CYCLE_LIMIT"
+                    for _, code in cycle.deferred
+                )
+                for cycle in (first, second, third)
+            ],
+            [2, 1, 0],
+        )
+        self.assertEqual(service.refresh_calls, [])
 
     def test_private_receipt_adoption_needs_no_worker_projection(self) -> None:
         task_id = "legacy-private-receipt"

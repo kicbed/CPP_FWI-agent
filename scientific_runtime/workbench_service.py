@@ -269,6 +269,52 @@ def _public_dataset(dataset: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _public_dispatch_reconciliation(value: Any) -> dict[str, Any]:
+    """Project only the stable, non-sensitive reconciliation summary."""
+
+    state = _value(value, "state")
+    failure_code = _value(value, "failure_code")
+    recorded_at = _value(value, "recorded_at")
+    result = _value(value, "result")
+    evidence_kind = _value(value, "evidence_kind")
+    resolved_at = _value(value, "resolved_at")
+    valid_failure_code = (
+        isinstance(failure_code, str)
+        and re.fullmatch(r"[A-Z0-9_]{1,128}", failure_code) is not None
+        and failure_code.replace("_", "").isalnum()
+    )
+    valid_recorded_at = isinstance(recorded_at, str) and 0 < len(recorded_at) <= 80
+    required = (
+        state == "required"
+        and result is None
+        and evidence_kind is None
+        and resolved_at is None
+    )
+    resolved = (
+        state == "resolved"
+        and result == "dispatched"
+        and evidence_kind in {"managed_worker_receipt", "private_receipt"}
+        and isinstance(resolved_at, str)
+        and 0 < len(resolved_at) <= 80
+    )
+    if not valid_failure_code or not valid_recorded_at or not (required or resolved):
+        raise WorkbenchRuntimeError(
+            "SERVICE_RESPONSE_INVALID",
+            ["dispatch reconciliation projection is invalid"],
+        )
+    _timestamp(recorded_at, field="dispatch reconciliation recorded_at")
+    if resolved:
+        _timestamp(resolved_at, field="dispatch reconciliation resolved_at")
+    return {
+        "failure_code": failure_code,
+        "recorded_at": recorded_at,
+        "state": "action_required" if required else "resolved",
+        "result": result,
+        "evidence_kind": evidence_kind,
+        "resolved_at": resolved_at,
+    }
+
+
 def _public_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "id": manifest["id"],
@@ -441,6 +487,7 @@ class GuidedWorkbench:
                 "supervisor_leases": True,
                 "running_cancel": True,
                 "runtime_timeout": True,
+                "positive_receipt_reconciliation": True,
                 "automatic_reconciliation": False,
                 "streaming_events": False,
             },
@@ -454,6 +501,7 @@ class GuidedWorkbench:
                 "supervised_runtime_scheduling": True,
                 "continuous_status_supervision": True,
                 "supervisor_leases": True,
+                "positive_receipt_reconciliation": True,
                 "automatic_reconciliation": False,
                 "dag": False,
             },
@@ -1339,12 +1387,18 @@ class GuidedWorkbench:
         approval = snapshot.approval
         dispatch = None
         if intent is not None:
+            reconciliation = _value(intent, "reconciliation")
             dispatch = {
                 "state": _value(intent, "state"),
                 "failure_code": _value(intent, "failure_code"),
                 "created_at": _value(intent, "created_at"),
                 "dispatch_claimed_at": _value(intent, "dispatch_claimed_at"),
                 "outcome_recorded_at": _value(intent, "outcome_recorded_at"),
+                "reconciliation": (
+                    None
+                    if reconciliation is None
+                    else _public_dispatch_reconciliation(reconciliation)
+                ),
             }
         status = _as_mapping(adapter_status)
         if status is not None:

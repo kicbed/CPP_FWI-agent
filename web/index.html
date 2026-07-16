@@ -2383,6 +2383,42 @@
       };
     }
 
+    function normalizeGuidedReconciliationProjection(value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+      const keys = Object.keys(value).sort().join(',');
+      if (keys !== 'evidence_kind,failure_code,recorded_at,resolved_at,result,state') {
+        return null;
+      }
+      const stateName = ['action_required', 'resolved'].includes(value.state)
+        ? value.state : '';
+      const failureCode = /^(?=.*[A-Z0-9])[A-Z0-9_]{1,128}$/.test(value.failure_code || '')
+        ? value.failure_code : '';
+      const recordedAt = boundedGuidedText(value.recorded_at, 80);
+      const result = value.result === null
+        ? null : (value.result === 'dispatched' ? value.result : '');
+      const evidenceKind = value.evidence_kind === null
+        ? null : (['managed_worker_receipt', 'private_receipt'].includes(value.evidence_kind)
+          ? value.evidence_kind : '');
+      const resolvedAt = value.resolved_at === null
+        ? null : boundedGuidedText(value.resolved_at, 80);
+      const timestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/;
+      if (!stateName || !failureCode || !recordedAt || !timestamp.test(recordedAt)
+          || result === '' || evidenceKind === '' || resolvedAt === ''
+          || (resolvedAt !== null && !timestamp.test(resolvedAt))) return null;
+      if (stateName === 'action_required'
+          && (result !== null || evidenceKind !== null || resolvedAt !== null)) return null;
+      if (stateName === 'resolved'
+          && (result !== 'dispatched' || evidenceKind === null || !resolvedAt)) return null;
+      return {
+        state: stateName,
+        failureCode,
+        recordedAt,
+        result,
+        evidenceKind,
+        resolvedAt,
+      };
+    }
+
     function normalizeGuidedTaskProjection(value, expectedTaskId = '') {
       const outer = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
       const source = outer.task && typeof outer.task === 'object' ? outer.task : outer;
@@ -2463,6 +2499,11 @@
         ? source.adapter_status
         : (source.runtime_status && typeof source.runtime_status === 'object' ? source.runtime_status : {});
       const dispatchState = dispatchSource.state || dispatchSource.status || '';
+      if (hasDispatch && !Object.hasOwn(dispatchSource, 'reconciliation')) return null;
+      const hasReconciliation = hasDispatch && dispatchSource.reconciliation !== null;
+      const normalizedReconciliation = hasReconciliation
+        ? normalizeGuidedReconciliationProjection(dispatchSource.reconciliation) : null;
+      if (hasReconciliation && normalizedReconciliation === null) return null;
       const adapterStatus = ['Queued', 'Running', 'Succeeded', 'Failed', 'Cancelled'].includes(adapterSource.status)
         ? adapterSource.status : '';
       const planNodeSource = Array.isArray(planSource.nodes) && planSource.nodes.length === 1
@@ -2515,6 +2556,7 @@
             ? dispatchState : '',
           failureCode: /^[A-Z0-9_]{1,128}$/.test(dispatchSource.failure_code || '')
             ? dispatchSource.failure_code : '',
+          reconciliation: normalizedReconciliation,
         },
         canCancel: source.can_cancel,
         cancellation: hasCancellation ? {
@@ -2611,7 +2653,21 @@
       if (hasDispatch) {
         if (!['pending', 'dispatching', 'dispatched', 'reconciliation_required']
           .includes(normalized.dispatch.state)) return null;
-      } else if (normalized.dispatch.state || normalized.dispatch.failureCode) {
+        if (normalized.dispatch.state === 'reconciliation_required'
+            && (!normalized.dispatch.reconciliation
+              || normalized.dispatch.reconciliation.state !== 'action_required'
+              || normalized.dispatch.failureCode
+                !== normalized.dispatch.reconciliation.failureCode)) return null;
+        if (normalized.dispatch.state !== 'reconciliation_required'
+            && normalized.dispatch.failureCode) return null;
+        if (normalized.dispatch.reconciliation?.state === 'action_required'
+            && normalized.dispatch.state !== 'reconciliation_required') return null;
+        if (normalized.dispatch.reconciliation?.state === 'resolved'
+            && normalized.dispatch.state !== 'dispatched') return null;
+        if (['pending', 'dispatching'].includes(normalized.dispatch.state)
+            && normalized.dispatch.reconciliation !== null) return null;
+      } else if (normalized.dispatch.state || normalized.dispatch.failureCode
+          || normalized.dispatch.reconciliation) {
         return null;
       }
 
@@ -3505,9 +3561,18 @@
         pending: 'SQLite 已提交，派发尚未被一次性认领。不会由浏览器重发。',
         dispatching: '派发认领已持久化；若回执缺失，结果需要后续核对。',
         dispatched: '固定 Adapter 已返回可验证派发回执。',
-        reconciliation_required: '派发结果不确定，需要人工 reconciliation；浏览器不会重试。',
+        reconciliation_required: '派发结果仍需处理；只有受围栏 Supervisor 的严格正向回执可解决，浏览器不会重试。',
       };
       return explanations[stateName] || '等待持久派发状态。';
+    }
+
+    function guidedReconciliationExplanation(reconciliation) {
+      if (!reconciliation) return '';
+      const explanations = {
+        action_required: '尚无可认领的严格正向回执；保持 action_required，不自动重试或退款。',
+        resolved: '严格正向回执已由受围栏 Supervisor 认领；这是 receipt adoption，不是任务 retry。',
+      };
+      return explanations[reconciliation.state] || '';
     }
 
     function guidedCancellationExplanation(cancellation) {
@@ -3543,6 +3608,10 @@
       const linkedToCurrent = isTaskReferencedByChat(state.chats[state.chatId], task.taskId);
       const cancellationPending = task.cancellation?.state === 'requested';
       const timeoutPending = task.timeout?.state === 'requested';
+      const reconciliation = task.dispatch.reconciliation;
+      const reconciliationHtml = reconciliation
+        ? `<dt>reconciliation</dt><dd>${escapeHtml(reconciliation.state)}</dd><dt>reconciliation 说明</dt><dd>${escapeHtml(guidedReconciliationExplanation(reconciliation))}</dd><dt>原失败码</dt><dd class="font-mono">${escapeHtml(reconciliation.failureCode)}</dd><dt>记录时间</dt><dd>${escapeHtml(reconciliation.recordedAt)}</dd>${reconciliation.result ? `<dt>认领结果</dt><dd>${escapeHtml(reconciliation.result)}</dd>` : ''}${reconciliation.evidenceKind ? `<dt>证据类型</dt><dd>${escapeHtml(reconciliation.evidenceKind)}</dd>` : ''}${reconciliation.resolvedAt ? `<dt>解决时间</dt><dd>${escapeHtml(reconciliation.resolvedAt)}</dd>` : ''}`
+        : '';
       const cancellationHtml = task.cancellation
         ? `<dt>取消状态</dt><dd>${escapeHtml(task.cancellation.state)}</dd><dt>取消说明</dt><dd>${escapeHtml(guidedCancellationExplanation(task.cancellation))}</dd><dt>取消请求时间</dt><dd>${escapeHtml(task.cancellation.requestedAt || '—')}</dd>${task.cancellation.resolvedAt ? `<dt>取消解决时间</dt><dd>${escapeHtml(task.cancellation.resolvedAt)}</dd>` : ''}${task.cancellation.failureCode ? `<dt>取消状态码</dt><dd class="font-mono">${escapeHtml(task.cancellation.failureCode)}</dd>` : ''}`
         : '';
@@ -3560,7 +3629,7 @@
         ? `<p class="mt-3 text-sm text-red-700" role="alert">${escapeHtml(state.guided.error)}</p>` : '';
       return `<section class="rounded-lg border ${isCrashState ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-white'} p-4" data-guided-view="task">
         <div class="flex flex-wrap items-start justify-between gap-3"><div><h4 class="font-heading font-semibold text-slate-900">Scientific Runtime task</h4><p class="text-xs text-slate-500 mt-1">SQLite 是任务状态真源；轮询只执行 GET</p></div><span class="data-pill ${task.status === 'Succeeded' ? '' : 'warning'}">${escapeHtml(task.status)}</span></div>
-        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd><dt>optimizer / LR</dt><dd class="font-mono">${escapeHtml(`${(task.draft.optimizer || 'legacy').toUpperCase()} / ${task.draft.learningRate || 'preset default'}`)}</dd><dt>dispatch</dt><dd>${escapeHtml(task.dispatch.state || 'not recorded')}</dd><dt>dispatch evidence</dt><dd>${escapeHtml(guidedDispatchExplanation(task.dispatch.state))}</dd><dt>Adapter status</dt><dd>${escapeHtml(adapter.status || 'not available')}</dd><dt>stage</dt><dd>${escapeHtml(adapter.stage || '—')}</dd><dt>progress</dt><dd>${escapeHtml(`${completed} / ${total}`)}</dd><dt>message</dt><dd>${task.timeout ? escapeHtml(guidedTimeoutExplanation(task.timeout)) : escapeHtml(adapter.message || task.dispatch.failureCode || '等待状态更新')}</dd>${cancellationHtml}${timeoutHtml}</dl>
+        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd><dt>optimizer / LR</dt><dd class="font-mono">${escapeHtml(`${(task.draft.optimizer || 'legacy').toUpperCase()} / ${task.draft.learningRate || 'preset default'}`)}</dd><dt>dispatch</dt><dd>${escapeHtml(task.dispatch.state || 'not recorded')}</dd><dt>dispatch evidence</dt><dd>${escapeHtml(guidedDispatchExplanation(task.dispatch.state))}</dd>${reconciliationHtml}<dt>Adapter status</dt><dd>${escapeHtml(adapter.status || 'not available')}</dd><dt>stage</dt><dd>${escapeHtml(adapter.stage || '—')}</dd><dt>progress</dt><dd>${escapeHtml(`${completed} / ${total}`)}</dd><dt>message</dt><dd>${task.timeout ? escapeHtml(guidedTimeoutExplanation(task.timeout)) : escapeHtml(adapter.message || task.dispatch.failureCode || '等待状态更新')}</dd>${cancellationHtml}${timeoutHtml}</dl>
         <div class="mt-3 flex flex-wrap gap-2">${cancelButton}${task.status === 'Succeeded' ? '' : '<button type="button" onclick="refreshGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">刷新状态（GET）</button>'}${linkedToCurrent ? '<button type="button" onclick="unlinkCurrentConversationFromGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">从当前对话移除引用</button>' : '<button type="button" onclick="linkCurrentConversationToGuidedTask()" class="px-3 py-2 rounded-lg border border-accent/40 bg-accent/5 text-sm text-accent">关联当前对话</button>'}</div>${error}
       </section>`;
     }

@@ -24,6 +24,7 @@ from scientific_runtime.workbench_service import (
     GuidedWorkbench,
     WorkbenchConflict,
     WorkbenchNotFound,
+    WorkbenchRuntimeError,
     WorkbenchValidationError,
     _stable_id,
 )
@@ -260,6 +261,9 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertTrue(capabilities["features"]["running_cancel"])
         self.assertTrue(capabilities["features"]["runtime_timeout"])
+        self.assertTrue(
+            capabilities["features"]["positive_receipt_reconciliation"]
+        )
         self.assertNotIn("can_timeout", capabilities["features"])
         self.assertNotIn("timeout", capabilities["capabilities"])
         self.assertFalse(capabilities["features"]["automatic_reconciliation"])
@@ -316,6 +320,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                 "supervised_runtime_scheduling": True,
                 "continuous_status_supervision": True,
                 "supervisor_leases": True,
+                "positive_receipt_reconciliation": True,
                 "automatic_reconciliation": False,
                 "dag": False,
             },
@@ -1094,6 +1099,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(snapshot.approval["plan_hash"], created["plan"]["plan_hash"])
         self.assertEqual(result["status"], "Queued")
         self.assertEqual(result["dispatch"]["state"], "pending")
+        self.assertIsNone(result["dispatch"]["reconciliation"])
         self.assertFalse(result["dispatch_attempted"])
         self.assertNotIn("handle", repr(result))
         self.assertNotIn("fwi-workbench-test-job", repr(result))
@@ -1105,6 +1111,144 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertTrue(replay["replayed"])
         self.assertFalse(replay["dispatch_attempted"])
         self.assertEqual(self.dispatcher.dispatch_calls, 0)
+
+    def test_dispatch_reconciliation_projection_is_bounded_and_path_free(self) -> None:
+        created = self.workbench.create_task(guided_form(), "create-reconciliation")
+        self.workbench.approve_and_submit(
+            created["task_id"], created["plan"]["plan_hash"], "approve-reconciliation"
+        )
+        snapshot = self.store.get_task(created["task_id"])
+        base_intent = self.store.get_dispatch_intent(created["task_id"])
+        self.assertIsNotNone(base_intent)
+        recorded_at = "2026-07-16T12:00:00.000000Z"
+        resolved_at = "2026-07-16T12:00:01.000000Z"
+
+        required = self.workbench._project(
+            snapshot,
+            intent={
+                "state": "reconciliation_required",
+                "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                "created_at": base_intent.created_at,
+                "dispatch_claimed_at": recorded_at,
+                "outcome_recorded_at": recorded_at,
+                "reconciliation": {
+                    "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                    "recorded_at": recorded_at,
+                    "state": "required",
+                    "result": None,
+                    "evidence_kind": None,
+                    "resolved_at": None,
+                    "handle": {"job_id": "private-job"},
+                    "document_hash": "sha256:" + "a" * 64,
+                    "pid": 4242,
+                    "relative_path": "/root/private/run",
+                },
+            },
+        )
+        self.assertEqual(
+            required["dispatch"]["reconciliation"],
+            {
+                "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                "recorded_at": recorded_at,
+                "state": "action_required",
+                "result": None,
+                "evidence_kind": None,
+                "resolved_at": None,
+            },
+        )
+
+        resolved = self.workbench._project(
+            snapshot,
+            intent={
+                "state": "dispatched",
+                "failure_code": None,
+                "created_at": base_intent.created_at,
+                "dispatch_claimed_at": recorded_at,
+                "outcome_recorded_at": resolved_at,
+                "handle": {"job_id": "must-not-project"},
+                "reconciliation": {
+                    "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                    "recorded_at": recorded_at,
+                    "state": "resolved",
+                    "result": "dispatched",
+                    "evidence_kind": "managed_worker_receipt",
+                    "resolved_at": resolved_at,
+                    "attempt_id": "must-not-project",
+                    "receipt_record_hash": "sha256:" + "b" * 64,
+                },
+            },
+        )
+        self.assertEqual(resolved["dispatch"]["state"], "dispatched")
+        self.assertEqual(
+            resolved["dispatch"]["reconciliation"],
+            {
+                "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                "recorded_at": recorded_at,
+                "state": "resolved",
+                "result": "dispatched",
+                "evidence_kind": "managed_worker_receipt",
+                "resolved_at": resolved_at,
+            },
+        )
+        private_receipt = self.workbench._project(
+            snapshot,
+            intent={
+                "state": "dispatched",
+                "failure_code": None,
+                "created_at": base_intent.created_at,
+                "dispatch_claimed_at": recorded_at,
+                "outcome_recorded_at": resolved_at,
+                "reconciliation": {
+                    "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                    "recorded_at": recorded_at,
+                    "state": "resolved",
+                    "result": "dispatched",
+                    "evidence_kind": "private_receipt",
+                    "resolved_at": resolved_at,
+                    "receipt_record_hash": "sha256:" + "c" * 64,
+                },
+            },
+        )
+        self.assertEqual(
+            private_receipt["dispatch"]["reconciliation"]["evidence_kind"],
+            "private_receipt",
+        )
+        serialized = repr(
+            (
+                required["dispatch"],
+                resolved["dispatch"],
+                private_receipt["dispatch"],
+            )
+        )
+        for private_value in (
+            "private-job",
+            "/root/private/run",
+            "must-not-project",
+            "sha256:" + "a" * 64,
+            "sha256:" + "b" * 64,
+            "sha256:" + "c" * 64,
+            "4242",
+        ):
+            self.assertNotIn(private_value, serialized)
+        self.assertFalse(
+            self.workbench.session_capabilities()["capabilities"]["retry"]
+        )
+
+        with self.assertRaises(WorkbenchRuntimeError):
+            self.workbench._project(
+                snapshot,
+                intent={
+                    "state": "dispatched",
+                    "reconciliation": {
+                        "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                        "recorded_at": recorded_at,
+                        "state": "resolved",
+                        "result": "dispatched",
+                        "evidence_kind": "private_receipt",
+                        "resolved_at": "/root/private/resolution",
+                    },
+                },
+            )
 
     def test_concurrent_first_approval_same_key_converges_despite_clock_skew(
         self,

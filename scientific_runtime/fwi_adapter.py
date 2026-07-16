@@ -352,6 +352,30 @@ class AdapterPrivateReceiptProof:
 
 
 @dataclass(frozen=True)
+class AdapterExistingDispatchReceiptProof:
+    """Proof of one exact, already-positive dispatch receipt."""
+
+    evidence_kind: str
+    handle: AdapterHandle
+    private_schema_version: str | None
+    receipt_record_hash: str | None
+    worker_evidence: dict[str, Any] | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "evidence_kind": self.evidence_kind,
+            "handle": self.handle.as_dict(),
+            "private_schema_version": self.private_schema_version,
+            "receipt_record_hash": self.receipt_record_hash,
+            "evidence": (
+                None
+                if self.worker_evidence is None
+                else copy.deepcopy(self.worker_evidence)
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class AdapterStatus:
     job_id: str
     task_id: str
@@ -2514,6 +2538,62 @@ class DeepwaveAdapter:
                 "evidence": evidence.as_dict(),
                 "handle": None if handle is None else handle.as_dict(),
             }
+
+    def probe_existing_dispatch_receipt(
+        self, **request: Any
+    ) -> AdapterExistingDispatchReceiptProof:
+        """Probe one exact positive receipt without launching a Worker.
+
+        Only an exact managed ready/heartbeat chain or a launched private 1.0
+        receipt is positive.  Every missing, incomplete, ambiguous, busy,
+        purged, or malformed state remains an explicit Adapter error for the
+        control plane to keep as action-required reconciliation.
+        """
+
+        try:
+            observed = self.observe_existing_worker_attempt(
+                **request,
+            )
+        except AdapterUnavailable as error:
+            if error.code != "WORKER_EVIDENCE_UNAVAILABLE":
+                raise
+        else:
+            evidence = observed.get("evidence")
+            handle_value = observed.get("handle")
+            ready = evidence.get("ready") if isinstance(evidence, Mapping) else None
+            heartbeat = (
+                evidence.get("heartbeat") if isinstance(evidence, Mapping) else None
+            )
+            if (
+                isinstance(handle_value, Mapping)
+                and isinstance(ready, Mapping)
+                and isinstance(heartbeat, Mapping)
+            ):
+                try:
+                    handle = AdapterHandle(**copy.deepcopy(dict(handle_value)))
+                except (TypeError, ValueError) as error:
+                    raise AdapterHandleError(
+                        "ADAPTER_SUBMISSION_INVALID: managed receipt handle is invalid"
+                    ) from error
+                return AdapterExistingDispatchReceiptProof(
+                    evidence_kind="managed_worker_receipt",
+                    handle=handle,
+                    private_schema_version="1.1.0",
+                    receipt_record_hash=None,
+                    worker_evidence=copy.deepcopy(dict(evidence)),
+                )
+            raise AdapterUnavailable(
+                "DISPATCH_RECEIPT_NOT_READY: managed receipt is not ready"
+            )
+
+        private = self.lookup_existing_private_receipt(**request)
+        return AdapterExistingDispatchReceiptProof(
+            evidence_kind="private_receipt",
+            handle=private.handle,
+            private_schema_version=private.private_schema_version,
+            receipt_record_hash=private.receipt_record_hash,
+            worker_evidence=None,
+        )
 
     def _lookup_existing_receipt(
         self,

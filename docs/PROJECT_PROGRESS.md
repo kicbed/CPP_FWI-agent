@@ -10,9 +10,11 @@
   P2-003 永久删除、P2-004 启动 receipt 收养、P2-005A 控制面 Supervisor lease/连续状态泵与
   P2-005B 固定 Adapter 托管 Worker launch fence、P2-005C fenced Worker 证据投影/late adoption、
   P2-006 可恢复 fenced scheduler/受监督首次派发、P2-007 exact-attempt user cancellation 与
-  P2-008 exact-attempt wall-time timeout 均为有界 Verified；完整 P2 Pending**
-- 当前阶段：**P2-008 exact-attempt wall-time timeout 有界切片 Verified；完整 P2 继续进行**
-- 下一动作：推进有限 retry 与 `reconciliation_required` resolution；SSE 继续后置
+  P2-008 exact-attempt wall-time timeout 与 P2-009A 有界 positive receipt resolution/adoption
+  均为有界 Verified；完整 P2 Pending**
+- 当前阶段：**P2-009A 有界 positive receipt resolution/adoption Verified；完整 P2 继续进行**
+- 下一动作：先请用户确认 finite retry 的次数、预算与可重试失败边界，再推进 P2-009B；负向/不确定
+  reconciliation 与 SSE 继续后置
 - 交付粒度：D-011 采用弹性中等切片，约十余个只是估算；保留逐切片验证和阶段质量门，不为
   migration/字段/单项测试单独制造路线切片，确有安全/验证证据时允许合理增加并记录原因
 - 当前阻塞：无
@@ -29,7 +31,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
 | P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 31/31；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
 | P1 最小持久垂直切片 | Verified | 既有 P1 Task Store/Registry/Adapter/atomic submit/Guided Web 全闭环及 D-006/D-007；D-008/P1-008 增加 Conversation/Task 可选引用、无级联本地对话删除和当前 Algorithm/Adapter 1.4 的 2 数值 + 6 PNG 结果画廊 | Runtime 165/165、Worker 28/28、Web 29/29、Embedding 6/6、CTest 39/39、MCP 1/1 及 UI/治理 PASS；fresh v6 CUDA 10 events、8 artifacts/6 PNG、数值更新和重启不变性 PASS | —（P1 及当前维护切片完成） |
-| P2 持久可靠性加固 | In progress（P2-001–P2-008 有界切片 Verified；完整 P2 Pending） | SQLite v12 exact-attempt timeout、v2 Worker self-stop 与七字段只读 Workbench 投影已验证 | Runtime 304/304、Worker 32/32、launch-control 25/25、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node/治理及真实 CPU timeout E2E PASS；未运行 CUDA | 有限重试、完整 reconciliation 与 SSE |
+| P2 持久可靠性加固 | In progress（P2-001–P2-009A 有界切片 Verified；完整 P2 Pending） | SQLite v13 append-only positive receipt resolution/effective dispatch、active-term adoption、每周期最多一次 probe、同周期 timeout/status catch-up 与六字段只读 Workbench 投影已验证 | Runtime 319/319、固定 venv Worker 32/32、launch-control 25/25、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；真实 Adapter 文件/锁 receipt probe 覆盖 managed/private 且 replacement launcher 零调用；未运行 CUDA | 用户确认 finite retry 策略后推进 P2-009B；负向/不确定 reconciliation、SSE 与完整 P2 出口仍 Pending |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
 | P5 算法 SDK | Pending | 无 | 无 | 受控数据可匹配多个独立算法；新增真实插件无需 Orchestrator 关键词且 conformance 通过 |
@@ -49,8 +51,9 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   one-shot dispatch 形成最小闭环。P2-006 当前产品路径已经改为 HTTP submit 只做 prepare/Gate 与
   `Queued/pending` 原子 admission，active-term Runtime Supervisor 才能首次派发 current 1.4。
   Worker 执行和同机容量仍由 P2-005B inherited `flock` 围栏；SQLite v10/v11 不是 Worker lease。
-  P2-007 已提供有界 exact-attempt user cancel；P2-008 已提供有界 exact-attempt timeout；当前
-  仍无 DAG、task retry、reconciliation resolution 或 SSE。
+  P2-007 已提供有界 exact-attempt user cancel；P2-008 已提供有界 exact-attempt timeout；P2-009A
+  已验证严格正向 receipt 证明下的有界 resolution/adoption。当前仍无 DAG、task retry、完整
+  reconciliation 或 SSE。
 - D-006/P1-006 已把固定 FWI 的显式整数上限扩展为 10000；该 checkpoint 使用
   Algorithm/Adapter `1.1.0`。D-007 的 `1.2.0` 是不可变六参数历史快照，`1.3.0` 是已验证
   checkpoint；D-008 当前新提交使用 `1.4.0`，旧 `1.0.0`–`1.3.0` manifest、persisted Plan
@@ -111,6 +114,16 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   admission 先赢为 `suppressed`；authorization/request 后自然终态先赢为 `superseded`；完整
   request/ack/stopped/idle proof 才是 `timed_out` 并提交 `Failed / WALL_TIME_EXCEEDED`。grace 后由
   exact Worker 自退出，控制面不 signal 持久 PID。
+- P2-009A 已验证：只处理 immutable `reconciliation_required` intent 的两类 current Adapter
+  `1.4.0` 严格正向证明——managed spawned + exact ready + heartbeat
+  （`running`/`succeeded`/`failed`），以及 current Adapter 下 legacy-private schema `1.0` exact
+  launched receipt。公共 Adapter `1.0`–`1.3`、缺失/歧义/损坏/不匹配/部分/
+  launch/ticket failed 或 staged 证据均不进入 resolution，继续保持 `action_required`；terminal
+  heartbeat `succeeded`/`failed` 仍是正向 receipt，认领后同一周期执行 status catch-up。只有 active
+  fenced Supervisor term 可追加 `resolved` adoption 事实。既有 outcome 不被改写或删除，也不触发
+  launcher、reset、refund、retry，也不根据 reconciliation 负向推断或合成 Task terminal；terminal
+  receipt 只沿既有 exact status bridge 追赶。Workbench/API 当前只暴露有界 `action_required`/
+  `resolved` 投影，不暴露 handle/hash/PID/path，不增加浏览器 mutation。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
 - D-011 已批准：保持阶段、依赖、测试和安全质量，减少过细切片但不取消慢速逐步开发；切片数
   是弹性估算而非固定 12。多算法表示多个独立可选工具，自动串联完整处理流程不作为当前出口。
@@ -125,7 +138,9 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   认证，只在 loopback 绑定时启用，不是容器/远程多用户部署方案；
 - P1.1c 历史 checkpoint 已实现后端 submit 幂等、预算消费、durable intent 与 Queued；P2-006
   当前 submit 已改为 enqueue-only，current 1.4 pending/no-record 首派由 active Supervisor term
-  负责。既有 immutable `reconciliation_required` outcome 的 resolution、退款和 task retry 仍未解决；
+  负责。P2-009A 只在上述两类 exact positive receipt 下推进 immutable
+  `reconciliation_required` 的有界 resolution/adoption；负向/不确定 reconciliation、退款和 task retry
+  仍未解决；
 - Deepwave Adapter 只覆盖固定 `acoustic_fwi_2d` 单节点，尚未成为通用 Algorithm SDK；旧
   forward 因输出语义不匹配而未接入标准 Adapter；
 - P2-006 已让 Web 进程在 scope-level fenced term 下调度并持续更新 task，不依赖浏览器 GET；
@@ -133,8 +148,10 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   声称所有 runtime write 都由唯一 Supervisor 独占。kernel `flock` 仍是执行/容量权威，heartbeat
   不是 lease 或 takeover 信号；standalone CLI/C++ MCP 不在该投影/容量边界，升级前或首次扫描前
   已终态的 task 不保证 evidence backfill。不完整 staging、确定性 Adapter/receipt 错误仍需未来
-  reconciliation；有限 retry、完整 reconciliation/SSE、P3 DAG 和 P4 Agent Planner 仍未实现。
-  P2-007/P2-008 不支持 pending/staged、legacy private schema 1.0 或公共 Adapter 1.0–1.3；
+  reconciliation；finite retry 具体策略仍 Pending，完整 reconciliation/SSE、P3 DAG 和 P4 Agent
+  Planner 仍未实现。P2-007/P2-008 不支持 pending/staged、legacy private schema 1.0 或公共 Adapter
+  1.0–1.3；P2-009A 只额外覆盖 current Adapter 下 legacy-private schema 1.0 的 exact launched receipt，
+  不把公共 Adapter 1.0–1.3 纳入；
   `resources.wall_time_seconds` 的 runtime enforcement 只在 P2-008 已验证的 exact 边界内成立。
 - P2-002 的普通“删除”仍只是可恢复 visibility Trash/Restore；D-009/P2-003 另提供强确认的
   本地 Worker 目录/result purge，但不硬删 Draft、Plan、Approval、RunEvent、幂等记录或
@@ -654,17 +671,53 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
   governance 均 PASS。真实固定 venv CPU Deepwave timeout E2E 验证了 v2 request/ack/stopped/idle
   proof、`timed_out` 与 `Failed / WALL_TIME_EXCEEDED`；本切片未运行 CUDA。
 
+### P2-009A 有界 positive receipt resolution/adoption（2026-07-16）
+
+- 状态：**Implemented → Verified；完整 P2 仍 Pending**。本切片不是 finite retry，也不把 finite retry 写成已接受
+  方向；finite retry 具体策略仍 Pending。
+- 范围只含 immutable `reconciliation_required` dispatch intent 的两类 current Adapter `1.4.0`
+  exact positive receipt：current managed attempt 的 spawned + exact ready + heartbeat
+  （`running`/`succeeded`/`failed`），以及 current Adapter 下
+  legacy-private schema `1.0` 的 exact launched receipt。公共 Adapter `1.0`–`1.3` 不在范围内。
+- 只有 active fenced Supervisor term 可以在严格 proof 成立时追加 bounded resolution/adoption；原有
+  `reconciliation_required` outcome 保持不可变。缺失、歧义、损坏、不匹配、部分、launch/ticket failed
+  或 staged evidence 继续为 `action_required`；spawned + exact ready 后的 terminal heartbeat
+  `succeeded`/`failed` 仍可认领，并在同一 Supervisor 周期执行 status catch-up。不做 launcher、
+  negative reset、refund、retry，也不根据 reconciliation 负向推断或合成 Task terminal；已证明的
+  terminal receipt 只沿既有 exact status bridge 追赶。
+- Workbench/API 只暴露有界 `action_required`/`resolved` 投影；不暴露 handle/hash/PID/path，也不
+  增加浏览器 mutation。session 只声明 `positive_receipt_reconciliation=true`，继续保持
+  `automatic_reconciliation=false` 与 `retry=false`，不宣称 full/automatic reconciliation。
+- SQLite v13 保留原 `reconciliation_required` outcome 的原始字节/hash，另追加 current-term
+  authorization、proof-specific adoption、resolution 与统一 `effective_dispatched_intents`；resolution、
+  authorization 均 append-only，adoption + resolution 同事务提交，dangling adoption fail-closed。
+  cancel、timeout 与 terminal trash SQL guard 统一消费 effective dispatch。
+- Adapter/Dispatcher 对 managed/private receipt 做固定身份和 fingerprint 校验；managed
+  `launching + exact ready` 只允许在既有 submission lock 内 bookkeeping-promote，不执行新的
+  `Popen`、替换 Worker、扫描 run root 或根据 heartbeat age 推断失活。Supervisor 每周期最多 probe
+  一个 action-required task，并用既有 projection cadence 保持多任务公平；managed running 同周期
+  arm timeout，terminal receipt 同周期 status catch-up。
+- 整体验证捕获并修复了既有 same-key 首次 approve/submit 的 late-replay TOCTOU：若另一调用在首次
+  replay lookup 后已将 Task 入队，Service 在返回状态冲突前再次读取同一 durable idempotency row。
+  该并发用例 10 进程并行重复 PASS，未放宽不同 key 或不同 request hash 的冲突边界。
+- 验证：Scientific Runtime 319/319；固定 venv Worker 32/32（含 CPU smoke 3/3）；launch-control
+  25/25；Web 46/46；Embedding 6/6；根 CTest 39/39；MCP 1/1；Node UI、continuity/launcher/
+  runtime-secret、编译与 diff 检查 PASS。真实 Adapter 文件/锁专项覆盖 managed ready promotion 与
+  legacy-private v1 exact receipt，replacement launcher 均为零调用；本切片未运行 CUDA。
+
 ### 完整 P2 仍 Pending
 
 P1 的既有必需交付与退出测试仍为 Verified。用户后续明确授权的 P2-001 任务发现/重开与
 P2-002 可恢复任务回收站、P2-003 本地结果永久删除和本次 P2-004 有界 receipt 收养/状态追赶
 以及 P2-005A 控制面 Supervisor、P2-005B 固定 Adapter 托管 Worker launch fence、P2-005C
 fenced Worker 证据投影/late adoption、P2-006 fenced scheduler/受监督首次派发和 P2-007
-exact-attempt user cancellation、P2-008 exact-attempt wall-time timeout 均已 Verified。P2-006
+exact-attempt user cancellation、P2-008 exact-attempt wall-time timeout 与 P2-009A 有界 positive
+receipt resolution/adoption 均已 Verified。P2-006
 已关闭 current managed pending/no-record 首派和 exact staged 同 attempt 恢复；P2-007 只关闭上述
 exact current managed attempt 的用户取消，P2-008 只关闭具备 v2 exact-stop capability 的上述
-managed attempt 自动 wall-time enforcement。task retry、`reconciliation_required` resolution 与
-SSE 仍未实现。服务器 transcript
+managed attempt 自动 wall-time enforcement。除 P2-009A 的上述正向 exact receipt 窗口外，task
+retry、负向/不确定 `reconciliation_required` resolution 与 SSE 仍未实现；finite retry 具体策略仍
+Pending。服务器 transcript
 永久删除、SQLite 审计历史硬
 删除和备份/外部副本清理仍 Pending。
 D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
@@ -721,6 +774,8 @@ D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 | 2026-07-16 | P2-007 | Pending → Implemented → Verified；完整 P2 仍 Pending | SQLite v11 exact request/active-term authorization/outcome、Worker-published capability 与 self-cancel、ack + stopped heartbeat + idle execution fence 终态证明、自然终态 superseded 竞争和 Guided Web requested/cancelled/superseded | Runtime 271/271、固定 venv Worker 31/31（CPU smoke 3/3）+ launch-control 17/17、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI、治理/编译/diff PASS；未运行 CUDA | 先由用户确认 timeout 的终态语义、计时起点和 force policy；随后有限 retry、reconciliation resolution 与 SSE |
 | 2026-07-16 | P2-008 | Pending → Accepted / In progress；完整 P2 仍 Pending | Failed/WALL_TIME_EXCEEDED、首条 durable ready+running observation 起算、v2 exact-stop、grace 后 Worker self-exit、timeout delivery authorization / durable cancel admission first-writer 的实现开始 | 设计边界已核对；实现与测试进行中，尚无 Verified 证据 | 完成 SQLite v12、Supervisor/Adapter/Worker、只读 Web 投影与分级回归 |
 | 2026-07-16 | P2-008 | Accepted / In progress → Implemented → Verified；完整 P2 仍 Pending | SQLite v12 immutable window/authorization/outcome、Store 首条 current Worker durable ready+running `observed_at` 起算、deadline/authorization 前零 Worker mutation、四态竞争、v2 Worker self-stop 与七字段只读 Workbench 投影；无 timeout POST | Runtime 304/304、固定 venv Worker 32/32（CPU smoke 3/3）、launch-control 25/25、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/governance PASS；真实固定 venv CPU Deepwave timeout E2E PASS，未运行 CUDA | 下一步有限 retry 与 `reconciliation_required` resolution；SSE 继续后置 |
+| 2026-07-16 | P2-009A | Pending → In progress；完整 P2 仍 Pending | 限定 current Adapter 1.4 managed spawned + exact ready + heartbeat（含 terminal succeeded/failed）与 current Adapter/legacy-private schema 1.0 exact launched receipt 的 bounded positive resolution/adoption；launch/ticket failed 等负向证据保持 `action_required`，无 retry/退款或 reconciliation 合成终态 | 范围与安全边界已核对；Store/Service/Supervisor、Workbench/API 只读投影及测试进行中，尚无 Verified 证据 | 完成实现与分级回归；finite retry 具体策略仍 Pending，SSE 后置 |
+| 2026-07-16 | P2-009A | In progress → Implemented → Verified；完整 P2 仍 Pending | SQLite v13 append-only authorization/adoption/resolution 与 effective dispatch；managed/private exact positive probe；每周期最多一次、同周期 timeout/status；六字段只读 Web 投影且无 mutation；整体验证同时关闭 same-key approve/submit late-replay race | Runtime 319/319、固定 venv Worker 32/32、launch-control 25/25、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；真实 Adapter 文件/锁 probe 中 replacement launcher 零调用；并发用例 10 进程重复 PASS；未运行 CUDA | 先请用户确认 finite retry 次数/预算/失败边界，再推进 P2-009B；负向 reconciliation 与 SSE 后置 |
 
 记录规则：
 

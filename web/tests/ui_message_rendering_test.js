@@ -142,6 +142,7 @@ function loadGuidedFunctions() {
     'expectedGuidedFwiPlanOutputs',
     'hasExactGuidedFwiPlanOutputs',
     'normalizeGuidedTimeoutProjection',
+    'normalizeGuidedReconciliationProjection',
     'normalizeGuidedTaskProjection',
     'isGuidedReviewReady',
     'isGuidedApprovedSubmitPending',
@@ -149,6 +150,7 @@ function loadGuidedFunctions() {
     'normalizeGuidedArtifacts',
     'isSafeGuidedBlobUrl',
     'guidedDispatchExplanation',
+    'guidedReconciliationExplanation',
     'guidedCancellationExplanation',
     'guidedTimeoutExplanation',
     'renderGuidedArtifactsHtml',
@@ -1268,7 +1270,8 @@ function makeGuidedTask(overrides = {}) {
       }],
     },
     approval,
-    dispatch: overrides.dispatch || null,
+    dispatch: overrides.dispatch
+      ? { reconciliation: null, ...overrides.dispatch } : null,
     runtime_status: overrides.adapter_status || null,
     can_cancel: overrides.can_cancel ?? false,
     cancellation: Object.hasOwn(overrides, 'cancellation')
@@ -1666,10 +1669,22 @@ function testGuidedTaskAndCrashStatesAreHonest() {
     ...reviewTask, plan: { ...reviewTask.plan, nodeCount: 2 },
   }, catalog), false);
   for (const dispatchState of ['pending', 'dispatching', 'dispatched', 'reconciliation_required']) {
+    const failureCode = 'DISPATCH_RECEIPT_INVALID';
     const task = api.normalizeGuidedTaskProjection(makeGuidedTask({
       status: 'Queued',
       approval: { approval_id: 'approval-guided-1', decision: 'approved' },
-      dispatch: { state: dispatchState, failure_code: dispatchState === 'reconciliation_required' ? 'DISPATCH_RECEIPT_INVALID' : '' },
+      dispatch: {
+        state: dispatchState,
+        failure_code: dispatchState === 'reconciliation_required' ? failureCode : null,
+        reconciliation: dispatchState === 'reconciliation_required' ? {
+          failure_code: failureCode,
+          recorded_at: '2026-07-16T12:00:00.000000Z',
+          state: 'action_required',
+          result: null,
+          evidence_kind: null,
+          resolved_at: null,
+        } : null,
+      },
       adapter_status: {
         status: dispatchState === 'dispatched' ? 'Running' : 'Queued',
         stage: '<img onerror=alert(1)>', completed: 1, total: 2,
@@ -1681,7 +1696,58 @@ function testGuidedTaskAndCrashStatesAreHonest() {
     assert.equal(task.adapter.stage, '<img onerror=alert(1)>');
   }
   assert.match(api.guidedDispatchExplanation('pending'), /不会由浏览器重发/);
-  assert.match(api.guidedDispatchExplanation('reconciliation_required'), /不会重试/);
+  assert.match(api.guidedDispatchExplanation('reconciliation_required'), /浏览器不会重试/);
+  const resolvedReconciliation = {
+    failure_code: 'DISPATCH_RECEIPT_UNKNOWN',
+    recorded_at: '2026-07-16T12:00:00.000000Z',
+    state: 'resolved',
+    result: 'dispatched',
+    evidence_kind: 'managed_worker_receipt',
+    resolved_at: '2026-07-16T12:00:01.000000Z',
+  };
+  const reconciled = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Queued',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: {
+      state: 'dispatched', failure_code: null,
+      reconciliation: resolvedReconciliation,
+    },
+  }));
+  assert.equal(reconciled.dispatch.state, 'dispatched');
+  assert.deepEqual(JSON.parse(JSON.stringify(reconciled.dispatch.reconciliation)), {
+    state: 'resolved',
+    failureCode: 'DISPATCH_RECEIPT_UNKNOWN',
+    recordedAt: '2026-07-16T12:00:00.000000Z',
+    result: 'dispatched',
+    evidenceKind: 'managed_worker_receipt',
+    resolvedAt: '2026-07-16T12:00:01.000000Z',
+  });
+  assert.match(
+    api.guidedReconciliationExplanation(reconciled.dispatch.reconciliation),
+    /receipt adoption.*不是任务 retry/,
+  );
+  assert.equal(
+    api.normalizeGuidedReconciliationProjection({
+      ...resolvedReconciliation, evidence_kind: 'private_receipt',
+    }).evidenceKind,
+    'private_receipt',
+  );
+  for (const malformedReconciliation of [
+    { ...resolvedReconciliation, handle: { job_id: 'private-job' } },
+    { ...resolvedReconciliation, receipt_record_hash: `sha256:${'a'.repeat(64)}` },
+    { ...resolvedReconciliation, resolved_at: '/root/private/run' },
+    { ...resolvedReconciliation, state: 'action_required' },
+    { ...resolvedReconciliation, evidence_kind: 'worker_pid' },
+  ]) {
+    assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+      status: 'Queued',
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+      dispatch: {
+        state: 'dispatched', failure_code: null,
+        reconciliation: malformedReconciliation,
+      },
+    })), null);
+  }
   const completed = api.normalizeGuidedTaskProjection(makeGuidedTask({
     status: 'Queued',
     approval: { approval_id: 'approval-guided-1', decision: 'approved' },
@@ -2158,6 +2224,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       supervised_runtime_scheduling: true,
       continuous_status_supervision: true,
       supervisor_leases: true,
+      positive_receipt_reconciliation: true,
       automatic_reconciliation: false,
     },
   });
@@ -2170,6 +2237,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       'supervised_runtime_scheduling',
       'continuous_status_supervision',
       'supervisor_leases',
+      'positive_receipt_reconciliation',
     ],
   );
   const catalog = api.normalizeGuidedCatalog({

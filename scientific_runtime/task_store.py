@@ -216,6 +216,18 @@ class SubmitGateContext:
 
 
 @dataclass(frozen=True)
+class DispatchReconciliationSnapshot:
+    """Original reconciliation case and any positive-evidence resolution."""
+
+    failure_code: str
+    recorded_at: str
+    state: str
+    result: str | None = None
+    evidence_kind: str | None = None
+    resolved_at: str | None = None
+
+
+@dataclass(frozen=True)
 class DispatchIntentSnapshot:
     """Durable dispatch state projected from immutable intent/claim/outcome rows."""
 
@@ -237,6 +249,7 @@ class DispatchIntentSnapshot:
     created_at: str
     dispatch_claimed_at: str | None
     outcome_recorded_at: str | None
+    reconciliation: DispatchReconciliationSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -303,6 +316,17 @@ class SupervisedDispatchAuthorization:
 
     intent: DispatchIntentSnapshot
     reason: str
+    fencing_token: int
+    authorized_at: str
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class SupervisedDispatchReconciliationAuthorization:
+    """One term authorized to inspect an exact unresolved dispatch case."""
+
+    intent: DispatchIntentSnapshot
+    evidence_kind: str
     fencing_token: int
     authorized_at: str
     replayed: bool
@@ -683,6 +707,16 @@ class TaskStore(Protocol):
         supervisor_lease: RuntimeSupervisorLease,
         supervisor_clock: Callable[[], str],
     ) -> SupervisedDispatchAuthorization:
+        ...
+
+    def authorize_supervised_dispatch_reconciliation(
+        self,
+        *,
+        intent_id: str,
+        evidence_kind: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedDispatchReconciliationAuthorization:
         ...
 
     def record_supervised_private_receipt_adoption(
@@ -2096,6 +2130,190 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    def authorize_supervised_dispatch_reconciliation(
+        self,
+        *,
+        intent_id: str,
+        evidence_kind: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedDispatchReconciliationAuthorization:
+        """Authorize one positive-evidence inspection without dispatching."""
+
+        if evidence_kind not in {
+            "managed_worker_receipt",
+            "private_receipt",
+        }:
+            raise TaskStoreConflict(
+                "dispatch reconciliation evidence kind is invalid"
+            )
+        if not isinstance(supervisor_lease, RuntimeSupervisorLease):
+            raise TaskStoreConflict("runtime supervisor lease is invalid")
+        if not callable(supervisor_clock):
+            raise TaskStoreConflict("runtime supervisor clock is invalid")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authorized_at, authorized_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            outcome = connection.execute(
+                """
+                SELECT outcome, document_hash FROM dispatch_outcomes
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if task is None or outcome is None:
+                raise TaskStoreCorruption(
+                    "dispatch reconciliation case cannot be read"
+                )
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=authorized_at_us,
+                action="dispatch reconciliation",
+            )
+            if (
+                task["status"] != "Queued"
+                or outcome["outcome"] != "reconciliation_required"
+                or intent.adapter_id != "fwi.deepwave_adapter"
+                or intent.adapter_version != "1.4.0"
+                or intent.request.get("algorithm")
+                != {"id": "deepwave.acoustic_fwi", "version": "1.4.0"}
+            ):
+                raise TaskStoreConflict(
+                    "dispatch intent is not eligible for reconciliation"
+                )
+            if connection.execute(
+                "SELECT 1 FROM task_purge_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict("purged task cannot be reconciled")
+            if connection.execute(
+                "SELECT 1 FROM task_cancel_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict(
+                    "task with a cancel request cannot be reconciled"
+                )
+
+            existing = connection.execute(
+                """
+                SELECT * FROM supervised_dispatch_reconciliation_attempts
+                WHERE intent_id = ? AND fencing_token = ?
+                  AND evidence_kind = ?
+                """,
+                (
+                    intent_id,
+                    supervisor_lease.fencing_token,
+                    evidence_kind,
+                ),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    stored_at, stored_at_us = _runtime_timestamp(
+                        existing["authorized_at"]
+                    )
+                except TaskStoreConflict as error:
+                    raise TaskStoreCorruption(
+                        "dispatch reconciliation authorization time is invalid"
+                    ) from error
+                if (
+                    existing["project_id"] != task["project_id"]
+                    or existing["principal_id"] != task["principal_id"]
+                    or existing["source_outcome_hash"]
+                    != outcome["document_hash"]
+                    or stored_at != existing["authorized_at"]
+                    or stored_at_us != existing["authorized_at_us"]
+                ):
+                    raise TaskStoreCorruption(
+                        "dispatch reconciliation authorization is inconsistent"
+                    )
+                connection.commit()
+                return SupervisedDispatchReconciliationAuthorization(
+                    intent=intent,
+                    evidence_kind=evidence_kind,
+                    fencing_token=supervisor_lease.fencing_token,
+                    authorized_at=stored_at,
+                    replayed=True,
+                )
+            if (
+                intent.state != "reconciliation_required"
+                or intent.reconciliation is None
+                or intent.reconciliation.state != "required"
+            ):
+                raise TaskStoreConflict(
+                    "dispatch reconciliation was already resolved"
+                )
+            connection.execute(
+                """
+                INSERT INTO supervised_dispatch_reconciliation_attempts(
+                    intent_id, project_id, principal_id, fencing_token,
+                    evidence_kind, source_outcome_hash,
+                    authorized_at, authorized_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    task["project_id"],
+                    task["principal_id"],
+                    supervisor_lease.fencing_token,
+                    evidence_kind,
+                    outcome["document_hash"],
+                    authorized_at,
+                    authorized_at_us,
+                ),
+            )
+            connection.commit()
+            return SupervisedDispatchReconciliationAuthorization(
+                intent=intent,
+                evidence_kind=evidence_kind,
+                fencing_token=supervisor_lease.fencing_token,
+                authorized_at=authorized_at,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "dispatch reconciliation lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "dispatch reconciliation authorization conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def authorize_supervised_timeout(
         self,
         *,
@@ -2836,9 +3054,8 @@ class SQLiteTaskStore:
                 FROM tasks AS task
                 JOIN dispatch_intents AS intent
                   ON intent.task_id = task.task_id
-                JOIN dispatch_outcomes AS dispatch
+                JOIN effective_dispatched_intents AS dispatch
                   ON dispatch.intent_id = intent.intent_id
-                 AND dispatch.outcome = 'dispatched'
                 JOIN worker_launch_attempts AS attempt
                   ON attempt.intent_id = intent.intent_id
                 JOIN worker_attempt_observations AS observation
@@ -6450,12 +6667,34 @@ class SQLiteTaskStore:
                    attempt.claimed_at AS dispatch_claimed_at,
                    outcome.outcome, outcome.document_json AS outcome_json,
                    outcome.document_hash AS outcome_hash,
-                   outcome.recorded_at AS outcome_recorded_at
+                   outcome.recorded_at AS outcome_recorded_at,
+                   resolution.result AS reconciliation_result,
+                   resolution.source_outcome_hash AS resolution_source_hash,
+                   resolution.evidence_kind AS resolution_evidence_kind,
+                   resolution.handle_json AS resolution_handle_json,
+                   resolution.handle_hash AS resolution_handle_hash,
+                   resolution.evidence_record_hash,
+                   resolution.attempt_id AS resolution_attempt_id,
+                   resolution.observation_sequence
+                       AS resolution_observation_sequence,
+                   resolution.private_schema_version
+                       AS resolution_private_schema_version,
+                   resolution.receipt_record_hash
+                       AS resolution_receipt_record_hash,
+                   resolution.effective_outcome_json,
+                   resolution.effective_outcome_hash,
+                   resolution.document_json AS resolution_json,
+                   resolution.document_hash AS resolution_hash,
+                   resolution.fencing_token AS resolution_fencing_token,
+                   resolution.resolved_at,
+                   resolution.resolved_at_us
             FROM dispatch_intents AS intent
             LEFT JOIN dispatch_attempts AS attempt
               ON attempt.intent_id = intent.intent_id
             LEFT JOIN dispatch_outcomes AS outcome
               ON outcome.intent_id = intent.intent_id
+            LEFT JOIN dispatch_reconciliation_resolutions AS resolution
+              ON resolution.intent_id = intent.intent_id
             WHERE intent.task_id = ?
             """,
             (task_id,),
@@ -6682,6 +6921,7 @@ class SQLiteTaskStore:
         failure_code: str | None = None
         dispatch_claimed_at: str | None = None
         outcome_recorded_at: str | None = None
+        reconciliation: DispatchReconciliationSnapshot | None = None
         if row["dispatch_claimed_at"] is not None:
             state = "dispatching"
             dispatch_claimed_at = str(row["dispatch_claimed_at"])
@@ -6719,11 +6959,271 @@ class SQLiteTaskStore:
                         "failed dispatch outcome fields are inconsistent"
                     )
                 value = outcome_document.get("failure_code")
-                if not isinstance(value, str) or not value:
+                if (
+                    not isinstance(value, str)
+                    or not value
+                    or len(value) > 128
+                    or not value.replace("_", "").isalnum()
+                    or value.upper() != value
+                ):
                     raise TaskStoreCorruption("dispatch failure code is invalid")
                 failure_code = value
+                reconciliation = DispatchReconciliationSnapshot(
+                    failure_code=value,
+                    recorded_at=outcome_recorded_at,
+                    state="required",
+                )
             else:
                 raise TaskStoreCorruption("dispatch outcome state is invalid")
+        if row["reconciliation_result"] is not None:
+            if (
+                state != "reconciliation_required"
+                or reconciliation is None
+                or row["reconciliation_result"] != "dispatched"
+                or row["resolution_source_hash"] != row["outcome_hash"]
+                or row["resolution_evidence_kind"]
+                not in {"managed_worker_receipt", "private_receipt"}
+            ):
+                raise TaskStoreCorruption(
+                    "dispatch reconciliation resolution identity is inconsistent"
+                )
+            resolution_handle = _decode_document(
+                row["resolution_handle_json"],
+                label="dispatch reconciliation handle",
+            )
+            try:
+                _, resolution_handle_hash = encode_document(resolution_handle)
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "dispatch reconciliation handle is invalid"
+                ) from error
+            effective_outcome = _decode_hashed_document(
+                {
+                    "document_json": row["effective_outcome_json"],
+                    "document_hash": row["effective_outcome_hash"],
+                },
+                label="effective dispatch outcome",
+            )
+            resolution_document = _decode_hashed_document(
+                {
+                    "document_json": row["resolution_json"],
+                    "document_hash": row["resolution_hash"],
+                },
+                label="dispatch reconciliation resolution",
+            )
+            try:
+                resolved_at, resolved_at_us = _runtime_timestamp(
+                    row["resolved_at"]
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "dispatch reconciliation resolution time is invalid"
+                ) from error
+            authorization = connection.execute(
+                """
+                SELECT project_id, principal_id, source_outcome_hash,
+                       authorized_at, authorized_at_us
+                FROM supervised_dispatch_reconciliation_attempts
+                WHERE intent_id = ? AND fencing_token = ?
+                  AND evidence_kind = ?
+                """,
+                (
+                    row["intent_id"],
+                    row["resolution_fencing_token"],
+                    row["resolution_evidence_kind"],
+                ),
+            ).fetchone()
+            if authorization is None:
+                raise TaskStoreCorruption(
+                    "dispatch reconciliation resolution lacks authorization"
+                )
+            try:
+                authorized_at, authorized_at_us = _runtime_timestamp(
+                    authorization["authorized_at"]
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "dispatch reconciliation authorization time is invalid"
+                ) from error
+            if (
+                resolution_handle_hash != row["resolution_handle_hash"]
+                or resolved_at != row["resolved_at"]
+                or resolved_at_us != row["resolved_at_us"]
+                or type(row["resolution_fencing_token"]) is not int
+                or row["resolution_fencing_token"] < 1
+                or authorization["project_id"] != task_identity["project_id"]
+                or authorization["principal_id"]
+                != task_identity["principal_id"]
+                or authorization["source_outcome_hash"] != row["outcome_hash"]
+                or authorized_at != authorization["authorized_at"]
+                or authorized_at_us != authorization["authorized_at_us"]
+                or authorized_at_us > resolved_at_us
+                or effective_outcome
+                != {
+                    "status": "dispatched",
+                    "handle": resolution_handle,
+                    "recorded_at": resolved_at,
+                }
+            ):
+                raise TaskStoreCorruption(
+                    "dispatch reconciliation resolution differs from its index"
+                )
+
+            evidence_kind = row["resolution_evidence_kind"]
+            if evidence_kind == "managed_worker_receipt":
+                attempt_id = row["resolution_attempt_id"]
+                observation_sequence = row[
+                    "resolution_observation_sequence"
+                ]
+                attempt = connection.execute(
+                    "SELECT * FROM worker_launch_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                observation = connection.execute(
+                    """
+                    SELECT * FROM worker_attempt_observations
+                    WHERE attempt_id = ? AND observation_sequence = ?
+                    """,
+                    (attempt_id, observation_sequence),
+                ).fetchone()
+                adoption = connection.execute(
+                    """
+                    SELECT * FROM supervised_dispatch_adoptions
+                    WHERE intent_id = ?
+                    """,
+                    (row["intent_id"],),
+                ).fetchone()
+                if attempt is None or observation is None or adoption is None:
+                    raise TaskStoreCorruption(
+                        "managed reconciliation proof is incomplete"
+                    )
+                evidence = _decode_worker_observation_row(observation)
+                _require_worker_attempt_observation_binding(
+                    attempt,
+                    evidence,
+                    intent_id=row["intent_id"],
+                    task_id=row["task_id"],
+                    project_id=task_identity["project_id"],
+                    principal_id=task_identity["principal_id"],
+                )
+                if (
+                    type(observation_sequence) is not int
+                    or observation_sequence < 1
+                    or observation["document_hash"]
+                    != row["evidence_record_hash"]
+                    or evidence["ticket"]["state"] != "spawned"
+                    or evidence["ready"] is None
+                    or evidence["heartbeat"] is None
+                    or evidence["heartbeat"]["state"]
+                    not in {"running", "succeeded", "failed"}
+                    or resolution_handle.get("submission_id")
+                    != evidence["submission_id"]
+                    or resolution_handle.get("job_id") != evidence["job_id"]
+                    or resolution_handle.get("request_hash")
+                    != evidence["request_hash"]
+                    or adoption["attempt_id"] != attempt_id
+                    or adoption["project_id"] != task_identity["project_id"]
+                    or adoption["principal_id"]
+                    != task_identity["principal_id"]
+                    or adoption["fencing_token"]
+                    != row["resolution_fencing_token"]
+                    or adoption["recorded_at"] != resolved_at
+                    or adoption["recorded_at_us"] != resolved_at_us
+                    or row["resolution_private_schema_version"] is not None
+                    or row["resolution_receipt_record_hash"] is not None
+                ):
+                    raise TaskStoreCorruption(
+                        "managed reconciliation proof is inconsistent"
+                    )
+                resolution_evidence = {
+                    "kind": "managed_worker_receipt",
+                    "attempt_id": attempt_id,
+                    "observation_sequence": observation_sequence,
+                    "observation_document_hash": observation[
+                        "document_hash"
+                    ],
+                }
+            else:
+                adoption = connection.execute(
+                    """
+                    SELECT * FROM supervised_private_receipt_adoptions
+                    WHERE intent_id = ?
+                    """,
+                    (row["intent_id"],),
+                ).fetchone()
+                if (
+                    adoption is None
+                    or row["resolution_attempt_id"] is not None
+                    or row["resolution_observation_sequence"] is not None
+                    or row["resolution_private_schema_version"] != "1.0.0"
+                    or row["resolution_receipt_record_hash"]
+                    != row["evidence_record_hash"]
+                    or adoption["private_schema_version"] != "1.0.0"
+                    or adoption["receipt_record_hash"]
+                    != row["evidence_record_hash"]
+                    or adoption["outcome_document_hash"]
+                    != row["effective_outcome_hash"]
+                    or adoption["project_id"] != task_identity["project_id"]
+                    or adoption["principal_id"]
+                    != task_identity["principal_id"]
+                    or adoption["fencing_token"]
+                    != row["resolution_fencing_token"]
+                    or adoption["recorded_at"] != resolved_at
+                    or adoption["recorded_at_us"] != resolved_at_us
+                ):
+                    raise TaskStoreCorruption(
+                        "private reconciliation proof is inconsistent"
+                    )
+                resolution_evidence = {
+                    "kind": "private_receipt",
+                    "private_schema_version": "1.0.0",
+                    "receipt_record_hash": row["evidence_record_hash"],
+                }
+            expected_resolution_document = {
+                "schema_version": "1.0.0",
+                "intent_id": row["intent_id"],
+                "task_id": row["task_id"],
+                "source_outcome_hash": row["outcome_hash"],
+                "result": "dispatched",
+                "effective_outcome": effective_outcome,
+                "evidence": resolution_evidence,
+                "resolved_at": resolved_at,
+                "extensions": {},
+            }
+            if resolution_document != expected_resolution_document:
+                raise TaskStoreCorruption(
+                    "dispatch reconciliation resolution fields are inconsistent"
+                )
+            state = "dispatched"
+            handle = resolution_handle
+            failure_code = None
+            outcome_recorded_at = resolved_at
+            reconciliation = DispatchReconciliationSnapshot(
+                failure_code=reconciliation.failure_code,
+                recorded_at=reconciliation.recorded_at,
+                state="resolved",
+                result="dispatched",
+                evidence_kind=evidence_kind,
+                resolved_at=resolved_at,
+            )
+        elif state == "reconciliation_required":
+            dangling_adoption = connection.execute(
+                """
+                SELECT EXISTS(
+                           SELECT 1 FROM supervised_dispatch_adoptions
+                           WHERE intent_id = ?
+                       )
+                       OR EXISTS(
+                           SELECT 1 FROM supervised_private_receipt_adoptions
+                           WHERE intent_id = ?
+                       )
+                """,
+                (row["intent_id"], row["intent_id"]),
+            ).fetchone()[0]
+            if dangling_adoption:
+                raise TaskStoreCorruption(
+                    "unresolved reconciliation has a dangling adoption"
+                )
         result = DispatchIntentSnapshot(
             intent_id=row["intent_id"],
             task_id=row["task_id"],
@@ -6743,6 +7243,7 @@ class SQLiteTaskStore:
             created_at=row["created_at"],
             dispatch_claimed_at=dispatch_claimed_at,
             outcome_recorded_at=outcome_recorded_at,
+            reconciliation=reconciliation,
         )
         if handle is not None:
             try:
@@ -6946,8 +7447,8 @@ class SQLiteTaskStore:
             intent = self._load_dispatch_intent(connection, task_id=task_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
-            if intent.state == "reconciliation_required":
-                if intent.failure_code != failure_code:
+            if intent.reconciliation is not None:
+                if intent.reconciliation.failure_code != failure_code:
                     raise TaskStoreConflict(
                         "dispatch reconciliation outcome already differs"
                     )
@@ -7771,13 +8272,13 @@ class SQLiteTaskStore:
                             FROM dispatch_intents AS intent
                             WHERE intent.task_id = ?
                         ) AS intent_id,
-                        (
-                            SELECT outcome.outcome
+                        EXISTS(
+                            SELECT 1
                             FROM dispatch_intents AS intent
-                            LEFT JOIN dispatch_outcomes AS outcome
+                            JOIN effective_dispatched_intents AS outcome
                               ON outcome.intent_id = intent.intent_id
                             WHERE intent.task_id = ?
-                        ) AS dispatch_outcome
+                        ) AS has_effective_dispatch
                     """,
                     (task_id, task_id, task_id, task_id),
                 ).fetchone()
@@ -7789,7 +8290,7 @@ class SQLiteTaskStore:
                 )
                 resolved_runtime = (
                     evidence["intent_id"] is not None
-                    and evidence["dispatch_outcome"] == "dispatched"
+                    and evidence["has_effective_dispatch"] == 1
                 )
                 if not (pre_runtime_abandonment or resolved_runtime):
                     raise TaskStoreConflict(
@@ -8694,6 +9195,142 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    @staticmethod
+    def _insert_dispatch_reconciliation_resolution(
+        connection: sqlite3.Connection,
+        *,
+        intent: DispatchIntentSnapshot,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        source_outcome_hash: str,
+        handle: Mapping[str, Any],
+        evidence_kind: str,
+        evidence_record_hash: str,
+        attempt_id: str | None,
+        observation_sequence: int | None,
+        private_schema_version: str | None,
+        receipt_record_hash: str | None,
+        supervisor_lease: RuntimeSupervisorLease,
+        resolved_at: str,
+        resolved_at_us: int,
+    ) -> tuple[str, str]:
+        """Append one effective dispatch receipt from exact positive proof."""
+
+        authorization = connection.execute(
+            """
+            SELECT project_id, principal_id, source_outcome_hash,
+                   authorized_at, authorized_at_us
+            FROM supervised_dispatch_reconciliation_attempts
+            WHERE intent_id = ? AND fencing_token = ?
+              AND evidence_kind = ?
+            """,
+            (
+                intent.intent_id,
+                supervisor_lease.fencing_token,
+                evidence_kind,
+            ),
+        ).fetchone()
+        if authorization is None:
+            raise TaskStoreConflict(
+                "dispatch reconciliation lacks current-term authorization"
+            )
+        try:
+            authorized_at, authorized_at_us = _runtime_timestamp(
+                authorization["authorized_at"]
+            )
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "dispatch reconciliation authorization time is invalid"
+            ) from error
+        if (
+            authorization["project_id"] != project_id
+            or authorization["principal_id"] != principal_id
+            or authorization["source_outcome_hash"] != source_outcome_hash
+            or authorized_at != authorization["authorized_at"]
+            or authorized_at_us != authorization["authorized_at_us"]
+            or authorized_at_us > resolved_at_us
+        ):
+            raise TaskStoreCorruption(
+                "dispatch reconciliation authorization is inconsistent"
+            )
+        normalized_handle = dict(handle)
+        handle_json, handle_hash = encode_document(normalized_handle)
+        effective_outcome = {
+            "status": "dispatched",
+            "handle": normalized_handle,
+            "recorded_at": resolved_at,
+        }
+        effective_outcome_json, effective_outcome_hash = encode_document(
+            effective_outcome
+        )
+        if evidence_kind == "managed_worker_receipt":
+            evidence = {
+                "kind": evidence_kind,
+                "attempt_id": attempt_id,
+                "observation_sequence": observation_sequence,
+                "observation_document_hash": evidence_record_hash,
+            }
+        elif evidence_kind == "private_receipt":
+            evidence = {
+                "kind": evidence_kind,
+                "private_schema_version": private_schema_version,
+                "receipt_record_hash": receipt_record_hash,
+            }
+        else:
+            raise TaskStoreConflict(
+                "dispatch reconciliation evidence kind is invalid"
+            )
+        resolution = {
+            "schema_version": "1.0.0",
+            "intent_id": intent.intent_id,
+            "task_id": task_id,
+            "source_outcome_hash": source_outcome_hash,
+            "result": "dispatched",
+            "effective_outcome": effective_outcome,
+            "evidence": evidence,
+            "resolved_at": resolved_at,
+            "extensions": {},
+        }
+        resolution_json, resolution_hash = encode_document(resolution)
+        connection.execute(
+            """
+            INSERT INTO dispatch_reconciliation_resolutions(
+                intent_id, task_id, project_id, principal_id,
+                source_outcome_hash, result, evidence_kind,
+                handle_json, handle_hash, evidence_record_hash,
+                attempt_id, observation_sequence, private_schema_version,
+                receipt_record_hash, effective_outcome_json,
+                effective_outcome_hash, document_json, document_hash,
+                fencing_token, resolved_at, resolved_at_us
+            ) VALUES (?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                intent.intent_id,
+                task_id,
+                project_id,
+                principal_id,
+                source_outcome_hash,
+                evidence_kind,
+                handle_json,
+                handle_hash,
+                evidence_record_hash,
+                attempt_id,
+                observation_sequence,
+                private_schema_version,
+                receipt_record_hash,
+                effective_outcome_json,
+                effective_outcome_hash,
+                resolution_json,
+                resolution_hash,
+                supervisor_lease.fencing_token,
+                resolved_at,
+                resolved_at_us,
+            ),
+        )
+        return effective_outcome_hash, resolution_hash
+
     def record_supervised_private_receipt_adoption(
         self,
         *,
@@ -8781,8 +9418,18 @@ class SQLiteTaskStore:
                     raise TaskStoreConflict(
                         "private receipt differs from the dispatch outcome"
                     )
+                if (
+                    intent.reconciliation is not None
+                    and intent.reconciliation.evidence_kind != "private_receipt"
+                ):
+                    raise TaskStoreConflict(
+                        "dispatch reconciliation used managed Worker evidence"
+                    )
                 outcome = connection.execute(
-                    "SELECT document_hash FROM dispatch_outcomes WHERE intent_id = ?",
+                    """
+                    SELECT outcome_document_hash
+                    FROM effective_dispatched_intents WHERE intent_id = ?
+                    """,
                     (intent_id,),
                 ).fetchone()
                 if outcome is None:
@@ -8795,7 +9442,7 @@ class SQLiteTaskStore:
                         intent=intent,
                         private_schema_version=private_schema_version,
                         receipt_record_hash=receipt_record_hash,
-                        outcome_document_hash=outcome["document_hash"],
+                        outcome_document_hash=outcome["outcome_document_hash"],
                         fencing_token=supervisor_lease.fencing_token,
                         recorded_at=recorded_at,
                         adopted=False,
@@ -8804,7 +9451,8 @@ class SQLiteTaskStore:
                 if (
                     existing["private_schema_version"] != private_schema_version
                     or existing["receipt_record_hash"] != receipt_record_hash
-                    or existing["outcome_document_hash"] != outcome["document_hash"]
+                    or existing["outcome_document_hash"]
+                    != outcome["outcome_document_hash"]
                 ):
                     raise TaskStoreConflict(
                         "private receipt adoption replay differs"
@@ -8819,13 +9467,20 @@ class SQLiteTaskStore:
                     intent=intent,
                     private_schema_version=private_schema_version,
                     receipt_record_hash=receipt_record_hash,
-                    outcome_document_hash=outcome["document_hash"],
+                    outcome_document_hash=outcome["outcome_document_hash"],
                     fencing_token=int(existing["fencing_token"]),
                     recorded_at=stored_at,
                     adopted=False,
                     replayed=True,
                 )
-            if intent.state != "dispatching" or existing is not None:
+            reconciliation_pending = (
+                intent.state == "reconciliation_required"
+                and intent.reconciliation is not None
+                and intent.reconciliation.state == "required"
+            )
+            if (
+                intent.state != "dispatching" and not reconciliation_pending
+            ) or existing is not None:
                 raise TaskStoreConflict(
                     "dispatch intent cannot adopt a private receipt"
                 )
@@ -8836,14 +9491,33 @@ class SQLiteTaskStore:
                 "recorded_at": recorded_at,
             }
             outcome_json, outcome_hash = encode_document(outcome_document)
-            connection.execute(
-                """
-                INSERT INTO dispatch_outcomes(
-                    intent_id, outcome, document_json, document_hash, recorded_at
-                ) VALUES (?, 'dispatched', ?, ?, ?)
-                """,
-                (intent_id, outcome_json, outcome_hash, recorded_at),
-            )
+            source_outcome_hash: str | None = None
+            if reconciliation_pending:
+                source_outcome = connection.execute(
+                    """
+                    SELECT outcome, document_hash FROM dispatch_outcomes
+                    WHERE intent_id = ?
+                    """,
+                    (intent_id,),
+                ).fetchone()
+                if (
+                    source_outcome is None
+                    or source_outcome["outcome"] != "reconciliation_required"
+                ):
+                    raise TaskStoreCorruption(
+                        "dispatch reconciliation source outcome cannot be read"
+                    )
+                source_outcome_hash = str(source_outcome["document_hash"])
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO dispatch_outcomes(
+                        intent_id, outcome, document_json, document_hash,
+                        recorded_at
+                    ) VALUES (?, 'dispatched', ?, ?, ?)
+                    """,
+                    (intent_id, outcome_json, outcome_hash, recorded_at),
+                )
             connection.execute(
                 """
                 INSERT INTO supervised_private_receipt_adoptions(
@@ -8864,6 +9538,33 @@ class SQLiteTaskStore:
                     recorded_at_us,
                 ),
             )
+            if reconciliation_pending:
+                if source_outcome_hash is None:
+                    raise TaskStoreCorruption(
+                        "dispatch reconciliation source hash is unavailable"
+                    )
+                effective_hash, _ = self._insert_dispatch_reconciliation_resolution(
+                    connection,
+                    intent=intent,
+                    task_id=task_id,
+                    project_id=task["project_id"],
+                    principal_id=task["principal_id"],
+                    source_outcome_hash=source_outcome_hash,
+                    handle=normalized_handle,
+                    evidence_kind="private_receipt",
+                    evidence_record_hash=receipt_record_hash,
+                    attempt_id=None,
+                    observation_sequence=None,
+                    private_schema_version=private_schema_version,
+                    receipt_record_hash=receipt_record_hash,
+                    supervisor_lease=supervisor_lease,
+                    resolved_at=recorded_at,
+                    resolved_at_us=recorded_at_us,
+                )
+                if effective_hash != outcome_hash:
+                    raise TaskStoreCorruption(
+                        "private reconciliation effective outcome hash changed"
+                    )
             stored = self._load_dispatch_intent(connection, task_id=task_id)
             if stored is None or stored.state != "dispatched":
                 raise TaskStoreCorruption(
@@ -9289,8 +9990,34 @@ class SQLiteTaskStore:
                 raise RuntimeSupervisorLeaseLost(
                     "Worker observation lost its supervisor lease"
                 )
-            if intent.state not in {"dispatching", "dispatched"}:
+            reconciliation_pending = (
+                intent.state == "reconciliation_required"
+                and intent.reconciliation is not None
+                and intent.reconciliation.state == "required"
+            )
+            if intent.state not in {"dispatching", "dispatched"} and not (
+                reconciliation_pending
+            ):
                 raise TaskStoreConflict("dispatch intent cannot accept Worker evidence")
+            if (
+                intent.state == "dispatched"
+                and intent.reconciliation is not None
+                and intent.reconciliation.evidence_kind != "managed_worker_receipt"
+            ):
+                raise TaskStoreConflict(
+                    "dispatch reconciliation used a private receipt"
+                )
+            if reconciliation_pending and (
+                normalized_handle is None
+                or ticket["state"] != "spawned"
+                or ready is None
+                or heartbeat is None
+                or heartbeat["state"]
+                not in {"running", "succeeded", "failed"}
+            ):
+                raise TaskStoreConflict(
+                    "dispatch reconciliation requires exact positive Worker proof"
+                )
 
             existing_attempt = connection.execute(
                 """
@@ -9549,6 +10276,58 @@ class SQLiteTaskStore:
                         raise TaskStoreConflict(
                             "Worker adoption differs from the dispatch outcome"
                         )
+                elif reconciliation_pending:
+                    source_outcome = connection.execute(
+                        """
+                        SELECT outcome, document_hash FROM dispatch_outcomes
+                        WHERE intent_id = ?
+                        """,
+                        (intent_id,),
+                    ).fetchone()
+                    if (
+                        source_outcome is None
+                        or source_outcome["outcome"]
+                        != "reconciliation_required"
+                    ):
+                        raise TaskStoreCorruption(
+                            "dispatch reconciliation source outcome cannot be read"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO supervised_dispatch_adoptions(
+                            intent_id, attempt_id, project_id, principal_id,
+                            fencing_token, recorded_at, recorded_at_us
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            intent_id,
+                            normalized["attempt_id"],
+                            task["project_id"],
+                            task["principal_id"],
+                            supervisor_lease.fencing_token,
+                            observed_at,
+                            observed_at_us,
+                        ),
+                    )
+                    self._insert_dispatch_reconciliation_resolution(
+                        connection,
+                        intent=intent,
+                        task_id=task_id,
+                        project_id=task["project_id"],
+                        principal_id=task["principal_id"],
+                        source_outcome_hash=source_outcome["document_hash"],
+                        handle=normalized_handle,
+                        evidence_kind="managed_worker_receipt",
+                        evidence_record_hash=document_hash,
+                        attempt_id=normalized["attempt_id"],
+                        observation_sequence=observation_sequence,
+                        private_schema_version=None,
+                        receipt_record_hash=None,
+                        supervisor_lease=supervisor_lease,
+                        resolved_at=observed_at,
+                        resolved_at_us=observed_at_us,
+                    )
+                    adopted = True
                 else:
                     outcome = {
                         "status": "dispatched",
