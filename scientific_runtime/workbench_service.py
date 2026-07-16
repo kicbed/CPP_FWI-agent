@@ -440,6 +440,7 @@ class GuidedWorkbench:
                 "continuous_status_supervision": True,
                 "supervisor_leases": True,
                 "running_cancel": True,
+                "runtime_timeout": True,
                 "automatic_reconciliation": False,
                 "streaming_events": False,
             },
@@ -1361,9 +1362,28 @@ class GuidedWorkbench:
                 "failure_code": None,
             }
         )
+        timeout = getattr(snapshot, "timeout", None)
+        timeout_projection = (
+            None
+            if timeout is None
+            else {
+                "state": timeout.state,
+                "wall_time_seconds": timeout.wall_time_seconds,
+                "started_at": timeout.started_at,
+                "deadline_at": timeout.deadline_at,
+                "resolved_at": timeout.resolved_at,
+                "failure_code": timeout.failure_code,
+                "terminal_status": timeout.terminal_status,
+            }
+        )
         can_cancel = False
         can_cancel_task = getattr(self._tasks, "can_cancel_task", None)
-        if cancellation is None and callable(can_cancel_task):
+        timeout_allows_cancel = timeout is None or timeout.state == "armed"
+        if (
+            cancellation is None
+            and timeout_allows_cancel
+            and callable(can_cancel_task)
+        ):
             can_cancel = bool(
                 self._call(
                     can_cancel_task,
@@ -1415,6 +1435,7 @@ class GuidedWorkbench:
             "runtime_status": status,
             "can_cancel": can_cancel,
             "cancellation": cancellation_projection,
+            "timeout": timeout_projection,
             "created_at": snapshot.created_at,
             "updated_at": snapshot.updated_at,
             "visibility_revision": snapshot.visibility_revision,
@@ -1495,6 +1516,9 @@ class GuidedWorkbench:
                     "seed": parameters.get("seed"),
                     "optimizer": parameters.get("optimizer"),
                     "learning_rate_milli": parameters.get("learning_rate_milli"),
+                    "wall_time_seconds": draft.get("resources", {}).get(
+                        "wall_time_seconds"
+                    ),
                     "created_at": snapshot.created_at,
                     "updated_at": snapshot.updated_at,
                     "visibility_revision": snapshot.visibility_revision,
@@ -1516,6 +1540,19 @@ class GuidedWorkbench:
                             "requested_at": snapshot.cancellation.requested_at,
                             "resolved_at": snapshot.cancellation.resolved_at,
                             "failure_code": None,
+                        }
+                    ),
+                    "timeout": (
+                        None
+                        if getattr(snapshot, "timeout", None) is None
+                        else {
+                            "state": snapshot.timeout.state,
+                            "wall_time_seconds": snapshot.timeout.wall_time_seconds,
+                            "started_at": snapshot.timeout.started_at,
+                            "deadline_at": snapshot.timeout.deadline_at,
+                            "resolved_at": snapshot.timeout.resolved_at,
+                            "failure_code": snapshot.timeout.failure_code,
+                            "terminal_status": snapshot.timeout.terminal_status,
                         }
                     ),
                 }

@@ -141,6 +141,7 @@ function loadGuidedFunctions() {
     'normalizeGuidedPlanOutputs',
     'expectedGuidedFwiPlanOutputs',
     'hasExactGuidedFwiPlanOutputs',
+    'normalizeGuidedTimeoutProjection',
     'normalizeGuidedTaskProjection',
     'isGuidedReviewReady',
     'isGuidedApprovedSubmitPending',
@@ -149,6 +150,7 @@ function loadGuidedFunctions() {
     'isSafeGuidedBlobUrl',
     'guidedDispatchExplanation',
     'guidedCancellationExplanation',
+    'guidedTimeoutExplanation',
     'renderGuidedArtifactsHtml',
   ];
   const source = [
@@ -1243,6 +1245,7 @@ function makeGuidedTask(overrides = {}) {
         optimizer: overrides.optimizer || 'adam',
         learning_rate_milli: overrides.learning_rate_milli ?? 10000,
       },
+      resources: { wall_time_seconds: overrides.wall_time_seconds ?? 7200 },
     },
     plan: {
       plan_id: 'plan-guided-1',
@@ -1270,6 +1273,7 @@ function makeGuidedTask(overrides = {}) {
     can_cancel: overrides.can_cancel ?? false,
     cancellation: Object.hasOwn(overrides, 'cancellation')
       ? overrides.cancellation : null,
+    timeout: Object.hasOwn(overrides, 'timeout') ? overrides.timeout : null,
   };
 }
 
@@ -1500,6 +1504,76 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   }));
   assert.equal(cancellable.canCancel, true);
   assert.equal(cancellable.cancellation, null);
+  const armedTimeout = {
+    state: 'armed', wall_time_seconds: 7200,
+    started_at: '2026-07-16T12:00:00.000000Z',
+    deadline_at: '2026-07-16T14:00:00.000000Z',
+    resolved_at: null, failure_code: null, terminal_status: null,
+  };
+  const timeoutArmed = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: true,
+    timeout: armedTimeout,
+  }));
+  assert.equal(timeoutArmed.canCancel, true);
+  assert.equal(timeoutArmed.timeout.state, 'armed');
+  assert.match(api.guidedTimeoutExplanation(timeoutArmed.timeout), /首次持久观察.*ready \+ running/);
+
+  const requestedTimeout = { ...armedTimeout, state: 'requested' };
+  const timeoutRequested = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: false,
+    timeout: requestedTimeout,
+  }));
+  assert.equal(timeoutRequested.status, 'Running');
+  assert.equal(timeoutRequested.timeout.state, 'requested');
+  assert.match(api.guidedTimeoutExplanation(timeoutRequested.timeout), /尚未确认变为 Failed/);
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: true,
+    timeout: requestedTimeout,
+  })), null, 'timeout authorization closes cancellation');
+
+  const timedOut = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Failed',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: false,
+    timeout: {
+      ...armedTimeout,
+      state: 'timed_out',
+      resolved_at: '2026-07-16T14:00:02.000000Z',
+      failure_code: 'WALL_TIME_EXCEEDED',
+      terminal_status: 'Failed',
+    },
+  }));
+  assert.equal(timedOut.status, 'Failed');
+  assert.equal(timedOut.timeout.failureCode, 'WALL_TIME_EXCEEDED');
+  assert.match(api.guidedTimeoutExplanation(timedOut.timeout), /exact Worker.*WALL_TIME_EXCEEDED/);
+  for (const malformedTimeout of [
+    { ...armedTimeout, timeout_id: `timeout-${'a'.repeat(32)}` },
+    { ...requestedTimeout, failure_code: 'WALL_TIME_EXCEEDED' },
+    { ...armedTimeout, wall_time_seconds: 7199 },
+    {
+      ...armedTimeout, state: 'timed_out',
+      resolved_at: '2026-07-16T14:00:02.000000Z',
+      failure_code: 'WORKER_FAILED', terminal_status: 'Failed',
+    },
+  ]) {
+    assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+      status: malformedTimeout.state === 'timed_out' ? 'Failed' : 'Running',
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+      dispatch: { state: 'dispatched' },
+      can_cancel: false,
+      timeout: malformedTimeout,
+    })), null);
+  }
   const requestedCancellation = {
     state: 'requested', reason: 'user_requested',
     requested_at: '2026-07-16T12:00:00Z', resolved_at: null, failure_code: null,
@@ -1514,6 +1588,31 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   assert.equal(cancelling.status, 'Running', 'a durable request is not terminal cancellation');
   assert.equal(cancelling.cancellation.state, 'requested');
   assert.match(api.guidedCancellationExplanation(cancelling.cancellation), /不能视为已取消/);
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: false,
+    cancellation: requestedCancellation,
+    timeout: armedTimeout,
+  })), null, 'user cancellation must project the timeout window as suppressed');
+  const timeoutSuppressed = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: false,
+    cancellation: requestedCancellation,
+    timeout: { ...armedTimeout, state: 'suppressed' },
+  }));
+  assert.equal(timeoutSuppressed.timeout.state, 'suppressed');
+  assert.match(api.guidedTimeoutExplanation(timeoutSuppressed.timeout), /用户取消先取得/);
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: false,
+    timeout: { ...armedTimeout, state: 'suppressed' },
+  })), null, 'a suppressed timeout must retain its durable cancellation');
   const cancelled = api.normalizeGuidedTaskProjection(makeGuidedTask({
     status: 'Cancelled',
     approval: { approval_id: 'approval-guided-1', decision: 'approved' },
@@ -1535,8 +1634,10 @@ function testGuidedTaskAndCrashStatesAreHonest() {
     cancellation: {
       ...requestedCancellation, state: 'superseded', resolved_at: '2026-07-16T12:00:03Z',
     },
+    timeout: { ...armedTimeout, state: 'suppressed' },
   }));
   assert.equal(superseded.cancellation.state, 'superseded');
+  assert.equal(superseded.timeout.state, 'suppressed');
   for (const malformedCancellation of [
     { ...requestedCancellation, reason: 'wall_time_exceeded' },
     { ...requestedCancellation, signal: 'SIGKILL' },
@@ -1646,6 +1747,8 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   assert.match(taskSource, /取消处理中…/);
   assert.match(taskSource, /task\.canCancel/);
   assert.match(taskSource, /task\.cancellation/);
+  assert.match(taskSource, /已超时，安全停止中/);
+  assert.match(taskSource, /guidedTimeoutExplanation\(task\.timeout\)/);
 }
 
 async function testGuidedRuntimeCancelUsesOneDurableMutation() {
@@ -2356,6 +2459,7 @@ async function testGuidedApproveFourXxRetainsOriginalKeyThroughGetRecovery() {
     extractFunction('normalizeGuidedPlanOutputs'),
     extractFunction('expectedGuidedFwiPlanOutputs'),
     extractFunction('hasExactGuidedFwiPlanOutputs'),
+    extractFunction('normalizeGuidedTimeoutProjection'),
     extractFunction('normalizeGuidedTaskProjection'),
     extractFunction('isGuidedReviewReady'),
     extractFunction('isGuidedApprovedSubmitPending'),
@@ -2775,6 +2879,7 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
     extractFunction('boundedGuidedText'),
     extractFunction('guidedIntegerValue'),
     extractFunction('guidedLearningRateFromMilli'),
+    extractFunction('normalizeGuidedTimeoutProjection'),
     extractFunction('normalizeGuidedTaskIndexPage'),
     extractFunction('isGuidedTerminalState'),
     extractFunction('renderGuidedTaskIndex'),
@@ -2790,6 +2895,7 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
         algorithm: { id: '<script>alert(1)</script>', version: '1.4.0' },
         preset: 'fwi_smoke', device: 'cuda', iterations: 50, seed: 0,
         optimizer: 'adam', learning_rate_milli: 10000,
+        wall_time_seconds: 7200, timeout: null,
         purge_state: '',
         relative_path: '../../../../etc/passwd', artifact_url: 'javascript:alert(1)',
       },
@@ -2961,6 +3067,8 @@ async function testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursor
     seed: index,
     optimizer: 'adam',
     learning_rate_milli: 10000,
+    wall_time_seconds: 7200,
+    timeout: null,
     created_at: '2026-07-15T01:00:00Z',
     updated_at: '2026-07-15T01:01:00Z',
   }));
@@ -3026,6 +3134,7 @@ async function testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursor
     extractFunction('guidedApiPath'),
     extractFunction('guidedIntegerValue'),
     extractFunction('guidedLearningRateFromMilli'),
+    extractFunction('normalizeGuidedTimeoutProjection'),
     extractFunction('normalizeGuidedTaskIndexPage'),
     `async ${extractFunction('loadGuidedTaskIndex')}`,
     'module.exports = { loadGuidedTaskIndex };',

@@ -72,7 +72,15 @@ class JobState:
             raise ValueError(f"invalid job status: {status}")
         previous = self.read()
         previous_status = previous.get("status") if previous else None
-        if status not in VALID_TRANSITIONS.get(previous_status, set()):
+        early_managed_timeout = (
+            previous_status is None
+            and status == "failed"
+            and details.get("failure_code") == "WALL_TIME_EXCEEDED"
+        )
+        if (
+            status not in VALID_TRANSITIONS.get(previous_status, set())
+            and not early_managed_timeout
+        ):
             raise ValueError(f"invalid status transition: {previous_status} -> {status}")
         value: dict[str, Any] = {
             "job_id": self.job_id,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import sqlite3
 import tempfile
@@ -18,6 +19,7 @@ from scientific_runtime.task_store import (
     RuntimeSupervisorLeaseLost,
     SQLiteTaskStore,
     TaskStoreConflict,
+    TaskStoreCorruption,
     encode_document,
 )
 from scientific_runtime_contracts import compute_plan_hash
@@ -78,6 +80,53 @@ def cancel_adapter_proof(
     return {**payload, "proof_hash": encode_document(payload)[1]}
 
 
+def timeout_capability_proof(*, attempt_id: str, binding_hash: str) -> dict:
+    payload = {
+        "schema_version": "2.0.0",
+        "private_schema_version": "1.1.0",
+        "attempt_id": attempt_id,
+        "binding_hash": binding_hash,
+        "capability_record_hash": "sha256:" + "8" * 64,
+        "supported_reasons": ["user_requested", "wall_time_exceeded"],
+    }
+    return {**payload, "proof_hash": encode_document(payload)[1]}
+
+
+def timeout_adapter_proof(
+    *,
+    timeout,
+    state: str,
+    terminal_status: str,
+    terminal_failure_code: str | None,
+    ready_record_hash: str,
+) -> dict:
+    confirmed = state == "timed_out"
+    payload = {
+        "schema_version": "1.0.0",
+        "task_id": timeout.task_id,
+        "request_id": timeout.timeout_id,
+        "reason": "wall_time_exceeded",
+        "state": state,
+        "code": "TIMEOUT_COMPLETED" if confirmed else "TIMEOUT_TERMINAL_WON",
+        "attempt_id": timeout.attempt_id,
+        "wall_time_seconds": timeout.wall_time_seconds,
+        "started_at": timeout.started_at,
+        "deadline_at": timeout.deadline_at,
+        "ready_record_hash": ready_record_hash,
+        "capability_record_hash": "sha256:" + "8" * 64,
+        "request_record_hash": "sha256:" + "9" * 64 if confirmed else None,
+        "acknowledgement_record_hash": (
+            "sha256:" + "a" * 64 if confirmed else None
+        ),
+        "terminal_status": terminal_status,
+        "terminal_failure_code": terminal_failure_code,
+        "local_run_state": "retained",
+        "replayed": False,
+        "receipt_record_hash": "sha256:" + "b" * 64,
+    }
+    return {**payload, "proof_hash": encode_document(payload)[1]}
+
+
 class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -129,11 +178,17 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         )
 
     def _pending_runtime(
-        self, *, key: str, deferred: bool = False
+        self,
+        *,
+        key: str,
+        deferred: bool = False,
+        wall_time_seconds: int | None = None,
     ):
         token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         draft = optimizer_task_draft()
         draft["draft_id"] = f"draft-{token}"
+        if wall_time_seconds is not None:
+            draft["resources"]["wall_time_seconds"] = wall_time_seconds
         created = self.service.create_task(
             draft=draft,
             idempotency_key=f"create-{key}",
@@ -148,6 +203,10 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "revision": created.snapshot.draft["revision"],
         }
         plan["nodes"][0]["idempotency_key"] = f"node-{token}-submit"
+        if wall_time_seconds is not None:
+            plan["nodes"][0]["resources"][
+                "wall_time_seconds"
+            ] = wall_time_seconds
         plan["plan_hash"] = compute_plan_hash(plan)
         self.service.persist_plan(task_id=task_id, plan=plan, **self.scope)
         approval = executable_approval_decision(plan)
@@ -206,6 +265,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             lease_seconds=10,
         )
         self.assertTrue(acquisition.acquired)
+
         scheduled = runtime.schedule_runtime_dispatch(
             task_id,
             **self.scope,
@@ -222,6 +282,295 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         self.assertFalse(admitted.replayed)
         self.assertIsNotNone(admitted.snapshot.cancellation)
         return task_id, dispatcher, runtime, acquisition.lease, admitted
+
+    def _timeout_runtime(self, *, key: str, wall_time_seconds: int = 5):
+        task_id, dispatcher, runtime, _ = self._pending_runtime(
+            key=key, wall_time_seconds=wall_time_seconds
+        )
+        acquisition = runtime.acquire_runtime_supervisor_lease(
+            **self.scope,
+            owner_id=f"timeout-owner-{key}",
+            lease_seconds=30,
+        )
+        self.assertTrue(acquisition.acquired)
+
+        def supports_exact_timeout(_intent, *, attempt_id):
+            connection = self._connection()
+            try:
+                attempt = connection.execute(
+                    """
+                    SELECT binding_hash FROM worker_launch_attempts
+                    WHERE attempt_id = ?
+                    """,
+                    (attempt_id,),
+                ).fetchone()
+                self.assertIsNotNone(attempt)
+                assert attempt is not None
+                return timeout_capability_proof(
+                    attempt_id=attempt_id,
+                    binding_hash=attempt["binding_hash"],
+                )
+            finally:
+                connection.close()
+
+        dispatcher.supports_exact_timeout = supports_exact_timeout
+        scheduled = runtime.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertTrue(scheduled.timeout_armed)
+        connection = self._connection()
+        try:
+            attempt = connection.execute(
+                """
+                SELECT attempt_id, binding_hash
+                FROM worker_launch_attempts WHERE intent_id = ?
+                """,
+                (scheduled.intent.intent_id,),
+            ).fetchone()
+            self.assertIsNotNone(attempt)
+            assert attempt is not None
+            proof = timeout_capability_proof(
+                attempt_id=attempt["attempt_id"],
+                binding_hash=attempt["binding_hash"],
+            )
+        finally:
+            connection.close()
+        armed = self.store.arm_worker_attempt_timeout(
+            intent_id=scheduled.intent.intent_id,
+            attempt_id=attempt["attempt_id"],
+            capability_proof=proof,
+            supervisor_lease=acquisition.lease,
+            supervisor_clock=lambda: self.now[0],
+        )
+        self.assertEqual(armed.timeout.state, "armed")
+        return (
+            task_id,
+            dispatcher,
+            runtime,
+            scheduled.intent,
+            acquisition.lease,
+            armed,
+            proof,
+        )
+
+    def _staged_then_running_timeout_runtime(self, *, key: str):
+        task_id, dispatcher, runtime, _ = self._pending_runtime(
+            key=key,
+            deferred=True,
+            wall_time_seconds=5,
+        )
+        acquisition = runtime.acquire_runtime_supervisor_lease(
+            **self.scope,
+            owner_id=f"timeout-owner-{key}",
+            lease_seconds=30,
+        )
+        self.assertTrue(acquisition.acquired)
+        staged = runtime.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        dispatcher.failure_code = None
+        dispatcher.defer_dispatch = False
+        handle = dispatcher.dispatch(staged.intent)
+        self.assertIsNotNone(dispatcher.worker_observation)
+        assert dispatcher.worker_observation is not None
+        evidence = dispatcher.worker_observation["evidence"]
+        projected = self.store.record_supervised_worker_observation(
+            intent_id=staged.intent.intent_id,
+            evidence=evidence,
+            handle=handle,
+            supervisor_lease=acquisition.lease,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertEqual(projected.observation_sequence, 2)
+        connection = self._connection()
+        try:
+            attempt = connection.execute(
+                "SELECT * FROM worker_launch_attempts WHERE attempt_id = ?",
+                (projected.attempt_id,),
+            ).fetchone()
+            self.assertIsNotNone(attempt)
+            assert attempt is not None
+        finally:
+            connection.close()
+        proof = timeout_capability_proof(
+            attempt_id=attempt["attempt_id"],
+            binding_hash=attempt["binding_hash"],
+        )
+        return task_id, staged.intent, acquisition.lease, attempt, proof
+
+    def _timeout_ready_record_hash(self, timeout_id: str) -> str:
+        connection = self._connection()
+        try:
+            row = connection.execute(
+                """
+                SELECT ready_record_hash FROM worker_attempt_timeout_windows
+                WHERE timeout_id = ?
+                """,
+                (timeout_id,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            return row["ready_record_hash"]
+        finally:
+            connection.close()
+
+    def _natural_timeout_failure_event(
+        self,
+        *,
+        timeout,
+        intent,
+        event_id: str,
+        occurred_at: str,
+    ) -> dict:
+        return {
+            "schema_version": "1.0.0",
+            "event_id": event_id,
+            "sequence": self.store.latest_run_event_sequence(timeout.task_id) + 1,
+            "task_id": timeout.task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "worker_failed",
+                "message": "FWI Worker reported a failure",
+                "retryable": False,
+            },
+            "occurred_at": occurred_at,
+            "fingerprint": intent.handle["fingerprint"],
+            "extensions": {
+                "org.agent_rpc.adapter_status": {
+                    "job_id": intent.handle["job_id"],
+                    "stage": "failed",
+                    "worker_updated_at": occurred_at,
+                }
+            },
+        }
+
+    def _confirmed_timeout_failure_event(
+        self,
+        *,
+        timeout,
+        intent,
+        proof: dict,
+        event_id: str,
+        occurred_at: str,
+    ) -> dict:
+        return {
+            "schema_version": "1.0.0",
+            "event_id": event_id,
+            "sequence": self.store.latest_run_event_sequence(timeout.task_id) + 1,
+            "task_id": timeout.task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "wall_time_exceeded",
+                "message": "FWI Worker exceeded its wall-time limit",
+                "retryable": False,
+            },
+            "occurred_at": occurred_at,
+            "fingerprint": intent.handle["fingerprint"],
+            "extensions": {
+                "org.agent_rpc.timeout": {
+                    "timeout_id": timeout.timeout_id,
+                    "attempt_id": timeout.attempt_id,
+                    "wall_time_seconds": timeout.wall_time_seconds,
+                    "started_at": timeout.started_at,
+                    "deadline_at": timeout.deadline_at,
+                    "failure_code": "WALL_TIME_EXCEEDED",
+                    "proof_hash": proof["proof_hash"],
+                }
+            },
+        }
+
+    def _insert_direct_terminal_preempted_timeout(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        timeout,
+        intent,
+        lease,
+        proof: dict,
+        event: dict,
+        resolved_at: str,
+        resolved_at_us: int,
+    ) -> None:
+        event_json, event_hash = encode_document(event)
+        _, fingerprint_hash = encode_document(event["fingerprint"])
+        connection.execute(
+            """
+            INSERT INTO run_events(
+                task_id, sequence, event_id, event_type, task_status,
+                node_id, fingerprint_hash, document_json, document_hash,
+                occurred_at, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timeout.task_id,
+                event["sequence"],
+                event["event_id"],
+                event["event_type"],
+                event["task_status"],
+                event["node_id"],
+                fingerprint_hash,
+                event_json,
+                event_hash,
+                event["occurred_at"],
+                resolved_at,
+            ),
+        )
+        connection.execute(
+            "UPDATE tasks SET status = 'Failed', updated_at = ? "
+            "WHERE task_id = ?",
+            (resolved_at, timeout.task_id),
+        )
+        proof_json, proof_hash = encode_document(proof)
+        outcome = {
+            "schema_version": "1.0.0",
+            "request_id": timeout.timeout_id,
+            "task_id": timeout.task_id,
+            "result": "terminal_preempted",
+            "terminal_status": "Failed",
+            "failure_code": None,
+            "adapter_proof": proof,
+            "resolved_at": resolved_at,
+            "extensions": {},
+        }
+        outcome_json, outcome_hash = encode_document(outcome)
+        connection.execute(
+            """
+            INSERT INTO task_timeout_outcomes(
+                timeout_id, task_id, project_id, principal_id,
+                intent_id, attempt_id, result, terminal_status,
+                failure_code, terminal_event_sequence,
+                adapter_proof_json, adapter_proof_hash,
+                document_json, document_hash, fencing_token,
+                resolved_at, resolved_at_us
+            ) VALUES (?, ?, ?, ?, ?, ?, 'terminal_preempted', 'Failed',
+                      NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timeout.timeout_id,
+                timeout.task_id,
+                PROJECT_ID,
+                PRINCIPAL_ID,
+                intent.intent_id,
+                timeout.attempt_id,
+                event["sequence"],
+                proof_json,
+                proof_hash,
+                outcome_json,
+                outcome_hash,
+                lease.fencing_token,
+                resolved_at,
+                resolved_at_us,
+            ),
+        )
 
     def _insert_direct_cancel_request(
         self,
@@ -367,8 +716,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             },
         }
 
-    def test_fresh_v11_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 11)
+    def test_fresh_v12_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 12)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -382,6 +731,9 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "task_cancel_requests",
             "supervised_cancel_attempts",
             "task_cancel_outcomes",
+            "worker_attempt_timeout_windows",
+            "supervised_timeout_attempts",
+            "task_timeout_outcomes",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -433,19 +785,53 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "supervised_cancel_attempts_cannot_be_deleted",
             "task_cancel_outcomes_are_immutable",
             "task_cancel_outcomes_cannot_be_deleted",
+            "worker_attempt_timeout_window_requires_exact_start",
+            "worker_attempt_timeout_window_requires_active_term",
+            "supervised_timeout_attempt_requires_due_window",
+            "supervised_timeout_attempt_requires_active_term",
+            "task_cancel_request_rejects_authorized_timeout",
+            "task_timeout_outcome_requires_terminal_event",
+            "task_timeout_outcome_requires_active_term",
+            "worker_attempt_timeout_windows_are_immutable",
+            "worker_attempt_timeout_windows_cannot_be_deleted",
+            "supervised_timeout_attempts_are_immutable",
+            "supervised_timeout_attempts_cannot_be_deleted",
+            "task_timeout_outcomes_are_immutable",
+            "task_timeout_outcomes_cannot_be_deleted",
+        }
+        expected_indexes = {
+            "idx_worker_attempt_timeout_windows_scope_deadline",
+            "idx_worker_attempt_timeout_windows_task",
+            "idx_supervised_timeout_attempts_term",
         }
         connection = self._connection()
         try:
             rows = connection.execute(
                 """
                 SELECT type, name FROM sqlite_master
-                WHERE type IN ('table', 'trigger')
+                WHERE type IN ('table', 'trigger', 'index')
                 """
             ).fetchall()
             tables = {row["name"] for row in rows if row["type"] == "table"}
             triggers = {row["name"] for row in rows if row["type"] == "trigger"}
+            indexes = {row["name"] for row in rows if row["type"] == "index"}
             self.assertTrue(expected_tables <= tables)
             self.assertTrue(expected_triggers <= triggers)
+            self.assertTrue(expected_indexes <= indexes)
+            timeout_query_plan = connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT 1 FROM worker_attempt_timeout_windows
+                WHERE task_id = ? LIMIT 1
+                """,
+                ("task-timeout-query-plan",),
+            ).fetchall()
+            self.assertTrue(
+                any(
+                    "idx_worker_attempt_timeout_windows_task" in row[3]
+                    for row in timeout_query_plan
+                )
+            )
             migration = connection.execute(
                 """
                 SELECT name FROM schema_migrations WHERE version = 8
@@ -469,6 +855,12 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(
                 cancel_migration["name"], "0011_task_cancellation.sql"
+            )
+            timeout_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 12"
+            ).fetchone()
+            self.assertEqual(
+                timeout_migration["name"], "0012_task_timeout.sql"
             )
         finally:
             connection.close()
@@ -514,12 +906,18 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v11(self) -> None:
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v12(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            connection.execute(
+                "DROP TRIGGER task_cancel_request_rejects_authorized_timeout"
+            )
+            connection.execute("DROP TABLE task_timeout_outcomes")
+            connection.execute("DROP TABLE supervised_timeout_attempts")
+            connection.execute("DROP TABLE worker_attempt_timeout_windows")
             connection.execute(
                 "DROP TRIGGER task_cancel_request_blocks_supervised_dispatch"
             )
@@ -538,7 +936,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 11)
+        self.assertEqual(reopened.migration_version(), 12)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -577,26 +975,32 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v11(self) -> None:
-        task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v11")
-        acquired = self._acquire("upgrade-v11-owner", lease_seconds=30)
+    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v12(self) -> None:
+        task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v12")
+        acquired = self._acquire("upgrade-v12-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            connection.execute(
+                "DROP TRIGGER task_cancel_request_rejects_authorized_timeout"
+            )
+            connection.execute("DROP TABLE task_timeout_outcomes")
+            connection.execute("DROP TABLE supervised_timeout_attempts")
+            connection.execute("DROP TABLE worker_attempt_timeout_windows")
             connection.execute(
                 "DROP TRIGGER task_cancel_request_blocks_supervised_dispatch"
             )
             connection.execute("DROP TABLE task_cancel_outcomes")
             connection.execute("DROP TABLE supervised_cancel_attempts")
             connection.execute("DROP TABLE task_cancel_requests")
-            connection.execute("DELETE FROM schema_migrations WHERE version = 11")
+            connection.execute("DELETE FROM schema_migrations WHERE version >= 11")
             connection.execute("PRAGMA user_version = 10")
             connection.commit()
         finally:
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 11)
+        self.assertEqual(reopened.migration_version(), 12)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -615,6 +1019,1534 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
             )
         finally:
+            connection.close()
+
+    def test_timeout_window_uses_first_durable_running_observation_and_replays(
+        self,
+    ) -> None:
+        (
+            task_id,
+            _,
+            _,
+            intent,
+            lease,
+            armed,
+            capability_proof,
+        ) = self._timeout_runtime(key="timeout-window-replay")
+        # The active TaskService projection performed the first arm; this
+        # direct Store call proves the exact capability/window replay.
+        self.assertTrue(armed.replayed)
+        self.assertEqual(armed.timeout.started_at, "2026-07-15T03:00:00.000000Z")
+        self.assertEqual(armed.timeout.deadline_at, "2026-07-15T03:00:05.000000Z")
+        self.assertEqual(armed.timeout.wall_time_seconds, 5)
+        self.assertEqual(armed.snapshot.timeout, armed.timeout)
+
+        replay = self.store.arm_worker_attempt_timeout(
+            intent_id=intent.intent_id,
+            attempt_id=armed.timeout.attempt_id,
+            capability_proof=capability_proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.timeout, armed.timeout)
+
+        before_due = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertFalse(before_due.authorized)
+        self.assertFalse(before_due.replayed)
+        self.assertEqual(before_due.timeout.state, "armed")
+
+        due = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(due.authorized)
+        self.assertFalse(due.replayed)
+        self.assertEqual(due.timeout.state, "requested")
+        self.assertEqual(
+            due.authorized_at, "2026-07-15T03:00:05.000000Z"
+        )
+        due_replay = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_10,
+        )
+        self.assertTrue(due_replay.authorized)
+        self.assertTrue(due_replay.replayed)
+        self.assertEqual(due_replay.authorized_at, due.authorized_at)
+
+        connection = self._connection()
+        try:
+            window = connection.execute(
+                """
+                SELECT start_observation_sequence, started_at_us,
+                       deadline_at_us, wall_time_seconds
+                FROM worker_attempt_timeout_windows WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            self.assertEqual(window["start_observation_sequence"], 1)
+            self.assertEqual(window["started_at_us"], 1784084400000000)
+            self.assertEqual(window["deadline_at_us"], 1784084405000000)
+            self.assertEqual(window["wall_time_seconds"], 5)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM supervised_timeout_attempts"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_timeout_window_rejects_an_invalid_exact_stop_capability(self) -> None:
+        task_id, _, runtime, _ = self._pending_runtime(
+            key="timeout-invalid-capability", wall_time_seconds=5
+        )
+        acquisition = runtime.acquire_runtime_supervisor_lease(
+            **self.scope,
+            owner_id="timeout-invalid-capability-owner",
+            lease_seconds=30,
+        )
+        self.assertTrue(acquisition.acquired)
+        scheduled = runtime.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        self.assertFalse(scheduled.timeout_armed)
+        connection = self._connection()
+        try:
+            attempt = connection.execute(
+                """
+                SELECT attempt_id, binding_hash FROM worker_launch_attempts
+                WHERE intent_id = ?
+                """,
+                (scheduled.intent.intent_id,),
+            ).fetchone()
+            self.assertIsNotNone(attempt)
+            assert attempt is not None
+        finally:
+            connection.close()
+        proof = timeout_capability_proof(
+            attempt_id=attempt["attempt_id"],
+            binding_hash=attempt["binding_hash"],
+        )
+        proof["supported_reasons"] = ["wall_time_exceeded"]
+        proof["proof_hash"] = encode_document(
+            {key: value for key, value in proof.items() if key != "proof_hash"}
+        )[1]
+
+        with self.assertRaisesRegex(TaskStoreConflict, "capability proof"):
+            self.store.arm_worker_attempt_timeout(
+                intent_id=scheduled.intent.intent_id,
+                attempt_id=attempt["attempt_id"],
+                capability_proof=proof,
+                supervisor_lease=acquisition.lease,
+                supervisor_clock=lambda: NOW,
+            )
+        self.assertIsNone(self.store.get_task(task_id).timeout)
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_attempt_timeout_windows"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_timeout_arm_rejects_forged_relational_running_observation(
+        self,
+    ) -> None:
+        task_id, dispatcher, runtime, _ = self._pending_runtime(
+            key="timeout-forged-running-observation",
+            deferred=True,
+            wall_time_seconds=5,
+        )
+        acquisition = runtime.acquire_runtime_supervisor_lease(
+            **self.scope,
+            owner_id="timeout-forged-observation-owner",
+            lease_seconds=30,
+        )
+        self.assertTrue(acquisition.acquired)
+        staged = runtime.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        self.assertEqual(staged.intent.state, "dispatching")
+        connection = self._connection()
+        try:
+            attempt = connection.execute(
+                """
+                SELECT attempt_id, binding_hash FROM worker_launch_attempts
+                WHERE intent_id = ?
+                """,
+                (staged.intent.intent_id,),
+            ).fetchone()
+            self.assertIsNotNone(attempt)
+            assert attempt is not None
+            first = connection.execute(
+                """
+                SELECT ticket_state FROM worker_attempt_observations
+                WHERE attempt_id = ? AND observation_sequence = 1
+                """,
+                (attempt["attempt_id"],),
+            ).fetchone()
+            self.assertEqual(first["ticket_state"], "staged")
+        finally:
+            connection.close()
+        dispatcher.failure_code = None
+        dispatcher.defer_dispatch = False
+        handle = dispatcher.dispatch(staged.intent)
+        dispatch_outcome = {
+            "status": "dispatched",
+            "handle": handle,
+            "recorded_at": NOW,
+        }
+        outcome_json, outcome_hash = encode_document(dispatch_outcome)
+        running = managed_worker_evidence(attempt_id=attempt["attempt_id"])
+        fake_document = managed_worker_evidence(
+            ticket_state="staged", attempt_id=attempt["attempt_id"]
+        )
+        fake_document["ticket"]["updated_at"] = T_PLUS_1
+        fake_ticket = {
+            **{
+                key: fake_document[key]
+                for key in (
+                    "schema_version",
+                    "submission_id",
+                    "attempt_id",
+                    "attempt_number",
+                    "job_id",
+                    "request_hash",
+                    "created_at",
+                )
+            },
+            "binding_hash": fake_document["binding_hash"],
+            "state": "staged",
+            "capacity_slot": None,
+            "capacity_generation": None,
+            "worker_pid": None,
+            "updated_at": T_PLUS_1,
+        }
+        fake_document["ticket"]["record_hash"] = encode_document(fake_ticket)[1]
+        fake_json, fake_hash = encode_document(fake_document)
+
+        connection = self._connection()
+        try:
+            connection.execute(
+                """
+                INSERT INTO dispatch_outcomes(
+                    intent_id, outcome, document_json, document_hash, recorded_at
+                ) VALUES (?, 'dispatched', ?, ?, ?)
+                """,
+                (
+                    staged.intent.intent_id,
+                    outcome_json,
+                    outcome_hash,
+                    NOW,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO worker_attempt_observations(
+                    attempt_id, observation_sequence, ticket_state,
+                    capacity_slot, capacity_generation, ticket_worker_pid,
+                    ticket_updated_at, ticket_record_hash,
+                    ready_worker_pid, ready_started_at, ready_record_hash,
+                    heartbeat_sequence, heartbeat_state,
+                    heartbeat_updated_at, heartbeat_record_hash,
+                    document_json, document_hash, project_id, principal_id,
+                    fencing_token, observed_at, observed_at_us
+                ) VALUES (?, 2, 'spawned', ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt["attempt_id"],
+                    running["ticket"]["capacity_slot"],
+                    running["ticket"]["capacity_generation"],
+                    running["ticket"]["worker_pid"],
+                    running["ticket"]["updated_at"],
+                    running["ticket"]["record_hash"],
+                    running["ready"]["worker_pid"],
+                    running["ready"]["started_at"],
+                    running["ready"]["record_hash"],
+                    running["heartbeat"]["sequence"],
+                    running["heartbeat"]["updated_at"],
+                    running["heartbeat"]["record_hash"],
+                    fake_json,
+                    fake_hash,
+                    PROJECT_ID,
+                    PRINCIPAL_ID,
+                    acquisition.lease.fencing_token,
+                    "2026-07-15T03:00:01.000000Z",
+                    1784084401000000,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        capability = timeout_capability_proof(
+            attempt_id=attempt["attempt_id"],
+            binding_hash=attempt["binding_hash"],
+        )
+        with self.assertRaisesRegex(TaskStoreCorruption, "columns differ"):
+            self.store.arm_worker_attempt_timeout(
+                intent_id=staged.intent.intent_id,
+                attempt_id=attempt["attempt_id"],
+                capability_proof=capability,
+                supervisor_lease=acquisition.lease,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+        self.assertIsNone(self.store.get_task(task_id).timeout)
+
+    def test_timeout_projection_rejects_corrupt_source_observation(self) -> None:
+        task_id, _, _, _, _, armed, _ = self._timeout_runtime(
+            key="timeout-source-observation-corruption"
+        )
+        connection = self._connection()
+        try:
+            connection.execute(
+                "DROP TRIGGER worker_attempt_observations_are_append_only"
+            )
+            connection.execute(
+                """
+                UPDATE worker_attempt_observations
+                SET document_hash = ?
+                WHERE attempt_id = ? AND observation_sequence = 1
+                """,
+                ("sha256:" + "f" * 64, armed.timeout.attempt_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(
+            TaskStoreCorruption, "observation hash does not match"
+        ):
+            self.store.get_task(task_id)
+
+    def test_timeout_arm_rejects_hidden_earlier_running_observation(self) -> None:
+        task_id, intent, lease, attempt, proof = (
+            self._staged_then_running_timeout_runtime(
+                key="timeout-hidden-earlier-running"
+            )
+        )
+        hidden_running = managed_worker_evidence(
+            attempt_id=attempt["attempt_id"], heartbeat_sequence=2
+        )
+        hidden_json, hidden_hash = encode_document(hidden_running)
+        connection = self._connection()
+        try:
+            connection.execute(
+                "DROP TRIGGER worker_attempt_observations_are_append_only"
+            )
+            connection.execute(
+                """
+                UPDATE worker_attempt_observations
+                SET document_json = ?, document_hash = ?
+                WHERE attempt_id = ? AND observation_sequence = 1
+                """,
+                (
+                    hidden_json,
+                    hidden_hash,
+                    attempt["attempt_id"],
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(TaskStoreCorruption, "columns differ"):
+            self.store.arm_worker_attempt_timeout(
+                intent_id=intent.intent_id,
+                attempt_id=attempt["attempt_id"],
+                capability_proof=proof,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+        self.assertIsNone(self.store.get_task(task_id).timeout)
+
+    def test_timeout_arm_rejects_forged_launch_attempt_binding(self) -> None:
+        task_id, intent, lease, attempt, _ = (
+            self._staged_then_running_timeout_runtime(
+                key="timeout-forged-launch-binding"
+            )
+        )
+        forged_binding = "sha256:" + "7" * 64
+        connection = self._connection()
+        try:
+            connection.execute("DROP TRIGGER worker_launch_attempts_are_append_only")
+            connection.execute(
+                """
+                UPDATE worker_launch_attempts SET binding_hash = ?
+                WHERE attempt_id = ?
+                """,
+                (forged_binding, attempt["attempt_id"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        forged_proof = timeout_capability_proof(
+            attempt_id=attempt["attempt_id"], binding_hash=forged_binding
+        )
+
+        with self.assertRaisesRegex(TaskStoreCorruption, "hashed observation"):
+            self.store.arm_worker_attempt_timeout(
+                intent_id=intent.intent_id,
+                attempt_id=attempt["attempt_id"],
+                capability_proof=forged_proof,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+        self.assertIsNone(self.store.get_task(task_id).timeout)
+
+    def test_timeout_projection_rejects_corrupt_launch_attempt_binding(
+        self,
+    ) -> None:
+        task_id, _, _, _, _, armed, _ = self._timeout_runtime(
+            key="timeout-launch-binding-corruption"
+        )
+        connection = self._connection()
+        try:
+            connection.execute("DROP TRIGGER worker_launch_attempts_are_append_only")
+            connection.execute(
+                """
+                UPDATE worker_launch_attempts SET job_id = 'job-forged-timeout'
+                WHERE attempt_id = ?
+                """,
+                (armed.timeout.attempt_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(TaskStoreCorruption, "hashed observation"):
+            self.store.get_task(task_id)
+
+    def test_timeout_projection_rejects_observation_sequence_gap(self) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-observation-sequence-gap"
+        )
+        evidence = managed_worker_evidence(
+            attempt_id=armed.timeout.attempt_id, heartbeat_sequence=2
+        )
+        projected = self.store.record_supervised_worker_observation(
+            intent_id=intent.intent_id,
+            evidence=evidence,
+            handle=intent.handle,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertEqual(projected.observation_sequence, 2)
+        connection = self._connection()
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                "DROP TRIGGER worker_attempt_observations_cannot_be_deleted"
+            )
+            connection.execute(
+                """
+                DELETE FROM worker_attempt_observations
+                WHERE attempt_id = ? AND observation_sequence = 1
+                """,
+                (armed.timeout.attempt_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(TaskStoreCorruption, "audit chain"):
+            self.store.get_task(task_id)
+
+    def test_timeout_projection_rejects_observation_scope_corruption(
+        self,
+    ) -> None:
+        task_id, _, _, _, _, armed, _ = self._timeout_runtime(
+            key="timeout-observation-scope-corruption"
+        )
+        connection = self._connection()
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                "DROP TRIGGER worker_attempt_observations_are_append_only"
+            )
+            connection.execute(
+                """
+                UPDATE worker_attempt_observations
+                SET project_id = 'project-forged-timeout'
+                WHERE attempt_id = ? AND observation_sequence = 1
+                """,
+                (armed.timeout.attempt_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(TaskStoreCorruption, "audit chain"):
+            self.store.get_task(task_id)
+
+    def test_timeout_completion_is_failed_with_exact_wall_time_code(self) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-complete"
+        )
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        connection = self._connection()
+        try:
+            ready_record_hash = connection.execute(
+                """
+                SELECT ready_record_hash
+                FROM worker_attempt_timeout_windows WHERE timeout_id = ?
+                """,
+                (armed.timeout.timeout_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="timed_out",
+            terminal_status="Failed",
+            terminal_failure_code="WALL_TIME_EXCEEDED",
+            ready_record_hash=ready_record_hash,
+        )
+        sequence = self.store.latest_run_event_sequence(task_id) + 1
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-timeout-complete",
+            "sequence": sequence,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "wall_time_exceeded",
+                "message": "FWI Worker exceeded its wall-time limit",
+                "retryable": False,
+            },
+            "occurred_at": T_PLUS_5,
+            "fingerprint": intent.handle["fingerprint"],
+            "extensions": {
+                "org.agent_rpc.timeout": {
+                    "timeout_id": armed.timeout.timeout_id,
+                    "attempt_id": armed.timeout.attempt_id,
+                    "wall_time_seconds": armed.timeout.wall_time_seconds,
+                    "started_at": armed.timeout.started_at,
+                    "deadline_at": armed.timeout.deadline_at,
+                    "failure_code": "WALL_TIME_EXCEEDED",
+                    "proof_hash": proof["proof_hash"],
+                }
+            },
+        }
+        completed = self.store.complete_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            result="timeout_confirmed",
+            terminal_event=event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertFalse(completed.replayed)
+        self.assertEqual(completed.snapshot.status, "Failed")
+        self.assertEqual(completed.timeout.state, "timed_out")
+        self.assertEqual(completed.timeout.result, "timeout_confirmed")
+        self.assertEqual(completed.timeout.failure_code, "WALL_TIME_EXCEEDED")
+        self.assertEqual(completed.timeout.terminal_status, "Failed")
+
+        replay = self.store.complete_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            result="timeout_confirmed",
+            terminal_event=event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_10,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.timeout, completed.timeout)
+        events = self.store.list_run_events(task_id)
+        self.assertEqual(events[-1]["error"]["code"], "wall_time_exceeded")
+        connection = self._connection()
+        try:
+            outcome = connection.execute(
+                """
+                SELECT result, terminal_status, failure_code
+                FROM task_timeout_outcomes WHERE timeout_id = ?
+                """,
+                (armed.timeout.timeout_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(outcome),
+                ("timeout_confirmed", "Failed", "WALL_TIME_EXCEEDED"),
+            )
+            for table in (
+                "worker_attempt_timeout_windows",
+                "supervised_timeout_attempts",
+                "task_timeout_outcomes",
+            ):
+                with self.subTest(table=table, operation="update"):
+                    with self.assertRaisesRegex(
+                        sqlite3.IntegrityError, "immutable"
+                    ):
+                        connection.execute(
+                            f"UPDATE {table} SET timeout_id = timeout_id "
+                            "WHERE timeout_id = ?",
+                            (armed.timeout.timeout_id,),
+                        )
+                    connection.rollback()
+                with self.subTest(table=table, operation="delete"):
+                    with self.assertRaisesRegex(
+                        sqlite3.IntegrityError, "immutable"
+                    ):
+                        connection.execute(
+                            f"DELETE FROM {table} WHERE timeout_id = ?",
+                            (armed.timeout.timeout_id,),
+                        )
+                    connection.rollback()
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+        finally:
+            connection.close()
+
+    def test_natural_failure_can_win_an_authorized_timeout_race(self) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-natural-terminal-wins"
+        )
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        connection = self._connection()
+        try:
+            ready_record_hash = connection.execute(
+                """
+                SELECT ready_record_hash FROM worker_attempt_timeout_windows
+                WHERE timeout_id = ?
+                """,
+                (armed.timeout.timeout_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="terminal_won",
+            terminal_status="Failed",
+            terminal_failure_code=None,
+            ready_record_hash=ready_record_hash,
+        )
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-timeout-natural-failure",
+            "sequence": self.store.latest_run_event_sequence(task_id) + 1,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "worker_failed",
+                "message": "FWI Worker reported a failure",
+                "retryable": False,
+            },
+            "occurred_at": T_PLUS_5,
+            "fingerprint": intent.handle["fingerprint"],
+            "extensions": {
+                "org.agent_rpc.adapter_status": {
+                    "job_id": intent.handle["job_id"],
+                    "stage": "failed",
+                    "worker_updated_at": T_PLUS_5,
+                }
+            },
+        }
+        completed = self.store.complete_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            result="terminal_preempted",
+            terminal_event=event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertFalse(completed.replayed)
+        self.assertEqual(completed.snapshot.status, "Failed")
+        self.assertEqual(completed.timeout.state, "superseded")
+        self.assertEqual(completed.timeout.result, "terminal_preempted")
+        self.assertIsNone(completed.timeout.failure_code)
+        self.assertEqual(
+            self.store.list_run_events(task_id)[-1]["error"]["code"],
+            "worker_failed",
+        )
+
+    def test_supplied_natural_timeout_winner_requires_exact_adapter_event(
+        self,
+    ) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-natural-supplied-shape"
+        )
+        self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="terminal_won",
+            terminal_status="Failed",
+            terminal_failure_code=None,
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        event = self._natural_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            event_id="event-timeout-natural-supplied-shape",
+            occurred_at=T_PLUS_5,
+        )
+        event["extensions"] = {}
+
+        with self.assertRaisesRegex(
+            TaskStoreConflict, "natural terminal timeout event is invalid"
+        ):
+            self.store.complete_supervised_timeout(
+                timeout_id=armed.timeout.timeout_id,
+                result="terminal_preempted",
+                terminal_event=event,
+                adapter_proof=proof,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+        event = self._natural_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            event_id="event-timeout-natural-invalid-worker-time",
+            occurred_at="not-a-worker-timestamp",
+        )
+        with self.assertRaisesRegex(
+            TaskStoreConflict, "natural terminal timeout event is invalid"
+        ):
+            self.store.complete_supervised_timeout(
+                timeout_id=armed.timeout.timeout_id,
+                result="terminal_preempted",
+                terminal_event=event,
+                adapter_proof=proof,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+
+    def test_existing_natural_timeout_winner_requires_exact_adapter_event(
+        self,
+    ) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-natural-existing-shape"
+        )
+        self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="terminal_won",
+            terminal_status="Failed",
+            terminal_failure_code=None,
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        event = self._natural_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            event_id="event-timeout-natural-existing-shape",
+            occurred_at=T_PLUS_5,
+        )
+        event["error"] = {"code": "worker_failed"}
+        event_json, event_hash = encode_document(event)
+        _, fingerprint_hash = encode_document(event["fingerprint"])
+        connection = self._connection()
+        try:
+            connection.execute(
+                """
+                INSERT INTO run_events(
+                    task_id, sequence, event_id, event_type, task_status,
+                    node_id, fingerprint_hash, document_json, document_hash,
+                    occurred_at, recorded_at
+                ) VALUES (?, ?, ?, 'node_failed', 'Failed', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    event["sequence"],
+                    event["event_id"],
+                    event["node_id"],
+                    fingerprint_hash,
+                    event_json,
+                    event_hash,
+                    event["occurred_at"],
+                    T_PLUS_5,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Failed', updated_at = ? "
+                "WHERE task_id = ?",
+                (T_PLUS_5, task_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(
+            TaskStoreCorruption, "natural timeout winner is inconsistent"
+        ):
+            self.store.complete_supervised_timeout(
+                timeout_id=armed.timeout.timeout_id,
+                result="terminal_preempted",
+                terminal_event=None,
+                adapter_proof=proof,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+
+    def test_timeout_projection_rejects_malformed_natural_terminal_event(
+        self,
+    ) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-natural-loader-shape"
+        )
+        self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="terminal_won",
+            terminal_status="Failed",
+            terminal_failure_code=None,
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        event = self._natural_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            event_id="event-timeout-natural-loader-shape",
+            occurred_at=T_PLUS_5,
+        )
+        event["extensions"] = {}
+        connection = self._connection()
+        try:
+            self._insert_direct_terminal_preempted_timeout(
+                connection,
+                timeout=armed.timeout,
+                intent=intent,
+                lease=lease,
+                proof=proof,
+                event=event,
+                resolved_at="2026-07-15T03:00:05.000000Z",
+                resolved_at_us=1784084405000000,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(
+            TaskStoreCorruption, "terminal event is inconsistent"
+        ):
+            self.store.get_task(task_id)
+
+    def test_timeout_outcome_cannot_precede_deadline_or_authorization(self) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-causal-order-store"
+        )
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="terminal_won",
+            terminal_status="Failed",
+            terminal_failure_code=None,
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        event = self._natural_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            event_id="event-timeout-causal-order-store",
+            occurred_at=T_PLUS_5,
+        )
+        before_sequence = self.store.latest_run_event_sequence(task_id)
+
+        with self.assertRaisesRegex(
+            TaskStoreConflict, "precedes its durable authorization"
+        ):
+            self.store.complete_supervised_timeout(
+                timeout_id=armed.timeout.timeout_id,
+                result="terminal_preempted",
+                terminal_event=event,
+                adapter_proof=proof,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+        self.assertEqual(
+            self.store.latest_run_event_sequence(task_id), before_sequence
+        )
+
+        completed = self.store.complete_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            result="terminal_preempted",
+            terminal_event=event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        replay = self.store.complete_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            result="terminal_preempted",
+            terminal_event=event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_10,
+        )
+        self.assertFalse(completed.replayed)
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.timeout, completed.timeout)
+
+    def test_confirmed_timeout_event_must_fall_inside_supervisor_window(
+        self,
+    ) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-terminal-event-causal-window"
+        )
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="timed_out",
+            terminal_status="Failed",
+            terminal_failure_code="WALL_TIME_EXCEEDED",
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        before_sequence = self.store.latest_run_event_sequence(task_id)
+        for label, occurred_at in (
+            ("before-deadline", T_PLUS_1),
+            ("after-resolution", T_PLUS_10),
+        ):
+            with self.subTest(label=label):
+                event = self._confirmed_timeout_failure_event(
+                    timeout=armed.timeout,
+                    intent=intent,
+                    proof=proof,
+                    event_id=f"event-timeout-{label}",
+                    occurred_at=occurred_at,
+                )
+                with self.assertRaisesRegex(TaskStoreConflict, "causal order"):
+                    self.store.complete_supervised_timeout(
+                        timeout_id=armed.timeout.timeout_id,
+                        result="timeout_confirmed",
+                        terminal_event=event,
+                        adapter_proof=proof,
+                        supervisor_lease=lease,
+                        supervisor_clock=lambda: T_PLUS_5,
+                    )
+        self.assertEqual(
+            self.store.latest_run_event_sequence(task_id), before_sequence
+        )
+        valid_event = self._confirmed_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            proof=proof,
+            event_id="event-timeout-causal-window-valid",
+            occurred_at=T_PLUS_5,
+        )
+        completed = self.store.complete_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            result="timeout_confirmed",
+            terminal_event=valid_event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertEqual(completed.timeout.state, "timed_out")
+        self.assertEqual(
+            self.store.list_run_events(task_id)[-1]["occurred_at"], T_PLUS_5
+        )
+
+    def test_timeout_projection_rejects_terminal_event_outside_causal_window(
+        self,
+    ) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-terminal-event-causal-corruption"
+        )
+        self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="timed_out",
+            terminal_status="Failed",
+            terminal_failure_code="WALL_TIME_EXCEEDED",
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        event = self._confirmed_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            proof=proof,
+            event_id="event-timeout-causal-corruption",
+            occurred_at=T_PLUS_5,
+        )
+        self.store.complete_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            result="timeout_confirmed",
+            terminal_event=event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        connection = self._connection()
+        try:
+            connection.execute("DROP TRIGGER run_events_are_append_only")
+            for occurred_at in (T_PLUS_1, T_PLUS_10):
+                tampered = copy.deepcopy(event)
+                tampered["occurred_at"] = occurred_at
+                document_json, document_hash = encode_document(tampered)
+                connection.execute(
+                    """
+                    UPDATE run_events
+                    SET occurred_at = ?, document_json = ?, document_hash = ?
+                    WHERE task_id = ? AND sequence = ?
+                    """,
+                    (
+                        occurred_at,
+                        document_json,
+                        document_hash,
+                        task_id,
+                        event["sequence"],
+                    ),
+                )
+                connection.commit()
+                with self.subTest(occurred_at=occurred_at):
+                    with self.assertRaisesRegex(
+                        TaskStoreCorruption, "terminal event is inconsistent"
+                    ):
+                        self.store.get_task(task_id)
+        finally:
+            connection.close()
+
+    def test_direct_sql_timeout_outcome_rejects_backdated_resolution(self) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-causal-order-sql"
+        )
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="terminal_won",
+            terminal_status="Failed",
+            terminal_failure_code=None,
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        event = self._natural_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            event_id="event-timeout-causal-order-sql",
+            occurred_at=T_PLUS_1,
+        )
+        connection = self._connection()
+        try:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "exact terminal event"
+            ):
+                self._insert_direct_terminal_preempted_timeout(
+                    connection,
+                    timeout=armed.timeout,
+                    intent=intent,
+                    lease=lease,
+                    proof=proof,
+                    event=event,
+                    resolved_at="2026-07-15T03:00:01.000000Z",
+                    resolved_at_us=1784084401000000,
+                )
+        finally:
+            connection.rollback()
+            connection.close()
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+
+    def test_terminal_preempted_rejects_self_hashed_worker_failure_code(
+        self,
+    ) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-terminal-failure-code"
+        )
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="terminal_won",
+            terminal_status="Failed",
+            terminal_failure_code="WORKER_FAILED",
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        self.assertEqual(
+            proof["proof_hash"],
+            encode_document(
+                {
+                    key: value
+                    for key, value in proof.items()
+                    if key != "proof_hash"
+                }
+            )[1],
+        )
+        event = self._natural_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            event_id="event-timeout-terminal-failure-code",
+            occurred_at=T_PLUS_5,
+        )
+        with self.assertRaisesRegex(
+            TaskStoreConflict, "Adapter proof is invalid"
+        ):
+            self.store.complete_supervised_timeout(
+                timeout_id=armed.timeout.timeout_id,
+                result="terminal_preempted",
+                terminal_event=event,
+                adapter_proof=proof,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+
+        connection = self._connection()
+        try:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "exact terminal event"
+            ):
+                self._insert_direct_terminal_preempted_timeout(
+                    connection,
+                    timeout=armed.timeout,
+                    intent=intent,
+                    lease=lease,
+                    proof=proof,
+                    event=event,
+                    resolved_at="2026-07-15T03:00:05.000000Z",
+                    resolved_at_us=1784084405000000,
+                )
+        finally:
+            connection.rollback()
+            connection.close()
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_timeout_outcomes"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_timeout_projection_rejects_corrupt_causal_time_indexes(self) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-causal-order-corruption"
+        )
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="terminal_won",
+            terminal_status="Failed",
+            terminal_failure_code=None,
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        event = self._natural_timeout_failure_event(
+            timeout=armed.timeout,
+            intent=intent,
+            event_id="event-timeout-causal-order-corruption",
+            occurred_at=T_PLUS_5,
+        )
+        completed = self.store.complete_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            result="terminal_preempted",
+            terminal_event=event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertEqual(completed.timeout.state, "superseded")
+
+        connection = self._connection()
+        try:
+            connection.execute(
+                "DROP TRIGGER task_timeout_outcomes_are_immutable"
+            )
+            connection.execute(
+                """
+                UPDATE task_timeout_outcomes SET resolved_at_us = ?
+                WHERE timeout_id = ?
+                """,
+                (1784084401000000, armed.timeout.timeout_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(TaskStoreCorruption, "causal order"):
+            self.store.get_task(task_id)
+
+        connection = self._connection()
+        try:
+            connection.execute(
+                """
+                UPDATE task_timeout_outcomes SET resolved_at_us = ?
+                WHERE timeout_id = ?
+                """,
+                (1784084405000000, armed.timeout.timeout_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertEqual(self.store.get_task(task_id).timeout.state, "superseded")
+
+        connection = self._connection()
+        try:
+            connection.execute(
+                "DROP TRIGGER supervised_timeout_attempts_are_immutable"
+            )
+            connection.execute(
+                """
+                UPDATE supervised_timeout_attempts SET authorized_at_us = ?
+                WHERE timeout_id = ? AND fencing_token = ?
+                """,
+                (
+                    1784084401000000,
+                    armed.timeout.timeout_id,
+                    lease.fencing_token,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(
+            TaskStoreCorruption, "authorization time is inconsistent"
+        ):
+            self.store.get_task(task_id)
+
+        connection = self._connection()
+        try:
+            connection.execute(
+                """
+                UPDATE supervised_timeout_attempts
+                SET authorized_at = ?
+                WHERE timeout_id = ? AND fencing_token = ?
+                """,
+                (
+                    "2026-07-15T03:00:01.000000Z",
+                    armed.timeout.timeout_id,
+                    lease.fencing_token,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(
+            TaskStoreCorruption, "authorization time is inconsistent"
+        ):
+            self.store.get_task(task_id)
+
+    def test_pending_timeout_rejects_malformed_authorization_time(self) -> None:
+        task_id, _, _, _, lease, armed, _ = self._timeout_runtime(
+            key="timeout-authorization-time-corruption"
+        )
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        connection = self._connection()
+        try:
+            connection.execute(
+                "DROP TRIGGER supervised_timeout_attempts_are_immutable"
+            )
+            connection.execute(
+                """
+                UPDATE supervised_timeout_attempts
+                SET authorized_at = 'not-a-runtime-timestamp'
+                WHERE timeout_id = ? AND fencing_token = ?
+                """,
+                (armed.timeout.timeout_id, lease.fencing_token),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(
+            TaskStoreCorruption, "authorization time is invalid"
+        ):
+            self.store.get_task(task_id)
+        with self.assertRaisesRegex(
+            TaskStoreCorruption, "authorization time is invalid"
+        ):
+            self.store.authorize_supervised_timeout(
+                timeout_id=armed.timeout.timeout_id,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_10,
+            )
+
+    def test_timeout_projection_rejects_corrupt_terminal_run_event(self) -> None:
+        task_id, _, _, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-terminal-event-corruption"
+        )
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        proof = timeout_adapter_proof(
+            timeout=armed.timeout,
+            state="timed_out",
+            terminal_status="Failed",
+            terminal_failure_code="WALL_TIME_EXCEEDED",
+            ready_record_hash=self._timeout_ready_record_hash(
+                armed.timeout.timeout_id
+            ),
+        )
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-timeout-terminal-corruption",
+            "sequence": self.store.latest_run_event_sequence(task_id) + 1,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "wall_time_exceeded",
+                "message": "FWI Worker exceeded its wall-time limit",
+                "retryable": False,
+            },
+            "occurred_at": T_PLUS_5,
+            "fingerprint": intent.handle["fingerprint"],
+            "extensions": {
+                "org.agent_rpc.timeout": {
+                    "timeout_id": armed.timeout.timeout_id,
+                    "attempt_id": armed.timeout.attempt_id,
+                    "wall_time_seconds": armed.timeout.wall_time_seconds,
+                    "started_at": armed.timeout.started_at,
+                    "deadline_at": armed.timeout.deadline_at,
+                    "failure_code": "WALL_TIME_EXCEEDED",
+                    "proof_hash": proof["proof_hash"],
+                }
+            },
+        }
+        completed = self.store.complete_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            result="timeout_confirmed",
+            terminal_event=event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertEqual(completed.timeout.state, "timed_out")
+        connection = self._connection()
+        try:
+            terminal = connection.execute(
+                """
+                SELECT document_hash FROM run_events
+                WHERE task_id = ? AND sequence = ?
+                """,
+                (task_id, event["sequence"]),
+            ).fetchone()
+            original_hash = terminal["document_hash"]
+            connection.execute("DROP TRIGGER run_events_are_append_only")
+            connection.execute(
+                """
+                UPDATE run_events SET document_hash = ?
+                WHERE task_id = ? AND sequence = ?
+                """,
+                ("sha256:" + "f" * 64, task_id, event["sequence"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(TaskStoreCorruption, "hash does not match"):
+            self.store.get_task(task_id)
+
+        connection = self._connection()
+        try:
+            connection.execute(
+                """
+                UPDATE run_events SET document_hash = ?,
+                                      event_type = 'node_succeeded'
+                WHERE task_id = ? AND sequence = ?
+                """,
+                (original_hash, task_id, event["sequence"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(TaskStoreCorruption, "identity does not match"):
+            self.store.get_task(task_id)
+
+        tampered_event = copy.deepcopy(event)
+        tampered_event["extensions"]["org.agent_rpc.timeout"][
+            "proof_hash"
+        ] = "sha256:" + "e" * 64
+        tampered_json, tampered_hash = encode_document(tampered_event)
+        connection = self._connection()
+        try:
+            connection.execute(
+                """
+                UPDATE run_events
+                SET event_type = 'node_failed', document_json = ?,
+                    document_hash = ?
+                WHERE task_id = ? AND sequence = ?
+                """,
+                (
+                    tampered_json,
+                    tampered_hash,
+                    task_id,
+                    event["sequence"],
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(
+            TaskStoreCorruption, "terminal event is inconsistent"
+        ):
+            self.store.get_task(task_id)
+
+    def test_timeout_and_user_cancel_delivery_are_first_writer_wins(self) -> None:
+        task_id, _, runtime, intent, lease, armed, _ = self._timeout_runtime(
+            key="timeout-wins-stop-slot"
+        )
+        self.store.authorize_supervised_timeout(
+            timeout_id=armed.timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertFalse(runtime.can_cancel_task(task_id, **self.scope))
+        with self.assertRaises(TaskStoreConflict):
+            self.store.request_task_cancellation(
+                task_id=task_id,
+                project_id=PROJECT_ID,
+                principal_id=PRINCIPAL_ID,
+                request_id="cancel-" + "e" * 32,
+                reason="user_requested",
+                idempotency_key="cancel-after-timeout",
+                request_hash="sha256:" + "f" * 64,
+                build_documents=lambda *_: ({}, {}),
+                clock=lambda: T_PLUS_5,
+            )
+        connection = self._connection()
+        try:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "authorized timeout already owns the exact stop slot",
+            ):
+                self._insert_direct_cancel_request(
+                    connection,
+                    task_id=task_id,
+                    intent=intent,
+                    attempt_id=armed.timeout.attempt_id,
+                    request_id="cancel-" + "d" * 32,
+                    event_id="event-direct-cancel-after-timeout",
+                )
+        finally:
+            connection.rollback()
+            connection.close()
+        self.store.release_runtime_supervisor_lease(
+            lease=lease, clock=lambda: T_PLUS_5
+        )
+        self.now[0] = T_PLUS_5
+
+        cancel_task_id, _, cancel_runtime, _, cancel_lease, cancel_armed, _ = (
+            self._timeout_runtime(key="cancel-wins-stop-slot")
+        )
+        cancelled = cancel_runtime.cancel_task(
+            task_id=cancel_task_id,
+            reason="user_requested",
+            idempotency_key="cancel-wins-before-timeout",
+            **self.scope,
+        )
+        self.assertEqual(cancelled.snapshot.timeout.state, "suppressed")
+        with self.assertRaises(TaskStoreConflict):
+            self.store.authorize_supervised_timeout(
+                timeout_id=cancel_armed.timeout.timeout_id,
+                supervisor_lease=cancel_lease,
+                supervisor_clock=lambda: T_PLUS_10,
+            )
+        connection = self._connection()
+        try:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "due pending window"
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO supervised_timeout_attempts(
+                        timeout_id, project_id, principal_id, intent_id,
+                        attempt_id, fencing_token, action,
+                        authorized_at, authorized_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?,
+                              'deliver_exact_attempt_timeout', ?, ?)
+                    """,
+                    (
+                        cancel_armed.timeout.timeout_id,
+                        PROJECT_ID,
+                        PRINCIPAL_ID,
+                        cancel_armed.timeout.intent_id,
+                        cancel_armed.timeout.attempt_id,
+                        cancel_lease.fencing_token,
+                        "2026-07-15T03:00:10.000000Z",
+                        1784084410000000,
+                    ),
+                )
+        finally:
+            connection.rollback()
             connection.close()
 
     def test_cancel_request_attempt_and_outcome_are_append_only(self) -> None:

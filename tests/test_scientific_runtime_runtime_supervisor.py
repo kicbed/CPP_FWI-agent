@@ -53,6 +53,7 @@ class FakeSnapshot:
     principal_id: str
     status: str
     cancellation: "FakeCancellation | None" = None
+    timeout: "FakeTimeout | None" = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,21 @@ class FakeCancellation:
 
 
 @dataclass(frozen=True)
+class FakeTimeout:
+    state: str
+
+
+@dataclass(frozen=True)
 class FakeCancelProcess:
+    snapshot: FakeSnapshot
+    state: str
+    adapter_result: dict | None
+    replayed: bool
+    deferred_code: str | None = None
+
+
+@dataclass(frozen=True)
+class FakeTimeoutProcess:
     snapshot: FakeSnapshot
     state: str
     adapter_result: dict | None
@@ -83,6 +98,7 @@ class FakeProjection:
     adopted: bool
     replayed: bool
     deferred_code: str | None = None
+    timeout_armed: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +110,7 @@ class FakeSchedule:
     projected: bool
     adopted: bool
     deferred_code: str | None = None
+    timeout_armed: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,6 +162,7 @@ class FakeTaskService:
         self.schedule_calls: list[str] = []
         self.refresh_calls: list[str] = []
         self.cancel_calls: list[str] = []
+        self.timeout_calls: list[str] = []
         self.dispatch_calls = 0
         self.lease_held = False
         self.lose_on_heartbeat = False
@@ -156,6 +174,8 @@ class FakeTaskService:
         self.schedule_results: dict[str, FakeSchedule] = {}
         self.cancel_failures: dict[str, Exception] = {}
         self.cancel_results: dict[str, FakeCancelProcess] = {}
+        self.timeout_failures: dict[str, Exception] = {}
+        self.timeout_results: dict[str, FakeTimeoutProcess] = {}
         self.refresh_hook: Callable[[str], None] | None = None
         self.release_failures_remaining = 0
         self.active_lease: FakeLease | None = None
@@ -411,6 +431,37 @@ class FakeTaskService:
             replayed=False,
         )
 
+    def process_runtime_timeout(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: FakeLease,
+    ) -> FakeTimeoutProcess:
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        with self.lock:
+            if supervisor_lease != self.active_lease:
+                raise RuntimeSupervisorLeaseLost("simulated stale timeout write")
+            self.calls.append("timeout")
+            self.timeout_calls.append(task_id)
+        failure = self.timeout_failures.get(task_id)
+        if failure is not None:
+            raise failure
+        configured = self.timeout_results.get(task_id)
+        if configured is not None:
+            return configured
+        current = next(value for value in self.snapshots if value.task_id == task_id)
+        state = "none" if current.timeout is None else current.timeout.state
+        return FakeTimeoutProcess(
+            snapshot=current,
+            state=state,
+            adapter_result=None,
+            replayed=True,
+            deferred_code="TIMEOUT_NOT_DUE" if state == "armed" else None,
+        )
+
     def dispatch(self) -> None:
         self.dispatch_calls += 1
         raise AssertionError("the observation-only supervisor must not dispatch")
@@ -420,11 +471,15 @@ def snapshot(
     task_id: str,
     status: str,
     cancellation_state: str | None = None,
+    timeout_state: str | None = None,
 ) -> FakeSnapshot:
     cancellation = (
         None if cancellation_state is None else FakeCancellation(cancellation_state)
     )
-    return FakeSnapshot(task_id, PROJECT_ID, PRINCIPAL_ID, status, cancellation)
+    timeout = None if timeout_state is None else FakeTimeout(timeout_state)
+    return FakeSnapshot(
+        task_id, PROJECT_ID, PRINCIPAL_ID, status, cancellation, timeout
+    )
 
 
 def supervisor(
@@ -532,7 +587,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
     ) -> None:
         task_id = "cancel-first"
         service = FakeTaskService(
-            [snapshot(task_id, "Running", "requested")],
+            [snapshot(task_id, "Running", "requested", "requested")],
             {task_id: FakeIntent(task_id, "dispatched")},
         )
         runtime = supervisor(service)
@@ -552,6 +607,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertEqual(cycle.deferred, ())
             self.assertEqual(cycle.task_failures, ())
             self.assertEqual(service.cancel_calls, [task_id])
+            self.assertEqual(service.timeout_calls, [])
             self.assertEqual(service.intent_calls, [])
             self.assertEqual(service.projection_calls, [])
             self.assertEqual(service.schedule_calls, [])
@@ -559,6 +615,86 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertNotIn("intent", service.calls)
             self.assertNotIn("schedule", service.calls)
             self.assertNotIn("refresh", service.calls)
+        finally:
+            runtime.stop()
+
+    def test_requested_timeout_preempts_dispatch_and_status_in_same_cycle(
+        self,
+    ) -> None:
+        task_id = "timeout-first"
+        current = snapshot(task_id, "Running", timeout_state="requested")
+        service = FakeTaskService(
+            [current],
+            {task_id: FakeIntent(task_id, "dispatched")},
+        )
+        service.timeout_results[task_id] = FakeTimeoutProcess(
+            snapshot=current,
+            state="requested",
+            adapter_result={"state": "pending"},
+            replayed=True,
+            deferred_code="TIMEOUT_EXIT_UNPROVEN",
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(cycle.timeout_processed_task_ids, (task_id,))
+            self.assertEqual(cycle.timeout_resolved_task_ids, ())
+            self.assertEqual(
+                cycle.deferred, ((task_id, "TIMEOUT_EXIT_UNPROVEN"),)
+            )
+            self.assertEqual(cycle.refreshed_task_ids, ())
+            self.assertEqual(service.timeout_calls, [task_id])
+            self.assertEqual(service.cancel_calls, [])
+            self.assertEqual(service.intent_calls, [])
+            self.assertEqual(service.projection_calls, [])
+            self.assertEqual(service.schedule_calls, [])
+            self.assertEqual(service.refresh_calls, [])
+        finally:
+            runtime.stop()
+
+    def test_newly_armed_not_due_timeout_keeps_ordinary_status_observation(
+        self,
+    ) -> None:
+        task_id = "timeout-newly-armed"
+        current = snapshot(task_id, "Running")
+        armed = replace(current, timeout=FakeTimeout("armed"))
+        service = FakeTaskService(
+            [current],
+            {task_id: FakeIntent(task_id, "dispatched")},
+        )
+        service.projection_results[task_id] = FakeProjection(
+            intent=FakeIntent(task_id, "dispatched"),
+            evidence={"ticket": {"state": "spawned"}},
+            projected=True,
+            adopted=False,
+            replayed=False,
+            timeout_armed=True,
+        )
+        service.timeout_results[task_id] = FakeTimeoutProcess(
+            snapshot=armed,
+            state="armed",
+            adapter_result=None,
+            replayed=True,
+            deferred_code="TIMEOUT_NOT_DUE",
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(cycle.timeout_armed_task_ids, (task_id,))
+            self.assertEqual(cycle.timeout_processed_task_ids, (task_id,))
+            self.assertEqual(cycle.timeout_resolved_task_ids, ())
+            self.assertEqual(cycle.refreshed_task_ids, (task_id,))
+            self.assertEqual(cycle.deferred, ())
+            self.assertEqual(service.timeout_calls, [task_id])
+            self.assertEqual(service.refresh_calls, [task_id])
         finally:
             runtime.stop()
 

@@ -177,6 +177,7 @@ class TaskWorkerProjectionResult:
     adopted: bool
     replayed: bool
     deferred_code: str | None = None
+    timeout_armed: bool = False
 
 
 @dataclass(frozen=True)
@@ -190,6 +191,7 @@ class TaskScheduleResult:
     projected: bool
     adopted: bool
     deferred_code: str | None = None
+    timeout_armed: bool = False
 
 
 @dataclass(frozen=True)
@@ -203,6 +205,17 @@ class TaskCancellationResult:
 @dataclass(frozen=True)
 class TaskCancellationProcessResult:
     """One Supervisor-owned cancellation delivery/finalization pass."""
+
+    snapshot: TaskSnapshot
+    state: str
+    adapter_result: dict[str, Any] | None
+    replayed: bool
+    deferred_code: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskTimeoutProcessResult:
+    """One Supervisor-owned exact-attempt timeout enforcement pass."""
 
     snapshot: TaskSnapshot
     state: str
@@ -1309,6 +1322,14 @@ class TaskService:
             )
         if current.status not in {"Queued", "Running"}:
             raise TaskConflict("only a queued or running task can be cancelled")
+        current_timeout = getattr(current, "timeout", None)
+        if (
+            current_timeout is not None
+            and getattr(current_timeout, "state", None) != "armed"
+        ):
+            raise TaskConflict(
+                "automatic timeout already owns this exact Worker attempt"
+            )
         intent = self._store.get_dispatch_intent(task_id)
         candidate = self._store.get_task_cancel_candidate(task_id)
         if (
@@ -2519,6 +2540,7 @@ class TaskService:
                 dispatch_attempted=True,
                 projected=projection.projected,
                 adopted=projection.adopted,
+                timeout_armed=projection.timeout_armed,
                 deferred_code=(
                     None
                     if projection.intent.state == "dispatched"
@@ -2580,6 +2602,7 @@ class TaskService:
             dispatch_attempted=True,
             projected=projection.projected,
             adopted=projection.adopted,
+            timeout_armed=projection.timeout_armed,
             deferred_code=None,
         )
 
@@ -2673,12 +2696,79 @@ class TaskService:
             raise TaskSupervisorLeaseLost() from error
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
+        timeout_armed = False
+        projected_intent = projection.intent
+        ticket = evidence.get("ticket")
+        ready = evidence.get("ready")
+        heartbeat = evidence.get("heartbeat")
+        timeout_snapshot = getattr(snapshot, "timeout", None)
+        timeout_capable = (
+            timeout_snapshot is None
+            and projected_intent.state == "dispatched"
+            and isinstance(ticket, Mapping)
+            and ticket.get("state") == "spawned"
+            and isinstance(ready, Mapping)
+            and isinstance(heartbeat, Mapping)
+            and heartbeat.get("state") == "running"
+        )
+        if timeout_capable:
+            timeout_probe = getattr(
+                self._dispatcher, "supports_exact_timeout", None
+            )
+            capability_proof = None
+            if callable(timeout_probe):
+                try:
+                    capability_proof = timeout_probe(
+                        projected_intent, attempt_id=projection.attempt_id
+                    )
+                except DispatchError as error:
+                    raise TaskDispatchError(error.code) from error
+                except Exception as error:
+                    raise TaskDispatchError(
+                        "ADAPTER_TIMEOUT_CAPABILITY_UNAVAILABLE"
+                    ) from error
+            if capability_proof is not None:
+                try:
+                    timeout_record = self._store.arm_worker_attempt_timeout(
+                        intent_id=projected_intent.intent_id,
+                        attempt_id=projection.attempt_id,
+                        capability_proof=capability_proof,
+                        supervisor_lease=supervisor_lease,
+                        supervisor_clock=self._runtime_supervisor_clock,
+                    )
+                except RuntimeSupervisorLeaseLost as error:
+                    raise TaskSupervisorLeaseLost() from error
+                except TaskStoreConflict as error:
+                    raise TaskConflict(str(error)) from error
+                armed_timeout = getattr(timeout_record, "timeout", None)
+                replayed = getattr(timeout_record, "replayed", None)
+                armed_snapshot = getattr(timeout_record, "snapshot", None)
+                if (
+                    getattr(armed_snapshot, "task_id", None) != task_id
+                    or getattr(armed_timeout, "intent_id", None)
+                    != projected_intent.intent_id
+                    or getattr(armed_timeout, "attempt_id", None)
+                    != projection.attempt_id
+                    or getattr(armed_timeout, "state", None)
+                    not in {
+                        "armed",
+                        "requested",
+                        "timed_out",
+                        "superseded",
+                        "not_triggered",
+                        "suppressed",
+                    }
+                    or type(replayed) is not bool
+                ):
+                    raise TaskDispatchError("TIMEOUT_WINDOW_INVALID")
+                timeout_armed = not replayed
         return TaskWorkerProjectionResult(
-            intent=projection.intent,
+            intent=projected_intent,
             evidence=copy.deepcopy(dict(evidence)),
             projected=True,
             adopted=projection.adopted,
             replayed=projection.replayed,
+            timeout_armed=timeout_armed,
         )
 
     def recover_runtime_on_startup(
@@ -2785,6 +2875,9 @@ class TaskService:
             task_id, project_id=project_id, principal_id=principal_id
         )
         if snapshot.cancellation is not None:
+            return False
+        timeout = getattr(snapshot, "timeout", None)
+        if timeout is not None and getattr(timeout, "state", None) != "armed":
             return False
         candidate = self._store.get_task_cancel_candidate(task_id)
         if candidate is None or self._dispatcher is None:
@@ -3291,6 +3384,342 @@ class TaskService:
             replayed=completed.replayed,
         )
 
+    def process_runtime_timeout(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskTimeoutProcessResult:
+        """Arm, deliver, or finalize one automatic exact-attempt timeout."""
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        timeout = getattr(snapshot, "timeout", None)
+        if timeout is None:
+            return TaskTimeoutProcessResult(
+                snapshot=snapshot,
+                state="none",
+                adapter_result=None,
+                replayed=True,
+            )
+        timeout_state = getattr(timeout, "state", None)
+        if timeout_state not in {
+            "armed",
+            "requested",
+            "timed_out",
+            "superseded",
+            "not_triggered",
+            "suppressed",
+        }:
+            raise TaskConflict("task timeout state is invalid")
+        if timeout_state not in {"armed", "requested"}:
+            return TaskTimeoutProcessResult(
+                snapshot=snapshot,
+                state=timeout_state,
+                adapter_result=(
+                    None
+                    if getattr(timeout, "adapter_proof", None) is None
+                    else copy.deepcopy(timeout.adapter_proof)
+                ),
+                replayed=True,
+            )
+        intent = self._store.get_dispatch_intent(task_id)
+        if (
+            intent is None
+            or intent.intent_id != getattr(timeout, "intent_id", None)
+            or intent.state != "dispatched"
+            or intent.handle is None
+        ):
+            raise TaskConflict("task timeout lost its dispatched intent binding")
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        try:
+            authorization = self._store.authorize_supervised_timeout(
+                timeout_id=timeout.timeout_id,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            current = self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            current_timeout = getattr(current, "timeout", None)
+            if getattr(current_timeout, "state", None) == "suppressed":
+                return TaskTimeoutProcessResult(
+                    snapshot=current,
+                    state="suppressed",
+                    adapter_result=None,
+                    replayed=True,
+                )
+            raise TaskConflict(str(error)) from error
+        authorized_timeout = getattr(authorization, "timeout", None)
+        authorized = getattr(authorization, "authorized", None)
+        authorization_replayed = getattr(authorization, "replayed", None)
+        if (
+            getattr(authorized_timeout, "timeout_id", None) != timeout.timeout_id
+            or getattr(authorized_timeout, "task_id", None) != task_id
+            or getattr(authorized_timeout, "attempt_id", None)
+            != timeout.attempt_id
+            or getattr(authorized_timeout, "state", None)
+            not in {
+                "armed",
+                "requested",
+                "timed_out",
+                "superseded",
+                "not_triggered",
+                "suppressed",
+            }
+            or type(authorized) is not bool
+            or type(authorization_replayed) is not bool
+        ):
+            raise TaskDispatchError("TIMEOUT_AUTHORIZATION_INVALID")
+        if not authorized:
+            current = self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            current_timeout = getattr(current, "timeout", None)
+            current_state = getattr(current_timeout, "state", None)
+            if current_state not in {
+                "armed",
+                "requested",
+                "timed_out",
+                "superseded",
+                "not_triggered",
+                "suppressed",
+            }:
+                raise TaskDispatchError("TIMEOUT_AUTHORIZATION_INVALID")
+            return TaskTimeoutProcessResult(
+                snapshot=current,
+                state=current_state,
+                adapter_result=(
+                    None
+                    if getattr(current_timeout, "adapter_proof", None) is None
+                    else copy.deepcopy(current_timeout.adapter_proof)
+                ),
+                replayed=authorization_replayed,
+                deferred_code=(
+                    "TIMEOUT_NOT_DUE" if current_state == "armed" else None
+                ),
+            )
+        if getattr(authorized_timeout, "state", None) != "requested":
+            raise TaskDispatchError("TIMEOUT_AUTHORIZATION_INVALID")
+        try:
+            proof = self._dispatcher.timeout(
+                intent,
+                timeout_id=authorized_timeout.timeout_id,
+                attempt_id=authorized_timeout.attempt_id,
+                wall_time_seconds=authorized_timeout.wall_time_seconds,
+                started_at=authorized_timeout.started_at,
+                deadline_at=authorized_timeout.deadline_at,
+            )
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("ADAPTER_TIMEOUT_UNAVAILABLE") from error
+        if not isinstance(proof, Mapping):
+            raise TaskDispatchError("ADAPTER_TIMEOUT_RESPONSE_INVALID")
+        adapter_result = copy.deepcopy(dict(proof))
+        state = adapter_result.get("state")
+        if (
+            adapter_result.get("task_id") != task_id
+            or adapter_result.get("request_id")
+            != authorized_timeout.timeout_id
+            or adapter_result.get("attempt_id")
+            != authorized_timeout.attempt_id
+            or adapter_result.get("reason") != "wall_time_exceeded"
+            or adapter_result.get("wall_time_seconds")
+            != authorized_timeout.wall_time_seconds
+            or adapter_result.get("started_at")
+            != authorized_timeout.started_at
+            or adapter_result.get("deadline_at")
+            != authorized_timeout.deadline_at
+            or state
+            not in {
+                "requested",
+                "pending",
+                "timed_out",
+                "terminal_won",
+                "deferred",
+            }
+        ):
+            raise TaskDispatchError("ADAPTER_TIMEOUT_RESPONSE_INVALID")
+        if state in {"requested", "pending", "deferred"}:
+            current = self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            current_timeout = getattr(current, "timeout", None)
+            if getattr(current_timeout, "state", None) != "requested":
+                raise TaskDispatchError("TIMEOUT_STATE_CONFLICT")
+            return TaskTimeoutProcessResult(
+                snapshot=current,
+                state="requested",
+                adapter_result=adapter_result,
+                replayed=authorization_replayed,
+                deferred_code=(
+                    adapter_result.get("code") if state == "deferred" else None
+                ),
+            )
+
+        if state == "terminal_won":
+            terminal = adapter_result.get("terminal_status")
+            if terminal not in {"Succeeded", "Failed"}:
+                raise TaskDispatchError("ADAPTER_TIMEOUT_RESPONSE_INVALID")
+            try:
+                observed = self._dispatcher.status(intent)
+            except DispatchError as error:
+                raise TaskDispatchError(error.code) from error
+            except Exception as error:
+                raise TaskDispatchError("ADAPTER_STATUS_UNAVAILABLE") from error
+            adapter_status = self._validated_adapter_status(intent, observed)
+            if adapter_status["status"] != terminal:
+                raise TaskDispatchError("ADAPTER_TIMEOUT_RESPONSE_INVALID")
+            current = self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            if current.status == "Queued" and terminal == "Succeeded":
+                started = self._adapter_event(
+                    snapshot=current,
+                    intent=intent,
+                    adapter_status=adapter_status,
+                    event_type="node_started",
+                    sequence=self._store.latest_run_event_sequence(task_id) + 1,
+                )
+                self.record_run_event(
+                    task_id=task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    expected_status="Queued",
+                    event=started,
+                    supervisor_lease=supervisor_lease,
+                )
+                current = self.get_task(
+                    task_id, project_id=project_id, principal_id=principal_id
+                )
+            terminal_event: Mapping[str, Any] | None
+            if current.status in {"Succeeded", "Failed"}:
+                if current.status != terminal:
+                    raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
+                terminal_event = None
+            else:
+                event_type = (
+                    "node_succeeded"
+                    if terminal == "Succeeded"
+                    else "node_failed"
+                )
+                terminal_event = self._adapter_event(
+                    snapshot=current,
+                    intent=intent,
+                    adapter_status=adapter_status,
+                    event_type=event_type,
+                    sequence=self._store.latest_run_event_sequence(task_id) + 1,
+                )
+                self._validate_schema("run-event.schema.json", terminal_event)
+                _validate_run_event_semantics(terminal_event)
+                _validate_run_event_binding(current, terminal_event)
+            try:
+                completed = self._store.complete_supervised_timeout(
+                    timeout_id=authorized_timeout.timeout_id,
+                    result="terminal_preempted",
+                    terminal_event=terminal_event,
+                    adapter_proof=adapter_result,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+            except RuntimeSupervisorLeaseLost as error:
+                raise TaskSupervisorLeaseLost() from error
+            except TaskStoreConflict as error:
+                raise TaskConflict(str(error)) from error
+            return TaskTimeoutProcessResult(
+                snapshot=completed.snapshot,
+                state=completed.timeout.state,
+                adapter_result=adapter_result,
+                replayed=completed.replayed,
+            )
+
+        if (
+            adapter_result.get("terminal_status") != "Failed"
+            or adapter_result.get("terminal_failure_code")
+            != "WALL_TIME_EXCEEDED"
+        ):
+            raise TaskDispatchError("ADAPTER_TIMEOUT_RESPONSE_INVALID")
+        current = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        sequence = self._store.latest_run_event_sequence(task_id) + 1
+        occurred_at = self._runtime_supervisor_clock()
+        _, event_identity = encode_document(
+            {
+                "timeout_id": authorized_timeout.timeout_id,
+                "event_type": "node_failed",
+                "proof_hash": adapter_result.get("proof_hash"),
+                "sequence": sequence,
+            }
+        )
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-"
+            + event_identity.removeprefix("sha256:")[:32],
+            "sequence": sequence,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "wall_time_exceeded",
+                "message": "FWI Worker exceeded its wall-time limit",
+                "retryable": False,
+            },
+            "occurred_at": occurred_at,
+            "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+            "extensions": {
+                "org.agent_rpc.timeout": {
+                    "timeout_id": authorized_timeout.timeout_id,
+                    "attempt_id": authorized_timeout.attempt_id,
+                    "wall_time_seconds": authorized_timeout.wall_time_seconds,
+                    "started_at": authorized_timeout.started_at,
+                    "deadline_at": authorized_timeout.deadline_at,
+                    "failure_code": "WALL_TIME_EXCEEDED",
+                    "proof_hash": adapter_result.get("proof_hash"),
+                }
+            },
+        }
+        self._validate_schema("run-event.schema.json", event)
+        _validate_run_event_semantics(event)
+        _validate_run_event_binding(current, event)
+        try:
+            completed = self._store.complete_supervised_timeout(
+                timeout_id=authorized_timeout.timeout_id,
+                result="timeout_confirmed",
+                terminal_event=event,
+                adapter_proof=adapter_result,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        return TaskTimeoutProcessResult(
+            snapshot=completed.snapshot,
+            state=completed.timeout.state,
+            adapter_result=adapter_result,
+            replayed=completed.replayed,
+        )
+
     def refresh_runtime_status(
         self,
         task_id: str,
@@ -3322,13 +3751,18 @@ class TaskService:
             raise TaskConflict("runtime task has no dispatch intent")
         if intent.state != "dispatched":
             return TaskRuntimeResult(snapshot, intent, None)
-        if (
+        timeout = getattr(snapshot, "timeout", None)
+        supervised_control_pending = (
             snapshot.cancellation is not None
             and snapshot.cancellation.state == "requested"
-            and supervisor_lease is None
-        ):
-            # A browser GET may observe the durable request, but only the
-            # active fenced Supervisor may resolve its terminal race.
+        ) or (
+            timeout is not None
+            and getattr(timeout, "state", None) == "requested"
+        )
+        if supervised_control_pending:
+            # Durable lifecycle control has a dedicated fenced state machine.
+            # Neither a browser GET nor an ordinary active-term status pass
+            # may race that state machine or publish its terminal result.
             return TaskRuntimeResult(snapshot, intent, None)
         if self._dispatcher is None:
             raise TaskDispatchError("DISPATCHER_UNAVAILABLE")

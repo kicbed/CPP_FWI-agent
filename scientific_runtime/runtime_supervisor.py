@@ -108,6 +108,16 @@ class RuntimeSupervisorTaskService(Protocol):
     ) -> Any:
         ...
 
+    def process_runtime_timeout(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: Any,
+    ) -> Any:
+        ...
+
 
 @dataclass(frozen=True)
 class RuntimeSupervisorCycleResult:
@@ -123,6 +133,9 @@ class RuntimeSupervisorCycleResult:
     dispatched_task_ids: tuple[str, ...] = ()
     cancel_processed_task_ids: tuple[str, ...] = ()
     cancel_resolved_task_ids: tuple[str, ...] = ()
+    timeout_armed_task_ids: tuple[str, ...] = ()
+    timeout_processed_task_ids: tuple[str, ...] = ()
+    timeout_resolved_task_ids: tuple[str, ...] = ()
 
 
 class _SupervisorFailure(RuntimeError):
@@ -541,6 +554,53 @@ class RuntimeSupervisor:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
 
+    def _process_task_timeout(self, task_id: str, lease: Any) -> Any:
+        """Run and strictly validate one supervised timeout pass."""
+
+        processor = getattr(self._task_service, "process_runtime_timeout", None)
+        if not callable(processor):
+            # Compatibility for bounded TaskService implementations that do
+            # not advertise the session-level automatic-timeout feature.
+            return None
+        result = processor(
+            task_id,
+            project_id=self._project_id,
+            principal_id=self._principal_id,
+            supervisor_lease=lease,
+        )
+        state = getattr(result, "state", None)
+        snapshot = getattr(result, "snapshot", None)
+        deferred_code = getattr(result, "deferred_code", None)
+        replayed = getattr(result, "replayed", None)
+        if (
+            getattr(snapshot, "task_id", None) != task_id
+            or state
+            not in {
+                "none",
+                "armed",
+                "requested",
+                "timed_out",
+                "superseded",
+                "not_triggered",
+                "suppressed",
+            }
+            or type(replayed) is not bool
+            or (
+                deferred_code is not None
+                and (
+                    not isinstance(deferred_code, str)
+                    or _STABLE_CODE.fullmatch(deferred_code) is None
+                )
+            )
+            or (state == "none" and deferred_code is not None)
+            or (
+                state == "armed"
+                and deferred_code not in {None, "TIMEOUT_NOT_DUE"}
+            )
+        ):
+            raise _SupervisorFailure(FATAL)
+        return result
+
     def _observe_tasks(
         self, snapshots: list[Any], lease: Any, next_heartbeat: float
     ) -> tuple[RuntimeSupervisorCycleResult, Any, float]:
@@ -552,6 +612,9 @@ class RuntimeSupervisor:
         dispatched: list[str] = []
         cancel_processed: list[str] = []
         cancel_resolved: list[str] = []
+        timeout_armed: list[str] = []
+        timeout_processed: list[str] = []
+        timeout_resolved: list[str] = []
         deferred: list[tuple[str, str]] = []
         failures: list[tuple[str, str]] = []
         for snapshot in snapshots:
@@ -620,6 +683,36 @@ class RuntimeSupervisor:
                 # first dispatch nor the ordinary status pump may run in the
                 # same cycle after cancellation processing.
                 continue
+            timeout = getattr(snapshot, "timeout", None)
+            if getattr(timeout, "state", None) == "requested":
+                try:
+                    timeout_result = self._process_task_timeout(task_id, lease)
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "TIMEOUT_PROCESS_FAILED"
+                            ),
+                        )
+                    )
+                    continue
+                timeout_state = getattr(timeout_result, "state", "none")
+                timeout_code = getattr(timeout_result, "deferred_code", None)
+                if timeout_state in {"none", "armed"}:
+                    raise _SupervisorFailure(FATAL)
+                timeout_processed.append(task_id)
+                if timeout_state == "requested":
+                    deferred.append(
+                        (task_id, timeout_code or "TIMEOUT_IN_PROGRESS")
+                    )
+                else:
+                    timeout_resolved.append(task_id)
+                # Timeout authorization owns the exact Worker stop race.  The
+                # ordinary status bridge must not publish generic failure in
+                # the same cycle.
+                continue
             try:
                 intent = self._task_service.get_dispatch_intent(
                     task_id,
@@ -671,6 +764,9 @@ class RuntimeSupervisor:
                 attempted_flag = getattr(schedule, "dispatch_attempted", None)
                 schedule_projected = getattr(schedule, "projected", None)
                 schedule_adopted = getattr(schedule, "adopted", None)
+                schedule_timeout_armed = getattr(
+                    schedule, "timeout_armed", False
+                )
                 deferred_code = getattr(schedule, "deferred_code", None)
                 if (
                     getattr(scheduled_intent, "task_id", None) != task_id
@@ -686,6 +782,7 @@ class RuntimeSupervisor:
                     or type(attempted_flag) is not bool
                     or type(schedule_projected) is not bool
                     or type(schedule_adopted) is not bool
+                    or type(schedule_timeout_armed) is not bool
                     or attempted_flag != authorized_flag
                     or (authorization_replayed and not authorized_flag)
                     or (
@@ -707,6 +804,8 @@ class RuntimeSupervisor:
                     projected.append(task_id)
                 if schedule_adopted:
                     adopted.append(task_id)
+                if schedule_timeout_armed:
+                    timeout_armed.append(task_id)
                 if scheduled_state != "dispatched":
                     code = deferred_code or {
                         "pending": "DISPATCH_PENDING",
@@ -757,12 +856,16 @@ class RuntimeSupervisor:
                 deferred_code = getattr(projection, "deferred_code", None)
                 projected_flag = getattr(projection, "projected", None)
                 adopted_flag = getattr(projection, "adopted", None)
+                projection_timeout_armed = getattr(
+                    projection, "timeout_armed", False
+                )
                 projected_state = getattr(projected_intent, "state", None)
                 if (
                     getattr(projected_intent, "task_id", None) != task_id
                     or projected_state != "dispatched"
                     or type(projected_flag) is not bool
                     or type(adopted_flag) is not bool
+                    or type(projection_timeout_armed) is not bool
                     or (
                         projected_flag
                         and not isinstance(
@@ -786,6 +889,8 @@ class RuntimeSupervisor:
                     projected.append(task_id)
                 if adopted_flag:
                     adopted.append(task_id)
+                if projection_timeout_armed:
+                    timeout_armed.append(task_id)
                 if projected_state == "dispatched":
                     intent = projected_intent
             if self._stop_event.is_set():
@@ -793,6 +898,36 @@ class RuntimeSupervisor:
             lease, next_heartbeat = self._heartbeat_if_due(
                 lease, next_heartbeat
             )
+            try:
+                timeout_result = self._process_task_timeout(task_id, lease)
+            except Exception as error:
+                self._raise_if_fatal_task_error(error)
+                failures.append(
+                    (
+                        task_id,
+                        self._stable_error_code(
+                            error, "TIMEOUT_PROCESS_FAILED"
+                        ),
+                    )
+                )
+                continue
+            timeout_state = getattr(timeout_result, "state", "none")
+            timeout_code = getattr(timeout_result, "deferred_code", None)
+            if timeout_state != "none":
+                timeout_processed.append(task_id)
+            if timeout_state == "requested":
+                deferred.append(
+                    (task_id, timeout_code or "TIMEOUT_IN_PROGRESS")
+                )
+                continue
+            if timeout_state in {
+                "timed_out",
+                "superseded",
+                "not_triggered",
+                "suppressed",
+            }:
+                timeout_resolved.append(task_id)
+                continue
             try:
                 self._task_service.refresh_runtime_status(
                     task_id,
@@ -825,6 +960,9 @@ class RuntimeSupervisor:
                 dispatched_task_ids=tuple(dispatched),
                 cancel_processed_task_ids=tuple(cancel_processed),
                 cancel_resolved_task_ids=tuple(cancel_resolved),
+                timeout_armed_task_ids=tuple(dict.fromkeys(timeout_armed)),
+                timeout_processed_task_ids=tuple(timeout_processed),
+                timeout_resolved_task_ids=tuple(timeout_resolved),
             ),
             lease,
             next_heartbeat,

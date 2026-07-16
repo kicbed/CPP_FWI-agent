@@ -8,7 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fwi_worker.__main__ import run_worker
-from worker_launch_control import WorkerCancellationRequested
+from worker_launch_control import (
+    WorkerCancellationRequested,
+    WorkerWallTimeExceeded,
+)
 
 
 class WorkerFailureArtifactsTest(unittest.TestCase):
@@ -71,6 +74,34 @@ class WorkerFailureArtifactsTest(unittest.TestCase):
             self.assertTrue(metrics["partial"])
             self.assertEqual(manifest["status"], "failed")
             self.assertIn("simulated unavailable device", manifest["failure_reason"])
+
+    def test_cooperative_timeout_is_failed_without_failure_artifacts(self) -> None:
+        config_path = Path(__file__).parent / "fixtures" / "homogeneous_cuda.json"
+
+        def timeout() -> None:
+            raise WorkerWallTimeExceeded(
+                "timeout-worker-checkpoint-1", "wall_time_exceeded"
+            )
+
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ, {"FWI_RUN_ROOT": root}
+        ):
+            with self.assertRaises(WorkerWallTimeExceeded):
+                run_worker(
+                    "forward",
+                    str(config_path),
+                    None,
+                    cancel_check=timeout,
+                )
+            jobs = list(Path(root).iterdir())
+            self.assertEqual(len(jobs), 1)
+            run_dir = jobs[0]
+            self.assertFalse((run_dir / "metrics.json").exists())
+            self.assertFalse((run_dir / "manifest.json").exists())
+            status = json.loads((run_dir / "status.json").read_text())
+            self.assertEqual(status["status"], "failed")
+            self.assertEqual(status["stage"], "failed")
+            self.assertEqual(status["failure_code"], "WALL_TIME_EXCEEDED")
 
 
 if __name__ == "__main__":

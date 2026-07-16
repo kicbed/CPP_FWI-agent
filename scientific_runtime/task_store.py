@@ -59,6 +59,7 @@ WORKER_SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
 WORKER_ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
 WORKER_JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 DOCUMENT_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
+RUNTIME_TIMEOUT_ID = re.compile(r"^timeout-[0-9a-f]{32}$")
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "Draft": frozenset({"Draft", "NeedsInput", "AwaitingApproval", "Cancelled"}),
@@ -121,6 +122,25 @@ class TaskCancellationSnapshot:
 
 
 @dataclass(frozen=True)
+class TaskTimeoutSnapshot:
+    """Durable projection of one exact-attempt runtime timeout window."""
+
+    timeout_id: str
+    task_id: str
+    intent_id: str
+    attempt_id: str
+    wall_time_seconds: int
+    started_at: str
+    deadline_at: str
+    state: str
+    result: str | None = None
+    failure_code: str | None = None
+    terminal_status: str | None = None
+    resolved_at: str | None = None
+    adapter_proof: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class TaskSnapshot:
     """Current durable view of one task aggregate."""
 
@@ -141,6 +161,7 @@ class TaskSnapshot:
     purged_at: str | None = None
     purge_local_run_state: str | None = None
     cancellation: TaskCancellationSnapshot | None = None
+    timeout: TaskTimeoutSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -329,6 +350,26 @@ class SupervisedCancelAuthorization:
     cancellation: TaskCancellationSnapshot
     fencing_token: int
     authorized_at: str
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class TaskTimeoutRecord:
+    """One durable timeout-window mutation or terminal resolution."""
+
+    snapshot: TaskSnapshot
+    timeout: TaskTimeoutSnapshot
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class SupervisedTimeoutAuthorization:
+    """One active Supervisor term's exact timeout delivery decision."""
+
+    timeout: TaskTimeoutSnapshot
+    authorized: bool
+    fencing_token: int
+    authorized_at: str | None
     replayed: bool
 
 
@@ -667,6 +708,38 @@ class TaskStore(Protocol):
     ) -> WorkerAttemptProjection:
         ...
 
+    def arm_worker_attempt_timeout(
+        self,
+        *,
+        intent_id: str,
+        attempt_id: str,
+        capability_proof: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> TaskTimeoutRecord:
+        ...
+
+    def authorize_supervised_timeout(
+        self,
+        *,
+        timeout_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedTimeoutAuthorization:
+        ...
+
+    def complete_supervised_timeout(
+        self,
+        *,
+        timeout_id: str,
+        result: str,
+        terminal_event: Mapping[str, Any] | None,
+        adapter_proof: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> TaskTimeoutRecord:
+        ...
+
     def lookup_task_cancellation(
         self,
         *,
@@ -860,6 +933,146 @@ def _validate_cancel_adapter_proof(
     return proof
 
 
+def _validate_timeout_capability_proof(
+    value: Mapping[str, Any],
+    *,
+    attempt_id: str,
+    binding_hash: str,
+) -> dict[str, Any]:
+    """Validate the independent exact-stop v2 capability used to arm time."""
+
+    if not isinstance(value, Mapping):
+        raise TaskStoreConflict("timeout capability proof is invalid")
+    proof = dict(value)
+    required = {
+        "schema_version",
+        "private_schema_version",
+        "attempt_id",
+        "binding_hash",
+        "capability_record_hash",
+        "supported_reasons",
+        "proof_hash",
+    }
+    try:
+        _, calculated_hash = encode_document(
+            {key: item for key, item in proof.items() if key != "proof_hash"}
+        )
+    except TaskStoreConflict as error:
+        raise TaskStoreConflict("timeout capability proof is invalid") from error
+    if (
+        set(proof) != required
+        or proof.get("schema_version") != "2.0.0"
+        or proof.get("private_schema_version") != "1.1.0"
+        or proof.get("attempt_id") != attempt_id
+        or WORKER_ATTEMPT_ID.fullmatch(attempt_id) is None
+        or proof.get("binding_hash") != binding_hash
+        or not _is_sha256(binding_hash)
+        or not _is_sha256(proof.get("capability_record_hash"))
+        or proof.get("supported_reasons")
+        != ["user_requested", "wall_time_exceeded"]
+        or proof.get("proof_hash") != calculated_hash
+        or not _is_sha256(proof.get("proof_hash"))
+    ):
+        raise TaskStoreConflict("timeout capability proof is invalid")
+    return proof
+
+
+def _validate_timeout_adapter_proof(
+    value: Mapping[str, Any],
+    *,
+    timeout: TaskTimeoutSnapshot,
+    capability_record_hash: str,
+    ready_record_hash: str,
+    result: str,
+    terminal_status: str | None = None,
+) -> dict[str, Any]:
+    """Validate an exact Worker timeout proof before it becomes task truth."""
+
+    proof = dict(value)
+    expected_fields = {
+        "schema_version",
+        "task_id",
+        "request_id",
+        "reason",
+        "state",
+        "code",
+        "attempt_id",
+        "wall_time_seconds",
+        "started_at",
+        "deadline_at",
+        "ready_record_hash",
+        "capability_record_hash",
+        "request_record_hash",
+        "acknowledgement_record_hash",
+        "terminal_status",
+        "terminal_failure_code",
+        "local_run_state",
+        "replayed",
+        "receipt_record_hash",
+        "proof_hash",
+    }
+    request_hash = proof.get("request_record_hash")
+    acknowledgement_hash = proof.get("acknowledgement_record_hash")
+    chain_valid = (
+        (request_hash is None or _is_sha256(request_hash))
+        and (acknowledgement_hash is None or _is_sha256(acknowledgement_hash))
+        and not (request_hash is None and acknowledgement_hash is not None)
+    )
+    try:
+        _, calculated_proof_hash = encode_document(
+            {key: item for key, item in proof.items() if key != "proof_hash"}
+        )
+    except TaskStoreConflict as error:
+        raise TaskStoreConflict("task timeout Adapter proof is invalid") from error
+
+    final_shape_valid = False
+    if result == "timeout_confirmed":
+        final_shape_valid = (
+            proof.get("state") == "timed_out"
+            and proof.get("code") == "TIMEOUT_COMPLETED"
+            and proof.get("terminal_status") == "Failed"
+            and proof.get("terminal_failure_code") == "WALL_TIME_EXCEEDED"
+            and request_hash is not None
+            and acknowledgement_hash is not None
+        )
+    elif result == "terminal_preempted":
+        natural_code = proof.get("terminal_failure_code")
+        natural_status = proof.get("terminal_status")
+        final_shape_valid = (
+            proof.get("state") == "terminal_won"
+            and proof.get("code") == "TIMEOUT_TERMINAL_WON"
+            and natural_status in {"Succeeded", "Failed"}
+            and natural_code is None
+        )
+    if (
+        set(proof) != expected_fields
+        or proof.get("schema_version") != "1.0.0"
+        or proof.get("task_id") != timeout.task_id
+        or proof.get("request_id") != timeout.timeout_id
+        or proof.get("reason") != "wall_time_exceeded"
+        or proof.get("attempt_id") != timeout.attempt_id
+        or proof.get("wall_time_seconds") != timeout.wall_time_seconds
+        or proof.get("started_at") != timeout.started_at
+        or proof.get("deadline_at") != timeout.deadline_at
+        or proof.get("ready_record_hash") != ready_record_hash
+        or proof.get("capability_record_hash") != capability_record_hash
+        or not _is_sha256(capability_record_hash)
+        or not chain_valid
+        or not final_shape_valid
+        or (
+            terminal_status is not None
+            and proof.get("terminal_status") != terminal_status
+        )
+        or proof.get("local_run_state") != "retained"
+        or type(proof.get("replayed")) is not bool
+        or not _is_sha256(proof.get("receipt_record_hash"))
+        or not _is_sha256(proof.get("proof_hash"))
+        or proof.get("proof_hash") != calculated_proof_hash
+    ):
+        raise TaskStoreConflict("task timeout Adapter proof is invalid")
+    return proof
+
+
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -883,6 +1096,36 @@ def _runtime_timestamp(value: str) -> tuple[str, int]:
         raise TaskStoreConflict("runtime supervisor timestamp is invalid")
     canonical = parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
     return canonical, microseconds
+
+
+def _runtime_timestamp_from_microseconds(value: int) -> str:
+    """Return the canonical RFC3339 spelling of one persisted runtime tick."""
+
+    if type(value) is not int or value < 0:
+        raise TaskStoreConflict("runtime supervisor timestamp is invalid")
+    try:
+        parsed = _UNIX_EPOCH + timedelta(microseconds=value)
+    except OverflowError as error:
+        raise TaskStoreConflict("runtime supervisor timestamp is invalid") from error
+    return parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _runtime_timeout_id(
+    *,
+    intent_id: str,
+    attempt_id: str,
+    start_observation_sequence: int,
+    wall_time_seconds: int,
+) -> str:
+    identity = "\x1f".join(
+        (
+            intent_id,
+            attempt_id,
+            str(start_observation_sequence),
+            str(wall_time_seconds),
+        )
+    )
+    return "timeout-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
 
 def _is_sha256(value: Any) -> bool:
@@ -1145,6 +1388,200 @@ def _decode_worker_observation_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _first_durable_running_observation(
+    connection: sqlite3.Connection,
+    *,
+    attempt_id: str,
+    project_id: str,
+    principal_id: str,
+) -> tuple[sqlite3.Row, dict[str, Any]] | None:
+    """Decode observations in sequence order before selecting the start tick.
+
+    Relational observation columns are only indexes over the hashed document,
+    so filtering on those columns first would let a forged earlier document
+    hide the real first-running observation.
+    """
+
+    observations = connection.execute(
+        """
+        SELECT * FROM worker_attempt_observations
+        WHERE attempt_id = ?
+        ORDER BY observation_sequence ASC
+        """,
+        (attempt_id,),
+    )
+    expected_sequence = 1
+    first_running: tuple[sqlite3.Row, dict[str, Any]] | None = None
+    for observation in observations:
+        evidence = _decode_worker_observation_row(observation)
+        if (
+            type(observation["observation_sequence"]) is not int
+            or observation["observation_sequence"] != expected_sequence
+            or observation["project_id"] != project_id
+            or observation["principal_id"] != principal_id
+        ):
+            raise TaskStoreCorruption(
+                "Worker attempt observation audit chain is invalid"
+            )
+        expected_sequence += 1
+        if first_running is None and (
+            evidence["ticket"]["state"] == "spawned"
+            and evidence["ready"] is not None
+            and evidence["heartbeat"] is not None
+            and evidence["heartbeat"]["state"] == "running"
+        ):
+            first_running = observation, evidence
+    return first_running
+
+
+def _require_worker_attempt_observation_binding(
+    attempt: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    *,
+    intent_id: str,
+    task_id: str,
+    project_id: str,
+    principal_id: str,
+) -> None:
+    """Bind the mutable relational attempt index back to hashed evidence."""
+
+    expected = {
+        "attempt_id": evidence["attempt_id"],
+        "intent_id": intent_id,
+        "task_id": task_id,
+        "project_id": project_id,
+        "principal_id": principal_id,
+        "attempt_number": evidence["attempt_number"],
+        "submission_id": evidence["submission_id"],
+        "job_id": evidence["job_id"],
+        "adapter_request_hash": evidence["request_hash"],
+        "binding_hash": evidence["binding_hash"],
+        "created_at": evidence["created_at"],
+    }
+    if any(attempt[key] != value for key, value in expected.items()):
+        raise TaskStoreCorruption(
+            "Worker launch attempt differs from its hashed observation"
+        )
+
+
+def _decode_run_event_row(
+    row: Mapping[str, Any], *, label: str = "run event"
+) -> dict[str, Any]:
+    """Decode one RunEvent and prove its JSON/index projections agree."""
+
+    event = _decode_hashed_document(row, label=label)
+    indexed = {
+        "task_id": row["task_id"],
+        "sequence": row["sequence"],
+        "event_id": row["event_id"],
+        "event_type": row["event_type"],
+        "task_status": row["task_status"],
+        "node_id": row["node_id"],
+        "occurred_at": row["occurred_at"],
+    }
+    fingerprint = event.get("fingerprint")
+    if not isinstance(fingerprint, Mapping):
+        raise TaskStoreCorruption(
+            f"persisted {label} identity does not match its index"
+        )
+    try:
+        _, fingerprint_hash = encode_document(fingerprint)
+    except TaskStoreConflict as error:
+        raise TaskStoreCorruption(
+            f"persisted {label} fingerprint is invalid"
+        ) from error
+    if (
+        any(event.get(key) != value for key, value in indexed.items())
+        or fingerprint_hash != row["fingerprint_hash"]
+    ):
+        raise TaskStoreCorruption(
+            f"persisted {label} identity does not match its index"
+        )
+    return event
+
+
+def _validate_timeout_natural_terminal_event(
+    event: Mapping[str, Any], *, receipt_job_id: str
+) -> None:
+    """Require the exact v1.4 Adapter-status bridge for a natural winner.
+
+    The Worker's ``occurred_at`` is intentionally not ordered against the
+    Supervisor clock.  Its same-clock binding to ``worker_updated_at`` is part
+    of the event itself and can be proved without assuming clock sync.
+    """
+
+    terminal_status = event.get("task_status")
+    expected_event_type = {
+        "Succeeded": "node_succeeded",
+        "Failed": "node_failed",
+    }.get(terminal_status)
+    expected_keys = {
+        "schema_version",
+        "event_id",
+        "sequence",
+        "task_id",
+        "node_id",
+        "event_type",
+        "task_status",
+        "occurred_at",
+        "fingerprint",
+        "extensions",
+    }
+    if terminal_status == "Failed":
+        expected_keys.add("error")
+    extensions = event.get("extensions")
+    adapter_status = (
+        extensions.get("org.agent_rpc.adapter_status")
+        if isinstance(extensions, Mapping)
+        else None
+    )
+    allowed_stages = {
+        "Succeeded": frozenset({"complete"}),
+        "Failed": frozenset({"failed", "worker_exit"}),
+    }.get(terminal_status, frozenset())
+    error_valid = (
+        "error" not in event
+        if terminal_status == "Succeeded"
+        else event.get("error")
+        == {
+            "code": "worker_failed",
+            "message": "FWI Worker reported a failure",
+            "retryable": False,
+        }
+    )
+    try:
+        _runtime_timestamp(event.get("occurred_at"))
+    except TaskStoreConflict as error:
+        raise TaskStoreConflict(
+            "natural terminal timeout event is invalid"
+        ) from error
+    if (
+        set(event) != expected_keys
+        or event.get("schema_version") != "1.0.0"
+        or not isinstance(event.get("event_id"), str)
+        or not event["event_id"]
+        or type(event.get("sequence")) is not int
+        or event["sequence"] < 1
+        or not isinstance(event.get("task_id"), str)
+        or not event["task_id"]
+        or not isinstance(event.get("node_id"), str)
+        or not event["node_id"]
+        or event.get("event_type") != expected_event_type
+        or not isinstance(event.get("occurred_at"), str)
+        or not event["occurred_at"]
+        or not isinstance(event.get("fingerprint"), Mapping)
+        or not isinstance(extensions, Mapping)
+        or set(extensions) != {"org.agent_rpc.adapter_status"}
+        or not isinstance(adapter_status, Mapping)
+        or set(adapter_status) != {"job_id", "stage", "worker_updated_at"}
+        or adapter_status.get("job_id") != receipt_job_id
+        or adapter_status.get("stage") not in allowed_stages
+        or adapter_status.get("worker_updated_at") != event.get("occurred_at")
+        or not error_valid
+    ):
+        raise TaskStoreConflict("natural terminal timeout event is invalid")
+
+
 def _runtime_lease_window(
     clock: Callable[[], str], lease_seconds: int
 ) -> tuple[str, int, str, int]:
@@ -1399,6 +1836,938 @@ class SQLiteTaskStore:
             raise
         return connection
 
+    def arm_worker_attempt_timeout(
+        self,
+        *,
+        intent_id: str,
+        attempt_id: str,
+        capability_proof: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> TaskTimeoutRecord:
+        """Arm one exact attempt from its first durable ready/running sample."""
+
+        if (
+            not isinstance(intent_id, str)
+            or not intent_id
+            or not isinstance(attempt_id, str)
+            or WORKER_ATTEMPT_ID.fullmatch(attempt_id) is None
+            or not isinstance(capability_proof, Mapping)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("Worker timeout window is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            recorded_at, recorded_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("timeout target task cannot be read")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=recorded_at_us,
+                action="Worker timeout window",
+            )
+            if (
+                task["status"] not in {"Queued", "Running"}
+                or intent.state != "dispatched"
+                or intent.handle is None
+                or intent.adapter_id != "fwi.deepwave_adapter"
+                or intent.adapter_version != "1.4.0"
+                or intent.request.get("algorithm")
+                != {"id": "deepwave.acoustic_fwi", "version": "1.4.0"}
+            ):
+                raise TaskStoreConflict(
+                    "timeout window requires a current managed dispatch"
+                )
+            if connection.execute(
+                "SELECT 1 FROM task_purge_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict("purged task cannot arm a timeout")
+            attempt = connection.execute(
+                """
+                SELECT * FROM worker_launch_attempts
+                WHERE intent_id = ?
+                ORDER BY attempt_number DESC LIMIT 1
+                """,
+                (intent_id,),
+            ).fetchone()
+            if attempt is None or attempt["attempt_id"] != attempt_id:
+                raise TaskStoreConflict(
+                    "timeout window requires the latest exact Worker attempt"
+                )
+            proof = _validate_timeout_capability_proof(
+                capability_proof,
+                attempt_id=attempt_id,
+                binding_hash=attempt["binding_hash"],
+            )
+            proof_json, proof_document_hash = encode_document(proof)
+            first_running = _first_durable_running_observation(
+                connection,
+                attempt_id=attempt_id,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+            )
+            if first_running is None:
+                raise TaskStoreConflict(
+                    "timeout window requires durable ready/running evidence"
+                )
+            observation, observation_evidence = first_running
+            _require_worker_attempt_observation_binding(
+                attempt,
+                observation_evidence,
+                intent_id=intent_id,
+                task_id=task_id,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+            )
+            try:
+                started_at, started_at_us = _runtime_timestamp(
+                    observation["observed_at"]
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "timeout start observation time is invalid"
+                ) from error
+            if (
+                started_at != observation["observed_at"]
+                or started_at_us != observation["observed_at_us"]
+                or recorded_at_us < started_at_us
+            ):
+                raise TaskStoreConflict("timeout window clock is inconsistent")
+            wall_time_seconds = intent.request.get("resources", {}).get(
+                "wall_time_seconds"
+            )
+            if (
+                type(wall_time_seconds) is not int
+                or not 1 <= wall_time_seconds <= 86_400
+            ):
+                raise TaskStoreCorruption(
+                    "dispatch intent wall-time policy is invalid"
+                )
+            deadline_at_us = started_at_us + wall_time_seconds * 1_000_000
+            deadline_at = _runtime_timestamp_from_microseconds(deadline_at_us)
+            timeout_id = _runtime_timeout_id(
+                intent_id=intent_id,
+                attempt_id=attempt_id,
+                start_observation_sequence=observation[
+                    "observation_sequence"
+                ],
+                wall_time_seconds=wall_time_seconds,
+            )
+            existing = connection.execute(
+                """
+                SELECT timeout_id, capability_proof_hash
+                FROM worker_attempt_timeout_windows
+                WHERE attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["timeout_id"] != timeout_id
+                    or existing["capability_proof_hash"]
+                    != proof_document_hash
+                ):
+                    raise TaskStoreConflict(
+                        "Worker attempt already has another timeout window"
+                    )
+                snapshot = self._load_snapshot(connection, task_id)
+                if snapshot is None or snapshot.timeout is None:
+                    raise TaskStoreCorruption("timeout window replay cannot be read")
+                connection.commit()
+                return TaskTimeoutRecord(
+                    snapshot=snapshot,
+                    timeout=snapshot.timeout,
+                    replayed=True,
+                )
+
+            window = {
+                "schema_version": "1.0.0",
+                "timeout_id": timeout_id,
+                "task_id": task_id,
+                "intent_id": intent_id,
+                "attempt_id": attempt_id,
+                "reason": "wall_time_exceeded",
+                "wall_time_seconds": wall_time_seconds,
+                "start_observation_sequence": observation[
+                    "observation_sequence"
+                ],
+                "started_at": started_at,
+                "deadline_at": deadline_at,
+                "ready_record_hash": observation["ready_record_hash"],
+                "running_heartbeat_record_hash": observation[
+                    "heartbeat_record_hash"
+                ],
+                "capability_proof": proof,
+                "recorded_at": recorded_at,
+                "extensions": {},
+            }
+            document_json, document_hash = encode_document(window)
+            connection.execute(
+                """
+                INSERT INTO worker_attempt_timeout_windows(
+                    timeout_id, task_id, project_id, principal_id,
+                    intent_id, attempt_id, start_observation_sequence,
+                    wall_time_seconds, started_at, started_at_us,
+                    deadline_at, deadline_at_us, ready_record_hash,
+                    running_heartbeat_record_hash, capability_record_hash,
+                    capability_proof_json, capability_proof_hash,
+                    document_json, document_hash, recorded_fencing_token,
+                    recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?)
+                """,
+                (
+                    timeout_id,
+                    task_id,
+                    task["project_id"],
+                    task["principal_id"],
+                    intent_id,
+                    attempt_id,
+                    observation["observation_sequence"],
+                    wall_time_seconds,
+                    started_at,
+                    started_at_us,
+                    deadline_at,
+                    deadline_at_us,
+                    observation["ready_record_hash"],
+                    observation["heartbeat_record_hash"],
+                    proof["capability_record_hash"],
+                    proof_json,
+                    proof_document_hash,
+                    document_json,
+                    document_hash,
+                    supervisor_lease.fencing_token,
+                    recorded_at,
+                    recorded_at_us,
+                ),
+            )
+            snapshot = self._load_snapshot(connection, task_id)
+            if snapshot is None or snapshot.timeout is None:
+                raise TaskStoreCorruption("timeout window cannot be read")
+            connection.commit()
+            return TaskTimeoutRecord(
+                snapshot=snapshot,
+                timeout=snapshot.timeout,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "Worker timeout window lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "Worker timeout window conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def authorize_supervised_timeout(
+        self,
+        *,
+        timeout_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedTimeoutAuthorization:
+        """Authorize the active term only once the durable deadline is due."""
+
+        if (
+            not isinstance(timeout_id, str)
+            or RUNTIME_TIMEOUT_ID.fullmatch(timeout_id) is None
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("supervised timeout authorization is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authorized_at, authorized_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            row = connection.execute(
+                """
+                SELECT timeout_id, task_id, project_id, principal_id,
+                       intent_id, attempt_id, deadline_at_us
+                FROM worker_attempt_timeout_windows
+                WHERE timeout_id = ?
+                """,
+                (timeout_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskStoreConflict("Worker timeout window does not exist")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=row["project_id"],
+                principal_id=row["principal_id"],
+                supplied=supervisor_lease,
+                now_us=authorized_at_us,
+                action="supervised timeout",
+            )
+            snapshot = self._load_snapshot(connection, row["task_id"])
+            if snapshot is None or snapshot.timeout is None:
+                raise TaskStoreCorruption("Worker timeout window cannot be read")
+            timeout = snapshot.timeout
+            if timeout.timeout_id != timeout_id:
+                raise TaskStoreCorruption("Worker timeout identity changed")
+            if timeout.state == "suppressed":
+                raise TaskStoreConflict(
+                    "task cancellation already owns the exact stop slot"
+                )
+            if timeout.state in {"timed_out", "superseded", "not_triggered"}:
+                connection.commit()
+                return SupervisedTimeoutAuthorization(
+                    timeout=timeout,
+                    authorized=False,
+                    fencing_token=supervisor_lease.fencing_token,
+                    authorized_at=None,
+                    replayed=True,
+                )
+            existing = connection.execute(
+                """
+                SELECT authorized_at, authorized_at_us
+                FROM supervised_timeout_attempts
+                WHERE timeout_id = ? AND fencing_token = ?
+                """,
+                (timeout_id, supervisor_lease.fencing_token),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    stored_at, stored_us = _runtime_timestamp(
+                        existing["authorized_at"]
+                    )
+                except TaskStoreConflict as error:
+                    raise TaskStoreCorruption(
+                        "supervised timeout authorization time is invalid"
+                    ) from error
+                if (
+                    stored_at != existing["authorized_at"]
+                    or stored_us != existing["authorized_at_us"]
+                ):
+                    raise TaskStoreCorruption(
+                        "supervised timeout authorization time is inconsistent"
+                    )
+                connection.commit()
+                return SupervisedTimeoutAuthorization(
+                    timeout=timeout,
+                    authorized=True,
+                    fencing_token=supervisor_lease.fencing_token,
+                    authorized_at=stored_at,
+                    replayed=True,
+                )
+            if authorized_at_us < row["deadline_at_us"]:
+                connection.commit()
+                return SupervisedTimeoutAuthorization(
+                    timeout=timeout,
+                    authorized=False,
+                    fencing_token=supervisor_lease.fencing_token,
+                    authorized_at=None,
+                    replayed=False,
+                )
+            connection.execute(
+                """
+                INSERT INTO supervised_timeout_attempts(
+                    timeout_id, project_id, principal_id, intent_id,
+                    attempt_id, fencing_token, action,
+                    authorized_at, authorized_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?,
+                          'deliver_exact_attempt_timeout', ?, ?)
+                """,
+                (
+                    timeout_id,
+                    row["project_id"],
+                    row["principal_id"],
+                    row["intent_id"],
+                    row["attempt_id"],
+                    supervisor_lease.fencing_token,
+                    authorized_at,
+                    authorized_at_us,
+                ),
+            )
+            snapshot = self._load_snapshot(connection, row["task_id"])
+            if snapshot is None or snapshot.timeout is None:
+                raise TaskStoreCorruption(
+                    "authorized Worker timeout cannot be read"
+                )
+            connection.commit()
+            return SupervisedTimeoutAuthorization(
+                timeout=snapshot.timeout,
+                authorized=True,
+                fencing_token=supervisor_lease.fencing_token,
+                authorized_at=authorized_at,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "supervised timeout lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "supervised timeout authorization conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def complete_supervised_timeout(
+        self,
+        *,
+        timeout_id: str,
+        result: str,
+        terminal_event: Mapping[str, Any] | None,
+        adapter_proof: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> TaskTimeoutRecord:
+        """Commit exact timeout failure or its natural terminal winner."""
+
+        if (
+            not isinstance(timeout_id, str)
+            or RUNTIME_TIMEOUT_ID.fullmatch(timeout_id) is None
+            or result not in {"timeout_confirmed", "terminal_preempted"}
+            or not isinstance(adapter_proof, Mapping)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("task timeout completion is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            resolved_at, resolved_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            row = connection.execute(
+                """
+                SELECT timeout.*, attempt.binding_hash
+                FROM worker_attempt_timeout_windows AS timeout
+                JOIN worker_launch_attempts AS attempt
+                  ON attempt.attempt_id = timeout.attempt_id
+                WHERE timeout.timeout_id = ?
+                """,
+                (timeout_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskStoreConflict("Worker timeout window does not exist")
+            timeout = TaskTimeoutSnapshot(
+                timeout_id=row["timeout_id"],
+                task_id=row["task_id"],
+                intent_id=row["intent_id"],
+                attempt_id=row["attempt_id"],
+                wall_time_seconds=row["wall_time_seconds"],
+                started_at=row["started_at"],
+                deadline_at=row["deadline_at"],
+                state="requested",
+            )
+            proof = _validate_timeout_adapter_proof(
+                adapter_proof,
+                timeout=timeout,
+                capability_record_hash=row["capability_record_hash"],
+                ready_record_hash=row["ready_record_hash"],
+                result=result,
+            )
+            proof_json, proof_hash = encode_document(proof)
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=row["project_id"],
+                principal_id=row["principal_id"],
+                supplied=supervisor_lease,
+                now_us=resolved_at_us,
+                action="task timeout completion",
+            )
+            existing = connection.execute(
+                """
+                SELECT result, adapter_proof_hash
+                FROM task_timeout_outcomes WHERE timeout_id = ?
+                """,
+                (timeout_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["result"] != result
+                    or existing["adapter_proof_hash"] != proof_hash
+                ):
+                    raise TaskStoreConflict(
+                        "task timeout was completed with another outcome"
+                    )
+                snapshot = self._load_snapshot(connection, row["task_id"])
+                if snapshot is None or snapshot.timeout is None:
+                    raise TaskStoreCorruption("task timeout outcome cannot be read")
+                connection.commit()
+                return TaskTimeoutRecord(
+                    snapshot=snapshot,
+                    timeout=snapshot.timeout,
+                    replayed=True,
+                )
+            authorization = connection.execute(
+                """
+                SELECT authorized_at, authorized_at_us
+                FROM supervised_timeout_attempts
+                WHERE timeout_id = ? AND fencing_token = ?
+                """,
+                (timeout_id, supervisor_lease.fencing_token),
+            ).fetchone()
+            if authorization is None:
+                raise TaskStoreConflict(
+                    "task timeout completion lacks current-term authorization"
+                )
+            try:
+                authorized_at, authorized_at_us = _runtime_timestamp(
+                    authorization["authorized_at"]
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "supervised timeout authorization time is invalid"
+                ) from error
+            if (
+                authorized_at != authorization["authorized_at"]
+                or authorized_at_us != authorization["authorized_at_us"]
+                or authorized_at_us < row["deadline_at_us"]
+            ):
+                raise TaskStoreCorruption(
+                    "supervised timeout authorization time is inconsistent"
+                )
+            if (
+                resolved_at_us < row["deadline_at_us"]
+                or resolved_at_us < authorized_at_us
+            ):
+                raise TaskStoreConflict(
+                    "task timeout completion precedes its durable authorization"
+                )
+            if connection.execute(
+                "SELECT 1 FROM task_cancel_requests WHERE task_id = ?",
+                (row["task_id"],),
+            ).fetchone() is not None:
+                raise TaskStoreConflict(
+                    "task cancellation owns the exact stop slot"
+                )
+            task = connection.execute(
+                "SELECT status FROM tasks WHERE task_id = ?",
+                (row["task_id"],),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("task timeout target cannot be read")
+            intent = self._load_dispatch_intent(
+                connection, task_id=row["task_id"]
+            )
+            if (
+                intent is None
+                or intent.intent_id != row["intent_id"]
+                or intent.handle is None
+            ):
+                raise TaskStoreCorruption(
+                    "task timeout lost its dispatch receipt"
+                )
+
+            event: dict[str, Any]
+            if result == "timeout_confirmed":
+                if task["status"] not in {"Queued", "Running"}:
+                    raise TaskStoreConflict(
+                        "timeout confirmation lost the terminal race"
+                    )
+                if terminal_event is None:
+                    raise TaskStoreConflict(
+                        "timeout confirmation requires its terminal event"
+                    )
+                event = dict(terminal_event)
+                next_sequence = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) + 1
+                    FROM run_events WHERE task_id = ?
+                    """,
+                    (row["task_id"],),
+                ).fetchone()[0]
+                expected_extension = {
+                    "timeout_id": timeout_id,
+                    "attempt_id": row["attempt_id"],
+                    "wall_time_seconds": row["wall_time_seconds"],
+                    "started_at": row["started_at"],
+                    "deadline_at": row["deadline_at"],
+                    "failure_code": "WALL_TIME_EXCEEDED",
+                    "proof_hash": proof["proof_hash"],
+                }
+                error = event.get("error")
+                try:
+                    _, event_occurred_at_us = _runtime_timestamp(
+                        event.get("occurred_at")
+                    )
+                except TaskStoreConflict as error:
+                    raise TaskStoreConflict(
+                        "task timeout terminal event is invalid"
+                    ) from error
+                if (
+                    event.get("schema_version") != "1.0.0"
+                    or not isinstance(event.get("event_id"), str)
+                    or not event["event_id"]
+                    or event.get("task_id") != row["task_id"]
+                    or event.get("sequence") != next_sequence
+                    or event.get("event_type") != "node_failed"
+                    or event.get("task_status") != "Failed"
+                    or event.get("node_id") != intent.node_id
+                    or event.get("fingerprint")
+                    != intent.handle["fingerprint"]
+                    or not isinstance(error, Mapping)
+                    or error.get("code") != "wall_time_exceeded"
+                    or error.get("message")
+                    != "FWI Worker exceeded its wall-time limit"
+                    or error.get("retryable") is not False
+                    or not isinstance(event.get("occurred_at"), str)
+                    or not event["occurred_at"]
+                    or event.get("extensions")
+                    != {"org.agent_rpc.timeout": expected_extension}
+                ):
+                    raise TaskStoreConflict(
+                        "task timeout terminal event is invalid"
+                    )
+                if (
+                    event_occurred_at_us < row["deadline_at_us"]
+                    or event_occurred_at_us < authorized_at_us
+                    or event_occurred_at_us > resolved_at_us
+                ):
+                    raise TaskStoreConflict(
+                        "task timeout terminal event violates its causal order"
+                    )
+                event_json, event_hash = encode_document(event)
+                _, fingerprint_hash = encode_document(event["fingerprint"])
+                connection.execute(
+                    """
+                    INSERT INTO run_events(
+                        task_id, sequence, event_id, event_type, task_status,
+                        node_id, fingerprint_hash, document_json,
+                        document_hash, occurred_at, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["task_id"],
+                        next_sequence,
+                        event["event_id"],
+                        event["event_type"],
+                        event["task_status"],
+                        event["node_id"],
+                        fingerprint_hash,
+                        event_json,
+                        event_hash,
+                        event["occurred_at"],
+                        resolved_at,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE tasks SET status = 'Failed', updated_at = ? "
+                    "WHERE task_id = ?",
+                    (resolved_at, row["task_id"]),
+                )
+                terminal_status = "Failed"
+                failure_code = "WALL_TIME_EXCEEDED"
+                terminal_sequence = next_sequence
+                connection.execute(
+                    """
+                    INSERT INTO supervised_run_event_commits(
+                        task_id, sequence, project_id, principal_id,
+                        fencing_token, recorded_at, recorded_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["task_id"],
+                        next_sequence,
+                        row["project_id"],
+                        row["principal_id"],
+                        supervisor_lease.fencing_token,
+                        resolved_at,
+                        resolved_at_us,
+                    ),
+                )
+            else:
+                failure_code = None
+                if terminal_event is None:
+                    if task["status"] not in {"Succeeded", "Failed"}:
+                        raise TaskStoreConflict(
+                            "terminal-preempted timeout requires a natural terminal task"
+                        )
+                    terminal_status = task["status"]
+                    terminal = connection.execute(
+                        """
+                        SELECT task_id, sequence, event_id, event_type,
+                               task_status, node_id, fingerprint_hash,
+                               occurred_at, document_json, document_hash
+                        FROM run_events WHERE task_id = ?
+                        ORDER BY sequence DESC LIMIT 1
+                        """,
+                        (row["task_id"],),
+                    ).fetchone()
+                    expected_type = (
+                        "node_succeeded"
+                        if terminal_status == "Succeeded"
+                        else "node_failed"
+                    )
+                    if (
+                        terminal is None
+                        or terminal["event_type"] != expected_type
+                        or terminal["task_status"] != terminal_status
+                    ):
+                        raise TaskStoreCorruption(
+                            "natural timeout winner is inconsistent"
+                        )
+                    natural_event = _decode_run_event_row(
+                        terminal, label="natural timeout winner event"
+                    )
+                    if (
+                        natural_event.get("node_id") != intent.node_id
+                        or natural_event.get("fingerprint")
+                        != intent.handle["fingerprint"]
+                    ):
+                        raise TaskStoreCorruption(
+                            "natural timeout winner lost its dispatch binding"
+                        )
+                    try:
+                        _validate_timeout_natural_terminal_event(
+                            natural_event,
+                            receipt_job_id=intent.handle["job_id"],
+                        )
+                    except TaskStoreConflict as error:
+                        raise TaskStoreCorruption(
+                            "natural timeout winner is inconsistent"
+                        ) from error
+                    terminal_sequence = terminal["sequence"]
+                else:
+                    if task["status"] not in {"Queued", "Running"}:
+                        raise TaskStoreConflict(
+                            "terminal-preempted timeout lost the terminal race"
+                        )
+                    event = dict(terminal_event)
+                    terminal_status = event.get("task_status")
+                    expected_type = {
+                        "Succeeded": "node_succeeded",
+                        "Failed": "node_failed",
+                    }.get(terminal_status)
+                    next_sequence = connection.execute(
+                        """
+                        SELECT COALESCE(MAX(sequence), 0) + 1
+                        FROM run_events WHERE task_id = ?
+                        """,
+                        (row["task_id"],),
+                    ).fetchone()[0]
+                    if (
+                        event.get("schema_version") != "1.0.0"
+                        or not isinstance(event.get("event_id"), str)
+                        or not event["event_id"]
+                        or expected_type is None
+                        or event.get("task_id") != row["task_id"]
+                        or event.get("sequence") != next_sequence
+                        or event.get("event_type") != expected_type
+                        or event.get("node_id") != intent.node_id
+                        or event.get("fingerprint")
+                        != intent.handle["fingerprint"]
+                        or terminal_status
+                        not in ALLOWED_TRANSITIONS.get(
+                            task["status"], frozenset()
+                        )
+                        or not isinstance(event.get("occurred_at"), str)
+                        or not event["occurred_at"]
+                    ):
+                        raise TaskStoreConflict(
+                            "natural terminal timeout event is invalid"
+                        )
+                    _validate_timeout_natural_terminal_event(
+                        event, receipt_job_id=intent.handle["job_id"]
+                    )
+                    event_json, event_hash = encode_document(event)
+                    _, fingerprint_hash = encode_document(
+                        event["fingerprint"]
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO run_events(
+                            task_id, sequence, event_id, event_type,
+                            task_status, node_id, fingerprint_hash,
+                            document_json, document_hash, occurred_at,
+                            recorded_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["task_id"],
+                            next_sequence,
+                            event["event_id"],
+                            event["event_type"],
+                            terminal_status,
+                            event["node_id"],
+                            fingerprint_hash,
+                            event_json,
+                            event_hash,
+                            event["occurred_at"],
+                            resolved_at,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE tasks SET status = ?, updated_at = ? "
+                        "WHERE task_id = ?",
+                        (terminal_status, resolved_at, row["task_id"]),
+                    )
+                    terminal_sequence = next_sequence
+                    connection.execute(
+                        """
+                        INSERT INTO supervised_run_event_commits(
+                            task_id, sequence, project_id, principal_id,
+                            fencing_token, recorded_at, recorded_at_us
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["task_id"],
+                            next_sequence,
+                            row["project_id"],
+                            row["principal_id"],
+                            supervisor_lease.fencing_token,
+                            resolved_at,
+                            resolved_at_us,
+                        ),
+                    )
+            if proof["terminal_status"] != terminal_status:
+                raise TaskStoreConflict(
+                    "task timeout Adapter proof contradicts the terminal outcome"
+                )
+            outcome = {
+                "schema_version": "1.0.0",
+                "request_id": timeout_id,
+                "task_id": row["task_id"],
+                "result": result,
+                "terminal_status": terminal_status,
+                "failure_code": failure_code,
+                "adapter_proof": proof,
+                "resolved_at": resolved_at,
+                "extensions": {},
+            }
+            outcome_json, outcome_hash = encode_document(outcome)
+            connection.execute(
+                """
+                INSERT INTO task_timeout_outcomes(
+                    timeout_id, task_id, project_id, principal_id,
+                    intent_id, attempt_id, result, terminal_status,
+                    failure_code, terminal_event_sequence,
+                    adapter_proof_json, adapter_proof_hash,
+                    document_json, document_hash, fencing_token,
+                    resolved_at, resolved_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timeout_id,
+                    row["task_id"],
+                    row["project_id"],
+                    row["principal_id"],
+                    row["intent_id"],
+                    row["attempt_id"],
+                    result,
+                    terminal_status,
+                    failure_code,
+                    terminal_sequence,
+                    proof_json,
+                    proof_hash,
+                    outcome_json,
+                    outcome_hash,
+                    supervisor_lease.fencing_token,
+                    resolved_at,
+                    resolved_at_us,
+                ),
+            )
+            heartbeat = connection.execute(
+                """
+                UPDATE runtime_supervisor_leases
+                SET heartbeat_at = ?, heartbeat_at_us = ?
+                WHERE project_id = ? AND principal_id = ?
+                  AND fencing_token = ? AND owner_id = ?
+                  AND acquired_at = ?
+                """,
+                (
+                    resolved_at,
+                    resolved_at_us,
+                    row["project_id"],
+                    row["principal_id"],
+                    supervisor_lease.fencing_token,
+                    supervisor_lease.owner_id,
+                    supervisor_lease.acquired_at,
+                ),
+            )
+            if heartbeat.rowcount != 1:
+                raise RuntimeSupervisorLeaseLost(
+                    "task timeout completion lost its supervisor lease"
+                )
+            snapshot = self._load_snapshot(connection, row["task_id"])
+            if snapshot is None or snapshot.timeout is None:
+                raise TaskStoreCorruption("task timeout outcome cannot be read")
+            connection.commit()
+            return TaskTimeoutRecord(
+                snapshot=snapshot,
+                timeout=snapshot.timeout,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "task timeout completion lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "task timeout completion conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def lookup_task_cancellation(
         self,
         *,
@@ -1506,6 +2875,13 @@ class SQLiteTaskStore:
                       SELECT 1 FROM task_purge_requests AS purge
                       WHERE purge.task_id = task.task_id
                   )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM worker_attempt_timeout_windows AS timeout
+                      JOIN supervised_timeout_attempts AS delivery
+                        ON delivery.timeout_id = timeout.timeout_id
+                      WHERE timeout.task_id = task.task_id
+                  )
                 LIMIT 1
                 """,
                 (task_id,),
@@ -1611,6 +2987,20 @@ class SQLiteTaskStore:
                 (task_id,),
             ).fetchone() is not None:
                 raise TaskStoreConflict("purged task cannot be cancelled")
+            if connection.execute(
+                """
+                SELECT 1
+                FROM worker_attempt_timeout_windows AS timeout
+                JOIN supervised_timeout_attempts AS delivery
+                  ON delivery.timeout_id = timeout.timeout_id
+                WHERE timeout.task_id = ?
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict(
+                    "authorized timeout already owns the exact stop slot"
+                )
             intent = self._load_dispatch_intent(connection, task_id=task_id)
             if (
                 intent is None
@@ -4233,6 +5623,444 @@ class SQLiteTaskStore:
             adapter_proof=adapter_proof,
         )
 
+    def _load_task_timeout(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        *,
+        task_status: str,
+    ) -> TaskTimeoutSnapshot | None:
+        row = connection.execute(
+            """
+            SELECT timeout.*,
+                   attempt.attempt_number, attempt.binding_hash,
+                   outcome.result, outcome.terminal_status,
+                   outcome.failure_code, outcome.terminal_event_sequence,
+                   outcome.adapter_proof_json,
+                   outcome.adapter_proof_hash,
+                   outcome.document_json AS outcome_json,
+                   outcome.document_hash AS outcome_hash,
+                   outcome.resolved_at,
+                   outcome.resolved_at_us AS outcome_resolved_at_us,
+                   outcome.fencing_token AS outcome_fencing_token,
+                   outcome_delivery.authorized_at AS outcome_authorized_at,
+                   outcome_delivery.authorized_at_us
+                       AS outcome_authorized_at_us,
+                   outcome_delivery.fencing_token
+                       AS outcome_authorized_fencing_token,
+                   (SELECT COUNT(*) FROM supervised_timeout_attempts AS delivery
+                    WHERE delivery.timeout_id = timeout.timeout_id)
+                       AS authorization_count,
+                   EXISTS(
+                       SELECT 1 FROM task_cancel_requests AS cancel
+                       WHERE cancel.task_id = timeout.task_id
+                   ) AS has_cancel_request
+            FROM worker_attempt_timeout_windows AS timeout
+            JOIN worker_launch_attempts AS attempt
+              ON attempt.attempt_id = timeout.attempt_id
+            LEFT JOIN task_timeout_outcomes AS outcome
+              ON outcome.timeout_id = timeout.timeout_id
+            LEFT JOIN supervised_timeout_attempts AS outcome_delivery
+              ON outcome_delivery.timeout_id = outcome.timeout_id
+             AND outcome_delivery.fencing_token = outcome.fencing_token
+            WHERE timeout.task_id = ?
+            ORDER BY attempt.attempt_number DESC
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        capability_proof = _decode_document(
+            row["capability_proof_json"], label="timeout capability proof"
+        )
+        try:
+            capability_proof = _validate_timeout_capability_proof(
+                capability_proof,
+                attempt_id=row["attempt_id"],
+                binding_hash=row["binding_hash"],
+            )
+            _, capability_proof_hash = encode_document(capability_proof)
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "persisted timeout capability proof is invalid"
+            ) from error
+        if capability_proof_hash != row["capability_proof_hash"]:
+            raise TaskStoreCorruption(
+                "timeout capability proof hash does not match its content"
+            )
+
+        window = _decode_hashed_document(row, label="Worker timeout window")
+        expected_window = {
+            "schema_version": "1.0.0",
+            "timeout_id": row["timeout_id"],
+            "task_id": row["task_id"],
+            "intent_id": row["intent_id"],
+            "attempt_id": row["attempt_id"],
+            "reason": "wall_time_exceeded",
+            "wall_time_seconds": row["wall_time_seconds"],
+            "start_observation_sequence": row[
+                "start_observation_sequence"
+            ],
+            "started_at": row["started_at"],
+            "deadline_at": row["deadline_at"],
+            "ready_record_hash": row["ready_record_hash"],
+            "running_heartbeat_record_hash": row[
+                "running_heartbeat_record_hash"
+            ],
+            "capability_proof": capability_proof,
+            "recorded_at": row["recorded_at"],
+            "extensions": {},
+        }
+        try:
+            started_at, started_at_us = _runtime_timestamp(row["started_at"])
+            deadline_at, deadline_at_us = _runtime_timestamp(row["deadline_at"])
+            recorded_at, recorded_at_us = _runtime_timestamp(row["recorded_at"])
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption("persisted timeout time is invalid") from error
+        if (
+            window != expected_window
+            or RUNTIME_TIMEOUT_ID.fullmatch(row["timeout_id"]) is None
+            or row["capability_record_hash"]
+            != capability_proof["capability_record_hash"]
+            or started_at != row["started_at"]
+            or started_at_us != row["started_at_us"]
+            or deadline_at != row["deadline_at"]
+            or deadline_at_us != row["deadline_at_us"]
+            or recorded_at != row["recorded_at"]
+            or recorded_at_us != row["recorded_at_us"]
+            or row["deadline_at_us"]
+            != row["started_at_us"] + row["wall_time_seconds"] * 1_000_000
+            or row["recorded_at_us"] < row["started_at_us"]
+            or row["timeout_id"]
+            != _runtime_timeout_id(
+                intent_id=row["intent_id"],
+                attempt_id=row["attempt_id"],
+                start_observation_sequence=row["start_observation_sequence"],
+                wall_time_seconds=row["wall_time_seconds"],
+            )
+        ):
+            raise TaskStoreCorruption(
+                "timeout window differs from its immutable index"
+            )
+
+        first_running = _first_durable_running_observation(
+            connection,
+            attempt_id=row["attempt_id"],
+            project_id=row["project_id"],
+            principal_id=row["principal_id"],
+        )
+        observation, observation_evidence = (
+            (None, None) if first_running is None else first_running
+        )
+        attempt_row = connection.execute(
+            "SELECT * FROM worker_launch_attempts WHERE attempt_id = ?",
+            (row["attempt_id"],),
+        ).fetchone()
+        if observation_evidence is not None and attempt_row is not None:
+            _require_worker_attempt_observation_binding(
+                attempt_row,
+                observation_evidence,
+                intent_id=row["intent_id"],
+                task_id=task_id,
+                project_id=row["project_id"],
+                principal_id=row["principal_id"],
+            )
+        try:
+            observation_at, observation_at_us = (
+                (None, None)
+                if observation is None
+                else _runtime_timestamp(observation["observed_at"])
+            )
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "timeout source observation time is invalid"
+            ) from error
+        intent = self._load_dispatch_intent(connection, task_id=task_id)
+        if (
+            observation is None
+            or observation_evidence is None
+            or attempt_row is None
+            or observation_evidence["ticket"]["state"] != "spawned"
+            or observation_evidence["ready"] is None
+            or observation_evidence["heartbeat"] is None
+            or observation_evidence["heartbeat"]["state"] != "running"
+            or type(observation["observation_sequence"]) is not int
+            or observation["observation_sequence"]
+            != row["start_observation_sequence"]
+            or observation["ready_record_hash"] != row["ready_record_hash"]
+            or observation["heartbeat_state"] != "running"
+            or observation["heartbeat_record_hash"]
+            != row["running_heartbeat_record_hash"]
+            or observation_at != observation["observed_at"]
+            or observation_at_us != observation["observed_at_us"]
+            or observation["observed_at"] != row["started_at"]
+            or observation["observed_at_us"] != row["started_at_us"]
+            or intent is None
+            or intent.intent_id != row["intent_id"]
+            or intent.adapter_id != "fwi.deepwave_adapter"
+            or intent.adapter_version != "1.4.0"
+            or intent.request.get("algorithm")
+            != {"id": "deepwave.acoustic_fwi", "version": "1.4.0"}
+            or intent.request.get("resources", {}).get("wall_time_seconds")
+            != row["wall_time_seconds"]
+        ):
+            raise TaskStoreCorruption(
+                "timeout window lost its exact Worker or intent binding"
+            )
+
+        authorization_rows = connection.execute(
+            """
+            SELECT fencing_token, authorized_at, authorized_at_us
+            FROM supervised_timeout_attempts
+            WHERE timeout_id = ?
+            ORDER BY fencing_token ASC
+            """,
+            (row["timeout_id"],),
+        ).fetchall()
+        for authorization in authorization_rows:
+            try:
+                authorized_at, authorized_at_us = _runtime_timestamp(
+                    authorization["authorized_at"]
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "supervised timeout authorization time is invalid"
+                ) from error
+            if (
+                type(authorization["fencing_token"]) is not int
+                or authorization["fencing_token"] < 1
+                or authorized_at != authorization["authorized_at"]
+                or authorized_at_us != authorization["authorized_at_us"]
+                or authorized_at_us < row["deadline_at_us"]
+            ):
+                raise TaskStoreCorruption(
+                    "supervised timeout authorization time is inconsistent"
+                )
+        authorization_count = len(authorization_rows)
+        if authorization_count != int(row["authorization_count"]):
+            raise TaskStoreCorruption(
+                "supervised timeout authorization count is inconsistent"
+            )
+        has_cancel_request = bool(row["has_cancel_request"])
+        if row["result"] is None:
+            if authorization_count > 0 and has_cancel_request:
+                raise TaskStoreCorruption(
+                    "timeout and cancellation both own the exact stop slot"
+                )
+            if authorization_count > 0:
+                if task_status not in {"Queued", "Running"}:
+                    raise TaskStoreCorruption(
+                        "pending timeout has an unresolved terminal task"
+                    )
+                state = "requested"
+            elif has_cancel_request:
+                state = "suppressed"
+            elif task_status in {"Queued", "Running"}:
+                state = "armed"
+            elif task_status in {"Succeeded", "Failed"}:
+                state = "not_triggered"
+            elif task_status == "Cancelled":
+                raise TaskStoreCorruption(
+                    "timeout window was cancelled without a cancel request"
+                )
+            else:
+                raise TaskStoreCorruption(
+                    "timeout window has an incompatible task status"
+                )
+            return TaskTimeoutSnapshot(
+                timeout_id=row["timeout_id"],
+                task_id=row["task_id"],
+                intent_id=row["intent_id"],
+                attempt_id=row["attempt_id"],
+                wall_time_seconds=row["wall_time_seconds"],
+                started_at=row["started_at"],
+                deadline_at=row["deadline_at"],
+                state=state,
+            )
+
+        if authorization_count < 1 or has_cancel_request:
+            raise TaskStoreCorruption(
+                "timeout outcome lacks exclusive delivery authorization"
+            )
+        try:
+            resolved_at, resolved_at_us = _runtime_timestamp(
+                row["resolved_at"]
+            )
+            authorized_at, authorized_at_us = _runtime_timestamp(
+                row["outcome_authorized_at"]
+            )
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "task timeout outcome causal time is invalid"
+            ) from error
+        if (
+            resolved_at != row["resolved_at"]
+            or resolved_at_us != row["outcome_resolved_at_us"]
+            or authorized_at != row["outcome_authorized_at"]
+            or authorized_at_us != row["outcome_authorized_at_us"]
+            or type(row["outcome_fencing_token"]) is not int
+            or row["outcome_fencing_token"] < 1
+            or row["outcome_authorized_fencing_token"]
+            != row["outcome_fencing_token"]
+            or resolved_at_us < authorized_at_us
+            or authorized_at_us < row["deadline_at_us"]
+        ):
+            raise TaskStoreCorruption(
+                "task timeout outcome violates its causal order"
+            )
+        base_timeout = TaskTimeoutSnapshot(
+            timeout_id=row["timeout_id"],
+            task_id=row["task_id"],
+            intent_id=row["intent_id"],
+            attempt_id=row["attempt_id"],
+            wall_time_seconds=row["wall_time_seconds"],
+            started_at=row["started_at"],
+            deadline_at=row["deadline_at"],
+            state="requested",
+        )
+        try:
+            adapter_proof = _decode_document(
+                row["adapter_proof_json"], label="task timeout Adapter proof"
+            )
+            _, adapter_proof_hash = encode_document(adapter_proof)
+            adapter_proof = _validate_timeout_adapter_proof(
+                adapter_proof,
+                timeout=base_timeout,
+                capability_record_hash=row["capability_record_hash"],
+                ready_record_hash=row["ready_record_hash"],
+                result=row["result"],
+                terminal_status=row["terminal_status"],
+            )
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "task timeout Adapter proof is invalid"
+            ) from error
+        if adapter_proof_hash != row["adapter_proof_hash"]:
+            raise TaskStoreCorruption(
+                "task timeout Adapter proof hash does not match its content"
+            )
+        outcome = _decode_hashed_document(
+            {
+                "document_json": row["outcome_json"],
+                "document_hash": row["outcome_hash"],
+            },
+            label="task timeout outcome",
+        )
+        expected_state = {
+            "timeout_confirmed": ("Failed", "WALL_TIME_EXCEEDED", "timed_out"),
+            "terminal_preempted": (row["terminal_status"], None, "superseded"),
+        }.get(row["result"])
+        if (
+            expected_state is None
+            or row["terminal_status"] != expected_state[0]
+            or row["failure_code"] != expected_state[1]
+            or task_status != row["terminal_status"]
+            or outcome
+            != {
+                "schema_version": "1.0.0",
+                "request_id": row["timeout_id"],
+                "task_id": row["task_id"],
+                "result": row["result"],
+                "terminal_status": row["terminal_status"],
+                "failure_code": row["failure_code"],
+                "adapter_proof": adapter_proof,
+                "resolved_at": row["resolved_at"],
+                "extensions": {},
+            }
+        ):
+            raise TaskStoreCorruption(
+                "task timeout outcome differs from its immutable index"
+            )
+        terminal = connection.execute(
+            """
+            SELECT task_id, sequence, event_id, event_type, task_status,
+                   node_id, fingerprint_hash, occurred_at,
+                   document_json, document_hash
+            FROM run_events WHERE task_id = ? AND sequence = ?
+            """,
+            (task_id, row["terminal_event_sequence"]),
+        ).fetchone()
+        if terminal is None or terminal["task_status"] != row["terminal_status"]:
+            raise TaskStoreCorruption(
+                "task timeout outcome lacks its exact terminal event"
+            )
+        terminal_event = _decode_run_event_row(
+            terminal, label="task timeout terminal event"
+        )
+        if (
+            intent.handle is None
+            or terminal_event.get("node_id") != intent.node_id
+            or terminal_event.get("fingerprint")
+            != intent.handle["fingerprint"]
+        ):
+            raise TaskStoreCorruption(
+                "task timeout terminal event lost its dispatch binding"
+            )
+        if row["result"] == "timeout_confirmed":
+            try:
+                _, event_occurred_at_us = _runtime_timestamp(
+                    terminal_event.get("occurred_at")
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "task timeout terminal event time is invalid"
+                ) from error
+            expected_extension = {
+                "timeout_id": row["timeout_id"],
+                "attempt_id": row["attempt_id"],
+                "wall_time_seconds": row["wall_time_seconds"],
+                "started_at": row["started_at"],
+                "deadline_at": row["deadline_at"],
+                "failure_code": "WALL_TIME_EXCEEDED",
+                "proof_hash": adapter_proof["proof_hash"],
+            }
+            error = terminal_event.get("error")
+            valid_terminal = (
+                terminal["event_type"] == "node_failed"
+                and isinstance(error, Mapping)
+                and error.get("code") == "wall_time_exceeded"
+                and error.get("message")
+                == "FWI Worker exceeded its wall-time limit"
+                and error.get("retryable") is False
+                and terminal_event.get("extensions")
+                == {"org.agent_rpc.timeout": expected_extension}
+                and event_occurred_at_us >= row["deadline_at_us"]
+                and event_occurred_at_us >= authorized_at_us
+                and event_occurred_at_us <= resolved_at_us
+            )
+        else:
+            try:
+                _validate_timeout_natural_terminal_event(
+                    terminal_event,
+                    receipt_job_id=intent.handle["job_id"],
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "task timeout outcome terminal event is inconsistent"
+                ) from error
+            valid_terminal = True
+        if not valid_terminal:
+            raise TaskStoreCorruption(
+                "task timeout outcome terminal event is inconsistent"
+            )
+        return TaskTimeoutSnapshot(
+            timeout_id=row["timeout_id"],
+            task_id=row["task_id"],
+            intent_id=row["intent_id"],
+            attempt_id=row["attempt_id"],
+            wall_time_seconds=row["wall_time_seconds"],
+            started_at=row["started_at"],
+            deadline_at=row["deadline_at"],
+            state=expected_state[2],
+            result=row["result"],
+            failure_code=row["failure_code"],
+            terminal_status=row["terminal_status"],
+            resolved_at=row["resolved_at"],
+            adapter_proof=adapter_proof,
+        )
+
     def _load_snapshot(
         self, connection: sqlite3.Connection, task_id: str
     ) -> TaskSnapshot | None:
@@ -4242,6 +6070,9 @@ class SQLiteTaskStore:
         if row is None:
             return None
         cancellation = self._load_task_cancellation(connection, task_id)
+        timeout = self._load_task_timeout(
+            connection, task_id, task_status=row["status"]
+        )
         if cancellation is not None:
             if cancellation.state == "requested" and row["status"] not in {
                 "Queued",
@@ -4571,6 +6402,7 @@ class SQLiteTaskStore:
             purged_at=purged_at,
             purge_local_run_state=purge_local_run_state,
             cancellation=cancellation,
+            timeout=timeout,
         )
 
     def _load_task_purge_record(
@@ -8030,25 +9862,7 @@ class SQLiteTaskStore:
             ).fetchall()
             events: list[dict[str, Any]] = []
             for row in rows:
-                event = _decode_hashed_document(row, label="run event")
-                indexed = {
-                    "task_id": row["task_id"],
-                    "sequence": row["sequence"],
-                    "event_id": row["event_id"],
-                    "event_type": row["event_type"],
-                    "task_status": row["task_status"],
-                    "node_id": row["node_id"],
-                    "occurred_at": row["occurred_at"],
-                }
-                _, fingerprint_hash = encode_document(event["fingerprint"])
-                if (
-                    any(event.get(key) != value for key, value in indexed.items())
-                    or fingerprint_hash != row["fingerprint_hash"]
-                ):
-                    raise TaskStoreCorruption(
-                        "persisted run event identity does not match its index"
-                    )
-                events.append(event)
+                events.append(_decode_run_event_row(row))
             return events
         finally:
             connection.close()

@@ -18,6 +18,7 @@ from scientific_runtime.task_service import TaskCancellationResult, TaskService
 from scientific_runtime.task_store import (
     SQLiteTaskStore,
     TaskCancellationSnapshot,
+    TaskTimeoutSnapshot,
 )
 from scientific_runtime.workbench_service import (
     GuidedWorkbench,
@@ -258,6 +259,9 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             {"project_id": PROJECT_ID, "principal_id": PRINCIPAL_ID},
         )
         self.assertTrue(capabilities["features"]["running_cancel"])
+        self.assertTrue(capabilities["features"]["runtime_timeout"])
+        self.assertNotIn("can_timeout", capabilities["features"])
+        self.assertNotIn("timeout", capabilities["capabilities"])
         self.assertFalse(capabilities["features"]["automatic_reconciliation"])
         self.assertFalse(capabilities["features"]["startup_dispatch_recovery"])
         self.assertFalse(capabilities["features"]["startup_receipt_recovery"])
@@ -1326,6 +1330,102 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             },
         )
         self.assertEqual(caught.exception.code, "INVALID_CANCEL_REASON")
+
+    def test_timeout_projection_is_bounded_and_cancel_closes_after_authorization(
+        self,
+    ) -> None:
+        created = self.workbench.create_task(
+            guided_form(goal="bounded timeout projection"),
+            "timeout-projection-create",
+        )
+        task_id = created["task_id"]
+        snapshot = self.store.get_task(task_id)
+        wall_time_seconds = snapshot.draft["resources"]["wall_time_seconds"]
+        timeout = TaskTimeoutSnapshot(
+            timeout_id="timeout-" + "a" * 32,
+            task_id=task_id,
+            intent_id="intent-" + "b" * 32,
+            attempt_id="attempt-" + "c" * 32,
+            wall_time_seconds=wall_time_seconds,
+            started_at="2026-07-15T03:00:00.000000Z",
+            deadline_at="2026-07-15T03:06:00.000000Z",
+            state="requested",
+        )
+        requested = replace(snapshot, timeout=timeout)
+        original_get_task = self.tasks.get_task
+        original_list_tasks = self.tasks.list_tasks
+        original_can_cancel = self.tasks.can_cancel_task
+
+        def get_requested_task(current_task_id, **scope):
+            self.assertEqual(current_task_id, task_id)
+            self.assertEqual(scope, self.workbench._scope)
+            return requested
+
+        def list_requested_tasks(**scope):
+            self.assertEqual(
+                scope,
+                {
+                    **self.workbench._scope,
+                    "cursor": None,
+                    "limit": 20,
+                    "view": "active",
+                },
+            )
+
+            class Page:
+                snapshots = (requested,)
+                next_cursor = None
+
+            return Page()
+
+        def unexpected_probe(*args, **kwargs):
+            self.fail("authorized timeout must close cancellation without probing")
+
+        self.tasks.get_task = get_requested_task
+        self.tasks.list_tasks = list_requested_tasks
+        self.tasks.can_cancel_task = unexpected_probe
+        try:
+            detail = self.workbench.get_task(task_id, refresh=False)
+            listed = self.workbench.list_tasks()["tasks"][0]
+        finally:
+            self.tasks.get_task = original_get_task
+            self.tasks.list_tasks = original_list_tasks
+            self.tasks.can_cancel_task = original_can_cancel
+
+        expected = {
+            "state": "requested",
+            "wall_time_seconds": wall_time_seconds,
+            "started_at": "2026-07-15T03:00:00.000000Z",
+            "deadline_at": "2026-07-15T03:06:00.000000Z",
+            "resolved_at": None,
+            "failure_code": None,
+            "terminal_status": None,
+        }
+        self.assertFalse(detail["can_cancel"])
+        self.assertEqual(detail["timeout"], expected)
+        self.assertEqual(listed["timeout"], expected)
+        self.assertEqual(listed["wall_time_seconds"], wall_time_seconds)
+        serialized = repr({"detail": detail, "listed": listed})
+        for private in (
+            timeout.timeout_id,
+            timeout.intent_id,
+            timeout.attempt_id,
+            "proof_hash",
+            "record_hash",
+            "worker_pid",
+        ):
+            self.assertNotIn(private, serialized)
+
+        armed = replace(requested, timeout=replace(timeout, state="armed"))
+        self.tasks.get_task = lambda *_args, **_kwargs: armed
+        self.tasks.can_cancel_task = lambda *_args, **_kwargs: True
+        try:
+            armed_detail = self.workbench.get_task(task_id, refresh=False)
+        finally:
+            self.tasks.get_task = original_get_task
+            self.tasks.can_cancel_task = original_can_cancel
+        self.assertTrue(armed_detail["can_cancel"])
+        self.assertEqual(armed_detail["timeout"]["state"], "armed")
 
     def test_get_refresh_events_and_artifact_projection_do_not_leak_runtime_ids(self) -> None:
         created = self.workbench.create_task(guided_form(), "create-read")

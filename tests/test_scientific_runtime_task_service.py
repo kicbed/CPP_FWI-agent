@@ -32,6 +32,8 @@ from scientific_runtime import (
 )
 from scientific_runtime_contracts import compute_plan_hash, schema_errors
 from scientific_runtime.fwi_registry import load_deepwave_manifest
+from scientific_runtime.fwi_adapter import AdapterManagedTimeoutProof
+from scientific_runtime.task_dispatcher import DeepwaveTaskDispatcher
 from scientific_runtime.task_store import APPLICATION_ID, encode_document
 from tests.test_scientific_runtime_contracts import (
     append_second_plan_node,
@@ -195,6 +197,12 @@ class FakeDispatcher:
         self.cancel_result_state = "cancelled"
         self.cancel_terminal_status: str | None = "Cancelled"
         self.cancel_code: str | None = None
+        self.exact_timeout_supported = False
+        self.timeout_calls = 0
+        self.timeout_requests: list[tuple[str, str, int, str, str]] = []
+        self.timeout_result_state = "requested"
+        self.timeout_terminal_status: str | None = None
+        self.timeout_code: str | None = None
         self.collect_calls = 0
         self.read_calls = 0
         self.purge_calls = 0
@@ -360,6 +368,25 @@ class FakeDispatcher:
             and attempt_id.startswith("attempt-")
         )
 
+    def supports_exact_timeout(self, intent, *, attempt_id):
+        if not self.exact_timeout_supported:
+            return None
+        evidence = (self.worker_observation or {}).get("evidence", {})
+        if evidence.get("attempt_id") != attempt_id:
+            return None
+        payload = {
+            "schema_version": "2.0.0",
+            "private_schema_version": "1.1.0",
+            "attempt_id": attempt_id,
+            "binding_hash": evidence["binding_hash"],
+            "capability_record_hash": "sha256:" + "e" * 64,
+            "supported_reasons": [
+                "user_requested",
+                "wall_time_exceeded",
+            ],
+        }
+        return {**payload, "proof_hash": encode_document(payload)[1]}
+
     def cancel(self, intent, *, request_id, attempt_id, reason):
         with self.lock:
             self.cancel_calls += 1
@@ -392,6 +419,74 @@ class FakeDispatcher:
             "local_run_state": "retained",
             "replayed": self.cancel_result_state == "pending",
             "receipt_record_hash": "sha256:" + "d" * 64,
+        }
+        return {**payload, "proof_hash": encode_document(payload)[1]}
+
+    def timeout(
+        self,
+        intent,
+        *,
+        timeout_id,
+        attempt_id,
+        wall_time_seconds,
+        started_at,
+        deadline_at,
+    ):
+        with self.lock:
+            self.timeout_calls += 1
+            self.timeout_requests.append(
+                (
+                    timeout_id,
+                    attempt_id,
+                    wall_time_seconds,
+                    started_at,
+                    deadline_at,
+                )
+            )
+        code = self.timeout_code or {
+            "requested": "TIMEOUT_REQUESTED",
+            "pending": "TIMEOUT_PENDING",
+            "timed_out": "TIMEOUT_COMPLETED",
+            "terminal_won": "TIMEOUT_TERMINAL_WON",
+            "deferred": "TIMEOUT_EXIT_UNPROVEN",
+        }[self.timeout_result_state]
+        requested = self.timeout_result_state in {
+            "requested",
+            "pending",
+            "timed_out",
+        }
+        acknowledged = self.timeout_result_state == "timed_out"
+        evidence = (self.worker_observation or {}).get("evidence", {})
+        ready = evidence.get("ready") or {}
+        terminal_status = self.timeout_terminal_status
+        terminal_failure_code = None
+        if self.timeout_result_state == "timed_out":
+            terminal_status = "Failed"
+            terminal_failure_code = "WALL_TIME_EXCEEDED"
+        payload = {
+            "schema_version": "1.0.0",
+            "task_id": intent.task_id,
+            "request_id": timeout_id,
+            "reason": "wall_time_exceeded",
+            "state": self.timeout_result_state,
+            "code": code,
+            "attempt_id": attempt_id,
+            "wall_time_seconds": wall_time_seconds,
+            "started_at": started_at,
+            "deadline_at": deadline_at,
+            "ready_record_hash": ready.get("record_hash"),
+            "capability_record_hash": "sha256:" + "e" * 64,
+            "request_record_hash": (
+                "sha256:" + "f" * 64 if requested else None
+            ),
+            "acknowledgement_record_hash": (
+                "sha256:" + "0" * 64 if acknowledged else None
+            ),
+            "terminal_status": terminal_status,
+            "terminal_failure_code": terminal_failure_code,
+            "local_run_state": "retained",
+            "replayed": self.timeout_result_state == "pending",
+            "receipt_record_hash": "sha256:" + "1" * 64,
         }
         return {**payload, "proof_hash": encode_document(payload)[1]}
 
@@ -525,6 +620,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "task_cancel_requests",
                 "supervised_cancel_attempts",
                 "task_cancel_outcomes",
+                "worker_attempt_timeout_windows",
+                "supervised_timeout_attempts",
+                "task_timeout_outcomes",
             },
         )
         connection = sqlite3.connect(self.database_path)
@@ -574,7 +672,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 11)
+        self.assertEqual(self.store.migration_version(), 12)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -590,7 +688,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 11)
+        self.assertEqual(reopened.migration_version(), 12)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -677,12 +775,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 11)] * 8)
+        self.assertEqual(results, [("wal", 12)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 12")
+            connection.execute("PRAGMA user_version = 13")
             connection.commit()
         finally:
             connection.close()
@@ -2570,6 +2668,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(cancellation.state, "requested")
         self.assertEqual(cancellation.reason, "user_requested")
         self.assertEqual(dispatcher.cancel_calls, 0)
+
         self.assertFalse(service.can_cancel_task(task_id, **self.scope))
         self.assertEqual(self.raw_count("task_cancel_requests"), 1)
         self.assertEqual(self.raw_count("supervised_cancel_attempts"), 0)
@@ -2602,6 +2701,26 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             **self.scope,
         )
         try:
+            dispatcher.adapter_status = {
+                "status": "Failed",
+                "stage": "failed",
+                "completed": 0,
+                "total": 2,
+                "message": "natural terminal raced cancel admission",
+                "updated_at": "2026-07-15T03:00:05Z",
+                "terminal": True,
+            }
+            active_term_poll = service.refresh_runtime_status(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+            self.assertEqual(
+                active_term_poll.snapshot.cancellation.state, "requested"
+            )
+            self.assertIsNone(active_term_poll.adapter_status)
+            self.assertEqual(dispatcher.status_calls, 0)
+
             completed = service.process_runtime_cancellation(
                 task_id,
                 supervisor_lease=acquisition.lease,
@@ -2647,6 +2766,271 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(completed_admission_replay.snapshot.status, "Cancelled")
         self.assertEqual(self.raw_count("task_cancel_requests"), 1)
         self.assertEqual(self.raw_count("task_cancel_outcomes"), 1)
+
+    def test_runtime_timeout_is_armed_from_durable_observation_and_exactly_proven(
+        self,
+    ) -> None:
+        task_id, approval, dispatcher, _ = self.approved_runtime(
+            key="runtime-timeout-happy"
+        )
+        dispatcher.exact_timeout_supported = True
+        now = [NOW]
+        service = self.submit_service(dispatcher, clock=lambda: now[0])
+        service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-runtime-timeout-happy",
+            **self.scope,
+        )
+        acquisition = service.acquire_runtime_supervisor_lease(
+            owner_id="timeout-owner",
+            lease_seconds=3600,
+            **self.scope,
+        )
+        lease = acquisition.lease
+        try:
+            scheduled = service.schedule_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            self.assertTrue(scheduled.timeout_armed)
+            armed = service.get_task(task_id, **self.scope)
+            self.assertIsNotNone(armed.timeout)
+            assert armed.timeout is not None
+            self.assertEqual(armed.timeout.state, "armed")
+            self.assertEqual(armed.timeout.wall_time_seconds, 1800)
+            self.assertEqual(
+                armed.timeout.started_at, "2026-07-15T03:00:00.000000Z"
+            )
+            self.assertEqual(
+                armed.timeout.deadline_at, "2026-07-15T03:30:00.000000Z"
+            )
+            self.assertTrue(service.can_cancel_task(task_id, **self.scope))
+            self.assertEqual(self.raw_count("worker_attempt_timeout_windows"), 1)
+
+            now[0] = "2026-07-15T03:29:59Z"
+            early = service.process_runtime_timeout(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            self.assertEqual(early.state, "armed")
+            self.assertEqual(early.deferred_code, "TIMEOUT_NOT_DUE")
+            self.assertEqual(dispatcher.timeout_calls, 0)
+
+            now[0] = "2026-07-15T03:30:00Z"
+            requested = service.process_runtime_timeout(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            self.assertEqual(requested.state, "requested")
+            self.assertEqual(requested.snapshot.status, "Queued")
+            self.assertFalse(service.can_cancel_task(task_id, **self.scope))
+            self.assertEqual(dispatcher.timeout_calls, 1)
+            self.assertEqual(self.raw_count("supervised_timeout_attempts"), 1)
+            self.assertEqual(self.raw_count("task_timeout_outcomes"), 0)
+
+            status_calls = dispatcher.status_calls
+            browser_poll = service.refresh_runtime_status(task_id, **self.scope)
+            self.assertEqual(browser_poll.snapshot.status, "Queued")
+            self.assertEqual(browser_poll.snapshot.timeout.state, "requested")
+            self.assertEqual(dispatcher.status_calls, status_calls)
+
+            dispatcher.adapter_status = {
+                "status": "Failed",
+                "stage": "failed",
+                "completed": 0,
+                "total": 2,
+                "message": "natural terminal raced timeout authorization",
+                "updated_at": "2026-07-15T03:30:01Z",
+                "terminal": True,
+            }
+            active_term_poll = service.refresh_runtime_status(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            self.assertEqual(active_term_poll.snapshot.status, "Queued")
+            self.assertEqual(
+                active_term_poll.snapshot.timeout.state, "requested"
+            )
+            self.assertIsNone(active_term_poll.adapter_status)
+            self.assertEqual(dispatcher.status_calls, status_calls)
+
+            dispatcher.timeout_result_state = "timed_out"
+            completed = service.process_runtime_timeout(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(completed.state, "timed_out")
+        self.assertEqual(completed.snapshot.status, "Failed")
+        self.assertEqual(
+            completed.snapshot.timeout.failure_code, "WALL_TIME_EXCEEDED"
+        )
+        self.assertEqual(completed.snapshot.timeout.terminal_status, "Failed")
+        self.assertEqual(dispatcher.timeout_calls, 2)
+        self.assertEqual(self.raw_count("task_timeout_outcomes"), 1)
+        events = service.list_run_events(task_id, **self.scope)
+        self.assertEqual(
+            [event["event_type"] for event in events],
+            ["task_queued", "node_failed"],
+        )
+        self.assertEqual(events[-1]["error"]["code"], "wall_time_exceeded")
+        timeout_extension = events[-1]["extensions"]["org.agent_rpc.timeout"]
+        self.assertEqual(timeout_extension["failure_code"], "WALL_TIME_EXCEEDED")
+        self.assertEqual(
+            timeout_extension["timeout_id"], completed.snapshot.timeout.timeout_id
+        )
+
+    def test_natural_terminal_wins_runtime_timeout_race(self) -> None:
+        task_id, approval, dispatcher, _ = self.approved_runtime(
+            key="runtime-timeout-terminal-race"
+        )
+        dispatcher.exact_timeout_supported = True
+        now = [NOW]
+        service = self.submit_service(dispatcher, clock=lambda: now[0])
+        service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-runtime-timeout-terminal-race",
+            **self.scope,
+        )
+        acquisition = service.acquire_runtime_supervisor_lease(
+            owner_id="timeout-terminal-owner",
+            lease_seconds=3600,
+            **self.scope,
+        )
+        lease = acquisition.lease
+        try:
+            scheduled = service.schedule_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            self.assertTrue(scheduled.timeout_armed)
+            now[0] = "2026-07-15T03:30:00Z"
+            dispatcher.timeout_result_state = "terminal_won"
+            dispatcher.timeout_terminal_status = "Succeeded"
+            dispatcher.adapter_status = {
+                "status": "Succeeded",
+                "stage": "complete",
+                "completed": 2,
+                "total": 2,
+                "message": "completed before timeout won",
+                "updated_at": now[0],
+                "terminal": True,
+            }
+            completed = service.process_runtime_timeout(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(completed.state, "superseded")
+        self.assertEqual(completed.snapshot.status, "Succeeded")
+        self.assertEqual(completed.snapshot.timeout.terminal_status, "Succeeded")
+        self.assertIsNone(completed.snapshot.timeout.failure_code)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            ["task_queued", "node_started", "node_succeeded"],
+        )
+
+    def test_dispatcher_accepts_both_safe_capability_unavailable_timeout_chains(
+        self,
+    ) -> None:
+        task_id, _, _, service = self.submitted_runtime(
+            key="runtime-timeout-dispatcher-matrix"
+        )
+        intent = service.get_dispatch_intent(task_id, **self.scope)
+        self.assertIsNotNone(intent)
+        attempt_id = "attempt-" + hashlib.sha256(task_id.encode()).hexdigest()[:32]
+        timeout_id = "timeout-dispatcher-matrix-1"
+        started_at = "2026-07-15T03:00:00.000000Z"
+        deadline_at = "2026-07-15T03:30:00.000000Z"
+        ready_hash = "sha256:" + "2" * 64
+        capability_hash = "sha256:" + "3" * 64
+        request_hash = "sha256:" + "4" * 64
+
+        def proof(*, requested: bool, ready: str | None):
+            payload = {
+                "schema_version": "1.0.0",
+                "task_id": task_id,
+                "request_id": timeout_id,
+                "reason": "wall_time_exceeded",
+                "state": "deferred",
+                "code": "TIMEOUT_WORKER_CAPABILITY_UNAVAILABLE",
+                "attempt_id": attempt_id,
+                "wall_time_seconds": 1800,
+                "started_at": started_at,
+                "deadline_at": deadline_at,
+                "ready_record_hash": ready,
+                "capability_record_hash": capability_hash if requested else None,
+                "request_record_hash": request_hash if requested else None,
+                "acknowledgement_record_hash": None,
+                "terminal_status": None,
+                "terminal_failure_code": None,
+                "local_run_state": "retained",
+                "replayed": requested,
+                "receipt_record_hash": "sha256:" + "5" * 64,
+            }
+            return AdapterManagedTimeoutProof(
+                task_id=task_id,
+                timeout_id=timeout_id,
+                reason="wall_time_exceeded",
+                state="deferred",
+                code="TIMEOUT_WORKER_CAPABILITY_UNAVAILABLE",
+                attempt_id=attempt_id,
+                wall_time_seconds=1800,
+                started_at=started_at,
+                deadline_at=deadline_at,
+                ready_record_hash=ready,
+                capability_record_hash=payload["capability_record_hash"],
+                request_record_hash=payload["request_record_hash"],
+                acknowledgement_record_hash=None,
+                terminal_status=None,
+                terminal_failure_code=None,
+                local_run_state="retained",
+                replayed=requested,
+                receipt_record_hash=payload["receipt_record_hash"],
+                proof_hash=encode_document(payload)[1],
+            )
+
+        class Adapter:
+            result = proof(requested=False, ready=None)
+
+            def timeout(self, *_args, **_kwargs):
+                return self.result
+
+        adapter = Adapter()
+        dispatcher = DeepwaveTaskDispatcher(adapter)
+        arguments = {
+            "timeout_id": timeout_id,
+            "attempt_id": attempt_id,
+            "wall_time_seconds": 1800,
+            "started_at": started_at,
+            "deadline_at": deadline_at,
+        }
+        self.assertEqual(
+            dispatcher.timeout(intent, **arguments)["state"], "deferred"
+        )
+        adapter.result = proof(requested=True, ready=ready_hash)
+        self.assertTrue(dispatcher.timeout(intent, **arguments)["replayed"])
+        adapter.result = proof(requested=True, ready=None)
+        with self.assertRaisesRegex(
+            DispatchError, "ADAPTER_TIMEOUT_RESPONSE_INVALID"
+        ):
+            dispatcher.timeout(intent, **arguments)
 
     def test_runtime_cancel_requires_one_exact_managed_running_attempt(self) -> None:
         task_id, approval, dispatcher, service = self.approved_runtime(

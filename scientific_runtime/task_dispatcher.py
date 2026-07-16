@@ -14,6 +14,7 @@ from .fwi_adapter import (
     AdapterError,
     AdapterHandle,
     AdapterManagedCancelProof,
+    AdapterManagedTimeoutProof,
     DeepwaveAdapter,
     is_supported_receipt_binding,
 )
@@ -95,6 +96,11 @@ class TaskDispatcher(Protocol):
     ) -> bool:
         ...
 
+    def supports_exact_timeout(
+        self, intent: DispatchIntentSnapshot, *, attempt_id: str
+    ) -> dict[str, Any] | None:
+        ...
+
     def cancel(
         self,
         intent: DispatchIntentSnapshot,
@@ -102,6 +108,18 @@ class TaskDispatcher(Protocol):
         request_id: str,
         attempt_id: str,
         reason: str,
+    ) -> dict[str, Any]:
+        ...
+
+    def timeout(
+        self,
+        intent: DispatchIntentSnapshot,
+        *,
+        timeout_id: str,
+        attempt_id: str,
+        wall_time_seconds: int,
+        started_at: str,
+        deadline_at: str,
     ) -> dict[str, Any]:
         ...
 
@@ -470,6 +488,61 @@ class DeepwaveTaskDispatcher:
             raise DispatchError("ADAPTER_CANCEL_CAPABILITY_INVALID")
         return result
 
+    def supports_exact_timeout(
+        self, intent: DispatchIntentSnapshot, *, attempt_id: str
+    ) -> dict[str, Any] | None:
+        """Read one path-free exact-Worker timeout capability proof."""
+
+        handle = self._handle_from_intent(intent)
+        try:
+            result = self._adapter.supports_exact_timeout(
+                handle, attempt_id=attempt_id
+            )
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("ADAPTER_TIMEOUT_CAPABILITY_UNAVAILABLE") from error
+        if result is None:
+            return None
+        if not isinstance(result, Mapping):
+            raise DispatchError("ADAPTER_TIMEOUT_CAPABILITY_INVALID")
+        proof = copy.deepcopy(dict(result))
+        expected = {
+            "schema_version",
+            "private_schema_version",
+            "attempt_id",
+            "binding_hash",
+            "capability_record_hash",
+            "supported_reasons",
+            "proof_hash",
+        }
+        supplied_hash = proof.get("proof_hash")
+        payload = {
+            key: copy.deepcopy(value)
+            for key, value in proof.items()
+            if key != "proof_hash"
+        }
+        _, actual_hash = encode_document(payload)
+        if (
+            set(proof) != expected
+            or proof.get("schema_version") != "2.0.0"
+            or proof.get("private_schema_version") != "1.1.0"
+            or proof.get("attempt_id") != attempt_id
+            or not isinstance(attempt_id, str)
+            or _MANAGED_ATTEMPT_ID.fullmatch(attempt_id) is None
+            or not isinstance(proof.get("binding_hash"), str)
+            or _SHA256.fullmatch(proof["binding_hash"]) is None
+            or not isinstance(proof.get("capability_record_hash"), str)
+            or _SHA256.fullmatch(proof["capability_record_hash"]) is None
+            or proof.get("supported_reasons")
+            != ["user_requested", "wall_time_exceeded"]
+            or not isinstance(supplied_hash, str)
+            or _SHA256.fullmatch(supplied_hash) is None
+            or supplied_hash != actual_hash
+        ):
+            raise DispatchError("ADAPTER_TIMEOUT_CAPABILITY_INVALID")
+        return proof
+
     def cancel(
         self,
         intent: DispatchIntentSnapshot,
@@ -622,6 +695,207 @@ class DeepwaveTaskDispatcher:
             or supplied_hash != actual_hash
         ):
             raise DispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+        return proof
+
+    def timeout(
+        self,
+        intent: DispatchIntentSnapshot,
+        *,
+        timeout_id: str,
+        attempt_id: str,
+        wall_time_seconds: int,
+        started_at: str,
+        deadline_at: str,
+    ) -> dict[str, Any]:
+        """Request or finalize timeout of one dispatched exact receipt."""
+
+        handle = self._handle_from_intent(intent)
+        try:
+            result = self._adapter.timeout(
+                handle,
+                timeout_id=timeout_id,
+                attempt_id=attempt_id,
+                wall_time_seconds=wall_time_seconds,
+                started_at=started_at,
+                deadline_at=deadline_at,
+            )
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("ADAPTER_TIMEOUT_UNAVAILABLE") from error
+        if not isinstance(result, AdapterManagedTimeoutProof):
+            raise DispatchError("ADAPTER_TIMEOUT_RESPONSE_INVALID")
+        converted = result.as_dict()
+        if not isinstance(converted, Mapping):
+            raise DispatchError("ADAPTER_TIMEOUT_RESPONSE_INVALID")
+        proof = copy.deepcopy(dict(converted))
+        expected = {
+            "schema_version",
+            "task_id",
+            "request_id",
+            "reason",
+            "state",
+            "code",
+            "attempt_id",
+            "wall_time_seconds",
+            "started_at",
+            "deadline_at",
+            "ready_record_hash",
+            "capability_record_hash",
+            "request_record_hash",
+            "acknowledgement_record_hash",
+            "terminal_status",
+            "terminal_failure_code",
+            "local_run_state",
+            "replayed",
+            "receipt_record_hash",
+            "proof_hash",
+        }
+        supplied_hash = proof.get("proof_hash")
+        payload = {
+            key: copy.deepcopy(value)
+            for key, value in proof.items()
+            if key != "proof_hash"
+        }
+        _, actual_hash = encode_document(payload)
+        state = proof.get("state")
+        code = proof.get("code")
+        capability_hash = proof.get("capability_record_hash")
+        request_hash = proof.get("request_record_hash")
+        acknowledgement_hash = proof.get("acknowledgement_record_hash")
+        nullable_hashes = (
+            capability_hash,
+            request_hash,
+            acknowledgement_hash,
+        )
+        hash_chain_valid = (
+            all(
+                value is None
+                or (isinstance(value, str) and _SHA256.fullmatch(value))
+                for value in nullable_hashes
+            )
+            and not (capability_hash is None and request_hash is not None)
+            and not (request_hash is None and acknowledgement_hash is not None)
+        )
+        terminal_status = proof.get("terminal_status")
+        terminal_failure = proof.get("terminal_failure_code")
+        ready_hash = proof.get("ready_record_hash")
+        replayed = proof.get("replayed")
+        ready_hash_valid = (
+            isinstance(ready_hash, str)
+            and _SHA256.fullmatch(ready_hash) is not None
+        )
+        exact_request_chain = (
+            ready_hash_valid
+            and capability_hash is not None
+            and request_hash is not None
+        )
+        empty_stop_chain = all(value is None for value in nullable_hashes)
+        state_valid = False
+        if state == "requested":
+            state_valid = (
+                code == "TIMEOUT_REQUESTED"
+                and exact_request_chain
+                and terminal_status is None
+                and terminal_failure is None
+                and replayed is False
+            )
+        elif state == "pending":
+            state_valid = (
+                code == "TIMEOUT_PENDING"
+                and exact_request_chain
+                and terminal_status is None
+                and terminal_failure is None
+                and replayed is True
+            )
+        elif state == "timed_out":
+            state_valid = (
+                code == "TIMEOUT_COMPLETED"
+                and all(value is not None for value in nullable_hashes)
+                and ready_hash_valid
+                and terminal_status == "Failed"
+                and terminal_failure == "WALL_TIME_EXCEEDED"
+            )
+        elif state == "terminal_won":
+            state_valid = (
+                code == "TIMEOUT_TERMINAL_WON"
+                and ready_hash_valid
+                and capability_hash is not None
+                and terminal_status in {"Succeeded", "Failed"}
+                and terminal_failure is None
+            )
+        elif state == "deferred":
+            deferred_codes = {
+                "TIMEOUT_MANAGED_ATTEMPT_UNAVAILABLE",
+                "TIMEOUT_ATTEMPT_MISMATCH",
+                "TIMEOUT_WORKER_CAPABILITY_UNAVAILABLE",
+                "TIMEOUT_WORKER_NOT_RUNNING",
+                "TIMEOUT_NOT_DUE",
+                "TIMEOUT_EXIT_UNPROVEN",
+            }
+            pre_request_codes = {
+                "TIMEOUT_MANAGED_ATTEMPT_UNAVAILABLE",
+                "TIMEOUT_ATTEMPT_MISMATCH",
+            }
+            state_valid = (
+                code in deferred_codes
+                and terminal_status is None
+                and terminal_failure is None
+                and (
+                    code not in pre_request_codes
+                    or (empty_stop_chain and replayed is False)
+                )
+                and (
+                    code != "TIMEOUT_WORKER_CAPABILITY_UNAVAILABLE"
+                    or (empty_stop_chain and replayed is False)
+                    or (exact_request_chain and replayed is True)
+                )
+                and (
+                    replayed is not True
+                    or (
+                        capability_hash is not None
+                        and request_hash is not None
+                    )
+                )
+                and (
+                    code != "TIMEOUT_EXIT_UNPROVEN"
+                    or exact_request_chain
+                )
+            )
+        if (
+            set(proof) != expected
+            or proof.get("schema_version") != "1.0.0"
+            or proof.get("task_id") != intent.task_id
+            or proof.get("request_id") != timeout_id
+            or proof.get("reason") != "wall_time_exceeded"
+            or proof.get("attempt_id") != attempt_id
+            or not isinstance(attempt_id, str)
+            or _MANAGED_ATTEMPT_ID.fullmatch(attempt_id) is None
+            or proof.get("wall_time_seconds") != wall_time_seconds
+            or type(wall_time_seconds) is not int
+            or wall_time_seconds < 1
+            or proof.get("started_at") != started_at
+            or proof.get("deadline_at") != deadline_at
+            or not isinstance(started_at, str)
+            or not isinstance(deadline_at, str)
+            or (
+                ready_hash is not None
+                and (
+                    not isinstance(ready_hash, str)
+                    or _SHA256.fullmatch(ready_hash) is None
+                )
+            )
+            or not hash_chain_valid
+            or not state_valid
+            or proof.get("local_run_state") != "retained"
+            or type(replayed) is not bool
+            or not isinstance(proof.get("receipt_record_hash"), str)
+            or _SHA256.fullmatch(proof["receipt_record_hash"]) is None
+            or not isinstance(supplied_hash, str)
+            or _SHA256.fullmatch(supplied_hash) is None
+            or supplied_hash != actual_hash
+        ):
+            raise DispatchError("ADAPTER_TIMEOUT_RESPONSE_INVALID")
         return proof
 
     def collect(self, intent: DispatchIntentSnapshot) -> list[dict[str, Any]]:

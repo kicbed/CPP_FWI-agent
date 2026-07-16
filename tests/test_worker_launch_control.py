@@ -21,6 +21,7 @@ import worker_launch_control as worker_control
 from worker_launch_control import (
     CANCELLED_WORKER_EXIT_CODE,
     CONTROL_DIRECTORY,
+    WALL_TIME_EXCEEDED_WORKER_EXIT_CODE,
     WORKER_HEARTBEAT_NAME,
     WORKER_READY_NAME,
     LaunchAttemptBinding,
@@ -28,10 +29,13 @@ from worker_launch_control import (
     WorkerCancellationRequested,
     WorkerControlError,
     WorkerHeartbeat,
+    WorkerWallTimeExceeded,
     execution_fence_is_held,
     read_worker_cancel_evidence,
+    read_worker_stop_evidence,
     read_worker_attempt_evidence,
     request_worker_cancel,
+    request_worker_stop,
     stage_launch_attempt,
     worker_attempt_started,
 )
@@ -93,6 +97,31 @@ def _hard_exit_on_cancel(
     ready.put(os.getpid())
     # No numerical checkpoint cooperates.  The heartbeat's bounded grace path
     # must terminate this exact process while the inherited fences are held.
+    time.sleep(10.0)
+
+
+def _hard_exit_on_timeout(
+    run_root: str,
+    run_dir: str,
+    attempt_id: str,
+    attempt_fd: int,
+    capacity_fd: int,
+    ready: multiprocessing.Queue,
+) -> None:
+    heartbeat = WorkerHeartbeat(
+        run_root=run_root,
+        run_dir=run_dir,
+        attempt_id=attempt_id,
+        attempt_fd=attempt_fd,
+        capacity_fd=capacity_fd,
+        interval_seconds=0.02,
+        cancel_grace_seconds=0.1,
+        wall_time_seconds=1,
+    )
+    heartbeat.start()
+    assert heartbeat._started_monotonic is not None
+    heartbeat._started_monotonic -= 1.0
+    ready.put(os.getpid())
     time.sleep(10.0)
 
 
@@ -302,6 +331,17 @@ class WorkerLaunchControlTest(unittest.TestCase):
                 reason="user_requested",
                 requested_at=NOW,
             )
+        with self.assertRaisesRegex(WorkerControlError, "WORKER_STOP_CONFLICT"):
+            request_worker_stop(
+                self.root,
+                binding,
+                request_id="timeout-after-cancel-1",
+                reason="wall_time_exceeded",
+                requested_at="2026-07-16T08:30:00Z",
+                wall_time_seconds=1800,
+                started_at=NOW,
+                deadline_at="2026-07-16T08:30:00Z",
+            )
         self.assertFalse(
             any("cancel" in path.name for path in run_dir.iterdir())
         )
@@ -347,6 +387,231 @@ class WorkerLaunchControlTest(unittest.TestCase):
         self.assertIsNotNone(attempt)
         assert attempt is not None
         self.assertEqual(attempt.heartbeat_state, "stopped")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_timeout_window_keeps_microseconds_and_waits_for_monotonic_budget(
+        self,
+    ) -> None:
+        binding, run_dir = self.binding(14)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=1.0,
+            wall_time_seconds=1,
+            hard_exit=lambda _code: None,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        attempt = read_worker_attempt_evidence(self.root, run_dir, binding)
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        assert attempt.ready_record_hash is not None
+        try:
+            evidence, replayed = request_worker_stop(
+                self.root,
+                binding,
+                request_id="timeout-microseconds-1",
+                reason="wall_time_exceeded",
+                requested_at="2026-07-16T08:00:01.123456Z",
+                wall_time_seconds=1,
+                started_at="2026-07-16T08:00:00.123456Z",
+                deadline_at="2026-07-16T08:00:01.123456Z",
+                ready_record_hash=attempt.ready_record_hash,
+            )
+            self.assertFalse(replayed)
+            self.assertTrue(evidence.requested)
+            time.sleep(0.08)
+            self.assertFalse(
+                read_worker_stop_evidence(self.root, binding).acknowledged
+            )
+
+            assert heartbeat._started_monotonic is not None
+            heartbeat._started_monotonic -= 1.0
+            for _ in range(200):
+                evidence = read_worker_stop_evidence(self.root, binding)
+                if evidence.acknowledged:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(evidence.acknowledged)
+            self.assertEqual(
+                evidence.started_at, "2026-07-16T08:00:00.123456Z"
+            )
+            self.assertEqual(
+                evidence.deadline_at, "2026-07-16T08:00:01.123456Z"
+            )
+            self.assertEqual(
+                evidence.ready_record_hash, attempt.ready_record_hash
+            )
+            with self.assertRaises(WorkerWallTimeExceeded):
+                heartbeat.raise_if_cancel_requested()
+        finally:
+            heartbeat.stop("stopped")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_uncooperative_timeout_self_exits_with_distinct_code(self) -> None:
+        binding, run_dir = self.binding(15)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        context = multiprocessing.get_context("fork")
+        ready = context.Queue()
+        process = context.Process(
+            target=_hard_exit_on_timeout,
+            args=(
+                str(self.root),
+                str(run_dir),
+                binding.attempt_id,
+                lease.attempt_fd,
+                lease.capacity_fd,
+                ready,
+            ),
+        )
+        process.start()
+        try:
+            lease.mark_spawned(process.pid)
+            lease.close_parent()
+            self.assertEqual(ready.get(timeout=5.0), process.pid)
+            attempt = read_worker_attempt_evidence(
+                self.root, run_dir, binding
+            )
+            self.assertIsNotNone(attempt)
+            assert attempt is not None
+            assert attempt.ready_record_hash is not None
+            request_worker_stop(
+                self.root,
+                binding,
+                request_id="timeout-hard-exit-1",
+                reason="wall_time_exceeded",
+                requested_at="2026-07-16T08:00:01.123456Z",
+                wall_time_seconds=1,
+                started_at="2026-07-16T08:00:00.123456Z",
+                deadline_at="2026-07-16T08:00:01.123456Z",
+                ready_record_hash=attempt.ready_record_hash,
+            )
+            process.join(5.0)
+            self.assertFalse(process.is_alive())
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join(5.0)
+        self.assertEqual(
+            process.exitcode, WALL_TIME_EXCEEDED_WORKER_EXIT_CODE
+        )
+        evidence = read_worker_stop_evidence(self.root, binding)
+        self.assertTrue(evidence.acknowledged)
+        attempt = read_worker_attempt_evidence(self.root, run_dir, binding)
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertEqual(attempt.heartbeat_state, "stopped")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_timeout_ready_hash_mismatch_is_never_acknowledged(self) -> None:
+        binding, run_dir = self.binding(16)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=1.0,
+            wall_time_seconds=1,
+            hard_exit=lambda _code: None,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        assert heartbeat._started_monotonic is not None
+        heartbeat._started_monotonic -= 1.0
+        try:
+            evidence, _ = request_worker_stop(
+                self.root,
+                binding,
+                request_id="timeout-ready-mismatch-1",
+                reason="wall_time_exceeded",
+                requested_at="2026-07-16T08:00:01Z",
+                wall_time_seconds=1,
+                started_at=NOW,
+                deadline_at="2026-07-16T08:00:01Z",
+                ready_record_hash="sha256:" + "f" * 64,
+            )
+            self.assertTrue(evidence.requested)
+            with self.assertRaisesRegex(
+                WorkerControlError, "timeout ready receipt changed"
+            ):
+                heartbeat.raise_if_cancel_requested()
+            self.assertFalse(
+                read_worker_stop_evidence(self.root, binding).acknowledged
+            )
+        finally:
+            try:
+                heartbeat.stop("failed")
+            except WorkerControlError:
+                pass
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_tampered_timeout_ready_hash_fails_integrity_before_ack(self) -> None:
+        binding, run_dir = self.binding(17)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=1.0,
+            wall_time_seconds=1,
+            hard_exit=lambda _code: None,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        attempt = read_worker_attempt_evidence(self.root, run_dir, binding)
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        assert attempt.ready_record_hash is not None
+        try:
+            request_worker_stop(
+                self.root,
+                binding,
+                request_id="timeout-ready-tamper-1",
+                reason="wall_time_exceeded",
+                requested_at="2026-07-16T08:00:01Z",
+                wall_time_seconds=1,
+                started_at=NOW,
+                deadline_at="2026-07-16T08:00:01Z",
+                ready_record_hash=attempt.ready_record_hash,
+            )
+            request_path = (
+                self.root
+                / CONTROL_DIRECTORY
+                / "worker-stop"
+                / f"{binding.attempt_id}.request.json"
+            )
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            request["ready_record_hash"] = "sha256:" + "e" * 64
+            request_path.write_text(
+                json.dumps(request), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                WorkerControlError, "integrity check failed"
+            ):
+                heartbeat.raise_if_cancel_requested()
+            with self.assertRaisesRegex(
+                WorkerControlError, "integrity check failed"
+            ):
+                read_worker_stop_evidence(self.root, binding)
+        finally:
+            try:
+                heartbeat.stop("failed")
+            except WorkerControlError:
+                pass
         self.assertFalse(execution_fence_is_held(self.root, binding))
 
     def test_hard_exit_is_called_even_if_stopped_heartbeat_write_fails(self) -> None:
@@ -397,6 +662,261 @@ class WorkerLaunchControlTest(unittest.TestCase):
                 WorkerControlError, "WORKER_HEARTBEAT_FAILED"
             ):
                 heartbeat.stop("stopped")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_timeout_hard_exit_76_survives_stopped_write_failure(self) -> None:
+        binding, run_dir = self.binding(18)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        hard_exits: list[int] = []
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=0.1,
+            wall_time_seconds=1,
+            hard_exit=hard_exits.append,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        attempt = read_worker_attempt_evidence(self.root, run_dir, binding)
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        assert attempt.ready_record_hash is not None
+        assert heartbeat._started_monotonic is not None
+        heartbeat._started_monotonic -= 1.0
+        original_write = heartbeat._write_heartbeat
+
+        def fail_stopped(state: str) -> None:
+            if state == "stopped":
+                raise WorkerControlError(
+                    "WORKER_HEARTBEAT_FAILED: synthetic stopped write failure"
+                )
+            original_write(state)
+
+        with patch.object(
+            heartbeat, "_write_heartbeat", side_effect=fail_stopped
+        ):
+            request_worker_stop(
+                self.root,
+                binding,
+                request_id="timeout-hard-write-failure-1",
+                reason="wall_time_exceeded",
+                requested_at="2026-07-16T08:00:01Z",
+                wall_time_seconds=1,
+                started_at=NOW,
+                deadline_at="2026-07-16T08:00:01Z",
+                ready_record_hash=attempt.ready_record_hash,
+            )
+            for _ in range(200):
+                if hard_exits:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(
+                hard_exits, [WALL_TIME_EXCEEDED_WORKER_EXIT_CODE]
+            )
+            with self.assertRaisesRegex(
+                WorkerControlError, "WORKER_HEARTBEAT_FAILED"
+            ):
+                heartbeat.stop("stopped")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_acknowledged_stop_running_write_failure_keeps_force_deadline(
+        self,
+    ) -> None:
+        cases = (
+            (19, "user_requested", CANCELLED_WORKER_EXIT_CODE),
+            (20, "wall_time_exceeded", WALL_TIME_EXCEEDED_WORKER_EXIT_CODE),
+        )
+        for index, reason, expected_exit_code in cases:
+            with self.subTest(reason=reason):
+                binding, run_dir = self.binding(index)
+                lease = ParentLaunchLease.acquire(
+                    self.root, run_dir, max_active=1
+                )
+                lease.mark_spawned(os.getpid())
+                hard_exits: list[int] = []
+                heartbeat = WorkerHeartbeat(
+                    run_root=self.root,
+                    run_dir=run_dir,
+                    attempt_id=binding.attempt_id,
+                    attempt_fd=os.dup(lease.attempt_fd),
+                    capacity_fd=os.dup(lease.capacity_fd),
+                    interval_seconds=0.02,
+                    cancel_grace_seconds=0.1,
+                    wall_time_seconds=1,
+                    hard_exit=hard_exits.append,
+                )
+                lease.close_parent()
+                heartbeat.start()
+                attempt = read_worker_attempt_evidence(
+                    self.root, run_dir, binding
+                )
+                self.assertIsNotNone(attempt)
+                assert attempt is not None
+                assert attempt.ready_record_hash is not None
+                if reason == "wall_time_exceeded":
+                    assert heartbeat._started_monotonic is not None
+                    heartbeat._started_monotonic -= 1.0
+                running_write_failed = threading.Event()
+                original_write = heartbeat._write_heartbeat
+
+                def fail_acknowledged_running(state: str) -> None:
+                    if (
+                        state == "running"
+                        and heartbeat.stop_evidence is not None
+                    ):
+                        running_write_failed.set()
+                        raise WorkerControlError(
+                            "WORKER_HEARTBEAT_FAILED: synthetic grace write failure"
+                        )
+                    original_write(state)
+
+                with patch.object(
+                    heartbeat,
+                    "_write_heartbeat",
+                    side_effect=fail_acknowledged_running,
+                ):
+                    if reason == "user_requested":
+                        request_worker_cancel(
+                            self.root,
+                            binding,
+                            cancel_id="cancel-grace-running-write-1",
+                            reason=reason,
+                            requested_at=NOW,
+                        )
+                    else:
+                        request_worker_stop(
+                            self.root,
+                            binding,
+                            request_id="timeout-grace-running-write-1",
+                            reason=reason,
+                            requested_at="2026-07-16T08:00:01Z",
+                            wall_time_seconds=1,
+                            started_at=NOW,
+                            deadline_at="2026-07-16T08:00:01Z",
+                            ready_record_hash=attempt.ready_record_hash,
+                        )
+                    self.assertTrue(running_write_failed.wait(2.0))
+                    for _ in range(200):
+                        if hard_exits:
+                            break
+                        time.sleep(0.01)
+                    self.assertEqual(hard_exits, [expected_exit_code])
+                    forced_attempt = read_worker_attempt_evidence(
+                        self.root, run_dir, binding
+                    )
+                    self.assertIsNotNone(forced_attempt)
+                    assert forced_attempt is not None
+                    self.assertEqual(
+                        forced_attempt.heartbeat_state, "stopped"
+                    )
+                    with self.assertRaisesRegex(
+                        WorkerControlError, "WORKER_HEARTBEAT_FAILED"
+                    ):
+                        heartbeat.stop("stopped")
+                self.assertFalse(
+                    execution_fence_is_held(self.root, binding)
+                )
+
+    def test_cooperative_stop_wins_after_grace_running_write_failure(self) -> None:
+        binding, run_dir = self.binding(21)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        hard_exits: list[int] = []
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=1.0,
+            hard_exit=hard_exits.append,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        running_write_failed = threading.Event()
+        original_write = heartbeat._write_heartbeat
+
+        def fail_acknowledged_running(state: str) -> None:
+            if state == "running" and heartbeat.stop_evidence is not None:
+                running_write_failed.set()
+                raise WorkerControlError(
+                    "WORKER_HEARTBEAT_FAILED: synthetic grace write failure"
+                )
+            original_write(state)
+
+        with patch.object(
+            heartbeat,
+            "_write_heartbeat",
+            side_effect=fail_acknowledged_running,
+        ):
+            request_worker_cancel(
+                self.root,
+                binding,
+                cancel_id="cancel-cooperative-after-write-failure-1",
+                reason="user_requested",
+                requested_at=NOW,
+            )
+            self.assertTrue(running_write_failed.wait(2.0))
+            with self.assertRaises(WorkerCancellationRequested):
+                heartbeat.raise_if_cancel_requested()
+            heartbeat.stop("stopped")
+        self.assertEqual(hard_exits, [])
+        attempt = read_worker_attempt_evidence(self.root, run_dir, binding)
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertEqual(attempt.heartbeat_state, "stopped")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_post_ack_clock_failure_cannot_escape_force_deadline(self) -> None:
+        binding, run_dir = self.binding(22)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        hard_exits: list[int] = []
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=0.1,
+            hard_exit=hard_exits.append,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        original_monotonic = heartbeat._monotonic
+        monotonic_calls = 0
+
+        def fail_after_ack() -> float:
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            if monotonic_calls > 1:
+                raise RuntimeError("synthetic post-ack clock failure")
+            return original_monotonic()
+
+        heartbeat._monotonic = fail_after_ack
+        request_worker_cancel(
+            self.root,
+            binding,
+            cancel_id="cancel-post-ack-clock-failure-1",
+            reason="user_requested",
+            requested_at=NOW,
+        )
+        for _ in range(200):
+            if hard_exits:
+                break
+            time.sleep(0.01)
+        self.assertEqual(hard_exits, [CANCELLED_WORKER_EXIT_CODE])
+        with self.assertRaisesRegex(
+            WorkerControlError, "WORKER_HEARTBEAT_FAILED"
+        ):
+            heartbeat.stop("stopped")
         self.assertFalse(execution_fence_is_held(self.root, binding))
 
     def test_append_only_request_name_never_exposes_partial_json(self) -> None:

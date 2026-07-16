@@ -37,7 +37,10 @@ from .job_state import JobState
 from .metrics import calculate_metrics, environment_info
 from .model_io import load_model, make_initial_model
 from .plots import generate_all_plots
-from worker_launch_control import WorkerCancellationRequested
+from worker_launch_control import (
+    WorkerCancellationRequested,
+    WorkerWallTimeExceeded,
+)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -405,6 +408,17 @@ def run_worker(
             int(previous.get("iteration", 0)),
             config.iterations,
             "FWI Worker cancellation acknowledged",
+        )
+        raise
+    except WorkerWallTimeExceeded:
+        previous = state.read() or {}
+        state.update(
+            "failed",
+            "failed",
+            int(previous.get("iteration", 0)),
+            config.iterations,
+            "FWI Worker wall time exceeded",
+            failure_code="WALL_TIME_EXCEEDED",
         )
         raise
     except Exception as error:

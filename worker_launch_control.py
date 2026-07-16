@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -38,7 +38,9 @@ LAUNCH_TICKET_NAME = ".worker-launch.json"
 WORKER_READY_NAME = ".worker-ready.json"
 WORKER_HEARTBEAT_NAME = ".worker-heartbeat.json"
 WORKER_CANCEL_DIRECTORY = "worker-cancel"
+WORKER_STOP_DIRECTORY = "worker-stop"
 CONTROL_SCHEMA_VERSION = "1.0.0"
+STOP_PROTOCOL_VERSION = "2.0.0"
 MAX_CONTROL_JSON_BYTES = 64 * 1024
 MAX_CAPACITY = 64
 
@@ -48,7 +50,10 @@ JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 CANCEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CANCEL_CAPABILITY = re.compile(r"^cancel-capability-[0-9a-f]{64}$")
+STOP_CAPABILITY = re.compile(r"^stop-capability-[0-9a-f]{64}$")
 CANCELLED_WORKER_EXIT_CODE = 75
+WALL_TIME_EXCEEDED_WORKER_EXIT_CODE = 76
+SUPPORTED_STOP_REASONS = ("user_requested", "wall_time_exceeded")
 
 
 class WorkerControlError(RuntimeError):
@@ -73,6 +78,15 @@ class WorkerCancellationRequested(BaseException):
         super().__init__("managed Worker cancellation requested")
 
 
+class WorkerWallTimeExceeded(BaseException):
+    """Cooperative timeout unwind raised only inside the exact Worker."""
+
+    def __init__(self, timeout_id: str, reason: str):
+        self.timeout_id = timeout_id
+        self.reason = reason
+        super().__init__("managed Worker wall time exceeded")
+
+
 def _utc_now() -> str:
     return (
         datetime.now(timezone.utc)
@@ -81,15 +95,16 @@ def _utc_now() -> str:
     )
 
 
-def _parse_timestamp(value: Any) -> None:
+def _parse_timestamp(value: Any) -> datetime:
     if not isinstance(value, str) or not value.endswith("Z"):
         raise WorkerControlError("WORKER_CONTROL_INVALID: timestamp is invalid")
     try:
-        datetime.fromisoformat(value[:-1] + "+00:00")
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
     except ValueError as error:
         raise WorkerControlError(
             "WORKER_CONTROL_INVALID: timestamp is invalid"
         ) from error
+    return parsed
 
 
 def _stable_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -582,6 +597,53 @@ class WorkerCancelEvidence:
 
 
 @dataclass(frozen=True)
+class WorkerStopEvidence:
+    """Path-free proof for one exact v2 managed-attempt stop channel."""
+
+    attempt_id: str
+    binding_hash: str
+    capability_record_hash: str
+    supported_reasons: tuple[str, ...]
+    request_id: str | None = None
+    reason: str | None = None
+    requested_at: str | None = None
+    wall_time_seconds: int | None = None
+    started_at: str | None = None
+    deadline_at: str | None = None
+    ready_record_hash: str | None = None
+    request_record_hash: str | None = None
+    acknowledged_at: str | None = None
+    acknowledgement_record_hash: str | None = None
+
+    @property
+    def requested(self) -> bool:
+        return self.request_record_hash is not None
+
+    @property
+    def acknowledged(self) -> bool:
+        return self.acknowledgement_record_hash is not None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": STOP_PROTOCOL_VERSION,
+            "attempt_id": self.attempt_id,
+            "binding_hash": self.binding_hash,
+            "capability_record_hash": self.capability_record_hash,
+            "supported_reasons": list(self.supported_reasons),
+            "request_id": self.request_id,
+            "reason": self.reason,
+            "requested_at": self.requested_at,
+            "wall_time_seconds": self.wall_time_seconds,
+            "started_at": self.started_at,
+            "deadline_at": self.deadline_at,
+            "ready_record_hash": self.ready_record_hash,
+            "request_record_hash": self.request_record_hash,
+            "acknowledged_at": self.acknowledged_at,
+            "acknowledgement_record_hash": self.acknowledgement_record_hash,
+        }
+
+
+@dataclass(frozen=True)
 class WorkerAttemptEvidence:
     """One path-free, exact snapshot of an already staged Worker attempt.
 
@@ -793,7 +855,7 @@ def ensure_worker_cancel_capability(
     return existing
 
 
-def read_worker_cancel_capability(
+def _read_legacy_worker_cancel_capability(
     run_root: Path | str, binding: LaunchAttemptBinding
 ) -> dict[str, Any] | None:
     """Read a Worker-issued capability without creating any control path."""
@@ -909,7 +971,7 @@ def _validate_cancel_acknowledgement(
     return copy.deepcopy(dict(value))
 
 
-def request_worker_cancel(
+def _request_legacy_worker_cancel(
     run_root: Path | str,
     binding: LaunchAttemptBinding,
     *,
@@ -924,7 +986,7 @@ def request_worker_cancel(
             "WORKER_CANCEL_INVALID: cancellation identity or reason is invalid"
         )
     _parse_timestamp(requested_at)
-    capability = read_worker_cancel_capability(run_root, binding)
+    capability = _read_legacy_worker_cancel_capability(run_root, binding)
     if capability is None:
         raise WorkerControlError(
             "WORKER_CANCEL_UNSUPPORTED: exact Worker issued no cancellation capability"
@@ -955,13 +1017,13 @@ def request_worker_cancel(
         raise WorkerControlError(
             "WORKER_CANCEL_CONFLICT: attempt is bound to another cancellation request"
         )
-    return read_worker_cancel_evidence(run_root, binding), replayed
+    return _read_legacy_worker_cancel_evidence(run_root, binding), replayed
 
 
-def read_worker_cancel_evidence(
+def _read_legacy_worker_cancel_evidence(
     run_root: Path | str, binding: LaunchAttemptBinding
 ) -> WorkerCancelEvidence:
-    capability = read_worker_cancel_capability(run_root, binding)
+    capability = _read_legacy_worker_cancel_capability(run_root, binding)
     if capability is None:
         raise WorkerControlError(
             "WORKER_CANCEL_UNSUPPORTED: exact Worker issued no cancellation capability"
@@ -1012,7 +1074,7 @@ def read_worker_cancel_evidence(
 def _acknowledge_worker_cancel(
     run_root: Path | str, binding: LaunchAttemptBinding
 ) -> WorkerCancelEvidence:
-    capability = read_worker_cancel_capability(run_root, binding)
+    capability = _read_legacy_worker_cancel_capability(run_root, binding)
     if capability is None:
         raise WorkerControlError(
             "WORKER_CANCEL_UNSUPPORTED: exact Worker issued no cancellation capability"
@@ -1041,10 +1103,10 @@ def _acknowledge_worker_cancel(
         _validate_cancel_acknowledgement(
             existing, binding, capability, request
         )
-    return read_worker_cancel_evidence(run_root, binding)
+    return _read_legacy_worker_cancel_evidence(run_root, binding)
 
 
-def purge_worker_cancel_control(
+def _purge_legacy_worker_cancel_control(
     run_root: Path | str, binding: LaunchAttemptBinding
 ) -> bool:
     """Delete only the exact attempt's private cancel controls after purge."""
@@ -1069,7 +1131,7 @@ def purge_worker_cancel_control(
     # Validate the whole chain before deleting any member.  A corrupt control
     # record remains visible for reconciliation instead of being erased.
     if canonical_present:
-        read_worker_cancel_evidence(run_root, binding)
+        _read_legacy_worker_cancel_evidence(run_root, binding)
     removed = False
     for path in (*temporary_paths, *reversed(paths)):
         try:
@@ -1099,6 +1161,607 @@ def purge_worker_cancel_control(
         finally:
             os.close(directory_descriptor)
     return removed
+
+
+def _stop_control_paths(
+    run_root: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    create: bool,
+) -> tuple[Path, Path, Path]:
+    root = Path(run_root)
+    if not root.is_absolute() or root.is_symlink():
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise WorkerControlError(
+            "WORKER_CONTROL_UNAVAILABLE: run root is unavailable"
+        ) from error
+    if resolved != root:
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    _require_protected_directory(root)
+    if create:
+        control = _ensure_private_directory(root / CONTROL_DIRECTORY)
+        stop = _ensure_private_directory(control / WORKER_STOP_DIRECTORY)
+    else:
+        control = _require_private_directory(root / CONTROL_DIRECTORY)
+        stop = _require_private_directory(control / WORKER_STOP_DIRECTORY)
+    prefix = binding.attempt_id
+    return (
+        stop / f"{prefix}.capability.json",
+        stop / f"{prefix}.request.json",
+        stop / f"{prefix}.ack.json",
+    )
+
+
+def _validate_stop_capability(
+    value: Mapping[str, Any], binding: LaunchAttemptBinding
+) -> dict[str, Any]:
+    required = {
+        *binding.payload().keys(),
+        "binding_hash",
+        "protocol_version",
+        "supported_reasons",
+        "capability",
+        "worker_pid",
+        "capacity_slot",
+        "capacity_generation",
+        "wall_time_seconds",
+        "issued_at",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_STOP_INVALID: stop capability fields are invalid"
+        )
+    _validate_record_hash(value)
+    if (
+        any(
+            value.get(key) != expected
+            for key, expected in _cancel_binding_payload(binding).items()
+        )
+        or value.get("protocol_version") != STOP_PROTOCOL_VERSION
+        or value.get("supported_reasons") != list(SUPPORTED_STOP_REASONS)
+        or STOP_CAPABILITY.fullmatch(value.get("capability", "")) is None
+        or type(value.get("worker_pid")) is not int
+        or value["worker_pid"] <= 0
+        or type(value.get("capacity_slot")) is not int
+        or not 0 <= value["capacity_slot"] < MAX_CAPACITY
+        or type(value.get("capacity_generation")) is not int
+        or value["capacity_generation"] < 1
+        or type(value.get("wall_time_seconds")) is not int
+        or not 1 <= value["wall_time_seconds"] <= 86_400
+    ):
+        raise WorkerControlError(
+            "WORKER_STOP_INVALID: stop capability binding changed"
+        )
+    _parse_timestamp(value.get("issued_at"))
+    return copy.deepcopy(dict(value))
+
+
+def ensure_worker_stop_capability(
+    run_root: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    worker_pid: int,
+    capacity_slot: int,
+    capacity_generation: int,
+    wall_time_seconds: int,
+) -> dict[str, Any]:
+    """Worker-publish one exact v2, append-only stop capability."""
+
+    if (
+        type(worker_pid) is not int
+        or worker_pid != os.getpid()
+        or type(capacity_slot) is not int
+        or not 0 <= capacity_slot < MAX_CAPACITY
+        or type(capacity_generation) is not int
+        or capacity_generation < 1
+        or type(wall_time_seconds) is not int
+        or not 1 <= wall_time_seconds <= 86_400
+    ):
+        raise WorkerControlError(
+            "WORKER_STOP_INVALID: Worker stop capability identity is invalid"
+        )
+
+    capability_path, _, _ = _stop_control_paths(run_root, binding, create=True)
+    try:
+        existing = _read_private_json(capability_path)
+    except FileNotFoundError:
+        candidate = _record_with_hash(
+            {
+                **_cancel_binding_payload(binding),
+                "protocol_version": STOP_PROTOCOL_VERSION,
+                "supported_reasons": list(SUPPORTED_STOP_REASONS),
+                "capability": "stop-capability-" + secrets.token_hex(32),
+                "worker_pid": worker_pid,
+                "capacity_slot": capacity_slot,
+                "capacity_generation": capacity_generation,
+                "wall_time_seconds": wall_time_seconds,
+                "issued_at": _utc_now(),
+            }
+        )
+        try:
+            _create_private_json(capability_path, candidate)
+            return candidate
+        except FileExistsError:
+            existing = _read_private_json(capability_path)
+    existing = _validate_stop_capability(existing, binding)
+    if (
+        existing["worker_pid"] != worker_pid
+        or existing["capacity_slot"] != capacity_slot
+        or existing["capacity_generation"] != capacity_generation
+        or existing["wall_time_seconds"] != wall_time_seconds
+    ):
+        raise WorkerControlError(
+            "WORKER_STOP_INVALID: Worker stop capability identity changed"
+        )
+    return existing
+
+
+def read_worker_stop_capability(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> dict[str, Any] | None:
+    """Read a Worker-issued v2 capability without creating control state."""
+
+    root = Path(run_root)
+    if not root.is_absolute() or root.is_symlink():
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise WorkerControlError(
+            "WORKER_CONTROL_UNAVAILABLE: run root is unavailable"
+        ) from error
+    if resolved != root:
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    _require_protected_directory(root)
+    control = _require_private_directory(root / CONTROL_DIRECTORY)
+    stop_path = control / WORKER_STOP_DIRECTORY
+    try:
+        stop_path.lstat()
+    except FileNotFoundError:
+        return None
+    stop = _require_private_directory(stop_path)
+    capability_path = stop / f"{binding.attempt_id}.capability.json"
+    request_path = stop / f"{binding.attempt_id}.request.json"
+    acknowledgement_path = stop / f"{binding.attempt_id}.ack.json"
+    try:
+        capability = _read_private_json(capability_path)
+    except FileNotFoundError:
+        if any(
+            path.exists() or path.is_symlink()
+            for path in (request_path, acknowledgement_path)
+        ):
+            raise WorkerControlError(
+                "WORKER_STOP_INVALID: stop controls have no capability"
+            )
+        return None
+    return _validate_stop_capability(capability, binding)
+
+
+def _validate_stop_request(
+    value: Mapping[str, Any],
+    binding: LaunchAttemptBinding,
+    capability: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        *binding.payload().keys(),
+        "binding_hash",
+        "protocol_version",
+        "capability_record_hash",
+        "request_id",
+        "reason",
+        "requested_at",
+        "wall_time_seconds",
+        "started_at",
+        "deadline_at",
+        "ready_record_hash",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_STOP_INVALID: stop request fields are invalid"
+        )
+    _validate_record_hash(value)
+    reason = value.get("reason")
+    if (
+        any(
+            value.get(key) != expected
+            for key, expected in _cancel_binding_payload(binding).items()
+        )
+        or value.get("protocol_version") != STOP_PROTOCOL_VERSION
+        or value.get("capability_record_hash") != capability.get("record_hash")
+        or CANCEL_ID.fullmatch(value.get("request_id", "")) is None
+        or reason not in capability.get("supported_reasons", [])
+    ):
+        raise WorkerControlError(
+            "WORKER_STOP_INVALID: stop request binding changed"
+        )
+    requested = _parse_timestamp(value.get("requested_at"))
+    if reason == "user_requested":
+        if any(
+            value.get(field) is not None
+            for field in (
+                "wall_time_seconds",
+                "started_at",
+                "deadline_at",
+                "ready_record_hash",
+            )
+        ):
+            raise WorkerControlError(
+                "WORKER_STOP_INVALID: user stop request has timeout fields"
+            )
+    else:
+        wall_time_seconds = value.get("wall_time_seconds")
+        if (
+            type(wall_time_seconds) is not int
+            or wall_time_seconds != capability.get("wall_time_seconds")
+            or SHA256.fullmatch(value.get("ready_record_hash", "")) is None
+        ):
+            raise WorkerControlError(
+                "WORKER_STOP_INVALID: timeout wall time changed"
+            )
+        started = _parse_timestamp(value.get("started_at"))
+        deadline = _parse_timestamp(value.get("deadline_at"))
+        if (
+            deadline - started != timedelta(seconds=wall_time_seconds)
+            or requested < deadline
+        ):
+            raise WorkerControlError(
+                "WORKER_STOP_INVALID: timeout window is invalid"
+            )
+    return copy.deepcopy(dict(value))
+
+
+def _validate_stop_acknowledgement(
+    value: Mapping[str, Any],
+    binding: LaunchAttemptBinding,
+    capability: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        *binding.payload().keys(),
+        "binding_hash",
+        "protocol_version",
+        "capability_record_hash",
+        "request_id",
+        "reason",
+        "request_record_hash",
+        "acknowledged_at",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_STOP_INVALID: stop acknowledgement fields are invalid"
+        )
+    _validate_record_hash(value)
+    expected = {
+        **_cancel_binding_payload(binding),
+        "protocol_version": STOP_PROTOCOL_VERSION,
+        "capability_record_hash": capability["record_hash"],
+        "request_id": request["request_id"],
+        "reason": request["reason"],
+        "request_record_hash": request["record_hash"],
+    }
+    if any(value.get(key) != item for key, item in expected.items()):
+        raise WorkerControlError(
+            "WORKER_STOP_INVALID: stop acknowledgement binding changed"
+        )
+    _parse_timestamp(value.get("acknowledged_at"))
+    return copy.deepcopy(dict(value))
+
+
+def request_worker_stop(
+    run_root: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    request_id: str,
+    reason: str,
+    requested_at: str,
+    wall_time_seconds: int | None = None,
+    started_at: str | None = None,
+    deadline_at: str | None = None,
+    ready_record_hash: str | None = None,
+) -> tuple[WorkerStopEvidence, bool]:
+    """Create or exactly replay the v2 attempt's single stop request."""
+
+    if CANCEL_ID.fullmatch(request_id) is None or reason not in SUPPORTED_STOP_REASONS:
+        raise WorkerControlError(
+            "WORKER_STOP_INVALID: stop identity or reason is invalid"
+        )
+    _parse_timestamp(requested_at)
+    capability = read_worker_stop_capability(run_root, binding)
+    if capability is None or reason not in capability["supported_reasons"]:
+        raise WorkerControlError(
+            "WORKER_STOP_UNSUPPORTED: exact Worker issued no compatible stop capability"
+        )
+    _, request_path, _ = _stop_control_paths(run_root, binding, create=False)
+    replayed = False
+    try:
+        request = _read_private_json(request_path)
+        replayed = True
+    except FileNotFoundError:
+        candidate = _record_with_hash(
+            {
+                **_cancel_binding_payload(binding),
+                "protocol_version": STOP_PROTOCOL_VERSION,
+                "capability_record_hash": capability["record_hash"],
+                "request_id": request_id,
+                "reason": reason,
+                "requested_at": requested_at,
+                "wall_time_seconds": wall_time_seconds,
+                "started_at": started_at,
+                "deadline_at": deadline_at,
+                "ready_record_hash": ready_record_hash,
+            }
+        )
+        candidate = _validate_stop_request(candidate, binding, capability)
+        try:
+            _create_private_json(request_path, candidate)
+            request = candidate
+        except FileExistsError:
+            request = _read_private_json(request_path)
+            replayed = True
+    request = _validate_stop_request(request, binding, capability)
+    if request["request_id"] != request_id or request["reason"] != reason:
+        raise WorkerControlError(
+            "WORKER_STOP_CONFLICT: attempt is bound to another stop request"
+        )
+    expected_timeout = (
+        wall_time_seconds,
+        started_at,
+        deadline_at,
+        ready_record_hash,
+    )
+    actual_timeout = tuple(
+        request[field]
+        for field in (
+            "wall_time_seconds",
+            "started_at",
+            "deadline_at",
+            "ready_record_hash",
+        )
+    )
+    if actual_timeout != expected_timeout:
+        raise WorkerControlError(
+            "WORKER_STOP_CONFLICT: attempt timeout window changed"
+        )
+    return read_worker_stop_evidence(run_root, binding), replayed
+
+
+def read_worker_stop_evidence(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> WorkerStopEvidence:
+    capability = read_worker_stop_capability(run_root, binding)
+    if capability is None:
+        raise WorkerControlError(
+            "WORKER_STOP_UNSUPPORTED: exact Worker issued no stop capability"
+        )
+    _, request_path, ack_path = _stop_control_paths(
+        run_root, binding, create=False
+    )
+    try:
+        request = _validate_stop_request(
+            _read_private_json(request_path), binding, capability
+        )
+    except FileNotFoundError:
+        try:
+            _read_private_json(ack_path)
+        except FileNotFoundError:
+            pass
+        else:
+            raise WorkerControlError(
+                "WORKER_STOP_INVALID: acknowledgement has no request"
+            )
+        return WorkerStopEvidence(
+            attempt_id=binding.attempt_id,
+            binding_hash=binding.binding_hash,
+            capability_record_hash=capability["record_hash"],
+            supported_reasons=tuple(capability["supported_reasons"]),
+        )
+    try:
+        acknowledgement = _validate_stop_acknowledgement(
+            _read_private_json(ack_path), binding, capability, request
+        )
+    except FileNotFoundError:
+        acknowledgement = None
+    return WorkerStopEvidence(
+        attempt_id=binding.attempt_id,
+        binding_hash=binding.binding_hash,
+        capability_record_hash=capability["record_hash"],
+        supported_reasons=tuple(capability["supported_reasons"]),
+        request_id=request["request_id"],
+        reason=request["reason"],
+        requested_at=request["requested_at"],
+        wall_time_seconds=request["wall_time_seconds"],
+        started_at=request["started_at"],
+        deadline_at=request["deadline_at"],
+        ready_record_hash=request["ready_record_hash"],
+        request_record_hash=request["record_hash"],
+        acknowledged_at=(
+            None if acknowledgement is None else acknowledgement["acknowledged_at"]
+        ),
+        acknowledgement_record_hash=(
+            None if acknowledgement is None else acknowledgement["record_hash"]
+        ),
+    )
+
+
+def _acknowledge_worker_stop(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> WorkerStopEvidence:
+    capability = read_worker_stop_capability(run_root, binding)
+    if capability is None:
+        raise WorkerControlError(
+            "WORKER_STOP_UNSUPPORTED: exact Worker issued no stop capability"
+        )
+    _, request_path, ack_path = _stop_control_paths(
+        run_root, binding, create=False
+    )
+    request = _validate_stop_request(
+        _read_private_json(request_path), binding, capability
+    )
+    candidate = _record_with_hash(
+        {
+            **_cancel_binding_payload(binding),
+            "protocol_version": STOP_PROTOCOL_VERSION,
+            "capability_record_hash": capability["record_hash"],
+            "request_id": request["request_id"],
+            "reason": request["reason"],
+            "request_record_hash": request["record_hash"],
+            "acknowledged_at": _utc_now(),
+        }
+    )
+    try:
+        _create_private_json(ack_path, candidate)
+    except FileExistsError:
+        existing = _read_private_json(ack_path)
+        _validate_stop_acknowledgement(existing, binding, capability, request)
+    return read_worker_stop_evidence(run_root, binding)
+
+
+def purge_worker_stop_control(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> bool:
+    """Delete only the exact attempt's v2 stop controls after purge."""
+
+    try:
+        paths = _stop_control_paths(run_root, binding, create=False)
+    except WorkerControlError as error:
+        if error.code == "WORKER_CONTROL_UNAVAILABLE":
+            return False
+        raise
+    temporary_prefixes = tuple(f".{path.name}." for path in paths)
+    temporary_paths = tuple(
+        candidate
+        for candidate in paths[0].parent.iterdir()
+        if candidate.name.startswith(temporary_prefixes)
+    )
+    canonical_present = any(path.exists() or path.is_symlink() for path in paths)
+    if not canonical_present and not temporary_paths:
+        return False
+    if canonical_present:
+        read_worker_stop_evidence(run_root, binding)
+    removed = False
+    for path in (*temporary_paths, *reversed(paths)):
+        try:
+            entry = path.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_uid != os.geteuid()
+            or entry.st_nlink != 1
+            or stat.S_IMODE(entry.st_mode) & 0o077
+        ):
+            raise WorkerControlError(
+                "WORKER_STOP_INVALID: stop control is unsafe"
+            )
+        path.unlink()
+        removed = True
+    if removed:
+        directory_descriptor = os.open(
+            paths[0].parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    return removed
+
+
+def _stop_evidence_as_cancel(evidence: WorkerStopEvidence) -> WorkerCancelEvidence:
+    return WorkerCancelEvidence(
+        attempt_id=evidence.attempt_id,
+        capability_record_hash=evidence.capability_record_hash,
+        cancel_id=evidence.request_id,
+        reason=evidence.reason,
+        requested_at=evidence.requested_at,
+        request_record_hash=evidence.request_record_hash,
+        acknowledged_at=evidence.acknowledged_at,
+        acknowledgement_record_hash=evidence.acknowledgement_record_hash,
+    )
+
+
+def read_worker_cancel_capability(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> dict[str, Any] | None:
+    """Read the new stop capability, or a legacy cancel-only capability."""
+
+    stop = read_worker_stop_capability(run_root, binding)
+    if stop is not None:
+        return stop
+    return _read_legacy_worker_cancel_capability(run_root, binding)
+
+
+def request_worker_cancel(
+    run_root: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    cancel_id: str,
+    reason: str,
+    requested_at: str,
+) -> tuple[WorkerCancelEvidence, bool]:
+    """Route user cancellation through v2 when the exact Worker advertises it."""
+
+    stop = read_worker_stop_capability(run_root, binding)
+    if stop is not None:
+        try:
+            evidence, replayed = request_worker_stop(
+                run_root,
+                binding,
+                request_id=cancel_id,
+                reason=reason,
+                requested_at=requested_at,
+            )
+        except WorkerControlError as error:
+            if error.code == "WORKER_STOP_CONFLICT":
+                raise WorkerControlError(
+                    "WORKER_CANCEL_CONFLICT: attempt is bound to another stop request"
+                ) from error
+            raise
+        return _stop_evidence_as_cancel(evidence), replayed
+    return _request_legacy_worker_cancel(
+        run_root,
+        binding,
+        cancel_id=cancel_id,
+        reason=reason,
+        requested_at=requested_at,
+    )
+
+
+def read_worker_cancel_evidence(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> WorkerCancelEvidence:
+    stop = read_worker_stop_capability(run_root, binding)
+    if stop is not None:
+        return _stop_evidence_as_cancel(
+            read_worker_stop_evidence(run_root, binding)
+        )
+    return _read_legacy_worker_cancel_evidence(run_root, binding)
+
+
+def purge_worker_cancel_control(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> bool:
+    """Purge both current v2 and legacy v1 controls for the exact attempt."""
+
+    stop_removed = purge_worker_stop_control(run_root, binding)
+    legacy_removed = _purge_legacy_worker_cancel_control(run_root, binding)
+    return stop_removed or legacy_removed
 
 
 def binding_from_submission_record(record: Mapping[str, Any]) -> LaunchAttemptBinding:
@@ -1665,7 +2328,9 @@ class WorkerHeartbeat:
         capacity_fd: int,
         interval_seconds: float = 1.0,
         cancel_grace_seconds: float = 5.0,
+        wall_time_seconds: int = 86_400,
         hard_exit: Callable[[int], Any] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if ATTEMPT_ID.fullmatch(attempt_id) is None:
             raise WorkerControlError(
@@ -1691,13 +2356,23 @@ class WorkerHeartbeat:
             raise WorkerControlError(
                 "WORKER_CANCEL_INVALID: hard-exit callback is invalid"
             )
+        if type(wall_time_seconds) is not int or not 1 <= wall_time_seconds <= 86_400:
+            raise WorkerControlError(
+                "WORKER_STOP_INVALID: wall time is invalid"
+            )
+        if not callable(monotonic):
+            raise WorkerControlError(
+                "WORKER_STOP_INVALID: monotonic clock is invalid"
+            )
         self.root, self.run_dir = _validate_root_and_run(run_root, run_dir)
         self.attempt_id = attempt_id
         self.attempt_fd = attempt_fd
         self.capacity_fd = capacity_fd
         self.interval_seconds = float(interval_seconds)
         self.cancel_grace_seconds = float(cancel_grace_seconds)
+        self.wall_time_seconds = wall_time_seconds
         self._hard_exit = hard_exit or os._exit
+        self._monotonic = monotonic
         self._stop = threading.Event()
         self._thread_started = threading.Event()
         self._ready_published = threading.Event()
@@ -1708,10 +2383,12 @@ class WorkerHeartbeat:
         self._failure: BaseException | None = None
         self._sequence = 0
         self._started_at: str | None = None
+        self._started_monotonic: float | None = None
         self._ticket: dict[str, Any] | None = None
         self._binding: LaunchAttemptBinding | None = None
-        self._cancel_evidence: WorkerCancelEvidence | None = None
+        self._stop_evidence: WorkerStopEvidence | None = None
         self._cancel_deadline: float | None = None
+        self._cancel_force_deadline: float | None = None
         self._closed = False
 
     def start(self) -> None:
@@ -1803,14 +2480,16 @@ class WorkerHeartbeat:
             )
         self._binding = binding
         self._ticket = ticket
-        ensure_worker_cancel_capability(
+        ensure_worker_stop_capability(
             self.root,
             binding,
             worker_pid=worker_pid,
             capacity_slot=slot,
             capacity_generation=generation,
+            wall_time_seconds=self.wall_time_seconds,
         )
         self._started_at = _utc_now()
+        self._started_monotonic = self._monotonic()
         self._write_heartbeat("running")
         thread = threading.Thread(
             target=self._run,
@@ -1842,35 +2521,90 @@ class WorkerHeartbeat:
         with self._cancel_lock:
             if self._cancel_requested.is_set():
                 return
-            evidence = read_worker_cancel_evidence(self.root, self._binding)
+            evidence = read_worker_stop_evidence(self.root, self._binding)
             if not evidence.requested:
                 return
-            evidence = _acknowledge_worker_cancel(self.root, self._binding)
+            if evidence.reason == "wall_time_exceeded":
+                if (
+                    evidence.wall_time_seconds != self.wall_time_seconds
+                    or self._started_monotonic is None
+                ):
+                    raise WorkerControlError(
+                        "WORKER_STOP_INVALID: timeout policy changed"
+                    )
+                # The durable Supervisor clock determines when it may publish
+                # a timeout request.  This process-local monotonic guard makes
+                # a wall-clock jump unable to force an early acknowledgement.
+                if (
+                    self._monotonic() - self._started_monotonic
+                    < self.wall_time_seconds
+                ):
+                    return
+                attempt = read_worker_attempt_evidence(
+                    self.root, self.run_dir, self._binding
+                )
+                if (
+                    attempt is None
+                    or not attempt.ready
+                    or attempt.ready_record_hash
+                    != evidence.ready_record_hash
+                ):
+                    raise WorkerControlError(
+                        "WORKER_STOP_INVALID: timeout ready receipt changed"
+                    )
+            evidence = _acknowledge_worker_stop(self.root, self._binding)
             if not evidence.acknowledged:
                 raise WorkerControlError(
-                    "WORKER_CANCEL_INVALID: cancellation acknowledgement was not durable"
+                    "WORKER_STOP_INVALID: stop acknowledgement was not durable"
                 )
-            self._cancel_evidence = evidence
-            self._cancel_deadline = time.monotonic() + self.cancel_grace_seconds
+            try:
+                deadline_started = self._monotonic()
+            except BaseException:
+                deadline_started = None
+            try:
+                force_started = time.monotonic()
+            except BaseException:
+                force_started = None
+            self._stop_evidence = evidence
+            self._cancel_deadline = (
+                None
+                if deadline_started is None
+                else deadline_started + self.cancel_grace_seconds
+            )
+            self._cancel_force_deadline = (
+                None
+                if force_started is None
+                else force_started + self.cancel_grace_seconds
+            )
             self._cancel_requested.set()
 
     def raise_if_cancel_requested(self) -> None:
         """Raise only in the managed numerical main thread at a safe checkpoint."""
 
         if not self._cancel_requested.is_set():
-            return
+            self._observe_cancel_request()
+            if not self._cancel_requested.is_set():
+                return
         with self._cancel_lock:
-            evidence = self._cancel_evidence
-        if evidence is None or evidence.cancel_id is None or evidence.reason is None:
+            evidence = self._stop_evidence
+        if evidence is None or evidence.request_id is None or evidence.reason is None:
             raise WorkerControlError(
-                "WORKER_CANCEL_INVALID: cancellation acknowledgement was lost"
+                "WORKER_STOP_INVALID: stop acknowledgement was lost"
             )
-        raise WorkerCancellationRequested(evidence.cancel_id, evidence.reason)
+        if evidence.reason == "wall_time_exceeded":
+            raise WorkerWallTimeExceeded(evidence.request_id, evidence.reason)
+        raise WorkerCancellationRequested(evidence.request_id, evidence.reason)
 
     @property
     def cancel_evidence(self) -> WorkerCancelEvidence | None:
         with self._cancel_lock:
-            return self._cancel_evidence
+            evidence = self._stop_evidence
+        return None if evidence is None else _stop_evidence_as_cancel(evidence)
+
+    @property
+    def stop_evidence(self) -> WorkerStopEvidence | None:
+        with self._cancel_lock:
+            return self._stop_evidence
 
     def _write_ready(self) -> None:
         assert self._binding is not None
@@ -1937,6 +2671,74 @@ class WorkerHeartbeat:
                 self.run_dir / WORKER_HEARTBEAT_NAME, heartbeat
             )
 
+    def _enforce_acknowledged_stop(self) -> None:
+        """Keep the exact acknowledged stop deadline authoritative.
+
+        Once the append-only acknowledgement is valid, later heartbeat,
+        injected-clock, or wait failures may reduce evidence quality but must
+        never set ``_stop`` and let an uncooperative numerical loop escape.
+        Only an explicit cooperative ``stop()`` may win before hard exit.
+        """
+
+        evidence = self.stop_evidence
+        if evidence is None or not evidence.acknowledged:
+            raise WorkerControlError(
+                "WORKER_STOP_INVALID: acknowledged stop evidence was lost"
+            )
+        exit_code = (
+            WALL_TIME_EXCEEDED_WORKER_EXIT_CODE
+            if evidence.reason == "wall_time_exceeded"
+            else CANCELLED_WORKER_EXIT_CODE
+        )
+        while not self._stop.is_set():
+            remaining_values: list[float] = []
+            if self._cancel_deadline is not None:
+                try:
+                    remaining_values.append(
+                        self._cancel_deadline - self._monotonic()
+                    )
+                except BaseException:
+                    pass
+            if self._cancel_force_deadline is not None:
+                try:
+                    remaining_values.append(
+                        self._cancel_force_deadline - time.monotonic()
+                    )
+                except BaseException:
+                    pass
+            remaining = min(remaining_values) if remaining_values else 0.0
+            if remaining <= 0:
+                break
+            try:
+                if self._stop.wait(min(self.interval_seconds, remaining)):
+                    return
+            except BaseException:
+                # Re-sample the immutable deadlines.  The trusted fallback
+                # monotonic deadline prevents a faulty injected clock from
+                # turning this into an unbounded retry.
+                continue
+            if self._stop.is_set():
+                return
+            try:
+                self._write_heartbeat("running")
+            except BaseException:
+                continue
+
+        if self._stop.is_set():
+            return
+        try:
+            self._write_heartbeat("stopped")
+        except BaseException:
+            # Stopped evidence is best effort.  The exact process exit remains
+            # mandatory and releases both inherited kernel fences.
+            pass
+        if self._stop.is_set():
+            return
+        self._hard_exit(exit_code)
+        raise WorkerControlError(
+            "WORKER_STOP_FAILED: hard-exit callback returned"
+        )
+
     def _run(self) -> None:
         try:
             self._thread_started.set()
@@ -1946,31 +2748,8 @@ class WorkerHeartbeat:
             while not self._stop.is_set():
                 self._observe_cancel_request()
                 if self._cancel_requested.is_set():
-                    deadline = self._cancel_deadline
-                    assert deadline is not None
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        # This exact process acknowledged the request while it
-                        # still owns both inherited descriptors.  Publish the
-                        # stopped acknowledgement, then let process exit release
-                        # the kernel fences atomically.  Never close them here.
-                        try:
-                            self._write_heartbeat("stopped")
-                        finally:
-                            # Once this exact Worker has acknowledged the
-                            # append-only request, a control-write failure must
-                            # not defeat bounded process termination.  The
-                            # kernel releases both inherited fences on exit;
-                            # missing stopped evidence merely prevents the
-                            # Adapter from claiming terminal Cancelled proof.
-                            self._hard_exit(CANCELLED_WORKER_EXIT_CODE)
-                        raise WorkerControlError(
-                            "WORKER_CANCEL_FAILED: hard-exit callback returned"
-                        )
-                    if self._stop.wait(min(self.interval_seconds, remaining)):
-                        return
-                    self._write_heartbeat("running")
-                    continue
+                    self._enforce_acknowledged_stop()
+                    return
                 if self._stop.wait(self.interval_seconds):
                     return
                 self._write_heartbeat("running")
@@ -2177,6 +2956,9 @@ def worker_attempt_started(
 __all__ = [
     "CANCELLED_WORKER_EXIT_CODE",
     "CONTROL_DIRECTORY",
+    "STOP_PROTOCOL_VERSION",
+    "SUPPORTED_STOP_REASONS",
+    "WALL_TIME_EXCEEDED_WORKER_EXIT_CODE",
     "LaunchAttemptBinding",
     "ParentLaunchLease",
     "WorkerAttemptEvidence",
@@ -2184,16 +2966,23 @@ __all__ = [
     "WorkerCancellationRequested",
     "WorkerControlError",
     "WorkerHeartbeat",
+    "WorkerStopEvidence",
+    "WorkerWallTimeExceeded",
     "binding_from_submission_record",
     "ensure_worker_cancel_capability",
+    "ensure_worker_stop_capability",
     "execution_fence_is_held",
     "hold_idle_execution_fence",
     "mark_launch_failed",
     "purge_worker_cancel_control",
+    "purge_worker_stop_control",
     "read_worker_cancel_capability",
     "read_worker_cancel_evidence",
+    "read_worker_stop_capability",
+    "read_worker_stop_evidence",
     "read_worker_attempt_evidence",
     "request_worker_cancel",
+    "request_worker_stop",
     "stage_launch_attempt",
     "worker_attempt_started",
 ]

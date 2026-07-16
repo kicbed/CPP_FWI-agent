@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from scientific_runtime import (
 from scientific_runtime.fwi_adapter import (
     AdapterIdempotencyConflict,
     AdapterManagedCancelProof,
+    AdapterManagedTimeoutProof,
     AdapterUnavailable,
     DeepwaveAdapter,
     SafeSubprocessWorkerLauncher,
@@ -47,9 +49,11 @@ from worker_launch_control import (
     ParentLaunchLease,
     WorkerCancellationRequested,
     WorkerHeartbeat,
+    WorkerWallTimeExceeded,
     binding_from_submission_record,
     read_worker_cancel_evidence,
     read_worker_attempt_evidence,
+    read_worker_stop_evidence,
     stage_launch_attempt,
 )
 from tests.test_scientific_runtime_contracts import (
@@ -209,12 +213,14 @@ class FakeLauncher:
         config_path: Path,
         run_dir: Path,
         run_root: Path,
+        wall_time_seconds: int,
     ) -> int:
         call = {
             "command": command,
             "config_path": Path(config_path),
             "run_dir": Path(run_dir),
             "run_root": Path(run_root),
+            "wall_time_seconds": wall_time_seconds,
         }
         with self._lock:
             self.calls.append(call)
@@ -357,6 +363,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         *,
         run_root: Path | None = None,
         launcher: FakeLauncher | None = None,
+        clock: Any = None,
     ) -> DeepwaveAdapter:
         return DeepwaveAdapter(
             run_root=run_root or self.run_root,
@@ -365,7 +372,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             registry_snapshot_provider=self.registry_provider,
             device_validator=self.device_validator,
             fingerprint_factory=self.fingerprint_factory,
-            clock=lambda: NOW,
+            clock=clock or (lambda: NOW),
         )
 
     def execution_kwargs(self) -> dict[str, Any]:
@@ -456,6 +463,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             capacity_fd=os.dup(lease.capacity_fd),
             interval_seconds=0.02,
             cancel_grace_seconds=300.0,
+            wall_time_seconds=record["resources"]["wall_time_seconds"],
             hard_exit=lambda _code: None,
         )
         lease.close_parent()
@@ -2147,7 +2155,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             cancel_dir = (
                 self.run_root
                 / fwi_adapter_module.CONTROL_DIRECTORY
-                / "worker-cancel"
+                / "worker-stop"
             )
             interrupted_temp = cancel_dir / (
                 f".{binding.attempt_id}.request.json.interrupted"
@@ -2198,7 +2206,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         cancel_dir = (
             self.run_root
             / fwi_adapter_module.CONTROL_DIRECTORY
-            / "worker-cancel"
+            / "worker-stop"
         )
         capability = cancel_dir / f"{binding.attempt_id}.capability.json"
         capability.unlink()
@@ -2225,6 +2233,332 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             )
         finally:
             heartbeat.stop("succeeded")
+
+    def test_exact_timeout_capability_and_idle_fence_prove_wall_time_failure(
+        self,
+    ) -> None:
+        clock_value = ["2026-07-17T00:00:00Z"]
+        adapter = self.make_adapter(clock=lambda: clock_value[0])
+        handle = adapter.submit(
+            **self.submit_kwargs(
+                task_id="task-managed-timeout",
+                idempotency_key="task-managed-timeout:invert:0001",
+            )
+        )
+        run_dir = self.launcher.calls[-1]["run_dir"]
+        binding, heartbeat = self.start_exact_worker(handle, run_dir)
+        wall_time_seconds = resources()["wall_time_seconds"]
+        started_at = "2026-07-17T00:00:01.123456Z"
+        deadline_at = "2026-07-17T00:30:01.123456Z"
+        timeout_id = "timeout-managed-request-1"
+        try:
+            capability = adapter.supports_exact_timeout(
+                handle, binding.attempt_id
+            )
+            self.assertIsNotNone(capability)
+            assert capability is not None
+            self.assertEqual(
+                set(capability),
+                {
+                    "schema_version",
+                    "attempt_id",
+                    "binding_hash",
+                    "capability_record_hash",
+                    "supported_reasons",
+                    "private_schema_version",
+                    "proof_hash",
+                },
+            )
+            self.assertEqual(capability["schema_version"], "2.0.0")
+            self.assertEqual(
+                capability["supported_reasons"],
+                ["user_requested", "wall_time_exceeded"],
+            )
+
+            # Avoid a real 30-minute wait while preserving the Worker's
+            # independent monotonic early-ack check.
+            assert heartbeat._started_monotonic is not None
+            heartbeat._started_monotonic -= wall_time_seconds
+            clock_value[0] = deadline_at
+            first = adapter.timeout(
+                handle,
+                timeout_id,
+                binding.attempt_id,
+                wall_time_seconds,
+                started_at,
+                deadline_at,
+            )
+            self.assertIsInstance(first, AdapterManagedTimeoutProof)
+            self.assertEqual(first.state, "requested")
+            self.assertEqual(first.code, "TIMEOUT_REQUESTED")
+
+            for _ in range(200):
+                evidence = read_worker_stop_evidence(
+                    self.run_root, binding
+                )
+                if evidence.acknowledged:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(evidence.acknowledged)
+            self.assertEqual(evidence.reason, "wall_time_exceeded")
+            self.assertEqual(
+                evidence.ready_record_hash, first.ready_record_hash
+            )
+            with self.assertRaises(WorkerWallTimeExceeded):
+                heartbeat.raise_if_cancel_requested()
+            heartbeat.stop("stopped")
+            SafeSubprocessWorkerLauncher._mark_unexpected_exit(
+                run_dir,
+                76,
+                run_root=self.run_root,
+                launch_binding=binding,
+            )
+            reaped_status = json.loads(
+                (run_dir / "status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(reaped_status["status"], "failed")
+            self.assertEqual(
+                reaped_status["failure_code"], "WALL_TIME_EXCEEDED"
+            )
+
+            completed = adapter.timeout(
+                handle,
+                timeout_id,
+                binding.attempt_id,
+                wall_time_seconds,
+                started_at,
+                deadline_at,
+            )
+            self.assertEqual(completed.state, "timed_out")
+            self.assertEqual(completed.code, "TIMEOUT_COMPLETED")
+            self.assertEqual(
+                set(completed.as_dict()),
+                {
+                    "schema_version",
+                    "task_id",
+                    "request_id",
+                    "reason",
+                    "state",
+                    "code",
+                    "attempt_id",
+                    "wall_time_seconds",
+                    "started_at",
+                    "deadline_at",
+                    "ready_record_hash",
+                    "capability_record_hash",
+                    "request_record_hash",
+                    "acknowledgement_record_hash",
+                    "terminal_status",
+                    "terminal_failure_code",
+                    "local_run_state",
+                    "replayed",
+                    "receipt_record_hash",
+                    "proof_hash",
+                },
+            )
+            self.assertEqual(completed.terminal_status, "Failed")
+            self.assertEqual(
+                completed.terminal_failure_code, "WALL_TIME_EXCEEDED"
+            )
+            self.assertIsNotNone(completed.ready_record_hash)
+            self.assertEqual(
+                completed.capability_record_hash,
+                evidence.capability_record_hash,
+            )
+            status = json.loads((run_dir / "status.json").read_text())
+            self.assertEqual(status["status"], "failed")
+            self.assertEqual(status["failure_code"], "WALL_TIME_EXCEEDED")
+        finally:
+            try:
+                heartbeat.stop("stopped")
+            except Exception:
+                pass
+
+    def test_natural_terminal_wins_exact_timeout_with_armed_window_hashes(
+        self,
+    ) -> None:
+        clock_value = [NOW]
+        adapter = self.make_adapter(clock=lambda: clock_value[0])
+        handle = adapter.submit(
+            **self.submit_kwargs(
+                task_id="task-natural-terminal-timeout",
+                idempotency_key="task-natural-terminal-timeout:invert:0001",
+            )
+        )
+        run_dir = self.launcher.calls[-1]["run_dir"]
+        binding, heartbeat = self.start_exact_worker(handle, run_dir)
+        wall_time_seconds = resources()["wall_time_seconds"]
+        attempt = read_worker_attempt_evidence(
+            self.run_root, run_dir, binding
+        )
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        assert attempt.ready_started_at is not None
+        assert attempt.ready_record_hash is not None
+        started = datetime.fromisoformat(
+            attempt.ready_started_at.replace("Z", "+00:00")
+        ) + timedelta(microseconds=1)
+        deadline = started + timedelta(seconds=wall_time_seconds)
+        started_at = started.isoformat().replace("+00:00", "Z")
+        deadline_at = deadline.isoformat().replace("+00:00", "Z")
+        evidence = read_worker_stop_evidence(self.run_root, binding)
+        try:
+            self.write_success_artifacts(run_dir)
+            heartbeat.stop("succeeded")
+            heartbeat = None
+            clock_value[0] = deadline_at
+            proof = adapter.timeout(
+                handle,
+                "timeout-after-natural-success-1",
+                binding.attempt_id,
+                wall_time_seconds,
+                started_at,
+                deadline_at,
+            )
+            self.assertEqual(proof.state, "terminal_won")
+            self.assertEqual(proof.code, "TIMEOUT_TERMINAL_WON")
+            self.assertEqual(proof.terminal_status, "Succeeded")
+            self.assertIsNone(proof.terminal_failure_code)
+            self.assertEqual(
+                proof.ready_record_hash, attempt.ready_record_hash
+            )
+            self.assertEqual(
+                proof.capability_record_hash,
+                evidence.capability_record_hash,
+            )
+            self.assertIsNone(proof.request_record_hash)
+            self.assertEqual(adapter.status(handle).status, "Succeeded")
+            request_path = (
+                self.run_root
+                / fwi_adapter_module.CONTROL_DIRECTORY
+                / "worker-stop"
+                / f"{binding.attempt_id}.request.json"
+            )
+            self.assertFalse(request_path.exists())
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop("succeeded")
+
+    def test_timeout_store_clock_may_precede_worker_ready_clock(self) -> None:
+        clock_value = [NOW]
+        adapter = self.make_adapter(clock=lambda: clock_value[0])
+        handle = adapter.submit(
+            **self.submit_kwargs(
+                task_id="task-cross-clock-timeout",
+                idempotency_key="task-cross-clock-timeout:invert:0001",
+            )
+        )
+        run_dir = self.launcher.calls[-1]["run_dir"]
+        binding, heartbeat = self.start_exact_worker(handle, run_dir)
+        wall_time_seconds = resources()["wall_time_seconds"]
+        attempt = read_worker_attempt_evidence(
+            self.run_root, run_dir, binding
+        )
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        assert attempt.ready_started_at is not None
+        assert attempt.ready_record_hash is not None
+        ready_time = datetime.fromisoformat(
+            attempt.ready_started_at.replace("Z", "+00:00")
+        )
+        observed_time = ready_time - timedelta(seconds=60)
+        deadline = observed_time + timedelta(seconds=wall_time_seconds)
+        started_at = observed_time.isoformat().replace("+00:00", "Z")
+        deadline_at = deadline.isoformat().replace("+00:00", "Z")
+        self.assertLess(observed_time, ready_time)
+        try:
+            clock_value[0] = deadline_at
+            requested = adapter.timeout(
+                handle,
+                "timeout-cross-clock-request-1",
+                binding.attempt_id,
+                wall_time_seconds,
+                started_at,
+                deadline_at,
+            )
+            self.assertEqual(requested.state, "requested")
+            self.assertEqual(requested.code, "TIMEOUT_REQUESTED")
+            self.assertEqual(
+                requested.ready_record_hash, attempt.ready_record_hash
+            )
+            time.sleep(0.08)
+            evidence = read_worker_stop_evidence(
+                self.run_root, binding
+            )
+            self.assertTrue(evidence.requested)
+            self.assertFalse(evidence.acknowledged)
+            self.assertEqual(evidence.started_at, started_at)
+            self.assertEqual(
+                evidence.ready_record_hash, attempt.ready_record_hash
+            )
+
+            assert heartbeat._started_monotonic is not None
+            heartbeat._started_monotonic -= wall_time_seconds
+            with self.assertRaises(WorkerWallTimeExceeded):
+                heartbeat.raise_if_cancel_requested()
+            heartbeat.stop("stopped")
+            heartbeat = None
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop("stopped")
+
+    def test_ordinary_failure_wins_exact_timeout_without_failure_code(
+        self,
+    ) -> None:
+        clock_value = [NOW]
+        adapter = self.make_adapter(clock=lambda: clock_value[0])
+        handle = adapter.submit(
+            **self.submit_kwargs(
+                task_id="task-natural-failure-timeout",
+                idempotency_key="task-natural-failure-timeout:invert:0001",
+            )
+        )
+        run_dir = self.launcher.calls[-1]["run_dir"]
+        binding, heartbeat = self.start_exact_worker(handle, run_dir)
+        wall_time_seconds = resources()["wall_time_seconds"]
+        attempt = read_worker_attempt_evidence(
+            self.run_root, run_dir, binding
+        )
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        assert attempt.ready_started_at is not None
+        assert attempt.ready_record_hash is not None
+        started = datetime.fromisoformat(
+            attempt.ready_started_at.replace("Z", "+00:00")
+        ) + timedelta(microseconds=1)
+        deadline = started + timedelta(seconds=wall_time_seconds)
+        started_at = started.isoformat().replace("+00:00", "Z")
+        deadline_at = deadline.isoformat().replace("+00:00", "Z")
+        evidence = read_worker_stop_evidence(self.run_root, binding)
+        try:
+            self.write_status(run_dir, "failed")
+            heartbeat.stop("failed")
+            heartbeat = None
+            clock_value[0] = deadline_at
+            proof = adapter.timeout(
+                handle,
+                "timeout-after-natural-failure-1",
+                binding.attempt_id,
+                wall_time_seconds,
+                started_at,
+                deadline_at,
+            )
+            self.assertEqual(proof.state, "terminal_won")
+            self.assertEqual(proof.code, "TIMEOUT_TERMINAL_WON")
+            self.assertEqual(proof.terminal_status, "Failed")
+            self.assertIsNone(proof.terminal_failure_code)
+            self.assertEqual(
+                proof.ready_record_hash, attempt.ready_record_hash
+            )
+            self.assertEqual(
+                proof.capability_record_hash,
+                evidence.capability_record_hash,
+            )
+            self.assertIsNone(proof.request_record_hash)
+            self.assertEqual(adapter.status(handle).status, "Failed")
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop("failed")
 
     def test_natural_terminal_wins_without_creating_cancel_request(self) -> None:
         handle, run_dir = self.submit_and_run_dir(
@@ -2675,6 +3009,8 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                     str(run_dir),
                     "--run-root",
                     str(launcher_root),
+                    "--wall-time-seconds",
+                    "86400",
                     "--launch-attempt-id",
                     launch_binding.attempt_id,
                     "--launch-attempt-fd",

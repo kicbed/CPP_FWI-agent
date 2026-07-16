@@ -33,7 +33,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
@@ -47,14 +47,18 @@ from worker_launch_control import (
     ParentLaunchLease,
     WorkerCancelEvidence,
     WorkerControlError,
+    WorkerStopEvidence,
     binding_from_submission_record,
     hold_idle_execution_fence,
     mark_launch_failed,
     purge_worker_cancel_control,
     read_worker_cancel_capability,
     read_worker_cancel_evidence,
+    read_worker_stop_capability,
+    read_worker_stop_evidence,
     read_worker_attempt_evidence,
     request_worker_cancel,
+    request_worker_stop,
     stage_launch_attempt,
     worker_attempt_started,
 )
@@ -486,6 +490,151 @@ def _managed_cancel_proof(
 
 
 @dataclass(frozen=True)
+class AdapterManagedTimeoutProof:
+    """Path-free proof for one exact current managed-Worker timeout."""
+
+    task_id: str
+    timeout_id: str
+    reason: str
+    state: str
+    code: str
+    attempt_id: str | None
+    wall_time_seconds: int
+    started_at: str
+    deadline_at: str
+    ready_record_hash: str | None
+    capability_record_hash: str | None
+    request_record_hash: str | None
+    acknowledgement_record_hash: str | None
+    terminal_status: str | None
+    terminal_failure_code: str | None
+    local_run_state: str
+    replayed: bool
+    receipt_record_hash: str
+    proof_hash: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0.0",
+            "task_id": self.task_id,
+            "request_id": self.timeout_id,
+            "reason": self.reason,
+            "state": self.state,
+            "code": self.code,
+            "attempt_id": self.attempt_id,
+            "wall_time_seconds": self.wall_time_seconds,
+            "started_at": self.started_at,
+            "deadline_at": self.deadline_at,
+            "ready_record_hash": self.ready_record_hash,
+            "capability_record_hash": self.capability_record_hash,
+            "request_record_hash": self.request_record_hash,
+            "acknowledgement_record_hash": self.acknowledgement_record_hash,
+            "terminal_status": self.terminal_status,
+            "terminal_failure_code": self.terminal_failure_code,
+            "local_run_state": self.local_run_state,
+            "replayed": self.replayed,
+            "receipt_record_hash": self.receipt_record_hash,
+            "proof_hash": self.proof_hash,
+        }
+
+
+def _managed_timeout_proof(
+    *,
+    task_id: str,
+    timeout_id: str,
+    state: str,
+    code: str,
+    attempt_id: str | None,
+    wall_time_seconds: int,
+    started_at: str,
+    deadline_at: str,
+    ready_record_hash: str | None,
+    evidence: WorkerStopEvidence | None,
+    terminal_status: str | None,
+    terminal_failure_code: str | None,
+    replayed: bool,
+    receipt_record_hash: str,
+) -> AdapterManagedTimeoutProof:
+    if state in {"timed_out", "terminal_won"} and (
+        ready_record_hash is None
+        or evidence is None
+        or (
+            evidence.requested
+            and evidence.ready_record_hash != ready_record_hash
+        )
+    ):
+        raise AdapterHandleError(
+            "ADAPTER_TIMEOUT_INVALID: terminal proof lacks armed Worker hashes"
+        )
+    if state == "timed_out" and (
+        code != "TIMEOUT_COMPLETED"
+        or terminal_status != "Failed"
+        or terminal_failure_code != "WALL_TIME_EXCEEDED"
+    ):
+        raise AdapterHandleError(
+            "ADAPTER_TIMEOUT_INVALID: timeout terminal proof is inconsistent"
+        )
+    if state == "terminal_won" and (
+        code != "TIMEOUT_TERMINAL_WON"
+        or terminal_status not in {"Succeeded", "Failed"}
+        or terminal_failure_code is not None
+    ):
+        raise AdapterHandleError(
+            "ADAPTER_TIMEOUT_INVALID: natural terminal proof is inconsistent"
+        )
+    payload = {
+        "schema_version": "1.0.0",
+        "task_id": task_id,
+        "request_id": timeout_id,
+        "reason": "wall_time_exceeded",
+        "state": state,
+        "code": code,
+        "attempt_id": attempt_id,
+        "wall_time_seconds": wall_time_seconds,
+        "started_at": started_at,
+        "deadline_at": deadline_at,
+        "ready_record_hash": ready_record_hash,
+        "capability_record_hash": (
+            None if evidence is None else evidence.capability_record_hash
+        ),
+        "request_record_hash": (
+            None if evidence is None else evidence.request_record_hash
+        ),
+        "acknowledgement_record_hash": (
+            None if evidence is None else evidence.acknowledgement_record_hash
+        ),
+        "terminal_status": terminal_status,
+        "terminal_failure_code": terminal_failure_code,
+        "local_run_state": "retained",
+        "replayed": replayed,
+        "receipt_record_hash": receipt_record_hash,
+    }
+    return AdapterManagedTimeoutProof(
+        task_id=task_id,
+        timeout_id=timeout_id,
+        reason="wall_time_exceeded",
+        state=state,
+        code=code,
+        attempt_id=attempt_id,
+        wall_time_seconds=wall_time_seconds,
+        started_at=started_at,
+        deadline_at=deadline_at,
+        ready_record_hash=ready_record_hash,
+        capability_record_hash=payload["capability_record_hash"],
+        request_record_hash=payload["request_record_hash"],
+        acknowledgement_record_hash=payload[
+            "acknowledgement_record_hash"
+        ],
+        terminal_status=terminal_status,
+        terminal_failure_code=terminal_failure_code,
+        local_run_state="retained",
+        replayed=replayed,
+        receipt_record_hash=receipt_record_hash,
+        proof_hash=_sha256_document(payload),
+    )
+
+
+@dataclass(frozen=True)
 class AdapterPurgeResult:
     task_id: str
     purge_id: str
@@ -511,6 +660,7 @@ class WorkerLauncher(Protocol):
         config_path: Path,
         run_dir: Path,
         run_root: Path,
+        wall_time_seconds: int = 86_400,
     ) -> Any: ...
 
 
@@ -1055,7 +1205,7 @@ class SafeSubprocessWorkerLauncher:
         run_root: Path | None = None,
         launch_binding: LaunchAttemptBinding | None = None,
     ) -> None:
-        cancellation_acknowledged = False
+        acknowledged_stop_reason: str | None = None
         if run_root is not None or launch_binding is not None:
             if run_root is None or launch_binding is None:
                 return
@@ -1067,23 +1217,34 @@ class SafeSubprocessWorkerLauncher:
                 # newer attempt's status evidence.
                 return
             try:
-                cancel_evidence = read_worker_cancel_evidence(
-                    run_root, launch_binding
-                )
+                try:
+                    stop_evidence = read_worker_stop_evidence(
+                        run_root, launch_binding
+                    )
+                    stop_reason = stop_evidence.reason
+                    stop_acknowledged = stop_evidence.acknowledged
+                except WorkerControlError as error:
+                    if error.code != "WORKER_STOP_UNSUPPORTED":
+                        raise
+                    cancel_evidence = read_worker_cancel_evidence(
+                        run_root, launch_binding
+                    )
+                    stop_reason = cancel_evidence.reason
+                    stop_acknowledged = cancel_evidence.acknowledged
                 attempt_evidence = read_worker_attempt_evidence(
                     run_root, run_dir, launch_binding
                 )
                 if (
-                    cancel_evidence.acknowledged
+                    stop_acknowledged
                     and attempt_evidence is not None
                     and attempt_evidence.heartbeat_state == "stopped"
                 ):
-                    cancellation_acknowledged = True
+                    acknowledged_stop_reason = stop_reason
             except (FileNotFoundError, WorkerControlError):
-                cancellation_acknowledged = False
+                acknowledged_stop_reason = None
         status_path = run_dir / "status.json"
 
-        def write_terminal(*, cancelled: bool) -> None:
+        def write_terminal(*, stop_reason: str | None) -> None:
             try:
                 value = _read_json_file(
                     status_path, code="WORKER_STATUS_INVALID"
@@ -1092,18 +1253,26 @@ class SafeSubprocessWorkerLauncher:
                 # even if a later process exit code is nonzero.
                 if value.get("status") in {"succeeded", "failed", "cancelled"}:
                     return
-                value.update(
-                    {
-                        "status": "cancelled" if cancelled else "failed",
-                        "stage": "cancelled" if cancelled else "worker_exit",
-                        "message": (
-                            "FWI Worker cancellation completed"
-                            if cancelled
-                            else f"FWI worker exited with code {return_code}"
-                        ),
-                        "updated_at": _utc_now(),
+                if stop_reason == "user_requested":
+                    update = {
+                        "status": "cancelled",
+                        "stage": "cancelled",
+                        "message": "FWI Worker cancellation completed",
                     }
-                )
+                elif stop_reason == "wall_time_exceeded":
+                    update = {
+                        "status": "failed",
+                        "stage": "failed",
+                        "message": "FWI Worker wall time exceeded",
+                        "failure_code": "WALL_TIME_EXCEEDED",
+                    }
+                else:
+                    update = {
+                        "status": "failed",
+                        "stage": "worker_exit",
+                        "message": f"FWI worker exited with code {return_code}",
+                    }
+                value.update({**update, "updated_at": _utc_now()})
                 _atomic_write_json(status_path, value)
             except Exception:
                 # Status is Worker evidence, while SQLite remains task truth.  A
@@ -1111,17 +1280,17 @@ class SafeSubprocessWorkerLauncher:
                 # being replaced with invented success evidence.
                 return
 
-        if cancellation_acknowledged:
+        if acknowledged_stop_reason is not None:
             assert run_root is not None and launch_binding is not None
             try:
                 with hold_idle_execution_fence(run_root, launch_binding):
-                    write_terminal(cancelled=True)
+                    write_terminal(stop_reason=acknowledged_stop_reason)
             except WorkerControlError:
                 # A descendant or still-exiting Worker retained the exact
                 # execution fence.  Leave finalization to a later observer.
                 return
         else:
-            write_terminal(cancelled=False)
+            write_terminal(stop_reason=None)
 
     @staticmethod
     def _terminate_before_ready(process: subprocess.Popen[Any]) -> bool:
@@ -1151,6 +1320,7 @@ class SafeSubprocessWorkerLauncher:
         config_path: Path,
         run_dir: Path,
         run_root: Path,
+        wall_time_seconds: int = 86_400,
     ) -> int:
         if command != "invert":
             raise AdapterValidationError(
@@ -1194,6 +1364,8 @@ class SafeSubprocessWorkerLauncher:
                 str(run_dir),
                 "--run-root",
                 str(run_root),
+                "--wall-time-seconds",
+                str(wall_time_seconds),
                 *lease.child_arguments,
             ]
             process = subprocess.Popen(
@@ -2571,6 +2743,7 @@ class DeepwaveAdapter:
                 config_path=job_dir / "config.original.json",
                 run_dir=job_dir,
                 run_root=self._run_root,
+                wall_time_seconds=validated.resources["wall_time_seconds"],
             )
         except _AdapterLaunchAmbiguous as error:
             # Popen may have succeeded and the child retains both kernel
@@ -2950,6 +3123,8 @@ class DeepwaveAdapter:
         *,
         cancellation_fence_held: bool = False,
         allow_pending_cancel: bool = False,
+        timeout_fence_held: bool = False,
+        allow_pending_timeout: bool = False,
     ) -> AdapterStatus:
         job_dir = self._job_directory(record)
         value = _read_json_file(job_dir / "status.json", code="ADAPTER_STATUS_INVALID")
@@ -3042,6 +3217,13 @@ class DeepwaveAdapter:
             raise AdapterStatusError(
                 "ADAPTER_STATUS_INVALID: status, stage, and progress contradict one another"
             )
+        failure_code = value.get("failure_code")
+        if failure_code is not None and (
+            worker_status != "failed" or failure_code != "WALL_TIME_EXCEEDED"
+        ):
+            raise AdapterStatusError(
+                "ADAPTER_STATUS_INVALID: Worker failure code is invalid"
+            )
         pending_cancel = False
         if worker_status == "cancelled":
             if (
@@ -3069,6 +3251,7 @@ class DeepwaveAdapter:
                 if (
                     current != value
                     or capability is None
+                    or evidence.reason != "user_requested"
                     or not evidence.requested
                     or not evidence.acknowledged
                     or attempt is None
@@ -3099,8 +3282,74 @@ class DeepwaveAdapter:
                     raise AdapterStatusError(
                         "ADAPTER_STATUS_INVALID: cancellation is not terminal"
                     ) from error
+        pending_timeout = False
+        if worker_status == "failed" and failure_code == "WALL_TIME_EXCEEDED":
+            if (
+                record.get("adapter_version") != ADAPTER_VERSION
+                or record.get("schema_version") != "1.1.0"
+            ):
+                raise AdapterStatusError(
+                    "ADAPTER_STATUS_INVALID: timeout proof is unavailable"
+                )
+
+            def prove_timed_out() -> None:
+                binding = binding_from_submission_record(record)
+                evidence = read_worker_stop_evidence(self._run_root, binding)
+                attempt = read_worker_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+                capability = read_worker_stop_capability(
+                    self._run_root, binding
+                )
+                current = _read_json_file(
+                    job_dir / "status.json", code="ADAPTER_STATUS_INVALID"
+                )
+                if (
+                    current != value
+                    or capability is None
+                    or evidence.reason != "wall_time_exceeded"
+                    or not evidence.requested
+                    or not evidence.acknowledged
+                    or evidence.wall_time_seconds
+                    != record["resources"]["wall_time_seconds"]
+                    or attempt is None
+                    or attempt.ticket_state != "spawned"
+                    or not attempt.ready
+                    or attempt.ready_record_hash is None
+                    or evidence.ready_record_hash
+                    != attempt.ready_record_hash
+                    or attempt.heartbeat_state != "stopped"
+                    or capability["record_hash"]
+                    != evidence.capability_record_hash
+                    or capability["worker_pid"] != attempt.ticket_worker_pid
+                    or capability["worker_pid"] != attempt.ready_worker_pid
+                    or capability["capacity_slot"] != attempt.capacity_slot
+                    or capability["capacity_generation"]
+                    != attempt.capacity_generation
+                    or capability["wall_time_seconds"]
+                    != record["resources"]["wall_time_seconds"]
+                ):
+                    raise WorkerControlError(
+                        "WORKER_STOP_INVALID: terminal timeout is unproven"
+                    )
+
+            try:
+                if timeout_fence_held:
+                    prove_timed_out()
+                else:
+                    binding = binding_from_submission_record(record)
+                    with hold_idle_execution_fence(self._run_root, binding):
+                        prove_timed_out()
+            except (FileNotFoundError, WorkerControlError, AdapterStatusError) as error:
+                if allow_pending_timeout:
+                    pending_timeout = True
+                else:
+                    raise AdapterStatusError(
+                        "ADAPTER_STATUS_INVALID: timeout is not terminal"
+                    ) from error
         _parse_timestamp(value["updated_at"], code="ADAPTER_STATUS_INVALID")
-        status = "Running" if pending_cancel else mapping[worker_status]
+        pending_stop = pending_cancel or pending_timeout
+        status = "Running" if pending_stop else mapping[worker_status]
         controlled_messages = {
             "Queued": "FWI job is queued",
             "Running": f"FWI job is running ({value['stage']})",
@@ -3122,7 +3371,7 @@ class DeepwaveAdapter:
             message=controlled_messages[status],
             updated_at=value["updated_at"],
             terminal=(
-                not pending_cancel
+                not pending_stop
                 and status in {"Succeeded", "Failed", "Cancelled"}
             ),
         )
@@ -3273,6 +3522,97 @@ class DeepwaveAdapter:
                 local_run_state="deleted",
                 replayed=replayed,
             )
+
+    def supports_exact_timeout(
+        self, handle: AdapterHandle, attempt_id: str
+    ) -> dict[str, Any] | None:
+        """Return a path-free proof that the exact live Worker supports timeout."""
+
+        if (
+            not isinstance(attempt_id, str)
+            or MANAGED_ATTEMPT_ID.fullmatch(attempt_id) is None
+        ):
+            raise AdapterValidationError(
+                "TIMEOUT_REQUEST_INVALID",
+                ["attempt_id is not an exact managed attempt identifier"],
+            )
+        initial = self._record_for_handle(handle)
+        if (
+            handle.adapter_version != ADAPTER_VERSION
+            or initial["adapter_version"] != ADAPTER_VERSION
+            or initial["schema_version"] != "1.1.0"
+        ):
+            return None
+        _, locks = self._control_paths()
+        index_name = handle.submission_id.removeprefix("submission-") + ".json"
+        lock_path = locks / (index_name + ".lock")
+        with self._lock_submission(lock_path, timeout_seconds=5.0):
+            record = self._record_for_handle(handle)
+            if (
+                record["adapter_version"] != ADAPTER_VERSION
+                or record["schema_version"] != "1.1.0"
+            ):
+                return None
+            try:
+                binding = binding_from_submission_record(record)
+                if binding.attempt_id != attempt_id:
+                    return None
+                job_dir = self._job_directory(record)
+                attempt = read_worker_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+                capability = read_worker_stop_capability(
+                    self._run_root, binding
+                )
+                if (
+                    attempt is None
+                    or attempt.ticket_state != "spawned"
+                    or not attempt.ready
+                    or attempt.heartbeat_state != "running"
+                    or capability is None
+                    or capability.get("supported_reasons")
+                    != ["user_requested", "wall_time_exceeded"]
+                    or capability.get("wall_time_seconds")
+                    != record["resources"]["wall_time_seconds"]
+                ):
+                    return None
+                if (
+                    capability["worker_pid"] != attempt.ticket_worker_pid
+                    or capability["worker_pid"] != attempt.ready_worker_pid
+                    or capability["capacity_slot"] != attempt.capacity_slot
+                    or capability["capacity_generation"]
+                    != attempt.capacity_generation
+                ):
+                    raise WorkerControlError(
+                        "WORKER_STOP_INVALID: capability Worker identity changed"
+                    )
+                stop_evidence = read_worker_stop_evidence(
+                    self._run_root, binding
+                )
+                if (
+                    stop_evidence.requested
+                    and stop_evidence.ready_record_hash
+                    != attempt.ready_record_hash
+                ):
+                    raise WorkerControlError(
+                        "WORKER_STOP_INVALID: timeout ready receipt changed"
+                    )
+            except (FileNotFoundError, WorkerControlError) as error:
+                raise AdapterHandleError(
+                    "ADAPTER_TIMEOUT_INVALID: exact timeout capability is invalid"
+                ) from error
+            payload = {
+                "schema_version": "2.0.0",
+                "attempt_id": binding.attempt_id,
+                "binding_hash": binding.binding_hash,
+                "capability_record_hash": capability["record_hash"],
+                "supported_reasons": [
+                    "user_requested",
+                    "wall_time_exceeded",
+                ],
+                "private_schema_version": "1.1.0",
+            }
+            return {**payload, "proof_hash": _sha256_document(payload)}
 
     def supports_exact_cancel(
         self, handle: AdapterHandle, *, attempt_id: str
@@ -3734,6 +4074,494 @@ class DeepwaveAdapter:
                     attempt_id=binding.attempt_id,
                     evidence=cancel_evidence,
                     terminal_status=None,
+                    replayed=replayed,
+                    receipt_record_hash=record["record_hash"],
+                )
+
+    def timeout(
+        self,
+        handle: AdapterHandle,
+        timeout_id: str,
+        attempt_id: str,
+        wall_time_seconds: int,
+        started_at: str,
+        deadline_at: str,
+    ) -> AdapterManagedTimeoutProof:
+        """Request or finalize one exact v2 Worker wall-time failure."""
+
+        if (
+            not isinstance(timeout_id, str)
+            or OPAQUE_ID.fullmatch(timeout_id) is None
+            or not isinstance(attempt_id, str)
+            or MANAGED_ATTEMPT_ID.fullmatch(attempt_id) is None
+            or type(wall_time_seconds) is not int
+            or not 1 <= wall_time_seconds <= 86_400
+        ):
+            raise AdapterValidationError(
+                "TIMEOUT_REQUEST_INVALID",
+                ["timeout_id, attempt_id, or wall time is invalid"],
+            )
+        try:
+            started = _parse_timestamp(started_at, code="TIMEOUT_REQUEST_INVALID")
+            deadline = _parse_timestamp(deadline_at, code="TIMEOUT_REQUEST_INVALID")
+        except AdapterStatusError as error:
+            raise AdapterValidationError(
+                "TIMEOUT_REQUEST_INVALID", ["timeout window is invalid"]
+            ) from error
+        if deadline - started != timedelta(seconds=wall_time_seconds):
+            raise AdapterValidationError(
+                "TIMEOUT_REQUEST_INVALID",
+                ["deadline must equal started_at plus wall_time_seconds"],
+            )
+
+        initial = self._record_for_handle(handle)
+        if (
+            handle.adapter_version != ADAPTER_VERSION
+            or initial["adapter_version"] != ADAPTER_VERSION
+            or initial["schema_version"] != "1.1.0"
+        ):
+            return _managed_timeout_proof(
+                task_id=handle.task_id,
+                timeout_id=timeout_id,
+                state="deferred",
+                code="TIMEOUT_MANAGED_ATTEMPT_UNAVAILABLE",
+                attempt_id=attempt_id,
+                wall_time_seconds=wall_time_seconds,
+                started_at=started_at,
+                deadline_at=deadline_at,
+                ready_record_hash=None,
+                evidence=None,
+                terminal_status=None,
+                terminal_failure_code=None,
+                replayed=False,
+                receipt_record_hash=initial["record_hash"],
+            )
+
+        _, locks = self._control_paths()
+        index_name = handle.submission_id.removeprefix("submission-") + ".json"
+        lock_path = locks / (index_name + ".lock")
+        with self._lock_submission(lock_path, timeout_seconds=5.0):
+            record = self._record_for_handle(handle)
+            if record["schema_version"] != "1.1.0":
+                return _managed_timeout_proof(
+                    task_id=handle.task_id,
+                    timeout_id=timeout_id,
+                    state="deferred",
+                    code="TIMEOUT_MANAGED_ATTEMPT_UNAVAILABLE",
+                    attempt_id=attempt_id,
+                    wall_time_seconds=wall_time_seconds,
+                    started_at=started_at,
+                    deadline_at=deadline_at,
+                    ready_record_hash=None,
+                    evidence=None,
+                    terminal_status=None,
+                    terminal_failure_code=None,
+                    replayed=False,
+                    receipt_record_hash=record["record_hash"],
+                )
+            if record["resources"].get("wall_time_seconds") != wall_time_seconds:
+                raise AdapterHandleError(
+                    "ADAPTER_TIMEOUT_INVALID: timeout differs from immutable resources"
+                )
+            try:
+                binding = binding_from_submission_record(record)
+                job_dir = self._job_directory(record)
+                observed = self._status_for_record(
+                    record, allow_pending_timeout=True
+                )
+            except (WorkerControlError, AdapterStatusError) as error:
+                raise AdapterHandleError(
+                    "ADAPTER_TIMEOUT_INVALID: managed attempt evidence is invalid"
+                ) from error
+            if binding.attempt_id != attempt_id:
+                return _managed_timeout_proof(
+                    task_id=handle.task_id,
+                    timeout_id=timeout_id,
+                    state="deferred",
+                    code="TIMEOUT_ATTEMPT_MISMATCH",
+                    attempt_id=attempt_id,
+                    wall_time_seconds=wall_time_seconds,
+                    started_at=started_at,
+                    deadline_at=deadline_at,
+                    ready_record_hash=None,
+                    evidence=None,
+                    terminal_status=None,
+                    terminal_failure_code=None,
+                    replayed=False,
+                    receipt_record_hash=record["record_hash"],
+                )
+
+            try:
+                existing = read_worker_stop_evidence(self._run_root, binding)
+            except WorkerControlError as error:
+                if error.code == "WORKER_STOP_UNSUPPORTED":
+                    existing = None
+                else:
+                    raise AdapterHandleError(
+                        "ADAPTER_TIMEOUT_INVALID: stop control is invalid"
+                    ) from error
+            if existing is not None and existing.requested and (
+                existing.request_id != timeout_id
+                or existing.reason != "wall_time_exceeded"
+                or existing.wall_time_seconds != wall_time_seconds
+                or existing.started_at != started_at
+                or existing.deadline_at != deadline_at
+            ):
+                raise AdapterIdempotencyConflict(
+                    "TIMEOUT_IDEMPOTENCY_CONFLICT: attempt has another stop request"
+                )
+            try:
+                window_attempt = read_worker_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+                window_capability = read_worker_stop_capability(
+                    self._run_root, binding
+                )
+            except (FileNotFoundError, WorkerControlError) as error:
+                raise AdapterHandleError(
+                    "ADAPTER_TIMEOUT_INVALID: timeout window evidence is invalid"
+                ) from error
+            if (
+                existing is not None
+                and existing.requested
+                and (
+                    window_attempt is None
+                    or existing.ready_record_hash
+                    != window_attempt.ready_record_hash
+                )
+            ):
+                raise AdapterHandleError(
+                    "ADAPTER_TIMEOUT_INVALID: timeout ready receipt changed"
+                )
+            window_valid = (
+                window_attempt is not None
+                and window_attempt.ticket_state == "spawned"
+                and window_attempt.ready
+                and window_attempt.ready_record_hash is not None
+                and window_capability is not None
+                and existing is not None
+                and (
+                    not existing.requested
+                    or existing.ready_record_hash
+                    == window_attempt.ready_record_hash
+                )
+                and window_capability["record_hash"]
+                == existing.capability_record_hash
+                and window_capability["worker_pid"]
+                == window_attempt.ticket_worker_pid
+                and window_capability["worker_pid"]
+                == window_attempt.ready_worker_pid
+                and window_capability["capacity_slot"]
+                == window_attempt.capacity_slot
+                and window_capability["capacity_generation"]
+                == window_attempt.capacity_generation
+                and window_capability["wall_time_seconds"]
+                == wall_time_seconds
+            )
+
+            # A natural terminal is authoritative even if a timeout request was
+            # already published.  WALL_TIME_EXCEEDED is deliberately excluded:
+            # it is terminal only after the exact stop/fence proof below.
+            raw_status = _read_json_file(
+                job_dir / "status.json", code="WORKER_STATUS_INVALID"
+            )
+            raw_failure_code = raw_status.get("failure_code")
+            if observed.terminal and (
+                observed.status == "Succeeded"
+                or (
+                    observed.status == "Failed"
+                    and raw_failure_code != "WALL_TIME_EXCEEDED"
+                )
+            ):
+                if not window_valid:
+                    return _managed_timeout_proof(
+                        task_id=handle.task_id,
+                        timeout_id=timeout_id,
+                        state="deferred",
+                        code="TIMEOUT_WORKER_CAPABILITY_UNAVAILABLE",
+                        attempt_id=binding.attempt_id,
+                        wall_time_seconds=wall_time_seconds,
+                        started_at=started_at,
+                        deadline_at=deadline_at,
+                        ready_record_hash=(
+                            None
+                            if window_attempt is None
+                            else window_attempt.ready_record_hash
+                        ),
+                        evidence=existing,
+                        terminal_status=None,
+                        terminal_failure_code=None,
+                        replayed=existing is not None and existing.requested,
+                        receipt_record_hash=record["record_hash"],
+                    )
+                return _managed_timeout_proof(
+                    task_id=handle.task_id,
+                    timeout_id=timeout_id,
+                    state="terminal_won",
+                    code="TIMEOUT_TERMINAL_WON",
+                    attempt_id=binding.attempt_id,
+                    wall_time_seconds=wall_time_seconds,
+                    started_at=started_at,
+                    deadline_at=deadline_at,
+                    ready_record_hash=window_attempt.ready_record_hash,
+                    evidence=existing,
+                    terminal_status=observed.status,
+                    terminal_failure_code=None,
+                    replayed=existing is not None and existing.requested,
+                    receipt_record_hash=record["record_hash"],
+                )
+
+            now_text = self._clock()
+            try:
+                now = _parse_timestamp(now_text, code="CLOCK_INVALID")
+            except AdapterStatusError as error:
+                raise AdapterUnavailable("CLOCK_INVALID") from error
+            if now < deadline:
+                return _managed_timeout_proof(
+                    task_id=handle.task_id,
+                    timeout_id=timeout_id,
+                    state="deferred",
+                    code="TIMEOUT_NOT_DUE",
+                    attempt_id=binding.attempt_id,
+                    wall_time_seconds=wall_time_seconds,
+                    started_at=started_at,
+                    deadline_at=deadline_at,
+                    ready_record_hash=(
+                        None
+                        if window_attempt is None
+                        else window_attempt.ready_record_hash
+                    ),
+                    evidence=existing,
+                    terminal_status=None,
+                    terminal_failure_code=None,
+                    replayed=existing is not None and existing.requested,
+                    receipt_record_hash=record["record_hash"],
+                )
+
+            try:
+                attempt = read_worker_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+            except (FileNotFoundError, WorkerControlError) as error:
+                raise AdapterHandleError(
+                    "ADAPTER_TIMEOUT_INVALID: Worker attempt evidence is invalid"
+                ) from error
+            if (
+                attempt is None
+                or attempt.ticket_state != "spawned"
+                or not attempt.ready
+                or attempt.heartbeat_state
+                not in ({"running", "stopped"} if existing and existing.requested else {"running"})
+            ):
+                return _managed_timeout_proof(
+                    task_id=handle.task_id,
+                    timeout_id=timeout_id,
+                    state="deferred",
+                    code="TIMEOUT_WORKER_NOT_RUNNING",
+                    attempt_id=binding.attempt_id,
+                    wall_time_seconds=wall_time_seconds,
+                    started_at=started_at,
+                    deadline_at=deadline_at,
+                    ready_record_hash=(
+                        None if attempt is None else attempt.ready_record_hash
+                    ),
+                    evidence=existing,
+                    terminal_status=None,
+                    terminal_failure_code=None,
+                    replayed=existing is not None and existing.requested,
+                    receipt_record_hash=record["record_hash"],
+                )
+            capability = read_worker_stop_capability(self._run_root, binding)
+            if capability is None:
+                return _managed_timeout_proof(
+                    task_id=handle.task_id,
+                    timeout_id=timeout_id,
+                    state="deferred",
+                    code="TIMEOUT_WORKER_CAPABILITY_UNAVAILABLE",
+                    attempt_id=binding.attempt_id,
+                    wall_time_seconds=wall_time_seconds,
+                    started_at=started_at,
+                    deadline_at=deadline_at,
+                    ready_record_hash=attempt.ready_record_hash,
+                    evidence=None,
+                    terminal_status=None,
+                    terminal_failure_code=None,
+                    replayed=False,
+                    receipt_record_hash=record["record_hash"],
+                )
+            if (
+                capability["worker_pid"] != attempt.ticket_worker_pid
+                or capability["worker_pid"] != attempt.ready_worker_pid
+                or capability["capacity_slot"] != attempt.capacity_slot
+                or capability["capacity_generation"] != attempt.capacity_generation
+                or capability["wall_time_seconds"] != wall_time_seconds
+            ):
+                raise AdapterHandleError(
+                    "ADAPTER_TIMEOUT_INVALID: capability Worker identity changed"
+                )
+
+            try:
+                evidence, replayed = request_worker_stop(
+                    self._run_root,
+                    binding,
+                    request_id=timeout_id,
+                    reason="wall_time_exceeded",
+                    requested_at=now_text,
+                    wall_time_seconds=wall_time_seconds,
+                    started_at=started_at,
+                    deadline_at=deadline_at,
+                    ready_record_hash=attempt.ready_record_hash,
+                )
+            except WorkerControlError as error:
+                if error.code == "WORKER_STOP_CONFLICT":
+                    raise AdapterIdempotencyConflict(
+                        "TIMEOUT_IDEMPOTENCY_CONFLICT: attempt has another stop request"
+                    ) from error
+                raise AdapterHandleError(
+                    "ADAPTER_TIMEOUT_INVALID: stop control is invalid"
+                ) from error
+
+            try:
+                with hold_idle_execution_fence(self._run_root, binding):
+                    raw_status = _read_json_file(
+                        job_dir / "status.json", code="WORKER_STATUS_INVALID"
+                    )
+                    if raw_status.get("status") in {"succeeded", "failed"} and raw_status.get(
+                        "failure_code"
+                    ) != "WALL_TIME_EXCEEDED":
+                        terminal = self._status_for_record(record)
+                        return _managed_timeout_proof(
+                            task_id=handle.task_id,
+                            timeout_id=timeout_id,
+                            state="terminal_won",
+                            code="TIMEOUT_TERMINAL_WON",
+                            attempt_id=binding.attempt_id,
+                            wall_time_seconds=wall_time_seconds,
+                            started_at=started_at,
+                            deadline_at=deadline_at,
+                            ready_record_hash=attempt.ready_record_hash,
+                            evidence=evidence,
+                            terminal_status=terminal.status,
+                            terminal_failure_code=None,
+                            replayed=replayed,
+                            receipt_record_hash=record["record_hash"],
+                        )
+                    evidence = read_worker_stop_evidence(
+                        self._run_root, binding
+                    )
+                    attempt = read_worker_attempt_evidence(
+                        self._run_root, job_dir, binding
+                    )
+                    capability = read_worker_stop_capability(
+                        self._run_root, binding
+                    )
+                    if (
+                        evidence.request_id != timeout_id
+                        or evidence.reason != "wall_time_exceeded"
+                        or evidence.wall_time_seconds != wall_time_seconds
+                        or evidence.started_at != started_at
+                        or evidence.deadline_at != deadline_at
+                        or not evidence.acknowledged
+                        or attempt is None
+                        or attempt.ticket_state != "spawned"
+                        or not attempt.ready
+                        or attempt.heartbeat_state != "stopped"
+                        or attempt.ready_record_hash is None
+                        or evidence.ready_record_hash
+                        != attempt.ready_record_hash
+                        or capability is None
+                        or capability["record_hash"]
+                        != evidence.capability_record_hash
+                        or capability["worker_pid"] != attempt.ticket_worker_pid
+                        or capability["worker_pid"] != attempt.ready_worker_pid
+                        or capability["capacity_slot"] != attempt.capacity_slot
+                        or capability["capacity_generation"]
+                        != attempt.capacity_generation
+                        or capability["wall_time_seconds"]
+                        != wall_time_seconds
+                    ):
+                        return _managed_timeout_proof(
+                            task_id=handle.task_id,
+                            timeout_id=timeout_id,
+                            state="deferred",
+                            code="TIMEOUT_EXIT_UNPROVEN",
+                            attempt_id=binding.attempt_id,
+                            wall_time_seconds=wall_time_seconds,
+                            started_at=started_at,
+                            deadline_at=deadline_at,
+                            ready_record_hash=(
+                                None if attempt is None else attempt.ready_record_hash
+                            ),
+                            evidence=evidence,
+                            terminal_status=None,
+                            terminal_failure_code=None,
+                            replayed=replayed,
+                            receipt_record_hash=record["record_hash"],
+                        )
+                    if raw_status.get("status") not in {
+                        "queued",
+                        "running",
+                        "failed",
+                    }:
+                        raise AdapterHandleError(
+                            "ADAPTER_TIMEOUT_INVALID: terminal timeout state is invalid"
+                        )
+                    if (
+                        raw_status.get("status") != "failed"
+                        or raw_status.get("failure_code")
+                        != "WALL_TIME_EXCEEDED"
+                    ):
+                        raw_status.update(
+                            {
+                                "status": "failed",
+                                "stage": "failed",
+                                "message": "FWI Worker wall time exceeded",
+                                "failure_code": "WALL_TIME_EXCEEDED",
+                                "updated_at": self._clock(),
+                            }
+                        )
+                        _atomic_write_json(job_dir / "status.json", raw_status)
+                    terminal = self._status_for_record(
+                        record, timeout_fence_held=True
+                    )
+                    if terminal.status != "Failed":
+                        raise AdapterHandleError(
+                            "ADAPTER_TIMEOUT_INVALID: timeout status was not durable"
+                        )
+                    return _managed_timeout_proof(
+                        task_id=handle.task_id,
+                        timeout_id=timeout_id,
+                        state="timed_out",
+                        code="TIMEOUT_COMPLETED",
+                        attempt_id=binding.attempt_id,
+                        wall_time_seconds=wall_time_seconds,
+                        started_at=started_at,
+                        deadline_at=deadline_at,
+                        ready_record_hash=attempt.ready_record_hash,
+                        evidence=evidence,
+                        terminal_status="Failed",
+                        terminal_failure_code="WALL_TIME_EXCEEDED",
+                        replayed=replayed,
+                        receipt_record_hash=record["record_hash"],
+                    )
+            except WorkerControlError as error:
+                if error.code != "WORKER_ATTEMPT_BUSY":
+                    raise AdapterHandleError(
+                        "ADAPTER_TIMEOUT_INVALID: execution fence is invalid"
+                    ) from error
+                return _managed_timeout_proof(
+                    task_id=handle.task_id,
+                    timeout_id=timeout_id,
+                    state="pending" if replayed else "requested",
+                    code=("TIMEOUT_PENDING" if replayed else "TIMEOUT_REQUESTED"),
+                    attempt_id=binding.attempt_id,
+                    wall_time_seconds=wall_time_seconds,
+                    started_at=started_at,
+                    deadline_at=deadline_at,
+                    ready_record_hash=attempt.ready_record_hash,
+                    evidence=evidence,
+                    terminal_status=None,
+                    terminal_failure_code=None,
                     replayed=replayed,
                     receipt_record_hash=record["record_hash"],
                 )
@@ -4387,6 +5215,7 @@ __all__ = [
     "AdapterHandleError",
     "AdapterIdempotencyConflict",
     "AdapterManagedCancelProof",
+    "AdapterManagedTimeoutProof",
     "AdapterPurgeError",
     "AdapterPurgeResult",
     "AdapterStatus",

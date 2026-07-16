@@ -20,12 +20,13 @@
   evidence projection/late adoption；P2-006 又增加 SQLite v10 受监督派发授权、enqueue-only
   submit、可恢复 fenced scheduler、exact staged attempt 恢复与 current 1.4 legacy-private
   receipt 的受 fence 收养；P2-007 增加 SQLite v11 durable user-cancel admission、active-term
-  delivery、exact Worker self-cancel 证明和 Guided Web 取消状态。
-- 当前阶段：完整 P2 仍在进行；上述 P2 子项不得表述为完整 P2 已完成。
-- 下一安全方向：先由用户确认 timeout 的终态语义、计时起点和 force policy，再实现 timeout；
-  随后处理有限 retry、`reconciliation_required` resolution，SSE 继续后置。
-- 当前阻塞：P2-007 无阻塞；timeout 产品语义尚未形成 Accepted 决定。工作树中的未提交内容
-  可能属于另一个活跃窗口，必须现场检查并保护。
+  delivery、exact Worker self-cancel 证明和 Guided Web 取消状态；P2-008 增加 SQLite v12
+  immutable timeout window/active-term authorization/outcome、Worker v2 exact-stop 自停止和
+  Guided Web 有界只读 timeout 投影。
+- 当前阶段：P2-008 exact-attempt wall-time timeout 有界切片已 Verified；完整 P2 仍在进行，
+  上述 P2 子项不得表述为完整 P2 已完成。
+- 下一安全方向：处理有限 retry 与 `reconciliation_required` resolution，SSE 继续后置。
+- 当前阻塞：无。工作树中的未提交内容可能属于另一个活跃窗口，必须现场检查并保护。
 - 已接受 D-011：继续保留逐切片开发，但采用弹性中等粒度；约十余个剩余切片只是估算，允许
   按真实风险小幅增加，不为 migration/字段/单项测试制造路线切片，也不得无说明膨胀成几十个。
   多算法首先是独立可选工具，自动全流程不是当前验收要求；测试分级执行但阶段质量门不降低。
@@ -74,7 +75,17 @@
   Worker ack + stopped heartbeat + idle execution `flock` 全部成立后提交 Cancelled。自然
   Succeeded/Failed 先到则 cancellation 为 superseded 且不改写终态。控制面不根据持久 PID
   发 signal；pending/staged、legacy private schema 1.0、公共历史 1.0–1.3 均不支持该入口。
-- `resources.wall_time_seconds` 仍只是持久资源策略字段，不是 runtime timeout；timeout 尚未实现。
+- P2-008 已验证：只对 current Algorithm/Adapter 1.4、private schema 1.1、durable dispatched
+  且能证明 v2 exact-stop capability 的最新 managed attempt 自动执行 wall-time timeout。时钟精确
+  从 Store 对该 current Worker 的首条 durable `spawned + ready + running` observation 的
+  `observed_at` 开始；deadline 到来且 active term 持久授权前 Worker mutation 为零。自然终态在
+  authorization 前完成记 `not_triggered`；durable user-cancel admission 先赢记 `suppressed`；
+  timeout authorization/request 后自然终态先赢记 `superseded`；只有 request + ack + stopped
+  heartbeat + idle execution `flock` 全部成立才记 `timed_out` 并提交
+  `Failed / WALL_TIME_EXCEEDED`。宽限耗尽时 exact Worker 自行退出，控制面不根据持久 PID 发
+  signal；旧 Worker/历史任务保持 fail-closed。Workbench 只读投影精确包含 `state`、
+  `wall_time_seconds`、`started_at`、`deadline_at`、`resolved_at`、`failure_code`、
+  `terminal_status` 七个字段，不暴露 ID/hash/PID/path，也不存在 `POST /timeout` mutation。
 - 不读取、打印或提交 `.env`、API Key、凭证、私有 prompt、模型、运行 artifact、数据库、
   日志、构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开报告；科学结论只限实际实验边界。

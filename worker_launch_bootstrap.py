@@ -16,8 +16,10 @@ from typing import Any
 
 from worker_launch_control import (
     CANCELLED_WORKER_EXIT_CODE,
+    WALL_TIME_EXCEEDED_WORKER_EXIT_CODE,
     WorkerCancellationRequested,
     WorkerHeartbeat,
+    WorkerWallTimeExceeded,
 )
 
 
@@ -30,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--launch-attempt-id", required=True)
     parser.add_argument("--launch-attempt-fd", required=True, type=int)
     parser.add_argument("--capacity-lease-fd", required=True, type=int)
+    parser.add_argument("--wall-time-seconds", type=int, default=86_400)
     return parser
 
 
@@ -51,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
             attempt_id=args.launch_attempt_id,
             attempt_fd=args.launch_attempt_fd,
             capacity_fd=args.capacity_lease_fd,
+            wall_time_seconds=args.wall_time_seconds,
         )
         heartbeat.start()
         heartbeat.raise_if_cancel_requested()
@@ -71,6 +75,11 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat.stop("stopped")
             heartbeat = None
         return CANCELLED_WORKER_EXIT_CODE
+    except WorkerWallTimeExceeded:
+        if heartbeat is not None:
+            heartbeat.stop("stopped")
+            heartbeat = None
+        return WALL_TIME_EXCEEDED_WORKER_EXIT_CODE
     except BaseException as error:
         if heartbeat is not None:
             try:

@@ -2329,6 +2329,60 @@
         ));
     }
 
+    function normalizeGuidedTimeoutProjection(value, wallTimeSeconds, taskStatus) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+      const keys = Object.keys(value).sort().join(',');
+      if (keys !== 'deadline_at,failure_code,resolved_at,started_at,state,terminal_status,wall_time_seconds') {
+        return null;
+      }
+      const stateName = [
+        'armed', 'requested', 'timed_out', 'superseded', 'not_triggered', 'suppressed',
+      ].includes(value.state) ? value.state : '';
+      const startedAt = boundedGuidedText(value.started_at, 80);
+      const deadlineAt = boundedGuidedText(value.deadline_at, 80);
+      const resolvedAt = value.resolved_at === null
+        ? null : boundedGuidedText(value.resolved_at, 80);
+      const failureCode = value.failure_code === null
+        ? null : (/^[A-Z][A-Z0-9_]{0,127}$/.test(value.failure_code || '')
+          ? value.failure_code : '');
+      const terminalStatus = value.terminal_status === null
+        ? null : (['Succeeded', 'Failed', 'Cancelled'].includes(value.terminal_status)
+          ? value.terminal_status : '');
+      if (!stateName
+          || !Number.isInteger(value.wall_time_seconds)
+          || value.wall_time_seconds !== wallTimeSeconds
+          || !startedAt || !deadlineAt
+          || resolvedAt === '' || failureCode === '' || terminalStatus === '') return null;
+      const active = ['Queued', 'Running', 'Waiting', 'Retrying'].includes(taskStatus);
+      if (['armed', 'requested'].includes(stateName)
+          && (!active || resolvedAt !== null || failureCode !== null || terminalStatus !== null)) {
+        return null;
+      }
+      if (stateName === 'timed_out'
+          && (taskStatus !== 'Failed' || !resolvedAt
+            || failureCode !== 'WALL_TIME_EXCEEDED' || terminalStatus !== 'Failed')) {
+        return null;
+      }
+      if (stateName === 'superseded'
+          && (!['Succeeded', 'Failed'].includes(taskStatus) || !resolvedAt
+            || failureCode !== null || terminalStatus !== taskStatus)) return null;
+      if (stateName === 'not_triggered'
+          && (!['Succeeded', 'Failed'].includes(taskStatus) || resolvedAt !== null
+            || failureCode !== null || terminalStatus !== null)) return null;
+      if (stateName === 'suppressed'
+          && (!['Queued', 'Running', 'Waiting', 'Retrying', 'Succeeded', 'Failed', 'Cancelled'].includes(taskStatus)
+            || resolvedAt !== null || failureCode !== null || terminalStatus !== null)) return null;
+      return {
+        state: stateName,
+        wallTimeSeconds: value.wall_time_seconds,
+        startedAt,
+        deadlineAt,
+        resolvedAt,
+        failureCode,
+        terminalStatus,
+      };
+    }
+
     function normalizeGuidedTaskProjection(value, expectedTaskId = '') {
       const outer = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
       const source = outer.task && typeof outer.task === 'object' ? outer.task : outer;
@@ -2348,25 +2402,40 @@
         : (draftSource.dataset && typeof draftSource.dataset === 'object' ? draftSource.dataset : {});
       const draftParameters = draftSource.parameters && typeof draftSource.parameters === 'object'
         ? draftSource.parameters : {};
+      const draftResources = draftSource.resources && typeof draftSource.resources === 'object'
+        ? draftSource.resources : {};
       const hasPlan = source.plan !== null && source.plan !== undefined;
       const hasApproval = source.approval !== null && source.approval !== undefined;
       const hasDispatch = source.dispatch !== null && source.dispatch !== undefined;
       const hasCancellation = source.cancellation !== null;
+      const hasTimeout = source.timeout !== null;
       if ((hasPlan && (typeof source.plan !== 'object' || Array.isArray(source.plan)))
           || (hasApproval && (typeof source.approval !== 'object' || Array.isArray(source.approval)))
           || (hasDispatch && (typeof source.dispatch !== 'object' || Array.isArray(source.dispatch)))
           || !Object.hasOwn(source, 'cancellation')
+          || !Object.hasOwn(source, 'timeout')
           || !Object.hasOwn(source, 'can_cancel')
           || typeof source.can_cancel !== 'boolean'
           || (hasCancellation
             && (typeof source.cancellation !== 'object'
-              || Array.isArray(source.cancellation)))) {
+              || Array.isArray(source.cancellation)))
+          || (hasTimeout
+            && (typeof source.timeout !== 'object'
+              || Array.isArray(source.timeout)))) {
         return null;
       }
       const planSource = hasPlan ? source.plan : {};
       const approvalSource = hasApproval ? source.approval : {};
       const dispatchSource = hasDispatch ? source.dispatch : {};
       const cancellationSource = hasCancellation ? source.cancellation : {};
+      const wallTimeSeconds = guidedIntegerValue(
+        draftResources.wall_time_seconds, 1, 7200,
+      );
+      const normalizedTimeout = hasTimeout
+        ? normalizeGuidedTimeoutProjection(
+          source.timeout, wallTimeSeconds, source.status,
+        ) : null;
+      if (wallTimeSeconds === null || (hasTimeout && normalizedTimeout === null)) return null;
       const cancellationKeys = hasCancellation
         ? Object.keys(cancellationSource).sort().join(',') : '';
       const cancellationState = ['requested', 'cancelled', 'superseded']
@@ -2426,6 +2495,7 @@
             draftParameters.learning_rate_milli, 1, 1000000000000,
           ),
           learningRate: guidedLearningRateFromMilli(draftParameters.learning_rate_milli),
+          wallTimeSeconds,
         },
         plan: {
           id: isSafeGuidedOpaqueId(planSource.plan_id) ? planSource.plan_id : '',
@@ -2454,6 +2524,7 @@
           resolvedAt: cancellationResolvedAt,
           failureCode: cancellationFailureCode,
         } : null,
+        timeout: normalizedTimeout,
         adapter: {
           status: adapterStatus,
           stage: boundedGuidedText(adapterSource.stage, 80),
@@ -2561,6 +2632,8 @@
       if (normalized.canCancel && (!cancellableState || normalized.cancellation !== null)) {
         return null;
       }
+      if (normalized.canCancel && normalized.timeout
+          && normalized.timeout.state !== 'armed') return null;
       if (normalized.cancellation) {
         if (normalized.canCancel) return null;
         if (normalized.cancellation.state === 'requested'
@@ -2572,6 +2645,10 @@
             && (!['Succeeded', 'Failed'].includes(normalized.status)
               || !normalized.cancellation.resolvedAt)) return null;
       }
+      if (normalized.timeout && normalized.cancellation !== null
+          && normalized.timeout.state !== 'suppressed') return null;
+      if (normalized.timeout?.state === 'suppressed'
+          && normalized.cancellation === null) return null;
       return normalized;
     }
 
@@ -2784,6 +2861,13 @@
         const adapter = item.adapter_status && typeof item.adapter_status === 'object'
           ? item.adapter_status : {};
         const learningRate = guidedLearningRateFromMilli(item.learning_rate_milli);
+        const wallTimeSeconds = guidedIntegerValue(item.wall_time_seconds, 1, 7200);
+        const hasTimeout = item.timeout !== null;
+        const timeout = hasTimeout
+          ? normalizeGuidedTimeoutProjection(
+            item.timeout, wallTimeSeconds, item.status,
+          ) : null;
+        if (wallTimeSeconds === null || (hasTimeout && timeout === null)) return null;
         return {
           taskId: item.task_id,
           status: item.status,
@@ -2797,6 +2881,8 @@
           optimizer: ['adam', 'sgd'].includes(item.optimizer) ? item.optimizer : '',
           learningRate,
           learningRateMilli: learningRate ? item.learning_rate_milli : null,
+          wallTimeSeconds,
+          timeout,
           progressCompleted: guidedIntegerValue(adapter.completed, 0, 10000),
           progressTotal: guidedIntegerValue(adapter.total, 0, 10000),
           resultReady: item.status === 'Succeeded',
@@ -2831,10 +2917,12 @@
         optimizer: task.draft.optimizer,
         learningRate: task.draft.learningRate,
         learningRateMilli: task.draft.learningRateMilli,
+        wallTimeSeconds: task.draft.wallTimeSeconds,
         progressCompleted: adapter.completed ?? null,
         progressTotal: adapter.total ?? null,
         canCancel: task.canCancel === true,
         cancellation: task.cancellation ? { ...task.cancellation } : null,
+        timeout: task.timeout ? { ...task.timeout } : null,
         resultReady: task.status === 'Succeeded',
         visibilityRevision: task.visibilityRevision,
         trashedAt: task.trashedAt,
@@ -2929,7 +3017,9 @@
         label.textContent = item.goal || item.taskId;
         const status = document.createElement('span');
         status.className = `data-pill ${item.status === 'Succeeded' ? '' : 'warning'}`;
-        status.textContent = item.status;
+        status.textContent = item.timeout?.state === 'requested'
+          ? '超时停止中'
+          : (item.timeout?.state === 'timed_out' ? '运行超时' : item.status);
         header.append(label, status);
         const detail = document.createElement('span');
         detail.className = 'mt-1 block truncate font-mono text-[11px] text-slate-500';
@@ -3430,6 +3520,19 @@
       return explanations[cancellation.state] || '';
     }
 
+    function guidedTimeoutExplanation(timeout) {
+      if (!timeout) return '';
+      const explanations = {
+        armed: '运行时限从受控 Supervisor 首次持久观察到 exact Worker ready + running 时开始计算。',
+        requested: '运行时限已超过，exact Worker 正在安全停止；任务尚未确认变为 Failed。',
+        timed_out: '服务端已证明 exact Worker 停止，任务以 WALL_TIME_EXCEEDED 失败。',
+        superseded: '超时停止完成前 Worker 已自然终结；保留原 Succeeded / Failed 终态。',
+        not_triggered: 'Worker 在超时停止请求前自然终结，未触发超时终态。',
+        suppressed: '用户取消先取得 exact Worker 停止权，自动超时不再交付。',
+      };
+      return explanations[timeout.state] || '';
+    }
+
     function renderGuidedTaskHtml() {
       const task = state.guided.task;
       if (!task) return '';
@@ -3439,19 +3542,25 @@
       const isCrashState = ['pending', 'dispatching', 'reconciliation_required'].includes(task.dispatch.state);
       const linkedToCurrent = isTaskReferencedByChat(state.chats[state.chatId], task.taskId);
       const cancellationPending = task.cancellation?.state === 'requested';
+      const timeoutPending = task.timeout?.state === 'requested';
       const cancellationHtml = task.cancellation
         ? `<dt>取消状态</dt><dd>${escapeHtml(task.cancellation.state)}</dd><dt>取消说明</dt><dd>${escapeHtml(guidedCancellationExplanation(task.cancellation))}</dd><dt>取消请求时间</dt><dd>${escapeHtml(task.cancellation.requestedAt || '—')}</dd>${task.cancellation.resolvedAt ? `<dt>取消解决时间</dt><dd>${escapeHtml(task.cancellation.resolvedAt)}</dd>` : ''}${task.cancellation.failureCode ? `<dt>取消状态码</dt><dd class="font-mono">${escapeHtml(task.cancellation.failureCode)}</dd>` : ''}`
         : '';
-      const cancelButton = cancellationPending
+      const timeoutHtml = task.timeout
+        ? `<dt>运行时限</dt><dd>${escapeHtml(`${task.timeout.wallTimeSeconds} 秒`)}</dd><dt>超时状态</dt><dd>${escapeHtml(task.timeout.state)}</dd><dt>超时说明</dt><dd>${escapeHtml(guidedTimeoutExplanation(task.timeout))}</dd><dt>计时起点</dt><dd>${escapeHtml(task.timeout.startedAt)}</dd><dt>截止时间</dt><dd>${escapeHtml(task.timeout.deadlineAt)}</dd>${task.timeout.resolvedAt ? `<dt>超时解决时间</dt><dd>${escapeHtml(task.timeout.resolvedAt)}</dd>` : ''}${task.timeout.failureCode ? `<dt>失败码</dt><dd class="font-mono">${escapeHtml(task.timeout.failureCode)}</dd>` : ''}`
+        : `<dt>运行时限</dt><dd>${escapeHtml(`${task.draft.wallTimeSeconds} 秒（尚无运行时计时证据）`)}</dd>`;
+      const cancelButton = timeoutPending
+        ? '<button type="button" disabled class="px-3 py-2 rounded-lg border border-amber-300 bg-amber-50 text-sm text-amber-800 opacity-70">已超时，安全停止中…</button>'
+        : (cancellationPending
         ? '<button type="button" disabled class="px-3 py-2 rounded-lg border border-amber-300 bg-amber-50 text-sm text-amber-800 opacity-70">取消处理中…</button>'
         : (task.canCancel
           ? `<button type="button" onclick="cancelGuidedTask()"${state.guided.mutation ? ' disabled' : ''} class="px-3 py-2 rounded-lg border border-red-200 bg-white text-sm text-red-700 disabled:opacity-40">${state.guided.mutation === 'cancel' ? '正在请求取消…' : '取消任务'}</button>`
-          : '');
+          : ''));
       const error = state.guided.error
         ? `<p class="mt-3 text-sm text-red-700" role="alert">${escapeHtml(state.guided.error)}</p>` : '';
       return `<section class="rounded-lg border ${isCrashState ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-white'} p-4" data-guided-view="task">
         <div class="flex flex-wrap items-start justify-between gap-3"><div><h4 class="font-heading font-semibold text-slate-900">Scientific Runtime task</h4><p class="text-xs text-slate-500 mt-1">SQLite 是任务状态真源；轮询只执行 GET</p></div><span class="data-pill ${task.status === 'Succeeded' ? '' : 'warning'}">${escapeHtml(task.status)}</span></div>
-        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd><dt>optimizer / LR</dt><dd class="font-mono">${escapeHtml(`${(task.draft.optimizer || 'legacy').toUpperCase()} / ${task.draft.learningRate || 'preset default'}`)}</dd><dt>dispatch</dt><dd>${escapeHtml(task.dispatch.state || 'not recorded')}</dd><dt>dispatch evidence</dt><dd>${escapeHtml(guidedDispatchExplanation(task.dispatch.state))}</dd><dt>Adapter status</dt><dd>${escapeHtml(adapter.status || 'not available')}</dd><dt>stage</dt><dd>${escapeHtml(adapter.stage || '—')}</dd><dt>progress</dt><dd>${escapeHtml(`${completed} / ${total}`)}</dd><dt>message</dt><dd>${escapeHtml(adapter.message || task.dispatch.failureCode || '等待状态更新')}</dd>${cancellationHtml}</dl>
+        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd><dt>optimizer / LR</dt><dd class="font-mono">${escapeHtml(`${(task.draft.optimizer || 'legacy').toUpperCase()} / ${task.draft.learningRate || 'preset default'}`)}</dd><dt>dispatch</dt><dd>${escapeHtml(task.dispatch.state || 'not recorded')}</dd><dt>dispatch evidence</dt><dd>${escapeHtml(guidedDispatchExplanation(task.dispatch.state))}</dd><dt>Adapter status</dt><dd>${escapeHtml(adapter.status || 'not available')}</dd><dt>stage</dt><dd>${escapeHtml(adapter.stage || '—')}</dd><dt>progress</dt><dd>${escapeHtml(`${completed} / ${total}`)}</dd><dt>message</dt><dd>${task.timeout ? escapeHtml(guidedTimeoutExplanation(task.timeout)) : escapeHtml(adapter.message || task.dispatch.failureCode || '等待状态更新')}</dd>${cancellationHtml}${timeoutHtml}</dl>
         <div class="mt-3 flex flex-wrap gap-2">${cancelButton}${task.status === 'Succeeded' ? '' : '<button type="button" onclick="refreshGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">刷新状态（GET）</button>'}${linkedToCurrent ? '<button type="button" onclick="unlinkCurrentConversationFromGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">从当前对话移除引用</button>' : '<button type="button" onclick="linkCurrentConversationToGuidedTask()" class="px-3 py-2 rounded-lg border border-accent/40 bg-accent/5 text-sm text-accent">关联当前对话</button>'}</div>${error}
       </section>`;
     }
