@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -53,6 +54,10 @@ WORKBENCH_MUTATION_OPERATIONS = frozenset(
 TASK_VISIBILITY_OPERATIONS = frozenset({"trash_task", "restore_task"})
 TASK_VISIBILITY_VIEWS = frozenset({"active", "trash"})
 TASK_PURGE_LOCAL_RUN_STATES = frozenset({"deleted", "not_created"})
+
+WORKER_SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
+WORKER_ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
+WORKER_JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "Draft": frozenset({"Draft", "NeedsInput", "AwaitingApproval", "Cancelled"}),
@@ -250,6 +255,18 @@ class RuntimeSupervisorLeaseAcquisition:
 
     lease: RuntimeSupervisorLease
     acquired: bool
+
+
+@dataclass(frozen=True)
+class WorkerAttemptProjection:
+    """Durable result of one fenced, observation-only Worker sample."""
+
+    intent: DispatchIntentSnapshot
+    attempt_id: str
+    observation_sequence: int
+    document_hash: str
+    adopted: bool
+    replayed: bool
 
 
 @dataclass(frozen=True)
@@ -554,6 +571,17 @@ class TaskStore(Protocol):
     ) -> RuntimeSupervisorLease | None:
         ...
 
+    def record_supervised_worker_observation(
+        self,
+        *,
+        intent_id: str,
+        evidence: Mapping[str, Any],
+        handle: Mapping[str, Any] | None,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> WorkerAttemptProjection:
+        ...
+
     def commit_runtime_transition(
         self,
         *,
@@ -619,6 +647,266 @@ def _runtime_timestamp(value: str) -> tuple[str, int]:
         raise TaskStoreConflict("runtime supervisor timestamp is invalid")
     canonical = parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
     return canonical, microseconds
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def _worker_evidence_timestamp(value: Any) -> None:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise TaskStoreConflict("Worker evidence timestamp is invalid")
+    try:
+        _runtime_timestamp(value)
+    except TaskStoreConflict as error:
+        raise TaskStoreConflict("Worker evidence timestamp is invalid") from error
+
+
+def _validated_worker_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and canonicalize the private Adapter's path-free evidence."""
+
+    if not isinstance(evidence, Mapping):
+        raise TaskStoreConflict("Worker evidence must be an object")
+    value = dict(evidence)
+    required = {
+        "schema_version",
+        "submission_id",
+        "attempt_id",
+        "attempt_number",
+        "job_id",
+        "request_hash",
+        "binding_hash",
+        "created_at",
+        "ticket",
+        "ready",
+        "heartbeat",
+    }
+    if set(value) != required or value.get("schema_version") != "1.0.0":
+        raise TaskStoreConflict("Worker evidence fields are invalid")
+    submission_id = value.get("submission_id")
+    attempt_id = value.get("attempt_id")
+    attempt_number = value.get("attempt_number")
+    job_id = value.get("job_id")
+    if (
+        not isinstance(submission_id, str)
+        or WORKER_SUBMISSION_ID.fullmatch(submission_id) is None
+        or not isinstance(attempt_id, str)
+        or WORKER_ATTEMPT_ID.fullmatch(attempt_id) is None
+        or type(attempt_number) is not int
+        or attempt_number != 1
+        or not isinstance(job_id, str)
+        or WORKER_JOB_ID.fullmatch(job_id) is None
+        or not _is_sha256(value.get("request_hash"))
+        or not _is_sha256(value.get("binding_hash"))
+    ):
+        raise TaskStoreConflict("Worker attempt identity is invalid")
+    _worker_evidence_timestamp(value.get("created_at"))
+    binding_payload = {
+        "schema_version": "1.0.0",
+        "submission_id": submission_id,
+        "attempt_id": attempt_id,
+        "attempt_number": attempt_number,
+        "job_id": job_id,
+        "request_hash": value["request_hash"],
+        "created_at": value["created_at"],
+    }
+    if encode_document(binding_payload)[1] != value["binding_hash"]:
+        raise TaskStoreConflict("Worker attempt binding hash is invalid")
+
+    ticket = value.get("ticket")
+    ticket_fields = {
+        "state",
+        "capacity_slot",
+        "capacity_generation",
+        "worker_pid",
+        "updated_at",
+        "record_hash",
+    }
+    if not isinstance(ticket, Mapping) or set(ticket) != ticket_fields:
+        raise TaskStoreConflict("Worker launch ticket is invalid")
+    ticket = dict(ticket)
+    state = ticket.get("state")
+    slot = ticket.get("capacity_slot")
+    generation = ticket.get("capacity_generation")
+    worker_pid = ticket.get("worker_pid")
+    if state == "staged":
+        projection_valid = slot is None and generation is None and worker_pid is None
+    elif state == "leased":
+        projection_valid = (
+            type(slot) is int
+            and slot >= 0
+            and type(generation) is int
+            and generation >= 1
+            and worker_pid is None
+        )
+    elif state == "spawned":
+        projection_valid = (
+            type(slot) is int
+            and slot >= 0
+            and type(generation) is int
+            and generation >= 1
+            and type(worker_pid) is int
+            and worker_pid >= 1
+        )
+    elif state == "failed":
+        projection_valid = worker_pid is None and (
+            (slot is None and generation is None)
+            or (
+                type(slot) is int
+                and slot >= 0
+                and type(generation) is int
+                and generation >= 1
+            )
+        )
+    else:
+        projection_valid = False
+    if not projection_valid or not _is_sha256(ticket.get("record_hash")):
+        raise TaskStoreConflict("Worker launch ticket projection is invalid")
+    _worker_evidence_timestamp(ticket.get("updated_at"))
+    ticket_payload = {
+        **binding_payload,
+        "binding_hash": value["binding_hash"],
+        "state": state,
+        "capacity_slot": slot,
+        "capacity_generation": generation,
+        "worker_pid": worker_pid,
+        "updated_at": ticket["updated_at"],
+    }
+    if encode_document(ticket_payload)[1] != ticket["record_hash"]:
+        raise TaskStoreConflict("Worker launch ticket hash is invalid")
+
+    ready = value.get("ready")
+    if ready is not None:
+        if not isinstance(ready, Mapping) or set(ready) != {
+            "worker_pid",
+            "started_at",
+            "record_hash",
+        }:
+            raise TaskStoreConflict("Worker ready evidence is invalid")
+        ready = dict(ready)
+        if (
+            state != "spawned"
+            or type(ready.get("worker_pid")) is not int
+            or ready["worker_pid"] < 1
+            or ready["worker_pid"] != worker_pid
+            or not _is_sha256(ready.get("record_hash"))
+        ):
+            raise TaskStoreConflict("Worker ready identity is invalid")
+        _worker_evidence_timestamp(ready.get("started_at"))
+        ready_payload = {
+            "schema_version": "1.0.0",
+            "submission_id": submission_id,
+            "attempt_id": attempt_id,
+            "attempt_number": attempt_number,
+            "binding_hash": value["binding_hash"],
+            "job_id": job_id,
+            "capacity_slot": slot,
+            "capacity_generation": generation,
+            "worker_pid": ready["worker_pid"],
+            "started_at": ready["started_at"],
+        }
+        if encode_document(ready_payload)[1] != ready["record_hash"]:
+            raise TaskStoreConflict("Worker ready evidence hash is invalid")
+
+    heartbeat = value.get("heartbeat")
+    if heartbeat is not None:
+        if (
+            ready is None
+            or not isinstance(heartbeat, Mapping)
+            or set(heartbeat)
+            != {"sequence", "state", "updated_at", "record_hash"}
+        ):
+            raise TaskStoreConflict("Worker heartbeat evidence is invalid")
+        heartbeat = dict(heartbeat)
+        if (
+            type(heartbeat.get("sequence")) is not int
+            or heartbeat["sequence"] < 1
+            or heartbeat.get("state")
+            not in {"running", "succeeded", "failed", "stopped"}
+            or not _is_sha256(heartbeat.get("record_hash"))
+        ):
+            raise TaskStoreConflict("Worker heartbeat state is invalid")
+        _worker_evidence_timestamp(heartbeat.get("updated_at"))
+        heartbeat_payload = {
+            "schema_version": "1.0.0",
+            "submission_id": submission_id,
+            "attempt_id": attempt_id,
+            "attempt_number": attempt_number,
+            "binding_hash": value["binding_hash"],
+            "job_id": job_id,
+            "capacity_slot": slot,
+            "capacity_generation": generation,
+            "sequence": heartbeat["sequence"],
+            "state": heartbeat["state"],
+            "worker_pid": ready["worker_pid"],
+            "started_at": ready["started_at"],
+            "updated_at": heartbeat["updated_at"],
+        }
+        if encode_document(heartbeat_payload)[1] != heartbeat["record_hash"]:
+            raise TaskStoreConflict("Worker heartbeat evidence hash is invalid")
+
+    if ready is not None and heartbeat is None:
+        raise TaskStoreConflict("Worker ready evidence has no heartbeat")
+
+    return {
+        **{key: value[key] for key in required - {"ticket", "ready", "heartbeat"}},
+        "ticket": ticket,
+        "ready": ready,
+        "heartbeat": heartbeat,
+    }
+
+
+def _worker_observation_columns(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the exact relational projection of validated Worker evidence."""
+
+    ticket = value["ticket"]
+    ready = value["ready"]
+    heartbeat = value["heartbeat"]
+    return {
+        "attempt_id": value["attempt_id"],
+        "ticket_state": ticket["state"],
+        "capacity_slot": ticket["capacity_slot"],
+        "capacity_generation": ticket["capacity_generation"],
+        "ticket_worker_pid": ticket["worker_pid"],
+        "ticket_updated_at": ticket["updated_at"],
+        "ticket_record_hash": ticket["record_hash"],
+        "ready_worker_pid": None if ready is None else ready["worker_pid"],
+        "ready_started_at": None if ready is None else ready["started_at"],
+        "ready_record_hash": None if ready is None else ready["record_hash"],
+        "heartbeat_sequence": (
+            None if heartbeat is None else heartbeat["sequence"]
+        ),
+        "heartbeat_state": None if heartbeat is None else heartbeat["state"],
+        "heartbeat_updated_at": (
+            None if heartbeat is None else heartbeat["updated_at"]
+        ),
+        "heartbeat_record_hash": (
+            None if heartbeat is None else heartbeat["record_hash"]
+        ),
+    }
+
+
+def _decode_worker_observation_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Decode one observation and prove its JSON/relational views agree."""
+
+    document = _decode_hashed_document(row, label="Worker attempt observation")
+    try:
+        normalized = _validated_worker_evidence(document)
+    except TaskStoreConflict as error:
+        raise TaskStoreCorruption(
+            "persisted Worker attempt observation is invalid"
+        ) from error
+    expected = _worker_observation_columns(normalized)
+    if any(row[key] != value for key, value in expected.items()):
+        raise TaskStoreCorruption(
+            "Worker attempt observation columns differ from its evidence"
+        )
+    return normalized
 
 
 def _runtime_lease_window(
@@ -5332,6 +5620,401 @@ class SQLiteTaskStore:
                 connection.rollback()
             raise RuntimeSupervisorLeaseLost(
                 "runtime supervisor release conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def record_supervised_worker_observation(
+        self,
+        *,
+        intent_id: str,
+        evidence: Mapping[str, Any],
+        handle: Mapping[str, Any] | None,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> WorkerAttemptProjection:
+        """Atomically project exact Worker evidence and optionally adopt it."""
+
+        if not isinstance(supervisor_lease, RuntimeSupervisorLease):
+            raise TaskStoreConflict("runtime supervisor lease is invalid")
+        if not callable(supervisor_clock):
+            raise TaskStoreConflict("runtime supervisor clock is invalid")
+        normalized = _validated_worker_evidence(evidence)
+        document_json, document_hash = encode_document(normalized)
+        normalized_handle = None if handle is None else dict(handle)
+        ticket = normalized["ticket"]
+        ready = normalized["ready"]
+        heartbeat = normalized["heartbeat"]
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            observed_at, observed_at_us = _runtime_timestamp(supervisor_clock())
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("Worker attempt task cannot be read")
+            current_lease = self._load_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+            )
+            if (
+                current_lease is None
+                or current_lease.state != "active"
+                or supervisor_lease.project_id != task["project_id"]
+                or supervisor_lease.principal_id != task["principal_id"]
+                or not self._runtime_supervisor_identity_matches(
+                    current_lease, supervisor_lease
+                )
+                or _runtime_timestamp(current_lease.heartbeat_at)[1]
+                > observed_at_us
+                or _runtime_timestamp(current_lease.expires_at)[1]
+                <= observed_at_us
+            ):
+                raise RuntimeSupervisorLeaseLost(
+                    "Worker observation lost its supervisor lease"
+                )
+            if intent.state not in {"dispatching", "dispatched"}:
+                raise TaskStoreConflict("dispatch intent cannot accept Worker evidence")
+
+            existing_attempt = connection.execute(
+                """
+                SELECT * FROM worker_launch_attempts
+                WHERE intent_id = ? ORDER BY attempt_number ASC LIMIT 1
+                """,
+                (intent_id,),
+            ).fetchone()
+            expected_attempt = {
+                "attempt_id": normalized["attempt_id"],
+                "intent_id": intent_id,
+                "task_id": task_id,
+                "project_id": task["project_id"],
+                "principal_id": task["principal_id"],
+                "attempt_number": normalized["attempt_number"],
+                "submission_id": normalized["submission_id"],
+                "job_id": normalized["job_id"],
+                "adapter_request_hash": normalized["request_hash"],
+                "binding_hash": normalized["binding_hash"],
+                "created_at": normalized["created_at"],
+            }
+            if existing_attempt is None:
+                connection.execute(
+                    """
+                    INSERT INTO worker_launch_attempts(
+                        attempt_id, intent_id, task_id, project_id, principal_id,
+                        attempt_number, submission_id, job_id,
+                        adapter_request_hash, binding_hash, created_at,
+                        first_fencing_token, first_observed_at,
+                        first_observed_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized["attempt_id"],
+                        intent_id,
+                        task_id,
+                        task["project_id"],
+                        task["principal_id"],
+                        normalized["attempt_number"],
+                        normalized["submission_id"],
+                        normalized["job_id"],
+                        normalized["request_hash"],
+                        normalized["binding_hash"],
+                        normalized["created_at"],
+                        supervisor_lease.fencing_token,
+                        observed_at,
+                        observed_at_us,
+                    ),
+                )
+            elif any(
+                existing_attempt[key] != expected
+                for key, expected in expected_attempt.items()
+            ):
+                raise TaskStoreConflict(
+                    "Worker attempt differs from the durable intent projection"
+                )
+
+            replay = connection.execute(
+                """
+                SELECT * FROM worker_attempt_observations
+                WHERE attempt_id = ? AND document_hash = ?
+                """,
+                (normalized["attempt_id"], document_hash),
+            ).fetchone()
+            if replay is not None:
+                latest_sequence = int(
+                    connection.execute(
+                        """
+                        SELECT MAX(observation_sequence)
+                        FROM worker_attempt_observations WHERE attempt_id = ?
+                        """,
+                        (normalized["attempt_id"],),
+                    ).fetchone()[0]
+                )
+                if int(replay["observation_sequence"]) != latest_sequence:
+                    raise TaskStoreConflict(
+                        "historical Worker evidence cannot be replayed as current"
+                    )
+                stored_document = _decode_worker_observation_row(replay)
+                if stored_document != normalized:
+                    raise TaskStoreCorruption(
+                        "Worker observation hash no longer identifies its evidence"
+                    )
+                observation_sequence = int(replay["observation_sequence"])
+                replayed = True
+            else:
+                latest = connection.execute(
+                    """
+                    SELECT * FROM worker_attempt_observations
+                    WHERE attempt_id = ?
+                    ORDER BY observation_sequence DESC LIMIT 1
+                    """,
+                    (normalized["attempt_id"],),
+                ).fetchone()
+                if latest is not None:
+                    prior = _decode_worker_observation_row(latest)
+                    prior_ticket = prior["ticket"]
+                    prior_ready = prior["ready"]
+                    prior_heartbeat = prior["heartbeat"]
+                    if (
+                        _runtime_timestamp(ticket["updated_at"])[1]
+                        < _runtime_timestamp(prior_ticket["updated_at"])[1]
+                    ):
+                        raise TaskStoreConflict(
+                            "Worker launch ticket time cannot regress"
+                        )
+                    allowed_ticket_states = {
+                        "staged": {"staged", "leased", "spawned", "failed"},
+                        "leased": {"leased", "spawned", "failed"},
+                        "spawned": {"spawned", "failed"},
+                        "failed": {"failed"},
+                    }
+                    if ticket["state"] not in allowed_ticket_states[
+                        prior_ticket["state"]
+                    ]:
+                        raise TaskStoreConflict(
+                            "Worker launch ticket state cannot regress"
+                        )
+                    if (
+                        ticket["state"] == prior_ticket["state"]
+                        and ticket["record_hash"] != prior_ticket["record_hash"]
+                    ):
+                        raise TaskStoreConflict(
+                            "Worker launch ticket changed within one state"
+                        )
+                    if prior_ticket["capacity_slot"] is not None and (
+                        ticket["capacity_slot"]
+                        != prior_ticket["capacity_slot"]
+                        or ticket["capacity_generation"]
+                        != prior_ticket["capacity_generation"]
+                    ):
+                        raise TaskStoreConflict(
+                            "Worker capacity identity cannot change"
+                        )
+                    if (
+                        prior_ticket["worker_pid"] is not None
+                        and ticket["state"] != "failed"
+                        and ticket["worker_pid"] != prior_ticket["worker_pid"]
+                    ):
+                        raise TaskStoreConflict(
+                            "Worker process identity cannot change"
+                        )
+                    if prior_ready is not None and ready != prior_ready:
+                        raise TaskStoreConflict(
+                            "Worker ready evidence cannot disappear or change"
+                        )
+                    if prior_heartbeat is not None:
+                        if heartbeat is None:
+                            raise TaskStoreConflict(
+                                "Worker heartbeat evidence cannot disappear"
+                            )
+                        if prior_heartbeat["state"] in {
+                            "succeeded",
+                            "failed",
+                            "stopped",
+                        }:
+                            raise TaskStoreConflict(
+                                "terminal Worker heartbeat cannot advance"
+                            )
+                        if heartbeat["sequence"] < prior_heartbeat["sequence"]:
+                            raise TaskStoreConflict(
+                                "Worker heartbeat sequence cannot regress"
+                            )
+                        if (
+                            heartbeat["sequence"] == prior_heartbeat["sequence"]
+                            and heartbeat["record_hash"]
+                            != prior_heartbeat["record_hash"]
+                        ):
+                            raise TaskStoreConflict(
+                                "Worker heartbeat cannot change at one sequence"
+                            )
+                        if (
+                            heartbeat["sequence"]
+                            > prior_heartbeat["sequence"]
+                            and _runtime_timestamp(heartbeat["updated_at"])[1]
+                            < _runtime_timestamp(
+                                prior_heartbeat["updated_at"]
+                            )[1]
+                        ):
+                            raise TaskStoreConflict(
+                                "Worker heartbeat time cannot regress"
+                            )
+                observation_sequence = int(
+                    connection.execute(
+                        """
+                        SELECT COALESCE(MAX(observation_sequence), 0) + 1
+                        FROM worker_attempt_observations WHERE attempt_id = ?
+                        """,
+                        (normalized["attempt_id"],),
+                    ).fetchone()[0]
+                )
+                columns = _worker_observation_columns(normalized)
+                connection.execute(
+                    """
+                    INSERT INTO worker_attempt_observations(
+                        attempt_id, observation_sequence, ticket_state,
+                        capacity_slot, capacity_generation, ticket_worker_pid,
+                        ticket_updated_at, ticket_record_hash,
+                        ready_worker_pid, ready_started_at, ready_record_hash,
+                        heartbeat_sequence, heartbeat_state,
+                        heartbeat_updated_at, heartbeat_record_hash,
+                        document_json, document_hash, project_id, principal_id,
+                        fencing_token, observed_at, observed_at_us
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        columns["attempt_id"],
+                        observation_sequence,
+                        columns["ticket_state"],
+                        columns["capacity_slot"],
+                        columns["capacity_generation"],
+                        columns["ticket_worker_pid"],
+                        columns["ticket_updated_at"],
+                        columns["ticket_record_hash"],
+                        columns["ready_worker_pid"],
+                        columns["ready_started_at"],
+                        columns["ready_record_hash"],
+                        columns["heartbeat_sequence"],
+                        columns["heartbeat_state"],
+                        columns["heartbeat_updated_at"],
+                        columns["heartbeat_record_hash"],
+                        document_json,
+                        document_hash,
+                        task["project_id"],
+                        task["principal_id"],
+                        supervisor_lease.fencing_token,
+                        observed_at,
+                        observed_at_us,
+                    ),
+                )
+                replayed = False
+
+            adopted = False
+            if normalized_handle is not None:
+                if ready is None or heartbeat is None:
+                    raise TaskStoreConflict(
+                        "dispatch adoption requires ready Worker heartbeat evidence"
+                    )
+                if any(
+                    normalized_handle.get(key) != normalized[evidence_key]
+                    for key, evidence_key in {
+                        "submission_id": "submission_id",
+                        "job_id": "job_id",
+                        "request_hash": "request_hash",
+                    }.items()
+                ):
+                    raise TaskStoreConflict(
+                        "dispatch handle differs from exact Worker evidence"
+                    )
+                self._validate_dispatch_handle(intent, normalized_handle)
+                if intent.state == "dispatched":
+                    if intent.handle != normalized_handle:
+                        raise TaskStoreConflict(
+                            "Worker adoption differs from the dispatch outcome"
+                        )
+                else:
+                    outcome = {
+                        "status": "dispatched",
+                        "handle": normalized_handle,
+                        "recorded_at": observed_at,
+                    }
+                    outcome_json, outcome_hash = encode_document(outcome)
+                    connection.execute(
+                        """
+                        INSERT INTO dispatch_outcomes(
+                            intent_id, outcome, document_json, document_hash,
+                            recorded_at
+                        ) VALUES (?, 'dispatched', ?, ?, ?)
+                        """,
+                        (intent_id, outcome_json, outcome_hash, observed_at),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO supervised_dispatch_adoptions(
+                            intent_id, attempt_id, project_id, principal_id,
+                            fencing_token, recorded_at, recorded_at_us
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            intent_id,
+                            normalized["attempt_id"],
+                            task["project_id"],
+                            task["principal_id"],
+                            supervisor_lease.fencing_token,
+                            observed_at,
+                            observed_at_us,
+                        ),
+                    )
+                    adopted = True
+
+            stored_intent = self._load_dispatch_intent(
+                connection, task_id=task_id
+            )
+            if stored_intent is None:
+                raise TaskStoreCorruption("projected dispatch intent cannot be read")
+            connection.commit()
+            return WorkerAttemptProjection(
+                intent=stored_intent,
+                attempt_id=normalized["attempt_id"],
+                observation_sequence=observation_sequence,
+                document_hash=document_hash,
+                adopted=adopted,
+                replayed=replayed,
+            )
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "Worker observation lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "Worker observation conflicts with durable state"
             ) from error
         except Exception:
             if connection.in_transaction:

@@ -166,6 +166,18 @@ class TaskRuntimeResult:
 
 
 @dataclass(frozen=True)
+class TaskWorkerProjectionResult:
+    """One Supervisor-only Worker evidence projection outcome."""
+
+    intent: DispatchIntentSnapshot
+    evidence: dict[str, Any] | None
+    projected: bool
+    adopted: bool
+    replayed: bool
+    deferred_code: str | None = None
+
+
+@dataclass(frozen=True)
 class RuntimeRecoveryResult:
     """Bounded outcome of one scope-wide startup recovery pass."""
 
@@ -2111,6 +2123,103 @@ class TaskService:
             raise TaskSupervisorLeaseLost() from error
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
+
+    def project_worker_attempt(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskWorkerProjectionResult:
+        """Project existing fixed-Adapter evidence under one exact term."""
+
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        intent = self._store.get_dispatch_intent(task_id)
+        if intent is None:
+            raise TaskConflict("runtime task has no dispatch intent")
+        if intent.state not in {"dispatching", "dispatched"}:
+            return TaskWorkerProjectionResult(
+                intent=intent,
+                evidence=None,
+                projected=False,
+                adopted=False,
+                replayed=False,
+                deferred_code={
+                    "pending": "DISPATCH_PENDING",
+                    "reconciliation_required": "RECONCILIATION_REQUIRED",
+                }.get(intent.state, "DISPATCH_INTENT_UNSUPPORTED"),
+            )
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        try:
+            observed = self._dispatcher.observe_existing_worker_attempt(intent)
+        except DispatchError as error:
+            if error.code in {
+                "ADAPTER_SUBMISSION_NOT_FOUND",
+                "ADAPTER_SUBMISSION_PREPARING",
+                "WORKER_EVIDENCE_NOT_READY",
+                "WORKER_EVIDENCE_UNAVAILABLE",
+            }:
+                return TaskWorkerProjectionResult(
+                    intent=intent,
+                    evidence=None,
+                    projected=False,
+                    adopted=False,
+                    replayed=False,
+                    deferred_code=error.code,
+                )
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("WORKER_EVIDENCE_UNAVAILABLE") from error
+        if not isinstance(observed, Mapping) or set(observed) != {
+            "evidence",
+            "handle",
+        }:
+            raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
+        evidence = observed.get("evidence")
+        handle = observed.get("handle")
+        if not isinstance(evidence, Mapping):
+            raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
+        validated_handle: dict[str, Any] | None = None
+        if handle is not None:
+            try:
+                validated_handle = self._validate_dispatch_receipt(
+                    snapshot=snapshot,
+                    intent=intent,
+                    handle=handle,
+                )
+            except TaskValidationError as error:
+                raise TaskDispatchError("DISPATCH_RECEIPT_INVALID") from error
+        if intent.state == "dispatched" and validated_handle != intent.handle:
+            raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
+        try:
+            projection = self._store.record_supervised_worker_observation(
+                intent_id=intent.intent_id,
+                evidence=evidence,
+                handle=validated_handle,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        return TaskWorkerProjectionResult(
+            intent=projection.intent,
+            evidence=copy.deepcopy(dict(evidence)),
+            projected=True,
+            adopted=projection.adopted,
+            replayed=projection.replayed,
+        )
 
     def recover_runtime_on_startup(
         self,

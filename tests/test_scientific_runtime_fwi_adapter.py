@@ -7,6 +7,7 @@ import io
 import json
 import multiprocessing
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -913,6 +914,17 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         try:
             replacement_launcher = FakeLauncher()
             reopened = self.make_adapter(launcher=replacement_launcher)
+            observed = reopened.observe_existing_worker_attempt(
+                **copy.deepcopy(request)
+            )
+            self.assertEqual(observed["handle"], launched.as_dict())
+            self.assertEqual(
+                observed["evidence"]["attempt_id"], binding.attempt_id
+            )
+            self.assertEqual(
+                observed["evidence"]["heartbeat"]["state"], "running"
+            )
+            self.assertNotIn(str(self.run_root), json.dumps(observed))
             recovered = reopened.lookup_existing_handle(
                 **copy.deepcopy(request)
             )
@@ -925,6 +937,32 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             )
         finally:
             heartbeat.stop("succeeded")
+
+    def test_preparing_observation_does_not_recreate_a_missing_job_directory(
+        self,
+    ) -> None:
+        request = self.submit_kwargs(
+            task_id="task-preparing-observation",
+            idempotency_key="task-preparing-observation:invert:0001",
+        )
+        handle = self.adapter.submit(**copy.deepcopy(request))
+        record_path = self.submission_record_path(handle)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["launch_state"] = "preparing"
+        self.adapter._write_submission(record_path, record)
+        run_dir = self.run_root / handle.job_id
+        shutil.rmtree(run_dir)
+
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        with self.assertRaises(RuntimeError) as raised:
+            reopened.observe_existing_worker_attempt(**copy.deepcopy(request))
+        self.assertEqual(
+            getattr(raised.exception, "code", None),
+            "WORKER_EVIDENCE_NOT_READY",
+        )
+        self.assertFalse(run_dir.exists())
+        self.assertEqual(replacement_launcher.calls, [])
 
     def test_lookup_existing_handle_rejects_malformed_and_symlink_records(self) -> None:
         replacement_launcher = FakeLauncher()
@@ -1079,6 +1117,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             self.make_adapter(launcher=recovery_launcher)
         )
         self.assertEqual(recovery_bridge.recover_existing_receipt(intent), handle)
+        self.assertEqual(recovery_launcher.calls, [])
+        observed = recovery_bridge.observe_existing_worker_attempt(intent)
+        self.assertIsNone(observed["handle"])
+        self.assertEqual(observed["evidence"]["ticket"]["state"], "staged")
+        self.assertIsNone(observed["evidence"]["ready"])
         self.assertEqual(recovery_launcher.calls, [])
 
         drift_hash = "sha256:" + "f" * 64
@@ -1665,6 +1708,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                     outcome_recorded_at=NOW,
                 )
                 self.assertEqual(dispatcher.status(intent)["status"], "Succeeded")
+                with self.assertRaises(DispatchError) as unavailable:
+                    dispatcher.observe_existing_worker_attempt(intent)
+                self.assertEqual(
+                    unavailable.exception.code, "WORKER_EVIDENCE_UNAVAILABLE"
+                )
                 artifacts = dispatcher.collect(intent)
                 self.assertEqual(len(artifacts), 2)
                 self.assertEqual(artifacts[0]["metrics"]["optimizer"], "adam")
@@ -1738,6 +1786,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         reopened = self.make_adapter(launcher=replacement_launcher)
         recovered = reopened.lookup_existing_handle(**copy.deepcopy(request))
         self.assertEqual(recovered.as_dict(), handle.as_dict())
+        with self.assertRaises(AdapterUnavailable) as unavailable:
+            reopened.observe_existing_worker_attempt(**copy.deepcopy(request))
+        self.assertEqual(
+            unavailable.exception.code, "WORKER_EVIDENCE_UNAVAILABLE"
+        )
         self.assertEqual(reopened.status(recovered).status, "Succeeded")
         artifacts = reopened.collect(recovered)
         self.assertEqual(len(artifacts), 8)

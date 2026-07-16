@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import multiprocessing
@@ -24,6 +25,7 @@ from worker_launch_control import (
     WorkerControlError,
     WorkerHeartbeat,
     execution_fence_is_held,
+    read_worker_attempt_evidence,
     stage_launch_attempt,
     worker_attempt_started,
 )
@@ -181,6 +183,17 @@ class WorkerLaunchControlTest(unittest.TestCase):
         heartbeat.start()
         try:
             self.assertTrue(worker_attempt_started(self.root, run_dir, binding))
+            evidence = read_worker_attempt_evidence(
+                self.root, run_dir, binding
+            )
+            self.assertIsNotNone(evidence)
+            assert evidence is not None
+            self.assertTrue(evidence.ready)
+            self.assertTrue(evidence.started)
+            self.assertEqual(evidence.ticket_state, "spawned")
+            self.assertEqual(evidence.ready_worker_pid, os.getpid())
+            self.assertGreaterEqual(evidence.heartbeat_sequence, 1)
+            self.assertNotIn(str(self.root), json.dumps(evidence.as_dict()))
             ready_path = run_dir / WORKER_READY_NAME
             ready = json.loads(ready_path.read_text(encoding="utf-8"))
             ready["attempt_id"] = "attempt-" + "f" * 32
@@ -192,6 +205,68 @@ class WorkerLaunchControlTest(unittest.TestCase):
                 worker_attempt_started(self.root, run_dir, binding)
         finally:
             heartbeat.stop("succeeded")
+
+    def test_staged_attempt_evidence_is_not_a_liveness_decision(self) -> None:
+        binding, run_dir = self.binding(8)
+        evidence = read_worker_attempt_evidence(self.root, run_dir, binding)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence.ticket_state, "staged")
+        self.assertFalse(evidence.ready)
+        self.assertFalse(evidence.started)
+        self.assertFalse(worker_attempt_started(self.root, run_dir, binding))
+
+    def test_ready_without_heartbeat_fails_closed(self) -> None:
+        binding, run_dir = self.binding(14)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=10.0,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        try:
+            (run_dir / WORKER_HEARTBEAT_NAME).unlink()
+            with self.assertRaisesRegex(
+                WorkerControlError, "WORKER_HEARTBEAT_INVALID"
+            ):
+                read_worker_attempt_evidence(self.root, run_dir, binding)
+        finally:
+            heartbeat.stop("failed")
+
+    def test_failed_ticket_rejects_partial_capacity_identity(self) -> None:
+        binding, run_dir = self.binding(15)
+        ticket_path = run_dir / ".worker-launch.json"
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+        ticket.update(
+            {
+                "state": "failed",
+                "capacity_slot": 0,
+                "capacity_generation": None,
+                "worker_pid": None,
+            }
+        )
+        ticket.pop("record_hash")
+        payload = json.dumps(
+            ticket,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        ticket["record_hash"] = "sha256:" + hashlib.sha256(payload).hexdigest()
+        ticket_path.write_text(json.dumps(ticket), encoding="utf-8")
+        ticket_path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            WorkerControlError, "launch ticket projection is invalid"
+        ):
+            read_worker_attempt_evidence(self.root, run_dir, binding)
 
     def test_capacity_policy_and_permanent_lock_inode_fail_closed(self) -> None:
         first, first_dir = self.binding(5)

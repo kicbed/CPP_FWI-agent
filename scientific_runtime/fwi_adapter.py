@@ -49,6 +49,7 @@ from worker_launch_control import (
     binding_from_submission_record,
     hold_idle_execution_fence,
     mark_launch_failed,
+    read_worker_attempt_evidence,
     stage_launch_attempt,
     worker_attempt_started,
 )
@@ -2025,6 +2026,142 @@ class DeepwaveAdapter:
                 os.close(self_nonlocal.descriptor)
 
         return SubmissionLock()
+
+    def observe_existing_worker_attempt(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Read one exact managed attempt without launching or scanning.
+
+        A ready ``launching`` attempt may be promoted to the already existing
+        immutable handle while the submission lock is held.  Heartbeat age is
+        deliberately not interpreted as a replacement or liveness signal.
+        """
+
+        self._validate_submit_identity(
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+        )
+        validated = self._validate_request(
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+            verify_runtime=False,
+        )
+        submission_id = self._submission_id(task_id, plan_hash, idempotency_key)
+        request_payload = self._request_payload(
+            submission_id=submission_id,
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            validated=validated,
+        )
+        request_hash = _sha256_document(request_payload)
+        index_name = submission_id.removeprefix("submission-") + ".json"
+        control = self._run_root / CONTROL_DIRECTORY
+        index_path = control / "submissions" / index_name
+        lock_path = control / "locks" / (index_name + ".lock")
+
+        with self._lock_submission(lock_path, create=False):
+            if not index_path.exists() and not index_path.is_symlink():
+                raise AdapterUnavailable(
+                    "ADAPTER_SUBMISSION_NOT_FOUND: no private submission record exists"
+                )
+            record = self._read_submission(index_path)
+            if (
+                record["adapter_version"] != ADAPTER_VERSION
+                or record["algorithm"] != validated.algorithm
+            ):
+                raise AdapterUnavailable(
+                    "ADAPTER_SUBMISSION_VERSION_UNSUPPORTED: private receipt is not current"
+                )
+            if (
+                record["submission_id"] != submission_id
+                or record["request_hash"] != request_hash
+                or self._record_request_payload(record) != request_payload
+            ):
+                raise AdapterIdempotencyConflict(
+                    "ADAPTER_IDEMPOTENCY_CONFLICT: key is bound to another request"
+                )
+            try:
+                expected_job_id = self._job_id(submission_id, record["created_at"])
+                self._validate_fingerprint(record["fingerprint"], validated=validated)
+            except AdapterError as error:
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: private receipt binding is invalid"
+                ) from error
+            if record["job_id"] != expected_job_id:
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: private job identity is invalid"
+                )
+            if record["schema_version"] != "1.1.0":
+                raise AdapterUnavailable(
+                    "WORKER_EVIDENCE_UNAVAILABLE: private receipt has no managed attempt"
+                )
+            if record["launch_state"] in {"purging", "purged"}:
+                raise AdapterUnavailable(
+                    "WORKER_EVIDENCE_UNAVAILABLE: private receipt is being purged"
+                )
+            job_dir = self._run_root / record["job_id"]
+            if (
+                record["launch_state"] == "preparing"
+                and not job_dir.exists()
+                and not job_dir.is_symlink()
+            ):
+                raise AdapterUnavailable(
+                    "WORKER_EVIDENCE_NOT_READY: managed job directory was not staged"
+                )
+            try:
+                binding = binding_from_submission_record(record)
+                evidence = read_worker_attempt_evidence(
+                    self._run_root,
+                    job_dir,
+                    binding,
+                )
+            except (FileNotFoundError, WorkerControlError) as error:
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: Worker attempt evidence is invalid"
+                ) from error
+            if evidence is None:
+                raise AdapterUnavailable(
+                    "WORKER_EVIDENCE_NOT_READY: managed launch ticket is unavailable"
+                )
+
+            handle: AdapterHandle | None = None
+            launch_state = record["launch_state"]
+            if evidence.started:
+                if launch_state == "launching":
+                    record["launch_state"] = "launched"
+                    self._write_submission(index_path, record)
+                    launch_state = "launched"
+                if launch_state == "launched":
+                    handle = self._handle_from_record(record)
+                else:
+                    raise AdapterHandleError(
+                        "ADAPTER_SUBMISSION_INVALID: Worker evidence conflicts with launch state"
+                    )
+            return {
+                "evidence": evidence.as_dict(),
+                "handle": None if handle is None else handle.as_dict(),
+            }
 
     def lookup_existing_handle(
         self,

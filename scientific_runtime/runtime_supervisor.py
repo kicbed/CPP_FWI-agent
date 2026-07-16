@@ -1,8 +1,9 @@
 """Fenced, observation-only runtime status supervisor.
 
-The supervisor deliberately has no dispatch or Worker-starting capability.  It
-owns one scope-local fenced lease and periodically asks :class:`TaskService` to
-observe only tasks that already have a durable ``dispatched`` receipt.
+The supervisor deliberately has no first-dispatch or Worker-starting
+capability.  It owns one scope-local fenced lease, projects evidence for an
+already staged fixed-Adapter attempt, may adopt its exact late receipt, and
+refreshes tasks that already have a durable ``dispatched`` receipt.
 """
 
 from __future__ import annotations
@@ -68,6 +69,16 @@ class RuntimeSupervisorTaskService(Protocol):
     ) -> Any:
         ...
 
+    def project_worker_attempt(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: Any,
+    ) -> Any:
+        ...
+
     def refresh_runtime_status(
         self,
         task_id: str,
@@ -87,6 +98,8 @@ class RuntimeSupervisorCycleResult:
     refreshed_task_ids: tuple[str, ...]
     deferred: tuple[tuple[str, str], ...]
     task_failures: tuple[tuple[str, str], ...]
+    projected_task_ids: tuple[str, ...] = ()
+    adopted_task_ids: tuple[str, ...] = ()
 
 
 class _SupervisorFailure(RuntimeError):
@@ -96,7 +109,7 @@ class _SupervisorFailure(RuntimeError):
 
 
 class RuntimeSupervisor:
-    """Continuously observe dispatched tasks under one fenced supervisor lease.
+    """Observe staged/dispatched runtime tasks under one fenced supervisor lease.
 
     Construction is side-effect free.  :meth:`start` is the only method that
     acquires a lease or creates a thread, and :meth:`stop` is the only normal
@@ -114,6 +127,7 @@ class RuntimeSupervisor:
         lease_seconds: int = 30,
         heartbeat_interval_seconds: float | None = None,
         poll_interval_seconds: float = 1.0,
+        worker_projection_interval_seconds: float = 60.0,
         max_tasks: int = 10_000,
         start_timeout_seconds: float = 5.0,
         join_timeout_seconds: float = 5.0,
@@ -140,13 +154,17 @@ class RuntimeSupervisor:
             )
         for field, value in (
             ("poll_interval_seconds", poll_interval_seconds),
+            (
+                "worker_projection_interval_seconds",
+                worker_projection_interval_seconds,
+            ),
             ("start_timeout_seconds", start_timeout_seconds),
             ("join_timeout_seconds", join_timeout_seconds),
         ):
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
-                or value <= 0
+                or not 0 < value < float("inf")
             ):
                 raise ValueError(f"{field} must be positive")
         if type(max_tasks) is not int or not 1 <= max_tasks <= 10_000:
@@ -161,6 +179,9 @@ class RuntimeSupervisor:
         self._lease_seconds = lease_seconds
         self._heartbeat_interval_seconds = float(heartbeat_interval_seconds)
         self._poll_interval_seconds = float(poll_interval_seconds)
+        self._worker_projection_interval_seconds = float(
+            worker_projection_interval_seconds
+        )
         self._max_tasks = max_tasks
         self._start_timeout_seconds = float(start_timeout_seconds)
         self._join_timeout_seconds = float(join_timeout_seconds)
@@ -176,6 +197,7 @@ class RuntimeSupervisor:
         self._failure_code: str | None = None
         self._cycle_count = 0
         self._last_cycle: RuntimeSupervisorCycleResult | None = None
+        self._worker_projection_deadlines: dict[str, float] = {}
 
     @property
     def running(self) -> bool:
@@ -266,6 +288,7 @@ class RuntimeSupervisor:
                 self._healthy = False
                 self._cycle_count = 0
                 self._last_cycle = None
+                self._worker_projection_deadlines = {}
                 self._stop_event = threading.Event()
                 self._ready_event = threading.Event()
 
@@ -500,6 +523,8 @@ class RuntimeSupervisor:
     ) -> tuple[RuntimeSupervisorCycleResult, Any, float]:
         scanned: list[str] = []
         refreshed: list[str] = []
+        projected: list[str] = []
+        adopted: list[str] = []
         deferred: list[tuple[str, str]] = []
         failures: list[tuple[str, str]] = []
         for snapshot in snapshots:
@@ -534,14 +559,108 @@ class RuntimeSupervisor:
                 deferred.append((task_id, "DISPATCH_INTENT_MISSING"))
                 continue
             intent_state = getattr(intent, "state", None)
-            if intent_state != "dispatched":
+            if intent_state not in {"dispatching", "dispatched"}:
                 code = {
                     "pending": "DISPATCH_PENDING",
-                    "dispatching": "DISPATCHING",
                     "reconciliation_required": "RECONCILIATION_REQUIRED",
                 }.get(intent_state, "DISPATCH_INTENT_UNSUPPORTED")
                 deferred.append((task_id, code))
                 continue
+            projection_due = (
+                intent_state == "dispatching"
+                or self._worker_projection_due(task_id)
+            )
+            if projection_due:
+                lease, next_heartbeat = self._heartbeat_if_due(
+                    lease, next_heartbeat
+                )
+                try:
+                    projection = self._task_service.project_worker_attempt(
+                        task_id,
+                        project_id=self._project_id,
+                        principal_id=self._principal_id,
+                        supervisor_lease=lease,
+                    )
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "WORKER_PROJECTION_FAILED"
+                            ),
+                        )
+                    )
+                    if intent_state == "dispatching":
+                        continue
+                    projection = None
+            else:
+                projection = None
+            if projection is not None:
+                projected_intent = getattr(projection, "intent", None)
+                deferred_code = getattr(projection, "deferred_code", None)
+                projected_flag = getattr(projection, "projected", None)
+                adopted_flag = getattr(projection, "adopted", None)
+                projected_state = getattr(projected_intent, "state", None)
+                if (
+                    getattr(projected_intent, "task_id", None) != task_id
+                    or projected_state not in {"dispatching", "dispatched"}
+                    or (
+                        intent_state == "dispatched"
+                        and projected_state != "dispatched"
+                    )
+                    or type(projected_flag) is not bool
+                    or type(adopted_flag) is not bool
+                    or (
+                        projected_flag
+                        and not isinstance(
+                            getattr(projection, "evidence", None), dict
+                        )
+                    )
+                    or (
+                        adopted_flag
+                        and (
+                            not projected_flag
+                            or intent_state != "dispatching"
+                            or projected_state != "dispatched"
+                        )
+                    )
+                    or (
+                        deferred_code is not None
+                        and (
+                            not isinstance(deferred_code, str)
+                            or _STABLE_CODE.fullmatch(deferred_code) is None
+                        )
+                    )
+                ):
+                    raise _SupervisorFailure(FATAL)
+                if projected_flag:
+                    projected.append(task_id)
+                if adopted_flag:
+                    adopted.append(task_id)
+                if intent_state == "dispatching" and projected_state != "dispatched":
+                    if deferred_code is None:
+                        evidence = getattr(projection, "evidence", None)
+                        ticket = (
+                            evidence.get("ticket")
+                            if isinstance(evidence, dict)
+                            else None
+                        )
+                        state = (
+                            ticket.get("state")
+                            if isinstance(ticket, dict)
+                            else None
+                        )
+                        deferred_code = {
+                            "staged": "WORKER_ATTEMPT_STAGED",
+                            "failed": "WORKER_ATTEMPT_FAILED",
+                        }.get(state, "WORKER_ATTEMPT_STARTING")
+                    deferred.append((task_id, deferred_code))
+                    continue
+                if projected_state == "dispatched":
+                    intent = projected_intent
+                    if intent_state == "dispatching":
+                        self._schedule_worker_projection(task_id)
             if self._stop_event.is_set():
                 break
             lease, next_heartbeat = self._heartbeat_if_due(
@@ -561,15 +680,40 @@ class RuntimeSupervisor:
                 )
             else:
                 refreshed.append(task_id)
+        active_task_ids = set(scanned)
+        self._worker_projection_deadlines = {
+            task_id: deadline
+            for task_id, deadline in self._worker_projection_deadlines.items()
+            if task_id in active_task_ids
+        }
         return (
             RuntimeSupervisorCycleResult(
                 scanned_task_ids=tuple(scanned),
                 refreshed_task_ids=tuple(refreshed),
                 deferred=tuple(deferred),
                 task_failures=tuple(failures),
+                projected_task_ids=tuple(projected),
+                adopted_task_ids=tuple(adopted),
             ),
             lease,
             next_heartbeat,
+        )
+
+    def _worker_projection_due(self, task_id: str) -> bool:
+        """Rate-limit sampled Worker evidence without slowing status refresh."""
+
+        now = self._monotonic()
+        deadline = self._worker_projection_deadlines.get(task_id)
+        if deadline is not None and now < deadline:
+            return False
+        self._worker_projection_deadlines[task_id] = (
+            now + self._worker_projection_interval_seconds
+        )
+        return True
+
+    def _schedule_worker_projection(self, task_id: str) -> None:
+        self._worker_projection_deadlines[task_id] = (
+            self._monotonic() + self._worker_projection_interval_seconds
         )
 
     def _heartbeat_if_due(

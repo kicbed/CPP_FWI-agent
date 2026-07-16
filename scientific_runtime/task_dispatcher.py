@@ -62,6 +62,11 @@ class TaskDispatcher(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def observe_existing_worker_attempt(
+        self, intent: DispatchIntentSnapshot
+    ) -> dict[str, Any]:
+        ...
+
     def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
         ...
 
@@ -245,6 +250,90 @@ class DeepwaveTaskDispatcher:
         ):
             raise DispatchError("DISPATCH_FINGERPRINT_DRIFT")
         return handle.as_dict()
+
+    def observe_existing_worker_attempt(
+        self, intent: DispatchIntentSnapshot
+    ) -> dict[str, Any]:
+        """Observe an exact managed attempt without dispatch capability."""
+
+        if (
+            intent.adapter_id == LOGICAL_ENTRYPOINT
+            and intent.adapter_version in SUPPORTED_ADAPTER_VERSIONS
+            and intent.adapter_version != ADAPTER_VERSION
+        ):
+            raise DispatchError("WORKER_EVIDENCE_UNAVAILABLE")
+        if (
+            intent.adapter_id != LOGICAL_ENTRYPOINT
+            or intent.adapter_version != ADAPTER_VERSION
+            or intent.state not in {"dispatching", "dispatched"}
+            or (intent.state == "dispatching" and intent.handle is not None)
+            or (intent.state == "dispatched" and not isinstance(intent.handle, Mapping))
+            or not isinstance(intent.request, Mapping)
+            or not isinstance(intent.queue_fingerprint, Mapping)
+        ):
+            raise DispatchError("DISPATCH_INTENT_INVALID")
+        request = copy.deepcopy(dict(intent.request))
+        normalized_config_hash = request.pop("normalized_config_hash", None)
+        expected = {
+            "task_id",
+            "node_id",
+            "plan_hash",
+            "idempotency_key",
+            "project_id",
+            "principal_id",
+            "algorithm",
+            "dataset",
+            "task_type",
+            "parameters",
+            "resources",
+        }
+        if (
+            set(request) != expected
+            or not isinstance(normalized_config_hash, str)
+            or request["task_id"] != intent.task_id
+            or request["node_id"] != intent.node_id
+            or request["plan_hash"] != intent.plan_hash
+            or request["idempotency_key"] != intent.node_idempotency_key
+            or intent.queue_fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+        ):
+            raise DispatchError("DISPATCH_INTENT_INVALID")
+        try:
+            observed = self._adapter.observe_existing_worker_attempt(**request)
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("WORKER_EVIDENCE_UNAVAILABLE") from error
+        if not isinstance(observed, Mapping) or set(observed) != {
+            "evidence",
+            "handle",
+        }:
+            raise DispatchError("WORKER_EVIDENCE_INVALID")
+        evidence = observed.get("evidence")
+        handle = observed.get("handle")
+        if not isinstance(evidence, Mapping):
+            raise DispatchError("WORKER_EVIDENCE_INVALID")
+        handle_fingerprint = (
+            handle.get("fingerprint") if isinstance(handle, Mapping) else None
+        )
+        if handle is not None and (
+            not isinstance(handle, Mapping)
+            or not isinstance(handle_fingerprint, Mapping)
+            or handle.get("adapter_version") != ADAPTER_VERSION
+            or handle.get("task_id") != intent.task_id
+            or handle.get("node_id") != intent.node_id
+            or handle.get("plan_hash") != intent.plan_hash
+            or handle.get("idempotency_key") != intent.node_idempotency_key
+            or handle_fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+        ):
+            raise DispatchError("DISPATCH_FINGERPRINT_DRIFT")
+        if intent.state == "dispatched" and handle != intent.handle:
+            raise DispatchError("WORKER_EVIDENCE_INVALID")
+        return {
+            "evidence": copy.deepcopy(dict(evidence)),
+            "handle": None if handle is None else copy.deepcopy(dict(handle)),
+        }
 
     @staticmethod
     def _handle_from_intent(intent: DispatchIntentSnapshot) -> AdapterHandle:

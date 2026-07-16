@@ -16,11 +16,12 @@
 - 已验证：P0、P1，以及 P2-001 任务发现/重开、P2-002 回收站、P2-003 本地结果永久
   删除、P2-004 有界启动 receipt 收养/一次状态追赶、P2-005A 控制面 fenced lease 与
   observation-only 持续状态泵、P2-005B 固定 Adapter 托管 Worker 的 staged launch、
-  attempt/capacity fence、ready/heartbeat 证据。
+  attempt/capacity fence、ready/heartbeat 证据，以及 P2-005C SQLite v9 fenced Worker
+  evidence projection/late adoption。
 - 当前阶段：完整 P2 仍在进行；上述 P2 子项不得表述为完整 P2 已完成。
-- 下一安全方向：把当前本机 Adapter attempt/ready/heartbeat 证据投影到 SQLite Task Store，
-  由 fenced Supervisor 消费并设计可恢复调度；证明跨进程调度不会重复启动后，才处理
-  pending/no-record 首次派发和 cancel/timeout，retry、完整 reconciliation 与 SSE 继续后置。
+- 下一安全方向：基于 v9 exact Worker projection 设计可恢复 fenced scheduler；先证明
+  pending/no-record 首次派发和控制面重启接管不会重复启动，再处理 cancel/timeout、有限 retry、
+  `reconciliation_required` resolution；SSE 继续后置。
 - 当前阻塞：无。工作树中的未提交内容可能属于另一个活跃窗口，必须现场检查并保护。
 - `D-005` 提示词分类仍是 Proposed，不得表述为 Accepted。
 
@@ -52,8 +53,9 @@
 - 批准绑定规范化 `plan_hash`；参数、数据、算法、资源或计划变化使旧批准失效。
 - 保留固定 Marmousi/Deepwave Adapter、MCP 白名单、路径校验和通用 JobBackend dry-run。
 - 不创建扫描 `FWI_RUN_ROOT` 并执行任务的 watcher；运行目录只是受控输出/状态。
-- P2-005B 的安全权威是同机内核 `flock`，不是 heartbeat 新鲜度；其容量只覆盖固定 Adapter
-  托管 Worker，legacy CLI/MCP 仍在该容量池之外，且 heartbeat 尚未进入 SQLite Task Store。
+- P2-005B/P2-005C 的执行安全权威仍是同机内核 `flock`，不是 heartbeat 新鲜度；SQLite v9
+  只保存 current managed Adapter 的受 fence 采样与 exact adoption，不提供 takeover 或首次派发。
+  legacy CLI/MCP 仍在该容量/投影边界之外，升级前已终态任务不保证 evidence backfill。
 - 不读取、打印或提交 `.env`、API Key、凭证、私有 prompt、模型、运行 artifact、数据库、
   日志、构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开报告；科学结论只限实际实验边界。

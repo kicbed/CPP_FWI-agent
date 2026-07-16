@@ -32,6 +32,7 @@ from tests.test_scientific_runtime_task_service import (
     PRINCIPAL_ID,
     PROJECT_ID,
     executable_approval_decision,
+    managed_worker_evidence,
 )
 
 
@@ -97,7 +98,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         )
 
     def _submitted_runtime(
-        self, *, key: str
+        self, *, key: str, deferred: bool = False
     ) -> tuple[str, FakeDispatcher, TaskService]:
         token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         draft = optimizer_task_draft()
@@ -126,7 +127,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             **self.scope,
         )
 
-        dispatcher = FakeDispatcher(self.store)
+        dispatcher = FakeDispatcher(
+            self.store,
+            failure_code=("ADAPTER_CONCURRENCY_LIMIT" if deferred else None),
+        )
+        dispatcher.defer_dispatch = deferred
         runtime = TaskService(
             self.store,
             clock=lambda: self.now[0],
@@ -138,16 +143,21 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             idempotency_key=f"submit-{key}",
             **self.scope,
         )
-        self.assertEqual(submitted.intent.state, "dispatched")
+        self.assertEqual(
+            submitted.intent.state, "dispatching" if deferred else "dispatched"
+        )
         return task_id, dispatcher, runtime
 
-    def test_fresh_v8_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 8)
+    def test_fresh_v9_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 9)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
             "runtime_supervisor_term_closures",
             "supervised_run_event_commits",
+            "worker_launch_attempts",
+            "worker_attempt_observations",
+            "supervised_dispatch_adoptions",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -162,6 +172,20 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "supervised_run_event_commit_requires_active_term",
             "supervised_run_event_commits_are_append_only",
             "supervised_run_event_commits_cannot_be_deleted",
+            "worker_launch_attempt_requires_matching_intent",
+            "worker_launch_attempt_requires_active_term",
+            "worker_attempt_observation_requires_matching_attempt",
+            "worker_attempt_observation_requires_active_term",
+            "worker_attempt_observation_sequence_is_contiguous",
+            "worker_attempt_observation_cannot_regress",
+            "supervised_dispatch_adoption_requires_matching_attempt",
+            "supervised_dispatch_adoption_requires_active_term",
+            "worker_launch_attempts_are_append_only",
+            "worker_launch_attempts_cannot_be_deleted",
+            "worker_attempt_observations_are_append_only",
+            "worker_attempt_observations_cannot_be_deleted",
+            "supervised_dispatch_adoptions_are_append_only",
+            "supervised_dispatch_adoptions_cannot_be_deleted",
         }
         connection = self._connection()
         try:
@@ -181,6 +205,12 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 """
             ).fetchone()
             self.assertEqual(migration["name"], "0008_runtime_supervisor.sql")
+            worker_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 9"
+            ).fetchone()
+            self.assertEqual(
+                worker_migration["name"], "0009_worker_attempt_projection.sql"
+            )
         finally:
             connection.close()
 
@@ -224,6 +254,87 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.rollback()
             connection.close()
+
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v9(self) -> None:
+        task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
+        acquired = self._acquire("upgrade-owner", lease_seconds=30)
+        self.assertTrue(acquired.acquired)
+        connection = self._connection()
+        try:
+            connection.execute("DROP TABLE supervised_dispatch_adoptions")
+            connection.execute("DROP TABLE worker_attempt_observations")
+            connection.execute("DROP TABLE worker_launch_attempts")
+            connection.execute("DELETE FROM schema_migrations WHERE version = 9")
+            connection.execute("PRAGMA user_version = 8")
+            connection.commit()
+        finally:
+            connection.close()
+
+        reopened = SQLiteTaskStore(self.database_path)
+        self.assertEqual(reopened.migration_version(), 9)
+        self.assertEqual(reopened.get_task(task_id).status, "Queued")
+        lease = reopened.get_runtime_supervisor_lease(**self.scope)
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        self.assertEqual(lease.fencing_token, acquired.lease.fencing_token)
+        self.assertEqual(lease.state, "active")
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_launch_attempts"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+        finally:
+            connection.close()
+
+    def test_stale_supervisor_term_cannot_project_or_adopt_worker(self) -> None:
+        task_id, dispatcher, runtime = self._submitted_runtime(
+            key="stale-worker-projection", deferred=True
+        )
+        intent = self.store.get_dispatch_intent(task_id)
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(),
+            "handle": dispatcher.recover_existing_receipt(intent),
+        }
+        old = self._acquire("worker-owner-old", lease_seconds=10)
+        self.now[0] = T_PLUS_11
+        current = self._acquire(
+            "worker-owner-current", now=T_PLUS_11, lease_seconds=10
+        )
+        self.assertTrue(current.acquired)
+        with self.assertRaises(TaskSupervisorLeaseLost):
+            runtime.project_worker_attempt(
+                task_id, supervisor_lease=old.lease, **self.scope
+            )
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_launch_attempts"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_outcomes"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+        projected = runtime.project_worker_attempt(
+            task_id, supervisor_lease=current.lease, **self.scope
+        )
+        self.assertTrue(projected.adopted)
+        self.assertEqual(projected.intent.state, "dispatched")
 
     def test_active_foreign_owner_cannot_take_over(self) -> None:
         first = self._acquire("owner-active-a")

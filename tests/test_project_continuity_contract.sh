@@ -45,6 +45,7 @@ required_files=(
     scientific_runtime/task_store.py
     scientific_runtime/task_service.py
     scientific_runtime/task_dispatcher.py
+    scientific_runtime/runtime_supervisor.py
     scientific_runtime/workbench_service.py
     worker_launch_bootstrap.py
     worker_launch_control.py
@@ -55,11 +56,15 @@ required_files=(
     scientific_runtime/migrations/0005_task_discovery.sql
     scientific_runtime/migrations/0006_task_visibility.sql
     scientific_runtime/migrations/0007_task_purge.sql
+    scientific_runtime/migrations/0008_runtime_supervisor.sql
+    scientific_runtime/migrations/0009_worker_attempt_projection.sql
     tests/test_scientific_runtime_registry.py
     tests/test_scientific_runtime_fwi_adapter.py
     tests/test_scientific_runtime_fwi_purge.py
     tests/test_scientific_runtime_task_purge_store.py
     tests/test_scientific_runtime_task_service.py
+    tests/test_scientific_runtime_runtime_supervisor.py
+    tests/test_scientific_runtime_supervisor_store.py
     tests/test_scientific_runtime_workbench.py
     tests/test_worker_launch_control.py
     contracts/scientific_runtime/v1/common.schema.json
@@ -115,7 +120,7 @@ require_text docs/PROJECT_CONTINUITY.md '## D-010：'
 require_text docs/PROJECT_CONTINUITY.md '低 token 自动接续与 CodeGraph 导航'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
-require_text docs/PROJECT_CONTINUITY.md 'P2.1–P2.5B 有界切片'
+require_text docs/PROJECT_CONTINUITY.md 'P2.1–P2.5C 有界切片'
 require_text docs/PROJECT_CONTINUITY.md '完整 P2 Pending'
 require_text docs/PROJECT_CONTINUITY.md '精确历史七个 form 字段'
 require_text docs/PROJECT_CONTINUITY.md '当前 Algorithm/Adapter `deepwave.acoustic_fwi@1.4.0`/`1.4.0`'
@@ -151,6 +156,7 @@ require_text docs/PROJECT_PROGRESS.md '当前新 Guided 任务使用 contract mi
 require_text docs/PROJECT_PROGRESS.md 'P1-008 / D-008'
 require_text docs/PROJECT_PROGRESS.md 'P2-002 / D-008'
 require_text docs/PROJECT_PROGRESS.md 'P2-003 / D-009'
+require_text docs/PROJECT_PROGRESS.md 'P2-005C fenced Worker 证据投影与 late adoption'
 require_text docs/PROJECT_PROGRESS.md 'D-010 / PREP-004'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'

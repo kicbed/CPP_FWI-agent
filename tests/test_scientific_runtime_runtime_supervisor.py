@@ -61,6 +61,16 @@ class FakeIntent:
 
 
 @dataclass(frozen=True)
+class FakeProjection:
+    intent: FakeIntent
+    evidence: dict | None
+    projected: bool
+    adopted: bool
+    replayed: bool
+    deferred_code: str | None = None
+
+
+@dataclass(frozen=True)
 class FakePage:
     snapshots: tuple[FakeSnapshot, ...]
     next_cursor: str | None
@@ -83,6 +93,14 @@ class StepClock:
             return self.value
 
 
+class ManualClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
 class FakeTaskService:
     def __init__(
         self,
@@ -97,12 +115,15 @@ class FakeTaskService:
         self.release_calls = 0
         self.list_calls = 0
         self.intent_calls: list[str] = []
+        self.projection_calls: list[str] = []
         self.refresh_calls: list[str] = []
         self.dispatch_calls = 0
         self.lease_held = False
         self.lose_on_heartbeat = False
         self.list_error: Exception | None = None
         self.refresh_failures: dict[str, Exception] = {}
+        self.projection_failures: dict[str, Exception] = {}
+        self.projection_results: dict[str, FakeProjection] = {}
         self.refresh_hook: Callable[[str], None] | None = None
         self.release_failures_remaining = 0
         self.active_lease: FakeLease | None = None
@@ -201,6 +222,42 @@ class FakeTaskService:
         if isinstance(value, Exception):
             raise value
         return value
+
+    def project_worker_attempt(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: FakeLease,
+    ) -> FakeProjection:
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        with self.lock:
+            if supervisor_lease != self.active_lease:
+                raise RuntimeSupervisorLeaseLost("simulated stale projection write")
+            self.calls.append("project")
+            self.projection_calls.append(task_id)
+        failure = self.projection_failures.get(task_id)
+        if failure is not None:
+            raise failure
+        configured = self.projection_results.get(task_id)
+        if configured is not None:
+            return configured
+        intent = self.intents.get(task_id)
+        assert isinstance(intent, FakeIntent)
+        return FakeProjection(
+            intent=intent,
+            evidence=None,
+            projected=False,
+            adopted=False,
+            replayed=False,
+            deferred_code=(
+                "WORKER_EVIDENCE_NOT_READY"
+                if intent.state == "dispatching"
+                else "WORKER_EVIDENCE_UNAVAILABLE"
+            ),
+        )
 
     def refresh_runtime_status(
         self,
@@ -385,7 +442,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
                 cycle.deferred,
                 (
                     ("queued-pending", "DISPATCH_PENDING"),
-                    ("queued-dispatching", "DISPATCHING"),
+                    ("queued-dispatching", "WORKER_EVIDENCE_NOT_READY"),
                     ("queued-reconcile", "RECONCILIATION_REQUIRED"),
                 ),
             )
@@ -401,12 +458,98 @@ class RuntimeSupervisorTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(
+                service.projection_calls,
+                ["queued-dispatched", "running-dispatched", "queued-dispatching"],
+            )
+            self.assertEqual(
                 service.refresh_calls,
                 ["queued-dispatched", "running-dispatched"],
             )
             self.assertEqual(service.dispatch_calls, 0)
         finally:
             runtime.stop()
+
+    def test_exact_ready_projection_is_adopted_and_refreshed_in_same_cycle(self) -> None:
+        task_id = "late-ready"
+        service = FakeTaskService(
+            [snapshot(task_id, "Queued")],
+            {task_id: FakeIntent(task_id, "dispatching")},
+        )
+        service.projection_results[task_id] = FakeProjection(
+            intent=FakeIntent(task_id, "dispatched"),
+            evidence={"ticket": {"state": "spawned"}},
+            projected=True,
+            adopted=True,
+            replayed=False,
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(cycle.projected_task_ids, (task_id,))
+            self.assertEqual(cycle.adopted_task_ids, (task_id,))
+            self.assertEqual(cycle.refreshed_task_ids, (task_id,))
+            self.assertEqual(cycle.deferred, ())
+            self.assertEqual(cycle.task_failures, ())
+            self.assertEqual(service.projection_calls, [task_id])
+            self.assertEqual(service.refresh_calls, [task_id])
+            self.assertEqual(service.dispatch_calls, 0)
+        finally:
+            runtime.stop()
+
+    def test_failed_launch_evidence_has_an_explicit_deferred_code(self) -> None:
+        task_id = "failed-attempt"
+        service = FakeTaskService(
+            [snapshot(task_id, "Queued")],
+            {task_id: FakeIntent(task_id, "dispatching")},
+        )
+        service.projection_results[task_id] = FakeProjection(
+            intent=FakeIntent(task_id, "dispatching"),
+            evidence={"ticket": {"state": "failed"}},
+            projected=True,
+            adopted=False,
+            replayed=False,
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(
+                cycle.deferred, ((task_id, "WORKER_ATTEMPT_FAILED"),)
+            )
+            self.assertEqual(service.refresh_calls, [])
+        finally:
+            runtime.stop()
+
+    def test_dispatched_worker_projection_has_an_independent_cadence(self) -> None:
+        task_id = "sampled-worker"
+        service = FakeTaskService(
+            [snapshot(task_id, "Running")],
+            {task_id: FakeIntent(task_id, "dispatched")},
+        )
+        clock = ManualClock()
+        runtime = supervisor(
+            service,
+            monotonic=clock,
+            worker_projection_interval_seconds=60,
+        )
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        runtime._observe_tasks(service.snapshots, lease, float("inf"))
+        clock.value = 30.0
+        runtime._observe_tasks(service.snapshots, lease, float("inf"))
+        clock.value = 60.0
+        runtime._observe_tasks(service.snapshots, lease, float("inf"))
+
+        self.assertEqual(service.projection_calls, [task_id, task_id])
+        self.assertEqual(service.refresh_calls, [task_id, task_id, task_id])
 
     def test_one_task_failure_is_contained_and_later_task_is_refreshed(self) -> None:
         service = FakeTaskService(

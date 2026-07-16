@@ -453,6 +453,84 @@ class LaunchAttemptBinding:
         }
 
 
+@dataclass(frozen=True)
+class WorkerAttemptEvidence:
+    """One path-free, exact snapshot of an already staged Worker attempt.
+
+    This is sampled evidence, not a lease and not a liveness decision.  In
+    particular, a stale heartbeat never authorizes another Worker launch; the
+    inherited kernel locks remain the execution and capacity authority.
+    """
+
+    submission_id: str
+    attempt_id: str
+    attempt_number: int
+    job_id: str
+    request_hash: str
+    binding_hash: str
+    created_at: str
+    ticket_state: str
+    capacity_slot: int | None
+    capacity_generation: int | None
+    ticket_worker_pid: int | None
+    ticket_updated_at: str
+    ticket_record_hash: str
+    ready_worker_pid: int | None = None
+    ready_started_at: str | None = None
+    ready_record_hash: str | None = None
+    heartbeat_sequence: int | None = None
+    heartbeat_state: str | None = None
+    heartbeat_updated_at: str | None = None
+    heartbeat_record_hash: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.ready_record_hash is not None
+
+    @property
+    def started(self) -> bool:
+        return self.ready and self.heartbeat_record_hash is not None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0.0",
+            "submission_id": self.submission_id,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "job_id": self.job_id,
+            "request_hash": self.request_hash,
+            "binding_hash": self.binding_hash,
+            "created_at": self.created_at,
+            "ticket": {
+                "state": self.ticket_state,
+                "capacity_slot": self.capacity_slot,
+                "capacity_generation": self.capacity_generation,
+                "worker_pid": self.ticket_worker_pid,
+                "updated_at": self.ticket_updated_at,
+                "record_hash": self.ticket_record_hash,
+            },
+            "ready": (
+                None
+                if not self.ready
+                else {
+                    "worker_pid": self.ready_worker_pid,
+                    "started_at": self.ready_started_at,
+                    "record_hash": self.ready_record_hash,
+                }
+            ),
+            "heartbeat": (
+                None
+                if self.heartbeat_record_hash is None
+                else {
+                    "sequence": self.heartbeat_sequence,
+                    "state": self.heartbeat_state,
+                    "updated_at": self.heartbeat_updated_at,
+                    "record_hash": self.heartbeat_record_hash,
+                }
+            ),
+        }
+
+
 def binding_from_submission_record(record: Mapping[str, Any]) -> LaunchAttemptBinding:
     attempt = record.get("launch_attempt")
     if not isinstance(attempt, Mapping) or set(attempt) != {
@@ -563,7 +641,15 @@ def _read_ticket(run_dir: Path, binding: LaunchAttemptBinding) -> dict[str, Any]
             and worker_pid > 0
         )
     else:
-        valid_projection = worker_pid is None
+        valid_projection = worker_pid is None and (
+            (slot is None and generation is None)
+            or (
+                type(slot) is int
+                and slot >= 0
+                and type(generation) is int
+                and generation >= 1
+            )
+        )
     if not valid_projection:
         raise WorkerControlError(
             "WORKER_CONTROL_INVALID: launch ticket projection is invalid"
@@ -1256,24 +1342,39 @@ class WorkerHeartbeat:
                 pass
 
 
-def worker_attempt_started(
+def read_worker_attempt_evidence(
     run_root: Path | str,
     run_dir: Path | str,
     binding: LaunchAttemptBinding,
-) -> bool:
-    """Return true only after the exact fenced Worker wrote a heartbeat."""
+) -> WorkerAttemptEvidence | None:
+    """Read one exact attempt without creating paths or inferring liveness."""
 
     _, job_dir = _validate_root_and_run(run_root, run_dir)
     try:
         ticket = _read_ticket(job_dir, binding)
     except FileNotFoundError:
-        return False
-    if ticket["state"] not in {"leased", "spawned"}:
-        return False
+        return None
+    evidence = {
+        "submission_id": binding.submission_id,
+        "attempt_id": binding.attempt_id,
+        "attempt_number": binding.attempt_number,
+        "job_id": binding.job_id,
+        "request_hash": binding.request_hash,
+        "binding_hash": binding.binding_hash,
+        "created_at": binding.created_at,
+        "ticket_state": ticket["state"],
+        "capacity_slot": ticket["capacity_slot"],
+        "capacity_generation": ticket["capacity_generation"],
+        "ticket_worker_pid": ticket["worker_pid"],
+        "ticket_updated_at": ticket["updated_at"],
+        "ticket_record_hash": ticket["record_hash"],
+    }
+    if ticket["state"] != "spawned":
+        return WorkerAttemptEvidence(**evidence)
     try:
         ready = _read_private_json(job_dir / WORKER_READY_NAME)
     except FileNotFoundError:
-        return False
+        return WorkerAttemptEvidence(**evidence)
     ready_required = {
         "schema_version",
         "submission_id",
@@ -1315,10 +1416,23 @@ def worker_attempt_started(
         raise WorkerControlError(
             "WORKER_READY_INVALID: ready Worker differs from launch ticket"
         )
+    evidence.update(
+        {
+            "ready_worker_pid": ready["worker_pid"],
+            "ready_started_at": ready["started_at"],
+            "ready_record_hash": ready["record_hash"],
+        }
+    )
     try:
         heartbeat = _read_private_json(job_dir / WORKER_HEARTBEAT_NAME)
-    except FileNotFoundError:
-        return False
+    except FileNotFoundError as error:
+        # WorkerHeartbeat writes the initial heartbeat before it publishes the
+        # ready receipt.  With the submission lock held by the Adapter reader,
+        # ready-without-heartbeat is therefore corruption, not a launch
+        # transient that may be projected indefinitely.
+        raise WorkerControlError(
+            "WORKER_HEARTBEAT_INVALID: ready receipt has no heartbeat"
+        ) from error
     required = {
         "schema_version",
         "submission_id",
@@ -1368,19 +1482,40 @@ def worker_attempt_started(
         )
     _parse_timestamp(heartbeat["started_at"])
     _parse_timestamp(heartbeat["updated_at"])
-    return True
+    evidence.update(
+        {
+            "heartbeat_sequence": heartbeat["sequence"],
+            "heartbeat_state": heartbeat["state"],
+            "heartbeat_updated_at": heartbeat["updated_at"],
+            "heartbeat_record_hash": heartbeat["record_hash"],
+        }
+    )
+    return WorkerAttemptEvidence(**evidence)
+
+
+def worker_attempt_started(
+    run_root: Path | str,
+    run_dir: Path | str,
+    binding: LaunchAttemptBinding,
+) -> bool:
+    """Return true only after the exact fenced Worker wrote a heartbeat."""
+
+    evidence = read_worker_attempt_evidence(run_root, run_dir, binding)
+    return evidence is not None and evidence.started
 
 
 __all__ = [
     "CONTROL_DIRECTORY",
     "LaunchAttemptBinding",
     "ParentLaunchLease",
+    "WorkerAttemptEvidence",
     "WorkerControlError",
     "WorkerHeartbeat",
     "binding_from_submission_record",
     "execution_fence_is_held",
     "hold_idle_execution_fence",
     "mark_launch_failed",
+    "read_worker_attempt_evidence",
     "stage_launch_attempt",
     "worker_attempt_started",
 ]

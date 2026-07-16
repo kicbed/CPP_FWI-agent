@@ -52,6 +52,10 @@ PROJECT_ID = "project-1"
 PRINCIPAL_ID = "user-1"
 CURRENT_ALGORITHM_VERSION = "1.4.0"
 CURRENT_ADAPTER_VERSION = "1.4.0"
+MANAGED_SUBMISSION_ID = "submission-" + "1" * 64
+MANAGED_ATTEMPT_ID = "attempt-" + "2" * 32
+MANAGED_JOB_ID = "fwi-20260715T030000Z-000000000001"
+MANAGED_REQUEST_HASH = "sha256:" + "a" * 64
 
 
 def executable_approval_decision(plan: dict) -> dict:
@@ -82,14 +86,105 @@ def dispatch_fingerprint() -> dict:
     return value
 
 
+def managed_worker_evidence(
+    *,
+    ticket_state: str = "spawned",
+    heartbeat_sequence: int | None = 1,
+    heartbeat_state: str = "running",
+    attempt_id: str = MANAGED_ATTEMPT_ID,
+) -> dict:
+    binding = {
+        "schema_version": "1.0.0",
+        "submission_id": MANAGED_SUBMISSION_ID,
+        "attempt_id": attempt_id,
+        "attempt_number": 1,
+        "job_id": MANAGED_JOB_ID,
+        "request_hash": MANAGED_REQUEST_HASH,
+        "created_at": NOW,
+    }
+    binding_hash = encode_document(binding)[1]
+    ticket = {
+        **binding,
+        "binding_hash": binding_hash,
+        "state": ticket_state,
+        "capacity_slot": 0 if ticket_state == "spawned" else None,
+        "capacity_generation": 1 if ticket_state == "spawned" else None,
+        "worker_pid": 4242 if ticket_state == "spawned" else None,
+        "updated_at": NOW,
+    }
+    if ticket_state != "spawned":
+        return {
+            **binding,
+            "binding_hash": binding_hash,
+            "ticket": {
+                "state": ticket_state,
+                "capacity_slot": None,
+                "capacity_generation": None,
+                "worker_pid": None,
+                "updated_at": NOW,
+                "record_hash": encode_document(ticket)[1],
+            },
+            "ready": None,
+            "heartbeat": None,
+        }
+    ready = {
+        "schema_version": "1.0.0",
+        "submission_id": MANAGED_SUBMISSION_ID,
+        "attempt_id": attempt_id,
+        "attempt_number": 1,
+        "binding_hash": binding_hash,
+        "job_id": MANAGED_JOB_ID,
+        "capacity_slot": 0,
+        "capacity_generation": 1,
+        "worker_pid": 4242,
+        "started_at": NOW,
+    }
+    heartbeat = None
+    if heartbeat_sequence is not None:
+        heartbeat_payload = {
+            **{key: value for key, value in ready.items() if key != "record_hash"},
+            "sequence": heartbeat_sequence,
+            "state": heartbeat_state,
+            "updated_at": NOW,
+        }
+        heartbeat = {
+            "sequence": heartbeat_sequence,
+            "state": heartbeat_state,
+            "updated_at": NOW,
+            "record_hash": encode_document(heartbeat_payload)[1],
+        }
+    return {
+        **binding,
+        "binding_hash": binding_hash,
+        "ticket": {
+            "state": "spawned",
+            "capacity_slot": 0,
+            "capacity_generation": 1,
+            "worker_pid": 4242,
+            "updated_at": NOW,
+            "record_hash": encode_document(ticket)[1],
+        },
+        "ready": {
+            "worker_pid": 4242,
+            "started_at": NOW,
+            "record_hash": encode_document(ready)[1],
+        },
+        "heartbeat": heartbeat,
+    }
+
+
 class FakeDispatcher:
     def __init__(self, store: SQLiteTaskStore, *, failure_code: str | None = None):
         self.store = store
         self.failure_code = failure_code
+        self.defer_dispatch = False
         self.prepare_calls = 0
         self.dispatch_calls = 0
         self.receipt_recovery_calls = 0
         self.receipt_recovery_failure_code: str | None = None
+        self.worker_observation_calls = 0
+        self.worker_observation: dict | None = None
+        self.worker_observation_failure_code: str | None = None
         self.status_calls = 0
         self.collect_calls = 0
         self.read_calls = 0
@@ -128,15 +223,17 @@ class FakeDispatcher:
         with self.lock:
             self.dispatch_calls += 1
         if self.failure_code is not None:
+            if self.defer_dispatch:
+                raise DispatchDeferred(self.failure_code)
             raise DispatchError(self.failure_code)
         return {
-            "submission_id": "submission-test-001",
+            "submission_id": MANAGED_SUBMISSION_ID,
             "task_id": intent.task_id,
             "node_id": intent.node_id,
-            "job_id": "fwi-20260715T030000Z-000000000001",
+            "job_id": MANAGED_JOB_ID,
             "idempotency_key": intent.node_idempotency_key,
             "plan_hash": intent.plan_hash,
-            "request_hash": "sha256:" + "a" * 64,
+            "request_hash": MANAGED_REQUEST_HASH,
             "algorithm": copy.deepcopy(intent.request["algorithm"]),
             # The queued fingerprint is preflight evidence.  Runtime events
             # bind to the actual fingerprint returned in this receipt.
@@ -150,17 +247,27 @@ class FakeDispatcher:
         if self.receipt_recovery_failure_code is not None:
             raise DispatchError(self.receipt_recovery_failure_code)
         return {
-            "submission_id": "submission-test-001",
+            "submission_id": MANAGED_SUBMISSION_ID,
             "task_id": intent.task_id,
             "node_id": intent.node_id,
-            "job_id": "fwi-20260715T030000Z-000000000001",
+            "job_id": MANAGED_JOB_ID,
             "idempotency_key": intent.node_idempotency_key,
             "plan_hash": intent.plan_hash,
-            "request_hash": "sha256:" + "a" * 64,
+            "request_hash": MANAGED_REQUEST_HASH,
             "algorithm": copy.deepcopy(intent.request["algorithm"]),
             "fingerprint": executable_fingerprint(),
             "adapter_version": intent.adapter_version,
         }
+
+    def observe_existing_worker_attempt(self, intent):
+        del intent
+        with self.lock:
+            self.worker_observation_calls += 1
+        if self.worker_observation_failure_code is not None:
+            raise DispatchError(self.worker_observation_failure_code)
+        if self.worker_observation is None:
+            raise DispatchError("WORKER_EVIDENCE_UNAVAILABLE")
+        return copy.deepcopy(self.worker_observation)
 
     def status(self, intent):
         with self.lock:
@@ -305,6 +412,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "task_purge_requests",
                 "task_purge_idempotency",
                 "task_purge_outcomes",
+                "worker_launch_attempts",
+                "worker_attempt_observations",
+                "supervised_dispatch_adoptions",
             },
         )
         connection = sqlite3.connect(self.database_path)
@@ -332,7 +442,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 8)
+        self.assertEqual(self.store.migration_version(), 9)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -348,7 +458,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 8)
+        self.assertEqual(reopened.migration_version(), 9)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -435,12 +545,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 8)] * 8)
+        self.assertEqual(results, [("wal", 9)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 9")
+            connection.execute("PRAGMA user_version = 10")
             connection.commit()
         finally:
             connection.close()
@@ -2302,6 +2412,260 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             current_dispatcher,
             self.submit_service(current_dispatcher),
         )
+
+    def test_fenced_worker_projection_adopts_once_and_rejects_regression(self) -> None:
+        dispatcher = FakeDispatcher(
+            self.store, failure_code="ADAPTER_CONCURRENCY_LIMIT"
+        )
+        dispatcher.defer_dispatch = True
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="worker-projection", dispatcher=dispatcher
+        )
+        submitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-worker-projection",
+            **self.scope,
+        )
+        self.assertEqual(submitted.intent.state, "dispatching")
+
+        acquisition = service.acquire_runtime_supervisor_lease(
+            owner_id="worker-projection-owner",
+            lease_seconds=30,
+            **self.scope,
+        )
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(ticket_state="staged"),
+            "handle": None,
+        }
+        staged = service.project_worker_attempt(
+            task_id,
+            supervisor_lease=acquisition.lease,
+            **self.scope,
+        )
+        self.assertTrue(staged.projected)
+        self.assertFalse(staged.adopted)
+        self.assertEqual(staged.intent.state, "dispatching")
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 1)
+        self.assertEqual(self.raw_count("supervised_dispatch_adoptions"), 0)
+
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(heartbeat_sequence=None),
+            "handle": None,
+        }
+        with self.assertRaises(TaskConflict):
+            service.project_worker_attempt(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 1)
+
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(),
+            "handle": dispatcher.recover_existing_receipt(submitted.intent),
+        }
+        mismatched = copy.deepcopy(dispatcher.worker_observation)
+        mismatched["handle"]["request_hash"] = "sha256:" + "f" * 64
+        dispatcher.worker_observation = mismatched
+        with self.assertRaises(TaskConflict):
+            service.project_worker_attempt(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 1)
+        self.assertEqual(self.raw_count("supervised_dispatch_adoptions"), 0)
+
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(),
+            "handle": dispatcher.recover_existing_receipt(submitted.intent),
+        }
+        first = service.project_worker_attempt(
+            task_id,
+            supervisor_lease=acquisition.lease,
+            **self.scope,
+        )
+        self.assertTrue(first.projected)
+        self.assertTrue(first.adopted)
+        self.assertFalse(first.replayed)
+        self.assertEqual(first.intent.state, "dispatched")
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 2)
+        self.assertEqual(self.raw_count("supervised_dispatch_adoptions"), 1)
+
+        replay = service.project_worker_attempt(
+            task_id,
+            supervisor_lease=acquisition.lease,
+            **self.scope,
+        )
+        self.assertTrue(replay.projected)
+        self.assertFalse(replay.adopted)
+        self.assertTrue(replay.replayed)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 2)
+
+        dispatcher.worker_observation["evidence"] = managed_worker_evidence(
+            attempt_id="attempt-" + "3" * 32
+        )
+        with self.assertRaises(TaskConflict):
+            service.project_worker_attempt(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 2)
+
+        dispatcher.worker_observation["evidence"] = managed_worker_evidence(
+            heartbeat_sequence=2
+        )
+        advanced = service.project_worker_attempt(
+            task_id,
+            supervisor_lease=acquisition.lease,
+            **self.scope,
+        )
+        self.assertFalse(advanced.replayed)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 3)
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO worker_attempt_observations(
+                        attempt_id, observation_sequence, ticket_state,
+                        capacity_slot, capacity_generation, ticket_worker_pid,
+                        ticket_updated_at, ticket_record_hash,
+                        ready_worker_pid, ready_started_at, ready_record_hash,
+                        heartbeat_sequence, heartbeat_state,
+                        heartbeat_updated_at, heartbeat_record_hash,
+                        document_json, document_hash, project_id, principal_id,
+                        fencing_token, observed_at, observed_at_us
+                    )
+                    SELECT attempt_id, 4, ticket_state,
+                           capacity_slot, capacity_generation, ticket_worker_pid,
+                           ticket_updated_at, ticket_record_hash,
+                           ready_worker_pid, ready_started_at, ready_record_hash,
+                           3, NULL, heartbeat_updated_at, ?, document_json, ?,
+                           project_id, principal_id, fencing_token,
+                           observed_at, observed_at_us
+                    FROM worker_attempt_observations
+                    WHERE attempt_id = ? AND observation_sequence = 3
+                    """,
+                    (
+                        "sha256:" + "8" * 64,
+                        "sha256:" + "9" * 64,
+                        MANAGED_ATTEMPT_ID,
+                    ),
+                )
+            connection.rollback()
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "worker observation cannot regress"
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO worker_attempt_observations(
+                        attempt_id, observation_sequence, ticket_state,
+                        capacity_slot, capacity_generation, ticket_worker_pid,
+                        ticket_updated_at, ticket_record_hash,
+                        ready_worker_pid, ready_started_at, ready_record_hash,
+                        heartbeat_sequence, heartbeat_state,
+                        heartbeat_updated_at, heartbeat_record_hash,
+                        document_json, document_hash, project_id, principal_id,
+                        fencing_token, observed_at, observed_at_us
+                    )
+                    SELECT attempt_id, 4, 'staged',
+                           NULL, NULL, NULL,
+                           ticket_updated_at, ticket_record_hash,
+                           NULL, NULL, NULL,
+                           NULL, NULL, NULL, NULL,
+                           document_json, ?, project_id, principal_id,
+                           fencing_token, observed_at, observed_at_us
+                    FROM worker_attempt_observations
+                    WHERE attempt_id = ? AND observation_sequence = 3
+                    """,
+                    ("sha256:" + "7" * 64, MANAGED_ATTEMPT_ID),
+                )
+            connection.rollback()
+        finally:
+            connection.close()
+
+        dispatcher.worker_observation["evidence"] = managed_worker_evidence()
+        with self.assertRaises(TaskConflict):
+            service.project_worker_attempt(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 3)
+
+        dispatcher.worker_observation["evidence"] = managed_worker_evidence(
+            heartbeat_sequence=2,
+            heartbeat_state="failed",
+        )
+        with self.assertRaises(TaskConflict):
+            service.project_worker_attempt(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 3)
+
+        dispatcher.worker_observation["evidence"] = managed_worker_evidence(
+            heartbeat_sequence=3,
+            heartbeat_state="succeeded",
+        )
+        terminal = service.project_worker_attempt(
+            task_id,
+            supervisor_lease=acquisition.lease,
+            **self.scope,
+        )
+        self.assertFalse(terminal.replayed)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 4)
+
+        dispatcher.worker_observation["evidence"] = managed_worker_evidence(
+            heartbeat_sequence=4,
+            heartbeat_state="running",
+        )
+        with self.assertRaises(TaskConflict):
+            service.project_worker_attempt(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 4)
+
+        # Simulate storage corruption/future-writer drift after disabling the
+        # migration's append-only guard.  Read-side validation must reject a
+        # legal-looking relational state that differs from canonical JSON.
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "DROP TRIGGER worker_attempt_observations_are_append_only"
+            )
+            connection.execute(
+                """
+                UPDATE worker_attempt_observations
+                SET heartbeat_state = 'failed'
+                WHERE attempt_id = ? AND observation_sequence = 4
+                """,
+                (MANAGED_ATTEMPT_ID,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        dispatcher.worker_observation["evidence"] = managed_worker_evidence(
+            heartbeat_sequence=3,
+            heartbeat_state="succeeded",
+        )
+        with self.assertRaises(TaskStoreCorruption):
+            service.project_worker_attempt(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
 
     def artifact_manifests(
         self, task_id: str
