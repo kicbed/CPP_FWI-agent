@@ -104,6 +104,16 @@ simulate real-time context.
   as durable truth.
 - A phase is complete only when its required deliverables exist and its exit
   tests pass. `Implemented` is not the same as `Verified`.
+- Follow accepted D-011: use elastic medium-sized slices. Merge adjacent work
+  that shares one state machine, interface, risk boundary, and exit test; split
+  only for a concrete safety, ownership, or verification reason and record it.
+  Do not create a roadmap slice solely for one migration, field, receipt, or
+  test, and do not treat the rough remaining-slice estimate as a quota.
+- Multi-algorithm support means independently discoverable/selectable tools by
+  default. Do not infer an automatic end-to-end algorithm pipeline unless the
+  user explicitly selects a workflow. Use focused tests internally and full
+  regression/representative CPU-CUDA E2E at phase exits without reducing
+  required coverage.
 - Follow `docs/GIT_AND_PROMPT_POLICY.md`: make bounded, reviewed checkpoints on
   the active feature branch; never push `main`, force-push, or rewrite published
   history without explicit user instruction.

@@ -216,6 +216,20 @@ manifest 还必须描述参数与结果 Schema、输入输出类型/shape/dtype/
 
 ## 6. 实施阶段与完成标准
 
+### 交付粒度与测试策略（D-011）
+
+阶段和出口条件继续作为质量边界；切片是实现与审阅单位，不是固定数量 KPI。后续默认使用
+中等、纵向、可独立验证的切片：共享同一状态机、接口和出口测试的相邻工作合并；只有出现明确
+并发/崩溃窗口、独立安全边界、文件所有权冲突或无法共同验证的风险时才拆分并记录理由。不得为
+单个 migration、字段、receipt/sidecar 或一项测试分别创建产品路线切片，也不得为了减少编号把
+高风险工作压成不可审阅的大提交。当前约十余个剩余中等切片只是估算，允许基于证据合理浮动，
+未经说明不得膨胀成几十个路线切片。
+
+测试按影响分级：内部变更先跑受影响单元测试；切片出口跑相关集成测试；阶段出口跑完整回归
+及适用的真实 CPU/CUDA/E2E。只有数值 Worker、依赖、数据或规范化配置变化时才重复对应耗时
+实验；复用证据必须绑定 Git tree、环境、数据和配置身份。该策略减少重复执行，不降低公共合同、
+故障、安全和科学验收覆盖。
+
 ### P0：契约与架构基线
 
 交付：
@@ -378,6 +392,11 @@ P2.5C 没有 dispatch/launcher 接口，不 claim pending，不创建 Adapter re
 启动；随后才安全推进 cancel、timeout、有限 retry、`reconciliation_required` resolution 与
 SSE。完整 P2 仍为 **Pending**。
 
+D-011 之后，P2 剩余工作优先聚合为四类中等切片：可恢复 fenced scheduler/首次派发；
+exact-attempt cancel 与 timeout；有限 retry 与 reconciliation resolution；SSE 与完整 P2 故障/
+CPU/CUDA 出口验收。这是当前规划基线而非固定配额；只有具体安全或验证证据才允许继续拆分，
+拆分理由必须写入进度账本，且不得降低上述完整 P2 出口条件。
+
 完成标准：重复请求不重复建任务；控制面重启后恢复或明确终结任务；取消能到达 Worker；
 已提交任务不依赖浏览器连接存活。
 
@@ -389,6 +408,9 @@ SSE。完整 P2 仍为 **Pending**。
 - 节点缓存/checkpoint 和失败传播策略；
 - 正演、质量检查和 FWI 等固定 Recipe；
 - Guided 模式从 Recipe 生成同一种 PlanGraph。
+
+多节点计划只在用户明确选择工作流或任务本身确需拆解时执行；系统不得因为多个算法已注册就
+自动把低频外拓、质量评价和 FWI 串联为默认全流程。
 
 完成标准：依赖正确、有界并行、恢复不重复已完成节点；固定流程参数和结果可追溯。
 
@@ -413,10 +435,13 @@ SSE。完整 P2 仍为 **Pending**。
 - `algorithm create/validate/test/register` 开发流程；
 - manifest、adapter、fixture 和安全一致性测试模板；
 - ArtifactManifest 驱动的通用图片/指标/表格/文本组件；
-- 接入至少一个真实去噪算法。
+- 受控数据上传/导入、Dataset Profile/Catalog 和输入输出兼容性筛选；
+- 除 Deepwave FWI 外接入至少一个真实独立算法，算法类别不预先限定为去噪。
 
 完成标准：新算法不修改 Orchestrator 关键词即可被发现；错误 Schema/权限/资源声明无法
-注册；完成一次“合成炮集 -> 去噪 -> 质量评价 -> FWI”的真实多算法任务图。
+注册；用户可上传或选择受控数据、查看兼容算法选项并独立执行至少两个真实注册算法。自动
+“低频外拓/去噪 -> 质量评价 -> FWI”任务图不是 P5 完成条件；显式多节点工作流仍由 P3 的
+PlanGraph、批准和资源边界控制。
 
 ### P6：评测、观测和安全加固
 
@@ -483,3 +508,4 @@ SSE。完整 P2 仍为 **Pending**。
 | 2026-07-16 | 实现 P2.5A 控制面 fenced lease/持续状态泵：SQLite v8 term/closure/commit fence、observation-only Supervisor 和 lease-before-listen 生命周期；Worker staged launch/capacity/heartbeat 继续延期 | 用户继续 D-003；先关闭浏览器连接依赖，同时保持绝不首次派发或重启 Worker 的安全边界 |
 | 2026-07-16 | 实现 P2.5B 固定 Adapter 托管 Worker staged launch fence：exec-inherited submission/capacity locks、pre-import ready/heartbeat、exact adoption、post-Popen deferred 与 purge fence；SQLite Worker scheduler 继续延期 | 用户继续 D-003；沿已接受的 Worker 分阶段启动方向关闭控制器崩溃重复启动窗口，同时不扩大到 pending/no-record 首次派发 |
 | 2026-07-16 | 实现 P2.5C fenced Worker 证据投影/late adoption：SQLite v9 exact attempt/heartbeat sample、active-term adoption、dispatching observation 与 dispatched 独立低频 cadence；首次派发与 lifecycle control 继续延期 | 用户继续 D-003；先让 Supervisor 在不拥有 launcher 的边界内消费 P2.5B 证据并证明 late-ready 收养不重复启动 |
+| 2026-07-16 | 采纳 D-011 弹性中等切片、独立多算法选项与分级测试；阶段/质量门保留，P5 不再强制自动端到端算法链 | 用户澄清只希望不降质量地减少过细切片；切片数允许基于真实风险小幅浮动，不固定为 12，也不得无说明膨胀为几十个 |

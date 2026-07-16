@@ -23,6 +23,9 @@
   pending/no-record 首次派发和控制面重启接管不会重复启动，再处理 cancel/timeout、有限 retry、
   `reconciliation_required` resolution；SSE 继续后置。
 - 当前阻塞：无。工作树中的未提交内容可能属于另一个活跃窗口，必须现场检查并保护。
+- 已接受 D-011：继续保留逐切片开发，但采用弹性中等粒度；约十余个剩余切片只是估算，允许
+  按真实风险小幅增加，不为 migration/字段/单项测试制造路线切片，也不得无说明膨胀成几十个。
+  多算法首先是独立可选工具，自动全流程不是当前验收要求；测试分级执行但阶段质量门不降低。
 - `D-005` 提示词分类仍是 Proposed，不得表述为 Accepted。
 
 具体状态与测试证据以 `docs/PROJECT_PROGRESS.md` 顶部阶段表、当前 checkpoint 和相应切片
@@ -47,6 +50,8 @@
 ## 当前不可破坏的边界
 
 - Guided/Agent 两种入口共用唯一 Task Runtime；当前 P4 通用 Planner 尚未实现。
+- P3 DAG 继续保留，但只在用户明确选择工作流或任务确需拆解时运行；算法注册本身不授权自动
+  串联。P5 以独立发现/选择/执行多个真实插件为主，已有 Profile 内算法应保持薄接入。
 - SQLite Task Store 是任务、计划、批准、状态和事件的唯一权威事实源；Redis 不是第二真源。
 - 执行只接受注册数据 ID/版本/hash、固定算法版本和结构化参数；不接受任意服务器路径、
   shell、`extra_args` 或浏览器/LLM 传入的执行命令。

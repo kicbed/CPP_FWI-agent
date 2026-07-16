@@ -3,7 +3,7 @@
 <!-- project-progress-schema: v1 -->
 
 - 最后更新：2026-07-16
-- 活跃决策：`D-003`、`D-004`、`D-006`、`D-007`、`D-008`、`D-009`、`D-010`；`D-005` 仍为 Proposed
+- 活跃决策：`D-003`、`D-004`、`D-006`、`D-007`、`D-008`、`D-009`、`D-010`、`D-011`；`D-005` 仍为 Proposed
 - 活跃分支：`feature/scientific-agent-runtime`
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
 - 总体状态：**P0 + P1（含 P1-008）已验证；P2-001 有界发现/重开已验证，P2-002 回收站、
@@ -13,6 +13,8 @@
 - 当前阶段：**P2-005C SQLite Worker attempt/heartbeat 投影与 fenced late adoption 已验证；完整 P2 继续进行**
 - 下一动作：基于 v9 exact Worker projection 设计可恢复 fenced scheduler；先证明 pending/no-record
   首次派发与重启接管不会重复启动，再推进 cancel/timeout、有限 retry 与 reconciliation resolution
+- 交付粒度：D-011 采用弹性中等切片，约十余个只是估算；保留逐切片验证和阶段质量门，不为
+  migration/字段/单项测试单独制造路线切片，确有安全/验证证据时允许合理增加并记录原因
 - 当前阻塞：无
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
 
@@ -30,7 +32,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | P2 持久可靠性加固 | In progress（P2-001–P2-005C 有界切片 Verified；完整 P2 Pending） | 在既有发现/回收/receipt 收养、控制面 lease 与 Worker kernel fence 上，P2-005C 增加 SQLite v9 exact attempt/heartbeat sample、active-term late adoption 和无 launcher 的 Supervisor 消费 | TaskService 82/82、Adapter + launch-control 44/44、Runtime 241/241、Worker 非数值 26/26、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI 与治理检查 PASS；未重跑数值 FWI/CUDA | fenced scheduler、pending/no-record 首次派发、取消、超时、有限重试、完整 reconciliation 与 SSE |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
-| P5 算法 SDK | Pending | 无 | 无 | 去噪→QC→FWI 多算法流程通过 |
+| P5 算法 SDK | Pending | 无 | 无 | 受控数据可匹配多个独立算法；新增真实插件无需 Orchestrator 关键词且 conformance 通过 |
 | P6 评测与加固 | Pending | 无 | 无 | 安全、故障、审计和部署验收通过 |
 
 工作项允许状态：`Pending | In progress | Partially implemented | Implemented | Verified | Blocked`。阶段只有在所有必需
@@ -91,6 +93,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   独立 60 秒 cadence，原 status refresh cadence 不变。每次实际观察的新 heartbeat 都持久化 high-water，
   历史 replay/同序列分歧/终态回退/JSON 与关系投影分歧/stale term 均 fail closed。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
+- D-011 已批准：保持阶段、依赖、测试和安全质量，减少过细切片但不取消慢速逐步开发；切片数
+  是弹性估算而非固定 12。多算法表示多个独立可选工具，自动串联完整处理流程不作为当前出口。
 - 2026-07-15 用户的风险评估已收紧顺序：最小 FWI Schema 先行，最小 SQLite TaskService
   提前到首个垂直切片，Redis 不作为任务事实源，P4 Agent Planner 后置。
 - Git 动态快照（截至 2026-07-15）：当前实现分支基于 `ffeb5bc`；本地 `main`
@@ -594,6 +598,7 @@ D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 | 2026-07-16 | D-010 / PREP-004 | Accepted → Implemented → Verified；D-003 runtime phase 不变 | 81 行短入口、AGENTS bootstrap v2、按需深读、CodeGraph 优先/回退、聚焦测试输出策略和同步规则 | launcher/continuity/helper/syntax/diff PASS；CodeGraph 定位 P2-005A RuntimeSupervisor；固定默认读取 201 行后再定向补充 | 新开一次 Codex 会话加载新指令；继续 P2 staged Worker launch 设计 |
 | 2026-07-16 | P2-005B | Pending → Implemented → Verified；完整 P2 仍 Pending | current 1.4 managed attempt ticket、stable submission/capacity `flock` 经 exec 继承、pre-import ready/heartbeat、exact launching adoption、post-Popen deferred、purge fence、legacy CLI/Web private-sidecar guard | Runtime 234/234 + launch-control 8/8、Worker 29/29、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；真实轻量 exec、父控漏写、N+1、0755 root、active purge/篡改/兼容覆盖；未运行数值 FWI/CUDA | 下一步将 Worker attempt/heartbeat 投影到 SQLite 并接入 fenced Supervisor/scheduler；pending/no-record、cancel/timeout/retry/reconciliation/SSE 仍 Pending |
 | 2026-07-16 | P2-005C | Pending → Implemented → Verified；完整 P2 仍 Pending | SQLite v9 exact Worker attempt/heartbeat samples、active-term/monotonic/JSON-column fence、latest-only replay、atomic late adoption；Adapter/Dispatcher observation 与 Supervisor dispatching/60s dispatched cadence，零 launcher | TaskService 82/82、Adapter + launch-control 44/44、Runtime 241/241、Worker 非数值 26/26、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；未运行 Deepwave 数值 FWI/CUDA | 下一步实现可恢复 fenced scheduler，先证明 pending/no-record 首次派发/重启不重复；cancel/timeout/有限 retry/reconciliation/SSE 仍 Pending |
+| 2026-07-16 | D-011 / PLAN-002 | Proposed → Accepted → Implemented / Verified（governance）；运行时阶段不变 | 弹性中等切片、独立多算法选项、显式工作流与分级测试规则；P5 不再强制自动去噪/QC/FWI 链 | continuity、launcher、helper、runtime-secret isolation、diff check：PASS；仅文档/治理变更，未运行数值 FWI/CUDA | 继续当前 P2 可恢复 fenced scheduler；仅在真实安全/验证边界出现时增加切片并记录依据 |
 
 记录规则：
 
