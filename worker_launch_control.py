@@ -2942,6 +2942,41 @@ def read_worker_attempt_evidence(
     return WorkerAttemptEvidence(**evidence)
 
 
+def read_pre_running_attempt_evidence(
+    run_root: Path | str,
+    run_dir: Path | str,
+    binding: LaunchAttemptBinding,
+) -> WorkerAttemptEvidence | None:
+    """Read an attempt only if no ready or heartbeat sidecar exists.
+
+    The ordinary evidence reader intentionally stops at a non-spawned ticket.
+    Retry proof needs a stronger negative fact: a failed ticket must not hide
+    sidecars left by an attempt that may have crossed the B1 boundary.  A
+    heartbeat without ready is deliberately treated as reconciliation
+    uncertainty: durable evidence cannot distinguish a failed ready publish
+    from a deleted/corrupt ready receipt.  A caller relying on this absence
+    must also hold the exact execution fence.
+    """
+
+    _, job_dir = _validate_root_and_run(run_root, run_dir)
+    evidence = read_worker_attempt_evidence(run_root, job_dir, binding)
+    if evidence is not None and (
+        evidence.ready or evidence.heartbeat_record_hash is not None
+    ):
+        raise WorkerControlError(
+            "WORKER_RETRY_UNSAFE: Worker attempt has started evidence"
+        )
+    for name in (WORKER_READY_NAME, WORKER_HEARTBEAT_NAME):
+        try:
+            _read_private_json(job_dir / name)
+        except FileNotFoundError:
+            continue
+        raise WorkerControlError(
+            "WORKER_RETRY_UNSAFE: Worker attempt has a start sidecar"
+        )
+    return evidence
+
+
 def worker_attempt_started(
     run_root: Path | str,
     run_dir: Path | str,
@@ -2976,6 +3011,7 @@ __all__ = [
     "mark_launch_failed",
     "purge_worker_cancel_control",
     "purge_worker_stop_control",
+    "read_pre_running_attempt_evidence",
     "read_worker_cancel_capability",
     "read_worker_cancel_evidence",
     "read_worker_stop_capability",

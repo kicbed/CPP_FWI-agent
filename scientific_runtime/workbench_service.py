@@ -319,6 +319,10 @@ def _public_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "id": manifest["id"],
         "version": manifest["version"],
+        "adapter": {
+            "protocol": manifest["adapter"]["protocol"],
+            "version": manifest["adapter"]["version"],
+        },
         "task_types": copy.deepcopy(manifest["task_types"]),
         "parameter_schema": copy.deepcopy(manifest["parameter_schema"]),
         "inputs": copy.deepcopy(manifest["inputs"]),
@@ -493,7 +497,17 @@ class GuidedWorkbench:
             },
             "capabilities": {
                 "cancel": True,
+                # `retry` remains the browser/manual mutation capability.  The
+                # bounded automatic policy is projected separately so clients
+                # cannot mistake an internal Supervisor action for a POST API.
                 "retry": False,
+                "manual_retry": False,
+                "finite_automatic_retry": {
+                    "max_attempts": 2,
+                    "max_concurrent_attempts": 1,
+                    "pre_running_launch_failure": True,
+                    "worker_exit": False,
+                },
                 "sse": False,
                 "startup_dispatch_recovery": False,
                 "startup_receipt_recovery": False,
@@ -1221,8 +1235,9 @@ class GuidedWorkbench:
             raise WorkbenchConflict("PLAN_REQUIRED", ["task has no current plan"])
         decided = _timestamp(decided_at, field="clock")
         dataset = snapshot.draft["datasets"][0]
+        resources = copy.deepcopy(snapshot.draft["resources"])
         return {
-            "schema_version": "1.0.0",
+            "schema_version": "1.1.0",
             "approval_id": _stable_id(
                 "approval",
                 self._project_id,
@@ -1239,11 +1254,21 @@ class GuidedWorkbench:
             "scope": {
                 "datasets": [_identity(dataset)],
                 "algorithms": [copy.deepcopy(snapshot.draft["algorithm"])],
-                "resource_limits": copy.deepcopy(snapshot.draft["resources"]),
+                "resource_limits": resources,
                 "side_effects": copy.deepcopy(
                     snapshot.plan["nodes"][0]["side_effects"]
                 ),
                 "max_tasks": 1,
+                "retry_policy": {
+                    "max_attempts": 2,
+                    "max_concurrent_attempts": 1,
+                    "max_cumulative_attempt_wall_time_seconds": 2
+                    * resources["wall_time_seconds"],
+                    "retryable_failure_classes": [
+                        "pre_running_launch_failure",
+                        "worker_exit",
+                    ],
+                },
             },
             "decided_at": _format_timestamp(decided),
             "expires_at": _format_timestamp(decided + timedelta(hours=1)),
@@ -1730,11 +1755,16 @@ class GuidedWorkbench:
         projected: list[dict[str, Any]] = []
         for event in events:
             value = copy.deepcopy(event)
-            adapter_detail = value.get("extensions", {}).get(
-                "org.agent_rpc.adapter_status"
-            )
-            if isinstance(adapter_detail, dict):
-                adapter_detail.pop("job_id", None)
+            extensions = value.get("extensions")
+            if isinstance(extensions, dict):
+                # The canonical exhaustion audit binds internal intent,
+                # attempt, observation, and private Adapter proof identities.
+                # Browser/API consumers need only the public retry_exhausted
+                # error code; never project that internal proof extension.
+                extensions.pop("org.agent_rpc.retry_exhaustion", None)
+                adapter_detail = extensions.get("org.agent_rpc.adapter_status")
+                if isinstance(adapter_detail, dict):
+                    adapter_detail.pop("job_id", None)
             projected.append(value)
         return projected
 

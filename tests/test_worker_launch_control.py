@@ -31,6 +31,8 @@ from worker_launch_control import (
     WorkerHeartbeat,
     WorkerWallTimeExceeded,
     execution_fence_is_held,
+    mark_launch_failed,
+    read_pre_running_attempt_evidence,
     read_worker_cancel_evidence,
     read_worker_stop_evidence,
     read_worker_attempt_evidence,
@@ -264,6 +266,67 @@ class WorkerLaunchControlTest(unittest.TestCase):
                 worker_attempt_started(self.root, run_dir, binding)
         finally:
             heartbeat.stop("succeeded")
+
+    def test_pre_running_evidence_rejects_ready_and_heartbeat_sidecars(
+        self,
+    ) -> None:
+        def stopped_attempt(index: int) -> tuple[LaunchAttemptBinding, Path]:
+            binding, run_dir = self.binding(index)
+            lease = ParentLaunchLease.acquire(
+                self.root, run_dir, max_active=1
+            )
+            lease.mark_spawned(os.getpid())
+            heartbeat = WorkerHeartbeat(
+                run_root=self.root,
+                run_dir=run_dir,
+                attempt_id=binding.attempt_id,
+                attempt_fd=os.dup(lease.attempt_fd),
+                capacity_fd=os.dup(lease.capacity_fd),
+                interval_seconds=10.0,
+            )
+            lease.close_parent()
+            heartbeat.start()
+            heartbeat.stop("stopped")
+            self.assertFalse(execution_fence_is_held(self.root, binding))
+            mark_launch_failed(run_dir, binding)
+            return binding, run_dir
+
+        ready_binding, ready_dir = stopped_attempt(16)
+        self.assertTrue((ready_dir / WORKER_READY_NAME).is_file())
+        with self.assertRaisesRegex(
+            WorkerControlError, "WORKER_RETRY_UNSAFE.*sidecar"
+        ):
+            read_pre_running_attempt_evidence(
+                self.root, ready_dir, ready_binding
+            )
+
+        heartbeat_binding, heartbeat_dir = stopped_attempt(17)
+        (heartbeat_dir / WORKER_READY_NAME).unlink()
+        heartbeat_document = json.loads(
+            (heartbeat_dir / WORKER_HEARTBEAT_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(heartbeat_document["state"], "stopped")
+        with self.assertRaisesRegex(WorkerControlError, "WORKER_RETRY_UNSAFE"):
+            read_pre_running_attempt_evidence(
+                self.root, heartbeat_dir, heartbeat_binding
+            )
+
+        stopped_binding, stopped_dir = self.binding(18)
+        stopped_lease = ParentLaunchLease.acquire(
+            self.root, stopped_dir, max_active=1
+        )
+        stopped_lease.abort()
+        self.assertFalse((stopped_dir / WORKER_READY_NAME).exists())
+        self.assertFalse((stopped_dir / WORKER_HEARTBEAT_NAME).exists())
+        evidence = read_pre_running_attempt_evidence(
+            self.root, stopped_dir, stopped_binding
+        )
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence.ticket_state, "failed")
+        self.assertFalse(evidence.ready)
 
     def test_exact_cancel_is_acknowledged_and_cooperatively_releases_fences(
         self,

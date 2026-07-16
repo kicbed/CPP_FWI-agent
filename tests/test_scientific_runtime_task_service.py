@@ -12,12 +12,14 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from scientific_runtime import (
     DispatchDeferred,
     DispatchError,
     DispatchPreparation,
     RegistryService,
+    RetryExhaustionCleanupProof,
     SQLiteTaskStore,
     TaskConflict,
     TaskDispatchError,
@@ -36,6 +38,7 @@ from scientific_runtime.fwi_adapter import AdapterManagedTimeoutProof
 from scientific_runtime.task_dispatcher import (
     DeepwaveTaskDispatcher,
     DispatchReceiptProbe,
+    DispatchRetryProof,
 )
 from scientific_runtime.task_store import APPLICATION_ID, encode_document
 from tests.test_scientific_runtime_contracts import (
@@ -55,26 +58,44 @@ from tests.test_scientific_runtime_contracts import (
 NOW = "2026-07-15T03:00:00Z"
 PROJECT_ID = "project-1"
 PRINCIPAL_ID = "user-1"
-CURRENT_ALGORITHM_VERSION = "1.4.0"
-CURRENT_ADAPTER_VERSION = "1.4.0"
+CURRENT_ALGORITHM_VERSION = "1.5.0"
+CURRENT_ADAPTER_VERSION = "1.5.0"
 MANAGED_SUBMISSION_ID = "submission-" + "1" * 64
 MANAGED_ATTEMPT_ID = "attempt-" + "2" * 32
 MANAGED_JOB_ID = "fwi-20260715T030000Z-000000000001"
 MANAGED_REQUEST_HASH = "sha256:" + "a" * 64
+RETRY_ATTEMPT_ID = "attempt-" + "3" * 32
+RETRY_JOB_ID = "fwi-20260715T030000Z-000000000002"
 
 
 def executable_approval_decision(plan: dict) -> dict:
     value = approval_decision(plan)
+    value["schema_version"] = "1.1.0"
+    value["scope"]["resource_limits"] = copy.deepcopy(
+        plan["nodes"][0]["resources"]
+    )
     value["scope"]["algorithms"] = [
-        {"id": "deepwave.acoustic_fwi", "version": CURRENT_ALGORITHM_VERSION}
+        copy.deepcopy(plan["nodes"][0]["algorithm"])
     ]
+    wall_time = value["scope"]["resource_limits"]["wall_time_seconds"]
+    value["scope"]["retry_policy"] = {
+        "max_attempts": 2,
+        "max_concurrent_attempts": 1,
+        "max_cumulative_attempt_wall_time_seconds": 2 * wall_time,
+        "retryable_failure_classes": [
+            "pre_running_launch_failure",
+            "worker_exit",
+        ],
+    }
     return value
 
 
-def executable_fingerprint() -> dict:
+def executable_fingerprint(
+    version: str = CURRENT_ADAPTER_VERSION,
+) -> dict:
     value = fingerprint()
-    value["algorithm"]["version"] = CURRENT_ALGORITHM_VERSION
-    value["adapter_version"] = CURRENT_ADAPTER_VERSION
+    value["algorithm"]["version"] = version
+    value["adapter_version"] = version
     return value
 
 
@@ -84,8 +105,10 @@ def executable_run_event() -> dict:
     return value
 
 
-def dispatch_fingerprint() -> dict:
-    value = executable_fingerprint()
+def dispatch_fingerprint(
+    version: str = CURRENT_ADAPTER_VERSION,
+) -> dict:
+    value = executable_fingerprint(version)
     value["provenance_mode"] = "development"
     value["source"] = {"identity_complete": False, "dirty": None}
     return value
@@ -97,15 +120,18 @@ def managed_worker_evidence(
     heartbeat_sequence: int | None = 1,
     heartbeat_state: str = "running",
     attempt_id: str = MANAGED_ATTEMPT_ID,
+    attempt_number: int = 1,
+    job_id: str = MANAGED_JOB_ID,
+    created_at: str = NOW,
 ) -> dict:
     binding = {
         "schema_version": "1.0.0",
         "submission_id": MANAGED_SUBMISSION_ID,
         "attempt_id": attempt_id,
-        "attempt_number": 1,
-        "job_id": MANAGED_JOB_ID,
+        "attempt_number": attempt_number,
+        "job_id": job_id,
         "request_hash": MANAGED_REQUEST_HASH,
-        "created_at": NOW,
+        "created_at": created_at,
     }
     binding_hash = encode_document(binding)[1]
     ticket = {
@@ -136,9 +162,9 @@ def managed_worker_evidence(
         "schema_version": "1.0.0",
         "submission_id": MANAGED_SUBMISSION_ID,
         "attempt_id": attempt_id,
-        "attempt_number": 1,
+        "attempt_number": attempt_number,
         "binding_hash": binding_hash,
-        "job_id": MANAGED_JOB_ID,
+        "job_id": job_id,
         "capacity_slot": 0,
         "capacity_generation": 1,
         "worker_pid": 4242,
@@ -179,9 +205,16 @@ def managed_worker_evidence(
 
 
 class FakeDispatcher:
-    def __init__(self, store: SQLiteTaskStore, *, failure_code: str | None = None):
+    def __init__(
+        self,
+        store: SQLiteTaskStore,
+        *,
+        failure_code: str | None = None,
+        adapter_version: str = CURRENT_ADAPTER_VERSION,
+    ):
         self.store = store
         self.failure_code = failure_code
+        self.adapter_version = adapter_version
         self.defer_dispatch = False
         self.prepare_calls = 0
         self.dispatch_calls = 0
@@ -214,6 +247,10 @@ class FakeDispatcher:
         self.read_calls = 0
         self.purge_calls = 0
         self.purge_ids: list[str] = []
+        self.retry_exhaustion_purge_calls = 0
+        self.retry_exhaustion_purge_proofs: list[
+            RetryExhaustionCleanupProof
+        ] = []
         self.adapter_status: dict | None = None
         self.manifests: list[dict] = []
         self.artifact_data: dict[str, bytes] = {}
@@ -223,13 +260,13 @@ class FakeDispatcher:
         with self.lock:
             self.prepare_calls += 1
         request = TaskService._expected_dispatch_request(snapshot)
-        current_fingerprint = dispatch_fingerprint()
+        current_fingerprint = dispatch_fingerprint(self.adapter_version)
         request["normalized_config_hash"] = current_fingerprint[
             "normalized_config_hash"
         ]
         return DispatchPreparation(
             adapter_id="fwi.deepwave_adapter",
-            adapter_version=CURRENT_ADAPTER_VERSION,
+            adapter_version=self.adapter_version,
             request=request,
             queue_fingerprint=current_fingerprint,
         )
@@ -271,7 +308,7 @@ class FakeDispatcher:
             "algorithm": copy.deepcopy(intent.request["algorithm"]),
             # The queued fingerprint is preflight evidence.  Runtime events
             # bind to the actual fingerprint returned in this receipt.
-            "fingerprint": executable_fingerprint(),
+            "fingerprint": executable_fingerprint(self.adapter_version),
             "adapter_version": intent.adapter_version,
         }
         attempt_id = "attempt-" + hashlib.sha256(
@@ -283,11 +320,10 @@ class FakeDispatcher:
         }
         return handle
 
-    @staticmethod
-    def supports_supervised_dispatch(intent):
+    def supports_supervised_dispatch(self, intent):
         return (
             intent.adapter_id == "fwi.deepwave_adapter"
-            and intent.adapter_version == CURRENT_ADAPTER_VERSION
+            and intent.adapter_version == self.adapter_version
         )
 
     def ensure_first_dispatch(self, intent):
@@ -307,7 +343,7 @@ class FakeDispatcher:
             "plan_hash": intent.plan_hash,
             "request_hash": MANAGED_REQUEST_HASH,
             "algorithm": copy.deepcopy(intent.request["algorithm"]),
-            "fingerprint": executable_fingerprint(),
+            "fingerprint": executable_fingerprint(self.adapter_version),
             "adapter_version": intent.adapter_version,
         }
 
@@ -326,7 +362,7 @@ class FakeDispatcher:
                 "plan_hash": intent.plan_hash,
                 "request_hash": MANAGED_REQUEST_HASH,
                 "algorithm": copy.deepcopy(intent.request["algorithm"]),
-                "fingerprint": executable_fingerprint(),
+                "fingerprint": executable_fingerprint(self.adapter_version),
                 "adapter_version": intent.adapter_version,
             },
             "private_schema_version": "1.0.0",
@@ -395,7 +431,7 @@ class FakeDispatcher:
         return (
             self.exact_cancel_supported
             and intent.adapter_id == "fwi.deepwave_adapter"
-            and intent.adapter_version == CURRENT_ADAPTER_VERSION
+            and intent.adapter_version == self.adapter_version
             and isinstance(attempt_id, str)
             and attempt_id.startswith("attempt-")
         )
@@ -550,6 +586,134 @@ class FakeDispatcher:
             "replayed": False,
         }
 
+    def purge_retry_exhausted(self, intent, *, purge_id, exhaustion):
+        self.assert_retry_exhaustion_cleanup(intent, purge_id, exhaustion)
+        with self.lock:
+            self.retry_exhaustion_purge_calls += 1
+            self.retry_exhaustion_purge_proofs.append(exhaustion)
+        return {
+            "task_id": intent.task_id,
+            "purge_id": purge_id,
+            "local_run_state": "deleted",
+            "replayed": False,
+        }
+
+    @staticmethod
+    def assert_retry_exhaustion_cleanup(intent, purge_id, exhaustion):
+        if (
+            not isinstance(exhaustion, RetryExhaustionCleanupProof)
+            or exhaustion.purge_id != purge_id
+            or exhaustion.intent_id != intent.intent_id
+            or exhaustion.task_id != intent.task_id
+            or exhaustion.attempt_id != RETRY_ATTEMPT_ID
+            or exhaustion.evidence["attempt_number"] != 2
+            or exhaustion.evidence_hash
+            != encode_document(exhaustion.evidence)[1]
+            or exhaustion.private_schema_version != "1.2.0"
+            or exhaustion.terminal_event_hash[:7] != "sha256:"
+        ):
+            raise DispatchError("WORKER_RETRY_EXHAUSTION_PURGE_INVALID")
+
+
+class PreRunningRetryFakeDispatcher(FakeDispatcher):
+    """Model one stopped launch and one staged-then-ready attempt-2 replay."""
+
+    def __init__(
+        self,
+        store: SQLiteTaskStore,
+        *,
+        lose_first_retry_return: bool = False,
+        exhaust_second_attempt: bool = False,
+    ):
+        super().__init__(store, failure_code="WORKER_LAUNCH_FAILED")
+        self.lose_first_retry_return = lose_first_retry_return
+        self.exhaust_second_attempt = exhaust_second_attempt
+        self.retry_probe_calls = 0
+        self.exhaustion_probe_calls = 0
+        self.exhaustion_probe_barrier: threading.Barrier | None = None
+        self.retry_calls = 0
+        self.retry_authorizations: list[dict] = []
+
+    def probe_pre_running_retry(self, intent):
+        del intent
+        self.retry_probe_calls += 1
+        return self._pre_running_proof(expected_attempt_number=1)
+
+    def probe_pre_running_retry_exhaustion(self, intent):
+        del intent
+        self.exhaustion_probe_calls += 1
+        if self.exhaustion_probe_barrier is not None:
+            self.exhaustion_probe_barrier.wait(timeout=5)
+        return self._pre_running_proof(expected_attempt_number=2)
+
+    def _pre_running_proof(self, *, expected_attempt_number):
+        evidence = copy.deepcopy(self.worker_observation["evidence"])
+        ticket = evidence["ticket"]
+        proof_payload = {
+            "schema_version": "1.0.0",
+            "failure_kind": "pre_running_launch_failure",
+            "submission_id": evidence["submission_id"],
+            "attempt_id": evidence["attempt_id"],
+            "attempt_number": evidence["attempt_number"],
+            "job_id": evidence["job_id"],
+            "request_hash": evidence["request_hash"],
+            "binding_hash": evidence["binding_hash"],
+            "ticket_record_hash": ticket["record_hash"],
+        }
+        return DispatchRetryProof(
+            failure_kind="pre_running_launch_failure",
+            previous_attempt_id=evidence["attempt_id"],
+            previous_attempt_number=expected_attempt_number,
+            private_schema_version="1.2.0",
+            private_proof_hash=encode_document(proof_payload)[1],
+            evidence=evidence,
+        )
+
+    def retry_pre_running(self, intent, *, authorization):
+        self.retry_calls += 1
+        self.retry_authorizations.append(copy.deepcopy(dict(authorization)))
+        evidence = managed_worker_evidence(
+            ticket_state="staged" if self.retry_calls == 1 else "spawned",
+            attempt_id=RETRY_ATTEMPT_ID,
+            attempt_number=2,
+            job_id=RETRY_JOB_ID,
+            created_at=authorization["authorized_at"],
+        )
+        if self.retry_calls == 1:
+            self.worker_observation = {"evidence": evidence, "handle": None}
+            if self.lose_first_retry_return:
+                raise DispatchError("WORKER_RETRY_DELIVERY_LOST")
+            raise DispatchDeferred("ADAPTER_CONCURRENCY_LIMIT")
+        if self.exhaust_second_attempt:
+            self.worker_observation = {
+                "evidence": managed_worker_evidence(
+                    ticket_state="failed",
+                    attempt_id=RETRY_ATTEMPT_ID,
+                    attempt_number=2,
+                    job_id=RETRY_JOB_ID,
+                    created_at=authorization["authorized_at"],
+                ),
+                "handle": None,
+            }
+            raise DispatchError("WORKER_LAUNCH_FAILED")
+        handle = {
+            "submission_id": MANAGED_SUBMISSION_ID,
+            "task_id": intent.task_id,
+            "node_id": intent.node_id,
+            "job_id": RETRY_JOB_ID,
+            "idempotency_key": intent.node_idempotency_key,
+            "plan_hash": intent.plan_hash,
+            "request_hash": MANAGED_REQUEST_HASH,
+            "algorithm": copy.deepcopy(intent.request["algorithm"]),
+            "fingerprint": executable_fingerprint(self.adapter_version),
+            "adapter_version": intent.adapter_version,
+        }
+        self.worker_observation = {
+            "evidence": evidence,
+            "handle": copy.deepcopy(handle),
+        }
+        return handle
+
 
 class ScientificRuntimeTaskServiceTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -646,8 +810,11 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "task_purge_outcomes",
                 "worker_launch_attempts",
                 "worker_attempt_observations",
+                "worker_retry_reservations",
+                "worker_retry_exhaustions",
                 "supervised_dispatch_adoptions",
                 "supervised_dispatch_attempts",
+                "supervised_retry_attempts",
                 "supervised_private_receipt_adoptions",
                 "task_cancel_requests",
                 "supervised_cancel_attempts",
@@ -704,7 +871,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 13)
+        self.assertEqual(self.store.migration_version(), 14)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -720,7 +887,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 13)
+        self.assertEqual(reopened.migration_version(), 14)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -807,12 +974,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 13)] * 8)
+        self.assertEqual(results, [("wal", 14)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 14")
+            connection.execute("PRAGMA user_version = 15")
             connection.commit()
         finally:
             connection.close()
@@ -1799,6 +1966,145 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 task_id=created.snapshot.task_id, plan=plan, **self.scope
             )
         self.assertEqual(self.raw_count("plans"), 0)
+
+    def test_retry_approval_rejects_historical_algorithm_but_v1_remains_valid(
+        self,
+    ) -> None:
+        self.registry.register_algorithm(
+            manifest=load_deepwave_manifest("1.4.0")
+        )
+        created = self.create_executable(
+            draft=optimizer_task_draft(algorithm_version="1.4.0"),
+            key="create-historical-retry-approval",
+        )
+        task_id = created.snapshot.task_id
+        historical_plan = optimizer_plan_graph(algorithm_version="1.4.0")
+        historical_plan["draft"] = {
+            "draft_id": created.snapshot.draft["draft_id"],
+            "revision": created.snapshot.draft["revision"],
+        }
+        historical_plan["plan_hash"] = compute_plan_hash(historical_plan)
+        self.service.persist_plan(
+            task_id=task_id, plan=historical_plan, **self.scope
+        )
+
+        retry_approval = executable_approval_decision(historical_plan)
+        with self.assertRaisesRegex(
+            TaskValidationError,
+            "APPROVAL_RETRY_POLICY_INVALID",
+        ):
+            self.service.persist_approval(
+                task_id=task_id,
+                approval=retry_approval,
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("approvals"), 0)
+
+        single_attempt = copy.deepcopy(retry_approval)
+        single_attempt["schema_version"] = "1.0.0"
+        single_attempt["scope"].pop("retry_policy")
+        accepted = self.service.persist_approval(
+            task_id=task_id,
+            approval=single_attempt,
+            **self.scope,
+        )
+        self.assertEqual(accepted.approval, single_attempt)
+        self.assertEqual(self.raw_count("approvals"), 1)
+
+    def test_store_direct_retry_approval_enforces_current_plan_invariant(
+        self,
+    ) -> None:
+        self.registry.register_algorithm(
+            manifest=load_deepwave_manifest("1.4.0")
+        )
+
+        def prepared(version: str, suffix: str) -> tuple[str, dict]:
+            draft = optimizer_task_draft(algorithm_version=version)
+            draft["draft_id"] = f"draft-store-approval-{suffix}"
+            created = self.service.create_task(
+                draft=draft,
+                idempotency_key=f"create-store-approval-{suffix}",
+                **self.scope,
+            )
+            plan = optimizer_plan_graph(algorithm_version=version)
+            plan["plan_id"] = f"plan-store-approval-{suffix}"
+            plan["draft"] = {
+                "draft_id": draft["draft_id"],
+                "revision": created.snapshot.draft["revision"],
+            }
+            plan["nodes"][0][
+                "idempotency_key"
+            ] = f"node-store-approval-{suffix}"
+            plan["plan_hash"] = compute_plan_hash(plan)
+            self.service.persist_plan(
+                task_id=created.snapshot.task_id,
+                plan=plan,
+                **self.scope,
+            )
+            return created.snapshot.task_id, plan
+
+        historical_task, historical_plan = prepared("1.4.0", "historical")
+        historical_retry = executable_approval_decision(historical_plan)
+        historical_retry["approval_id"] = "approval-store-historical-retry"
+        with self.assertRaisesRegex(
+            TaskStoreConflict,
+            "current managed FWI plan",
+        ):
+            self.store.store_approval(
+                task_id=historical_task,
+                approval=historical_retry,
+                now=NOW,
+            )
+        self.assertEqual(self.raw_count("approvals"), 0)
+
+        historical_single = copy.deepcopy(historical_retry)
+        historical_single["schema_version"] = "1.0.0"
+        historical_single["scope"].pop("retry_policy")
+        stored_historical = self.store.store_approval(
+            task_id=historical_task,
+            approval=historical_single,
+            now=NOW,
+        )
+        self.assertEqual(stored_historical.approval, historical_single)
+
+        current_task, current_plan = prepared("1.5.0", "current")
+        current_retry = executable_approval_decision(current_plan)
+        current_retry["approval_id"] = "approval-store-current-retry"
+        mismatched_budget = copy.deepcopy(current_retry)
+        mismatched_budget["approval_id"] = "approval-store-current-mismatch"
+        mismatched_budget["scope"]["retry_policy"][
+            "max_cumulative_attempt_wall_time_seconds"
+        ] += 1
+        with self.assertRaisesRegex(
+            TaskStoreConflict, "differs from its plan budget"
+        ):
+            self.store.store_approval(
+                task_id=current_task,
+                approval=mismatched_budget,
+                now=NOW,
+            )
+        stored_current = self.store.store_approval(
+            task_id=current_task,
+            approval=current_retry,
+            now=NOW,
+        )
+        self.assertEqual(stored_current.approval, current_retry)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            budgets = dict(
+                connection.execute(
+                    """
+                    SELECT approval_id, max_attempts
+                    FROM approval_retry_budgets
+                    WHERE task_id IN (?, ?)
+                    """,
+                    (historical_task, current_task),
+                ).fetchall()
+            )
+        finally:
+            connection.close()
+        self.assertEqual(budgets[historical_single["approval_id"]], 1)
+        self.assertEqual(budgets[current_retry["approval_id"]], 2)
 
     def test_exact_plan_or_approval_replay_does_not_reactivate_old_state(self) -> None:
         created = self.create()
@@ -3870,6 +4176,580 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
         service.release_runtime_supervisor_lease(successor.lease)
 
+    def test_exact_stopped_attempt_one_retries_once_and_adopts_attempt_two(
+        self,
+    ) -> None:
+        dispatcher = PreRunningRetryFakeDispatcher(self.store)
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="pre-running-retry-positive", dispatcher=dispatcher
+        )
+        submitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-pre-running-retry-positive",
+            **self.scope,
+        )
+        self.assertEqual(submitted.intent.state, "pending")
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(ticket_state="failed"),
+            "handle": None,
+        }
+
+        failed, first_lease = self.schedule_once(service, task_id)
+        self.assertEqual(failed.intent.state, "dispatching")
+        self.assertEqual(failed.deferred_code, "WORKER_LAUNCH_FAILED")
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+
+        staged = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=first_lease,
+            **self.scope,
+        )
+        self.assertTrue(staged.authorized)
+        self.assertTrue(staged.dispatch_attempted)
+        self.assertTrue(staged.projected)
+        self.assertFalse(staged.adopted)
+        self.assertEqual(staged.intent.state, "dispatching")
+        self.assertEqual(staged.deferred_code, "ADAPTER_CONCURRENCY_LIMIT")
+        self.assertEqual(dispatcher.retry_probe_calls, 1)
+        self.assertEqual(dispatcher.retry_calls, 1)
+        self.assertEqual(self.raw_count("worker_retry_reservations"), 1)
+        self.assertEqual(self.raw_count("supervised_retry_attempts"), 1)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 2)
+        service.release_runtime_supervisor_lease(first_lease)
+
+        successor = service.acquire_runtime_supervisor_lease(
+            owner_id="pre-running-retry-successor",
+            lease_seconds=30,
+            **self.scope,
+        )
+        adopted = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=successor.lease,
+            **self.scope,
+        )
+        self.assertTrue(adopted.authorized)
+        self.assertTrue(adopted.dispatch_attempted)
+        self.assertTrue(adopted.projected)
+        self.assertTrue(adopted.adopted)
+        self.assertEqual(adopted.intent.state, "dispatched")
+        self.assertEqual(adopted.intent.handle["job_id"], RETRY_JOB_ID)
+        self.assertEqual(dispatcher.retry_probe_calls, 1)
+        self.assertEqual(dispatcher.retry_calls, 2)
+        self.assertEqual(
+            dispatcher.retry_authorizations[0],
+            dispatcher.retry_authorizations[1],
+        )
+        self.assertEqual(
+            dispatcher.retry_authorizations[0]["previous_attempt_id"],
+            MANAGED_ATTEMPT_ID,
+        )
+        self.assertEqual(
+            dispatcher.retry_authorizations[0]["next_attempt_number"], 2
+        )
+        self.assertEqual(self.raw_count("worker_retry_reservations"), 1)
+        self.assertEqual(self.raw_count("supervised_retry_attempts"), 2)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 3)
+        self.assertEqual(self.raw_count("supervised_dispatch_adoptions"), 1)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+
+        exhausted = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=successor.lease,
+            **self.scope,
+        )
+        self.assertEqual(exhausted.intent.state, "dispatched")
+        self.assertFalse(exhausted.dispatch_attempted)
+        self.assertEqual(dispatcher.retry_probe_calls, 1)
+        self.assertEqual(dispatcher.retry_calls, 2)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            attempts = connection.execute(
+                """
+                SELECT attempt_number, attempt_id FROM worker_launch_attempts
+                WHERE intent_id = ? ORDER BY attempt_number
+                """,
+                (adopted.intent.intent_id,),
+            ).fetchall()
+            reservation = connection.execute(
+                """
+                SELECT attempt_number, previous_attempt_id, failure_kind,
+                       reserved_at
+                FROM worker_retry_reservations WHERE intent_id = ?
+                """,
+                (adopted.intent.intent_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(
+            attempts,
+            [(1, MANAGED_ATTEMPT_ID), (2, RETRY_ATTEMPT_ID)],
+        )
+        self.assertEqual(
+            reservation,
+            (
+                2,
+                MANAGED_ATTEMPT_ID,
+                "pre_running_launch_failure",
+                dispatcher.retry_authorizations[0]["authorized_at"],
+            ),
+        )
+        service.release_runtime_supervisor_lease(successor.lease)
+
+    def test_successor_projects_adapter_retry_after_authorizing_term_crash(
+        self,
+    ) -> None:
+        dispatcher = PreRunningRetryFakeDispatcher(
+            self.store, lose_first_retry_return=True
+        )
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="pre-running-retry-project-takeover", dispatcher=dispatcher
+        )
+        submitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-pre-running-retry-project-takeover",
+            **self.scope,
+        )
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(ticket_state="failed"),
+            "handle": None,
+        }
+
+        failed, first_lease = self.schedule_once(service, task_id)
+        self.assertEqual(failed.deferred_code, "WORKER_LAUNCH_FAILED")
+        lost = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=first_lease,
+            **self.scope,
+        )
+        self.assertEqual(lost.intent.state, "dispatching")
+        self.assertEqual(lost.deferred_code, "WORKER_RETRY_DELIVERY_LOST")
+        self.assertEqual(dispatcher.retry_probe_calls, 1)
+        self.assertEqual(dispatcher.retry_calls, 1)
+        self.assertEqual(self.raw_count("worker_retry_reservations"), 1)
+        self.assertEqual(self.raw_count("supervised_retry_attempts"), 1)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 1)
+        service.release_runtime_supervisor_lease(first_lease)
+
+        successor = service.acquire_runtime_supervisor_lease(
+            owner_id="pre-running-retry-project-successor",
+            lease_seconds=30,
+            **self.scope,
+        )
+        takeover_projection = service.project_worker_attempt(
+            task_id,
+            supervisor_lease=successor.lease,
+            **self.scope,
+        )
+        self.assertTrue(takeover_projection.projected)
+        self.assertFalse(takeover_projection.adopted)
+        self.assertEqual(takeover_projection.intent.state, "dispatching")
+        self.assertEqual(takeover_projection.attempt_id, RETRY_ATTEMPT_ID)
+        self.assertEqual(takeover_projection.evidence["attempt_number"], 2)
+        self.assertEqual(
+            takeover_projection.evidence["ticket"]["state"], "staged"
+        )
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 2)
+        self.assertEqual(self.raw_count("worker_retry_reservations"), 1)
+        self.assertEqual(self.raw_count("supervised_retry_attempts"), 1)
+
+        recovered = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=successor.lease,
+            **self.scope,
+        )
+        self.assertTrue(recovered.authorized)
+        self.assertFalse(recovered.authorization_replayed)
+        self.assertTrue(recovered.dispatch_attempted)
+        self.assertTrue(recovered.projected)
+        self.assertTrue(recovered.adopted)
+        self.assertEqual(recovered.intent.state, "dispatched")
+        self.assertEqual(recovered.intent.handle["job_id"], RETRY_JOB_ID)
+        self.assertEqual(dispatcher.retry_probe_calls, 1)
+        self.assertEqual(dispatcher.retry_calls, 2)
+        self.assertEqual(
+            dispatcher.retry_authorizations[0],
+            dispatcher.retry_authorizations[1],
+        )
+        self.assertEqual(self.raw_count("worker_retry_reservations"), 1)
+        self.assertEqual(self.raw_count("supervised_retry_attempts"), 2)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+        self.assertEqual(self.raw_count("worker_attempt_observations"), 3)
+        self.assertEqual(self.raw_count("supervised_dispatch_adoptions"), 1)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+
+        exhausted = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=successor.lease,
+            **self.scope,
+        )
+        self.assertEqual(exhausted.intent.state, "dispatched")
+        self.assertFalse(exhausted.dispatch_attempted)
+        self.assertEqual(dispatcher.retry_calls, 2)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+        service.release_runtime_supervisor_lease(successor.lease)
+
+    def test_exact_stopped_attempt_two_closes_finite_retry_budget(self) -> None:
+        dispatcher = PreRunningRetryFakeDispatcher(
+            self.store, exhaust_second_attempt=True
+        )
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="pre-running-retry-exhausted", dispatcher=dispatcher
+        )
+        submitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-pre-running-retry-exhausted",
+            **self.scope,
+        )
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(ticket_state="failed"),
+            "handle": None,
+        }
+
+        failed, lease = self.schedule_once(service, task_id)
+        self.assertEqual(failed.deferred_code, "WORKER_LAUNCH_FAILED")
+        staged = service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(staged.deferred_code, "ADAPTER_CONCURRENCY_LIMIT")
+        second_failed = service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(second_failed.deferred_code, "WORKER_LAUNCH_FAILED")
+        self.assertEqual(dispatcher.retry_calls, 2)
+
+        exhausted = service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(exhausted.deferred_code, "WORKER_RETRY_EXHAUSTED")
+        self.assertEqual(exhausted.intent.state, "retry_exhausted")
+        self.assertEqual(
+            exhausted.intent.failure_code, "WORKER_RETRY_EXHAUSTED"
+        )
+        self.assertFalse(exhausted.dispatch_attempted)
+        self.assertTrue(exhausted.projected)
+        self.assertEqual(dispatcher.retry_calls, 2)
+        self.assertEqual(dispatcher.retry_probe_calls, 1)
+        self.assertEqual(dispatcher.exhaustion_probe_calls, 1)
+        self.assertEqual(self.raw_count("worker_retry_reservations"), 1)
+        self.assertEqual(self.raw_count("worker_retry_exhaustions"), 1)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
+
+        snapshot = service.get_task(task_id, **self.scope)
+        self.assertEqual(snapshot.status, "Failed")
+        events = service.list_run_events(task_id, **self.scope)
+        self.assertEqual([event["event_type"] for event in events], [
+            "task_queued",
+            "node_failed",
+        ])
+        terminal = events[-1]
+        self.assertEqual(
+            terminal["error"],
+            {
+                "code": "retry_exhausted",
+                "message": "FWI Worker exhausted its approved launch attempts",
+                "retryable": False,
+            },
+        )
+        extension = terminal["extensions"][
+            "org.agent_rpc.retry_exhaustion"
+        ]
+        self.assertEqual(extension["intent_id"], exhausted.intent.intent_id)
+        self.assertEqual(extension["attempt_id"], RETRY_ATTEMPT_ID)
+        self.assertEqual(extension["attempt_number"], 2)
+        self.assertEqual(extension["failure_kind"], "pre_running_launch_failure")
+        self.assertEqual(extension["max_attempts"], 2)
+
+        stable = service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(stable.intent.state, "retry_exhausted")
+        self.assertEqual(stable.deferred_code, "WORKER_RETRY_EXHAUSTED")
+        self.assertEqual(dispatcher.retry_calls, 2)
+        self.assertEqual(dispatcher.exhaustion_probe_calls, 1)
+
+        proof = dispatcher._pre_running_proof(expected_attempt_number=2)
+        replay = self.store.finalize_supervised_retry_exhaustion(
+            intent_id=exhausted.intent.intent_id,
+            attempt_id=RETRY_ATTEMPT_ID,
+            observation_sequence=extension["observation_sequence"],
+            evidence=dispatcher.worker_observation["evidence"],
+            private_schema_version=proof.private_schema_version,
+            private_proof_hash=proof.private_proof_hash,
+            failure_kind=proof.failure_kind,
+            terminal_event=terminal,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: NOW,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.intent.state, "retry_exhausted")
+        self.assertEqual(self.raw_count("worker_retry_exhaustions"), 1)
+        trashed = service.trash_task(
+            task_id=task_id,
+            expected_visibility_revision=0,
+            idempotency_key="trash-pre-running-retry-exhausted",
+            **self.scope,
+        )
+        self.assertEqual(trashed.snapshot.status, "Failed")
+        self.assertEqual(trashed.snapshot.visibility_revision, 1)
+        self.assertIsNotNone(trashed.snapshot.trashed_at)
+        with patch.object(
+            self.store,
+            "complete_task_purge",
+            side_effect=TaskStoreConflict("synthetic post-cleanup crash"),
+        ):
+            with self.assertRaisesRegex(
+                TaskConflict, "synthetic post-cleanup crash"
+            ):
+                service.purge_task(
+                    task_id=task_id,
+                    expected_visibility_revision=1,
+                    idempotency_key="purge-pre-running-retry-exhausted",
+                    **self.scope,
+                )
+        self.assertEqual(dispatcher.retry_exhaustion_purge_calls, 1)
+        self.assertEqual(self.raw_count("task_purge_outcomes"), 0)
+
+        purged = service.purge_task(
+            task_id=task_id,
+            expected_visibility_revision=1,
+            idempotency_key="purge-pre-running-retry-exhausted",
+            **self.scope,
+        )
+        self.assertEqual(purged.local_run_state, "deleted")
+        self.assertTrue(purged.replayed)
+        self.assertEqual(dispatcher.retry_exhaustion_purge_calls, 2)
+        cleanup = dispatcher.retry_exhaustion_purge_proofs[-1]
+        self.assertEqual(cleanup.intent_id, exhausted.intent.intent_id)
+        self.assertEqual(cleanup.attempt_id, RETRY_ATTEMPT_ID)
+        self.assertEqual(cleanup.previous_attempt_id, MANAGED_ATTEMPT_ID)
+        self.assertEqual(cleanup.private_proof_hash, proof.private_proof_hash)
+        self.assertEqual(cleanup.terminal_event_hash, encode_document(terminal)[1])
+        replayed_purge = service.purge_task(
+            task_id=task_id,
+            expected_visibility_revision=1,
+            idempotency_key="purge-pre-running-retry-exhausted",
+            **self.scope,
+        )
+        self.assertTrue(replayed_purge.replayed)
+        self.assertEqual(dispatcher.retry_exhaustion_purge_calls, 2)
+        service.release_runtime_supervisor_lease(lease)
+
+    def test_concurrent_retry_exhaustion_converges_without_attempt_three(
+        self,
+    ) -> None:
+        dispatcher = PreRunningRetryFakeDispatcher(
+            self.store, exhaust_second_attempt=True
+        )
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="pre-running-retry-exhaustion-race", dispatcher=dispatcher
+        )
+        service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-pre-running-retry-exhaustion-race",
+            **self.scope,
+        )
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(ticket_state="failed"),
+            "handle": None,
+        }
+        _, lease = self.schedule_once(service, task_id)
+        service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        dispatcher.exhaustion_probe_barrier = threading.Barrier(2)
+
+        def finalize():
+            return service.schedule_runtime_dispatch(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: finalize(), range(2)))
+        self.assertEqual(
+            [result.deferred_code for result in results],
+            ["WORKER_RETRY_EXHAUSTED", "WORKER_RETRY_EXHAUSTED"],
+        )
+        self.assertEqual(
+            {result.intent.state for result in results}, {"retry_exhausted"}
+        )
+        self.assertEqual(self.raw_count("worker_retry_exhaustions"), 1)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+        self.assertEqual(self.raw_count("run_events"), 2)
+        self.assertEqual(dispatcher.retry_calls, 2)
+        self.assertEqual(dispatcher.exhaustion_probe_calls, 2)
+        service.release_runtime_supervisor_lease(lease)
+
+    def test_attempt_two_direct_insert_requires_exact_reserved_lineage(self) -> None:
+        dispatcher = PreRunningRetryFakeDispatcher(
+            self.store, lose_first_retry_return=True
+        )
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="pre-running-retry-lineage", dispatcher=dispatcher
+        )
+        service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-pre-running-retry-lineage",
+            **self.scope,
+        )
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(ticket_state="failed"),
+            "handle": None,
+        }
+        _, lease = self.schedule_once(service, task_id)
+        lost = service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(lost.deferred_code, "WORKER_RETRY_DELIVERY_LOST")
+        self.assertEqual(self.raw_count("worker_retry_reservations"), 1)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            intent = self.store.get_dispatch_intent(task_id)
+            prior = connection.execute(
+                "SELECT * FROM worker_launch_attempts WHERE intent_id = ?",
+                (intent.intent_id,),
+            ).fetchone()
+            reservation = connection.execute(
+                "SELECT * FROM worker_retry_reservations WHERE intent_id = ?",
+                (intent.intent_id,),
+            ).fetchone()
+            cases = [
+                ("submission-" + "9" * 64, prior["adapter_request_hash"],
+                 reservation["reserved_at"], RETRY_JOB_ID),
+                (prior["submission_id"], "sha256:" + "9" * 64,
+                 reservation["reserved_at"], RETRY_JOB_ID),
+                (prior["submission_id"], prior["adapter_request_hash"],
+                 "2026-07-15T03:00:01.000000Z", RETRY_JOB_ID),
+                (prior["submission_id"], prior["adapter_request_hash"],
+                 reservation["reserved_at"], prior["job_id"]),
+            ]
+            for index, (submission_id, request_hash, created_at, job_id) in enumerate(cases):
+                with self.subTest(index=index):
+                    with self.assertRaisesRegex(
+                        sqlite3.IntegrityError,
+                        "retry attempt requires its durable reservation",
+                    ):
+                        connection.execute(
+                            """
+                            INSERT INTO worker_launch_attempts(
+                                attempt_id, intent_id, task_id, project_id,
+                                principal_id, attempt_number, submission_id,
+                                job_id, adapter_request_hash, binding_hash,
+                                created_at, first_fencing_token,
+                                first_observed_at, first_observed_at_us
+                            ) VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                "attempt-" + f"{index + 10:032x}",
+                                intent.intent_id,
+                                task_id,
+                                PROJECT_ID,
+                                PRINCIPAL_ID,
+                                submission_id,
+                                job_id,
+                                request_hash,
+                                "sha256:" + "8" * 64,
+                                created_at,
+                                lease.fencing_token,
+                                reservation["reserved_at"],
+                                reservation["reserved_at_us"],
+                            ),
+                        )
+                    connection.rollback()
+        finally:
+            connection.close()
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        service.release_runtime_supervisor_lease(lease)
+
+    def test_retry_exhaustion_direct_insert_requires_atomic_terminal_case(self) -> None:
+        dispatcher = PreRunningRetryFakeDispatcher(
+            self.store, exhaust_second_attempt=True
+        )
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="pre-running-retry-exhaustion-direct-sql", dispatcher=dispatcher
+        )
+        submitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-pre-running-retry-exhaustion-direct-sql",
+            **self.scope,
+        )
+        dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(ticket_state="failed"),
+            "handle": None,
+        }
+        _, lease = self.schedule_once(service, task_id)
+        service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        projection = service.project_worker_attempt(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        proof = dispatcher._pre_running_proof(expected_attempt_number=2)
+
+        connection = sqlite3.connect(self.database_path)
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "retry exhaustion requires exact stopped attempt 2",
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO worker_retry_exhaustions(
+                        intent_id, attempt_number, task_id, project_id,
+                        principal_id, approval_id, attempt_id,
+                        observation_sequence, evidence_hash,
+                        private_schema_version, private_proof_hash,
+                        failure_kind, max_attempts, terminal_event_sequence,
+                        terminal_event_hash, fencing_token,
+                        exhausted_at, exhausted_at_us
+                    ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, '1.2.0', ?,
+                              'pre_running_launch_failure', 2, 2, ?, ?, ?, ?)
+                    """,
+                    (
+                        submitted.intent.intent_id,
+                        task_id,
+                        PROJECT_ID,
+                        PRINCIPAL_ID,
+                        approval["approval_id"],
+                        projection.attempt_id,
+                        projection.observation_sequence,
+                        projection.document_hash,
+                        proof.private_proof_hash,
+                        "sha256:" + "7" * 64,
+                        lease.fencing_token,
+                        NOW,
+                        1784084400000000,
+                    ),
+                )
+        finally:
+            connection.close()
+        self.assertEqual(self.raw_count("worker_retry_exhaustions"), 0)
+        self.assertEqual(service.get_task(task_id, **self.scope).status, "Queued")
+        service.release_runtime_supervisor_lease(lease)
+
     def test_submit_exact_replay_precedes_expiry_budget_and_preflight(self) -> None:
         created = self.create_executable()
         task_id = created.snapshot.task_id
@@ -4264,7 +5144,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(replay.intent.state, "dispatched")
         service.release_runtime_supervisor_lease(acquisition.lease)
 
-    def test_current_legacy_private_receipt_is_fenced_adopted_without_launch(
+    def test_current_v1_5_rejects_legacy_private_receipt_without_launch(
         self,
     ) -> None:
         created = self.create_executable(key="create-private-receipt")
@@ -4298,18 +5178,21 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             supervisor_lease=acquisition.lease,
             **self.scope,
         )
-        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertEqual(scheduled.intent.state, "dispatching")
         self.assertFalse(scheduled.authorized)
         self.assertFalse(scheduled.dispatch_attempted)
         self.assertFalse(scheduled.projected)
-        self.assertTrue(scheduled.adopted)
+        self.assertFalse(scheduled.adopted)
+        self.assertEqual(
+            scheduled.deferred_code, "PRIVATE_RECEIPT_ADOPTION_CONFLICT"
+        )
         self.assertEqual(dispatcher.dispatch_calls, 0)
         self.assertEqual(dispatcher.private_receipt_recovery_calls, 1)
         self.assertEqual(self.raw_count("supervised_dispatch_attempts"), 0)
         self.assertEqual(self.raw_count("worker_launch_attempts"), 0)
-        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
         self.assertEqual(
-            self.raw_count("supervised_private_receipt_adoptions"), 1
+            self.raw_count("supervised_private_receipt_adoptions"), 0
         )
         service.release_runtime_supervisor_lease(acquisition.lease)
 
@@ -4624,7 +5507,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             connection.close()
         self.assertEqual(outcome, "reconciliation_required")
 
-    def test_reconciliation_adopts_private_v1_receipt_without_worker_projection(
+    def test_v1_5_reconciliation_rejects_private_v1_receipt(
         self,
     ) -> None:
         task_id, approval, dispatcher, service = self.approved_runtime(
@@ -4666,10 +5549,13 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         finally:
             service.release_runtime_supervisor_lease(lease)
 
-        self.assertEqual(resolved.intent.state, "dispatched")
+        self.assertEqual(resolved.intent.state, "reconciliation_required")
         self.assertEqual(resolved.evidence_kind, "private_receipt")
         self.assertFalse(resolved.projected)
-        self.assertTrue(resolved.adopted)
+        self.assertFalse(resolved.adopted)
+        self.assertEqual(
+            resolved.deferred_code, "RECONCILIATION_ADOPTION_CONFLICT"
+        )
         self.assertFalse(resolved.timeout_armed)
         self.assertFalse(service.can_cancel_task(task_id, **self.scope))
         self.assertEqual(dispatcher.dispatch_calls, 1)

@@ -1222,6 +1222,7 @@ function testEmbeddingStatusUsesSameOriginHealthProxy() {
 function makeGuidedTask(overrides = {}) {
   const taskId = overrides.task_id || 'task-guided-1';
   const planHash = overrides.plan_hash || `sha256:${'a'.repeat(64)}`;
+  const algorithmVersion = overrides.algorithm_version || '1.5.0';
   const approval = overrides.approval
     ? {
         approval_id: 'approval-guided-1',
@@ -1241,7 +1242,7 @@ function makeGuidedTask(overrides = {}) {
       goal: '<img src=x onerror=alert(1)>',
       task_type: 'acoustic_fwi_2d',
       dataset: { id: 'marmousi_94_288', version: '1.0.0' },
-      algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
+      algorithm: { id: 'deepwave.acoustic_fwi', version: algorithmVersion },
       parameters: {
         preset: 'fwi_smoke', device: 'cpu', iterations: overrides.iterations ?? 2, seed: 0,
         optimizer: overrides.optimizer || 'adam',
@@ -1256,7 +1257,7 @@ function makeGuidedTask(overrides = {}) {
       task_type: 'acoustic_fwi_2d',
       nodes: [{
         node_id: 'invert',
-        algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
+        algorithm: { id: 'deepwave.acoustic_fwi', version: algorithmVersion },
         outputs: [
           { port: 'inverted_model', data_type: 'inverted_velocity_model_2d' },
           { port: 'loss', data_type: 'loss_curve' },
@@ -1477,7 +1478,7 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   const api = loadGuidedFunctions();
   const catalog = {
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.5.0' },
   };
   const reviewTask = api.normalizeGuidedTaskProjection(makeGuidedTask());
   assert.equal(api.isGuidedReviewReady(reviewTask, catalog), true);
@@ -1697,6 +1698,101 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   }
   assert.match(api.guidedDispatchExplanation('pending'), /不会由浏览器重发/);
   assert.match(api.guidedDispatchExplanation('reconciliation_required'), /浏览器不会重试/);
+  const retryExhaustedSource = makeGuidedTask({
+    status: 'Failed',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: {
+      state: 'retry_exhausted',
+      failure_code: 'WORKER_RETRY_EXHAUSTED',
+      created_at: '2026-07-16T12:00:00.000000Z',
+      dispatch_claimed_at: '2026-07-16T12:00:00.000000Z',
+      outcome_recorded_at: '2026-07-16T12:00:02.000000Z',
+      reconciliation: null,
+    },
+    adapter_status: {
+      status: 'Failed', stage: 'submit', completed: 0, total: 2,
+      message: 'finite automatic retry budget exhausted',
+    },
+  });
+  const retryExhausted = api.normalizeGuidedTaskProjection(retryExhaustedSource);
+  assert.ok(retryExhausted);
+  assert.equal(retryExhausted.status, 'Failed');
+  assert.deepEqual(JSON.parse(JSON.stringify(retryExhausted.dispatch)), {
+    state: 'retry_exhausted',
+    failureCode: 'WORKER_RETRY_EXHAUSTED',
+    reconciliation: null,
+  });
+  assert.equal(
+    api.isGuidedApprovalCompleted(retryExhausted, retryExhausted.plan.hash),
+    true,
+  );
+  const exhaustionExplanation = api.guidedDispatchExplanation('retry_exhausted');
+  assert.match(exhaustionExplanation, /两次受控尝试.*预算.*关闭为 Failed.*浏览器不会重试/);
+  assert.doesNotMatch(exhaustionExplanation, /proof|hash|job|path|sha256/i);
+
+  const renderSandbox = {
+    module: { exports: {} },
+    state: {
+      chatId: 'chat-guided',
+      chats: { 'chat-guided': [] },
+      guided: { task: retryExhausted, mutation: '', error: '' },
+    },
+    escapeHtml: api.escapeHtml,
+    guidedDispatchExplanation: api.guidedDispatchExplanation,
+    guidedReconciliationExplanation: api.guidedReconciliationExplanation,
+    guidedCancellationExplanation: api.guidedCancellationExplanation,
+    guidedTimeoutExplanation: api.guidedTimeoutExplanation,
+    isTaskReferencedByChat: () => false,
+  };
+  vm.runInNewContext([
+    extractFunction('renderGuidedTaskHtml'),
+    'module.exports = { renderGuidedTaskHtml };',
+  ].join('\n'), renderSandbox);
+  const exhaustionHtml = renderSandbox.module.exports.renderGuidedTaskHtml();
+  assert.match(exhaustionHtml, /border-slate-200 bg-white/);
+  assert.doesNotMatch(exhaustionHtml, /border-amber-300 bg-amber-50[^>]*data-guided-view="task"/);
+  assert.match(exhaustionHtml, /有限自动重试预算已经耗尽/);
+  assert.doesNotMatch(exhaustionHtml, /onclick="[^"]*retry/i);
+
+  for (const malformed of [
+    { status: 'Queued', failure_code: 'WORKER_RETRY_EXHAUSTED', reconciliation: null },
+    { status: 'Failed', failure_code: null, reconciliation: null },
+    { status: 'Failed', failure_code: 'WORKER_LAUNCH_FAILED', reconciliation: null },
+    {
+      status: 'Failed', failure_code: 'WORKER_RETRY_EXHAUSTED',
+      reconciliation: {
+        failure_code: 'WORKER_RETRY_EXHAUSTED',
+        recorded_at: '2026-07-16T12:00:02.000000Z',
+        state: 'action_required', result: null, evidence_kind: null, resolved_at: null,
+      },
+    },
+  ]) {
+    assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+      status: malformed.status,
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+      dispatch: {
+        state: 'retry_exhausted',
+        failure_code: malformed.failure_code,
+        reconciliation: malformed.reconciliation,
+      },
+    })), null);
+  }
+  for (const [privateKey, privateValue] of [
+    ['proof', { private: true }],
+    ['private_proof_hash', `sha256:${'c'.repeat(64)}`],
+    ['document_hash', `sha256:${'d'.repeat(64)}`],
+    ['job_id', 'fwi-private-job'],
+    ['path', '/root/private/run'],
+  ]) {
+    assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+      status: 'Failed',
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+      dispatch: {
+        state: 'retry_exhausted', failure_code: 'WORKER_RETRY_EXHAUSTED',
+        reconciliation: null, [privateKey]: privateValue,
+      },
+    })), null, `${privateKey} must fail closed instead of reaching the UI`);
+  }
   const resolvedReconciliation = {
     failure_code: 'DISPATCH_RECEIPT_UNKNOWN',
     recorded_at: '2026-07-16T12:00:00.000000Z',
@@ -1774,8 +1870,12 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   assert.equal(
     api.normalizeGuidedTaskProjection(currentMissingFigures),
     null,
-    'Algorithm 1.4 cannot silently fall back to the historical two-output contract',
+    'Algorithm 1.5 cannot silently fall back to the historical two-output contract',
   );
+  const historical14 = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    algorithm_version: '1.4.0',
+  }));
+  assert.ok(historical14, 'the exact historical Algorithm 1.4 output contract remains readable');
   const currentWrongFigurePort = makeGuidedTask();
   currentWrongFigurePort.plan.nodes[0].outputs[2].port = 'unexpected_figure';
   assert.equal(api.normalizeGuidedTaskProjection(currentWrongFigurePort), null);
@@ -2218,6 +2318,14 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
     features: { approval_required: true, running_cancel: true },
     capabilities: {
       cancel: true,
+      retry: false,
+      manual_retry: false,
+      finite_automatic_retry: {
+        max_attempts: 2,
+        max_concurrent_attempts: 1,
+        pre_running_launch_failure: true,
+        worker_exit: false,
+      },
       startup_dispatch_recovery: false,
       startup_receipt_recovery: false,
       startup_status_catchup: false,
@@ -2240,6 +2348,16 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       'positive_receipt_reconciliation',
     ],
   );
+  assert.equal(session.manualRetry, false);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(session.finiteAutomaticRetry)),
+    {
+      maxAttempts: 2,
+      maxConcurrentAttempts: 1,
+      preRunningLaunchFailure: true,
+      workerExit: false,
+    },
+  );
   const catalog = api.normalizeGuidedCatalog({
     datasets: [{
       id: 'marmousi_94_288', version: '1.0.0', immutable: true,
@@ -2252,14 +2370,44 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
         path: '/root/private/model.npy',
       },
     }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.1.0', entrypoint: '/root/run.py' },
+    algorithm: {
+      id: 'deepwave.acoustic_fwi', version: '1.5.0', entrypoint: '/root/run.py',
+      adapter: {
+        protocol: 'algorithm-adapter-v1', version: '1.5.0',
+        entrypoint_ref: '/root/private/adapter.py',
+      },
+    },
   });
   assert.equal(catalog.datasets[0].metadata.path, undefined);
   assert.equal(catalog.datasets[0].relative_path, undefined);
   assert.deepEqual(
     JSON.parse(JSON.stringify(catalog.algorithm)),
-    { id: 'deepwave.acoustic_fwi', version: '1.1.0' },
+    { id: 'deepwave.acoustic_fwi', version: '1.5.0' },
   );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(catalog.adapter)),
+    { protocol: 'algorithm-adapter-v1', version: '1.5.0' },
+  );
+  const historical14 = api.normalizeGuidedCatalog({
+    datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
+    algorithm: {
+      id: 'deepwave.acoustic_fwi', version: '1.4.0',
+      adapter: { protocol: 'algorithm-adapter-v1', version: '1.4.0' },
+    },
+  });
+  assert.equal(historical14.algorithm.version, '1.4.0');
+  assert.equal(historical14.adapter.version, '1.4.0');
+  assert.equal(api.normalizeGuidedCatalog({
+    datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
+    algorithm: {
+      id: 'deepwave.acoustic_fwi', version: '1.5.0',
+      adapter: { protocol: 'algorithm-adapter-v1', version: '1.4.0' },
+    },
+  }), null, 'mixed Algorithm/Adapter versions fail closed');
+  const catalogPreviewSource = extractFunction('renderGuidedCatalogPreview');
+  assert.match(catalogPreviewSource, /pre-running launch failure: enabled/);
+  assert.match(catalogPreviewSource, /worker_exit: pending/);
+  assert.match(catalogPreviewSource, /manual\/browser/);
   assert.doesNotMatch(extractFunction('renderGuidedCatalogPreview'), /relative_path|entrypoint|JSON\.stringify/);
 }
 
@@ -2393,12 +2541,79 @@ async function testGuidedApprovedSubmitPendingStopsPolling() {
   assert.equal(generatedKeys, 1);
 }
 
+async function testGuidedRetryExhaustionStopsPollingWithoutMutation() {
+  let scheduledPolls = 0;
+  let artifactLoads = 0;
+  const requests = [];
+  const exhaustedTask = {
+    taskId: 'task-guided-retry-exhausted-1',
+    status: 'Failed',
+    plan: { hash: `sha256:${'a'.repeat(64)}` },
+    approval: { id: 'approval-guided-1', decision: 'approved' },
+    dispatch: {
+      state: 'retry_exhausted',
+      failureCode: 'WORKER_RETRY_EXHAUSTED',
+      reconciliation: null,
+    },
+    cancellation: null,
+  };
+  const mutationKeys = Object.freeze({});
+  const sandbox = {
+    module: { exports: {} },
+    state: {
+      guided: {
+        taskId: exhaustedTask.taskId,
+        pollInFlight: false,
+        generation: 9,
+        task: null,
+        catalog: {},
+        error: '',
+        outcomeUnknown: false,
+        approvalReplayAvailable: false,
+        cancelReplayAvailable: false,
+        mutationKeys,
+        phase: 'monitoring',
+      },
+    },
+    isSafeGuidedOpaqueId: value => value === exhaustedTask.taskId,
+    isSafeGuidedPlanHash: value => /^sha256:[0-9a-f]{64}$/.test(value || ''),
+    clearGuidedPoll() {},
+    guidedApiPath: () => `/api/scientific-runtime/v1/tasks/${exhaustedTask.taskId}`,
+    async guidedApiRequest(path, options) {
+      requests.push({ path, options });
+      return { task_id: exhaustedTask.taskId };
+    },
+    normalizeGuidedTaskProjection: () => exhaustedTask,
+    isGuidedApprovedSubmitPending: () => false,
+    isGuidedApprovalCompleted: () => false,
+    async loadGuidedArtifacts() { artifactLoads += 1; },
+    scheduleGuidedPoll: () => { scheduledPolls += 1; },
+    upsertGuidedTaskIndex() {},
+    renderGuidedFwi() {},
+  };
+  vm.runInNewContext([
+    `async ${extractFunction('refreshGuidedTask')}`,
+    'module.exports = { refreshGuidedTask };',
+  ].join('\n'), sandbox);
+
+  assert.equal(await sandbox.module.exports.refreshGuidedTask(), true);
+  assert.equal(sandbox.state.guided.phase, 'terminal');
+  assert.equal(sandbox.state.guided.pollInFlight, false);
+  assert.equal(scheduledPolls, 0);
+  assert.equal(artifactLoads, 0);
+  assert.equal(sandbox.state.guided.mutationKeys, mutationKeys);
+  assert.deepEqual(requests, [{
+    path: `/api/scientific-runtime/v1/tasks/${exhaustedTask.taskId}`,
+    options: undefined,
+  }]);
+}
+
 async function testGuidedApproveFourXxRetainsOriginalKeyThroughGetRecovery() {
   const taskId = 'task-guided-approve-1';
   const planHash = `sha256:${'b'.repeat(64)}`;
   const catalog = {
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.5.0' },
   };
   const noApprovalProjection = makeGuidedTask({ task_id: taskId, plan_hash: planHash });
   const approvedSubmitPendingProjection = makeGuidedTask({
@@ -2960,7 +3175,7 @@ function testGuidedTaskIndexUsesSafeNormalizedDomText() {
     tasks: [
       {
         task_id: 'task-safe:1', status: 'Running', goal: maliciousGoal,
-        algorithm: { id: '<script>alert(1)</script>', version: '1.4.0' },
+        algorithm: { id: '<script>alert(1)</script>', version: '1.5.0' },
         preset: 'fwi_smoke', device: 'cuda', iterations: 50, seed: 0,
         optimizer: 'adam', learning_rate_milli: 10000,
         wall_time_seconds: 7200, timeout: null,
@@ -3128,7 +3343,7 @@ async function testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursor
     task_id: `task-page-${String(index).padStart(3, '0')}`,
     status: index % 2 === 0 ? 'Succeeded' : 'Running',
     goal: `durable task ${index}`,
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.5.0' },
     preset: 'fwi_smoke',
     device: 'cuda',
     iterations: 2,
@@ -3275,7 +3490,7 @@ function createGuidedRecoveryHarness(task, approvedSubmitPending = false) {
         phase: 'monitoring',
         csrfToken: 'csrf-token-1234567890',
         session: { mode: 'guided' },
-        catalog: { algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' } },
+        catalog: { algorithm: { id: 'deepwave.acoustic_fwi', version: '1.5.0' } },
         form: null,
         task,
         taskId: task.taskId,
@@ -3314,7 +3529,7 @@ function createGuidedRecoveryHarness(task, approvedSubmitPending = false) {
       throw new Error(`unexpected path ${path}`);
     },
     normalizeGuidedSession: () => ({ csrfToken: 'csrf-token-abcdefghijkl', mode: 'guided' }),
-    normalizeGuidedCatalog: () => ({ algorithm: { id: 'deepwave.acoustic_fwi', version: '1.4.0' } }),
+    normalizeGuidedCatalog: () => ({ algorithm: { id: 'deepwave.acoustic_fwi', version: '1.5.0' } }),
     normalizeGuidedTaskProjection: (_data, expectedTaskId) => (
       expectedTaskId === task.taskId ? task : null
     ),
@@ -3361,7 +3576,7 @@ function makeRecoveredGuidedTask(status = 'Running') {
       datasetId: 'marmousi_94_288',
       datasetVersion: '1.0.0',
       algorithmId: 'deepwave.acoustic_fwi',
-      algorithmVersion: '1.2.0',
+      algorithmVersion: '1.4.0',
       preset: 'fwi_smoke',
       device: 'cuda',
       iterations: 50,
@@ -3398,11 +3613,11 @@ async function testGuidedCloseRetainsIndexAndReopensThroughGets() {
   ]);
   assert.equal(harness.sandbox.state.guided.taskId, task.taskId);
   assert.equal(harness.sandbox.state.guided.task, task);
-  assert.equal(harness.sandbox.state.guided.catalog.algorithm.version, '1.4.0');
+  assert.equal(harness.sandbox.state.guided.catalog.algorithm.version, '1.5.0');
   assert.equal(
     harness.sandbox.state.guided.task.draft.algorithmVersion,
-    '1.2.0',
-    'a historical 1.2 task remains readable after the current catalog advances',
+    '1.4.0',
+    'a historical 1.4 task remains readable after the current catalog advances to 1.5',
   );
   assert.equal(harness.sandbox.state.guided.phase, 'monitoring');
   assert.equal(harness.sandbox.state.guided.taskIndex.length, 1);
@@ -3476,6 +3691,7 @@ async function main() {
   testGuidedCatalogProjectionDoesNotExposePaths();
   testGuidedApprovalCannotBeBypassedOrReplayedAutomatically();
   await testGuidedApprovedSubmitPendingStopsPolling();
+  await testGuidedRetryExhaustionStopsPollingWithoutMutation();
   await testGuidedApproveFourXxRetainsOriginalKeyThroughGetRecovery();
   testGuidedStateIsNotPersistedWithChats();
   testGuidedPollingPreservesReaderScrollPosition();

@@ -45,6 +45,7 @@ from worker_launch_control import (
     CONTROL_DIRECTORY,
     LaunchAttemptBinding,
     ParentLaunchLease,
+    WorkerAttemptEvidence,
     WorkerCancelEvidence,
     WorkerControlError,
     WorkerStopEvidence,
@@ -52,6 +53,7 @@ from worker_launch_control import (
     hold_idle_execution_fence,
     mark_launch_failed,
     purge_worker_cancel_control,
+    read_pre_running_attempt_evidence,
     read_worker_cancel_capability,
     read_worker_cancel_evidence,
     read_worker_stop_capability,
@@ -72,13 +74,14 @@ from .fwi_registry import (
 
 ALGORITHM_ID = DEEPWAVE_ALGORITHM_ID
 ALGORITHM_VERSION = DEEPWAVE_ALGORITHM_VERSION
-ADAPTER_VERSION = "1.4.0"
+ADAPTER_VERSION = "1.5.0"
 SUPPORTED_RECEIPT_BINDINGS = frozenset(
     {
         ("1.0.0", "1.0.0"),
         ("1.1.0", "1.1.0"),
         ("1.2.0", "1.2.0"),
         ("1.3.0", "1.3.0"),
+        ("1.4.0", "1.4.0"),
         (ALGORITHM_VERSION, ADAPTER_VERSION),
     }
 )
@@ -88,7 +91,7 @@ SUPPORTED_ADAPTER_VERSIONS = frozenset(
 LOGICAL_ENTRYPOINT = "fwi.deepwave_adapter"
 MODEL_ID = "marmousi_94_288"
 BOUND_MANIFEST_HASH = (
-    "sha256:d3d53be7e0697832e92f59c2efd56dd776456ad9ca81d4abd2932b55d0f4d81e"
+    "sha256:09168e087073e3f39a8829e457a9197d50331eea140cb1dbe989224d6ec6b658"
 )
 GRADIENT_CLIP_QUANTILE = 0.98
 ADAM_LEARNING_RATE_MILLI_RANGE = (100, 100_000)
@@ -199,6 +202,31 @@ def is_supported_receipt_binding(
     return True
 
 
+def _is_supported_managed_record(record: Mapping[str, Any]) -> bool:
+    """Recognize exact managed-control receipts retained across 1.5 rollout."""
+
+    version = record.get("adapter_version")
+    return (
+        (version == "1.4.0" and record.get("schema_version") == "1.1.0")
+        or (
+            version == "1.5.0"
+            and record.get("schema_version") in {"1.1.0", "1.2.0"}
+        )
+    )
+
+
+def _is_supported_managed_control_record(
+    handle: "AdapterHandle", record: Mapping[str, Any]
+) -> bool:
+    """Retain exact control for active 1.4 tasks while 1.5 is current."""
+
+    return (
+        _is_supported_managed_record(record)
+        and record.get("adapter_version") == handle.adapter_version
+        and record.get("algorithm") == handle.algorithm
+    )
+
+
 class AdapterError(RuntimeError):
     """Base class for stable Deepwave Adapter failures."""
 
@@ -247,6 +275,10 @@ class AdapterUnavailable(AdapterError):
 
 class _AdapterLaunchAmbiguous(AdapterUnavailable):
     """A child may exist but has not crossed the fenced ready barrier."""
+
+
+class _AdapterLaunchStopped(AdapterUnavailable):
+    """The production launcher proved that no pre-ready child remains."""
 
 
 @dataclass(frozen=True)
@@ -372,6 +404,28 @@ class AdapterExistingDispatchReceiptProof:
                 if self.worker_evidence is None
                 else copy.deepcopy(self.worker_evidence)
             ),
+        }
+
+
+@dataclass(frozen=True)
+class AdapterPreRunningRetryProof:
+    """Exact stopped-attempt proof; it never authorizes a state change."""
+
+    failure_kind: str
+    previous_attempt_id: str
+    previous_attempt_number: int
+    private_schema_version: str
+    private_proof_hash: str
+    evidence: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "failure_kind": self.failure_kind,
+            "previous_attempt_id": self.previous_attempt_id,
+            "previous_attempt_number": self.previous_attempt_number,
+            "private_schema_version": self.private_schema_version,
+            "private_proof_hash": self.private_proof_hash,
+            "evidence": copy.deepcopy(self.evidence),
         }
 
 
@@ -1346,6 +1400,36 @@ class SafeSubprocessWorkerLauncher:
         run_root: Path,
         wall_time_seconds: int = 86_400,
     ) -> int:
+        """Expose only explicitly stopped failures as retry candidates."""
+
+        try:
+            return self._launch_once(
+                command=command,
+                config_path=config_path,
+                run_dir=run_dir,
+                run_root=run_root,
+                wall_time_seconds=wall_time_seconds,
+            )
+        except _AdapterLaunchAmbiguous:
+            raise
+        except AdapterUnavailable as error:
+            if error.code == "WORKER_LAUNCH_FAILED":
+                raise _AdapterLaunchStopped(str(error)) from error
+            raise
+        except OSError as error:
+            raise _AdapterLaunchStopped(
+                f"WORKER_LAUNCH_FAILED: {type(error).__name__}"
+            ) from error
+
+    def _launch_once(
+        self,
+        *,
+        command: str,
+        config_path: Path,
+        run_dir: Path,
+        run_root: Path,
+        wall_time_seconds: int = 86_400,
+    ) -> int:
         if command != "invert":
             raise AdapterValidationError(
                 "TASK_TYPE_UNSUPPORTED_IN_P1",
@@ -1500,7 +1584,9 @@ class SafeSubprocessWorkerLauncher:
                 raise _AdapterLaunchAmbiguous(
                     "SUBMISSION_LAUNCH_PENDING: Worker reaper could not be established"
                 ) from error
-            raise
+            raise _AdapterLaunchStopped(
+                "WORKER_LAUNCH_FAILED: Worker reaper could not be established"
+            ) from error
         if not ready:
             raise _AdapterLaunchAmbiguous(
                 "SUBMISSION_LAUNCH_PENDING: Worker readiness is not yet durable"
@@ -2157,6 +2243,67 @@ class DeepwaveAdapter:
         return f"fwi-{stamp}-{suffix}"
 
     @staticmethod
+    def _retry_job_id(
+        submission_id: str, authorized_at: str, private_proof_hash: str
+    ) -> str:
+        parsed = _parse_timestamp(authorized_at, code="CLOCK_INVALID")
+        if PLAN_HASH.fullmatch(private_proof_hash) is None:
+            raise AdapterHandleError(
+                "ADAPTER_RETRY_INVALID: private proof hash is invalid"
+            )
+        stamp = parsed.strftime("%Y%m%dT%H%M%SZ")
+        suffix = hashlib.sha256(
+            _stable_json_bytes(
+                {
+                    "submission_id": submission_id,
+                    "attempt_number": 2,
+                    "private_proof_hash": private_proof_hash,
+                }
+            )
+        ).hexdigest()[:12]
+        return f"fwi-{stamp}-{suffix}"
+
+    def _expected_job_id(self, record: Mapping[str, Any]) -> str:
+        if record.get("schema_version") == "1.0.0":
+            return self._job_id(record["submission_id"], record["created_at"])
+        binding = binding_from_submission_record(record)
+        if binding.attempt_number == 1:
+            return self._job_id(record["submission_id"], record["created_at"])
+        authorization = record.get("retry_authorization")
+        if not isinstance(authorization, Mapping):
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: retry authorization is missing"
+            )
+        return self._retry_job_id(
+            record["submission_id"],
+            authorization.get("authorized_at"),
+            authorization.get("private_proof_hash"),
+        )
+
+    @staticmethod
+    def _failure_proof_payload(
+        record: Mapping[str, Any], evidence: WorkerAttemptEvidence
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0.0",
+            "failure_kind": "pre_running_launch_failure",
+            "submission_id": record["submission_id"],
+            "attempt_id": evidence.attempt_id,
+            "attempt_number": evidence.attempt_number,
+            "job_id": evidence.job_id,
+            "request_hash": evidence.request_hash,
+            "binding_hash": evidence.binding_hash,
+            "ticket_record_hash": evidence.ticket_record_hash,
+        }
+
+    @staticmethod
+    def _failure_proof(
+        record: Mapping[str, Any], evidence: WorkerAttemptEvidence
+    ) -> dict[str, Any]:
+        payload = DeepwaveAdapter._failure_proof_payload(record, evidence)
+        return {**payload, "proof_hash": _sha256_document(payload)}
+
+    @staticmethod
     def _request_payload(
         *,
         submission_id: str,
@@ -2205,6 +2352,65 @@ class DeepwaveAdapter:
             )
         }
 
+    def _retry_request_material(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> tuple[
+        AdapterValidation,
+        str,
+        dict[str, Any],
+        str,
+        Path,
+        Path,
+    ]:
+        self._validate_submit_identity(
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+        )
+        validated = self._validate_request(
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+            verify_runtime=False,
+        )
+        submission_id = self._submission_id(task_id, plan_hash, idempotency_key)
+        request_payload = self._request_payload(
+            submission_id=submission_id,
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            validated=validated,
+        )
+        request_hash = _sha256_document(request_payload)
+        index_name = submission_id.removeprefix("submission-") + ".json"
+        control = self._run_root / CONTROL_DIRECTORY
+        return (
+            validated,
+            submission_id,
+            request_payload,
+            request_hash,
+            control / "submissions" / index_name,
+            control / "locks" / (index_name + ".lock"),
+        )
+
     @staticmethod
     def _handle_from_record(record: Mapping[str, Any]) -> AdapterHandle:
         return AdapterHandle(
@@ -2234,6 +2440,193 @@ class DeepwaveAdapter:
             DeepwaveAdapter._record_integrity_payload(record)
         )
         _atomic_write_json(path, record)
+
+    @staticmethod
+    def _validate_failure_document(
+        failure: Any, binding: LaunchAttemptBinding
+    ) -> None:
+        required = {
+            "schema_version",
+            "failure_kind",
+            "submission_id",
+            "attempt_id",
+            "attempt_number",
+            "job_id",
+            "request_hash",
+            "binding_hash",
+            "ticket_record_hash",
+            "proof_hash",
+        }
+        if not isinstance(failure, Mapping) or set(failure) != required:
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: launch failure proof is invalid"
+            )
+        payload = {key: copy.deepcopy(failure[key]) for key in required - {"proof_hash"}}
+        if (
+            failure.get("schema_version") != "1.0.0"
+            or failure.get("failure_kind") != "pre_running_launch_failure"
+            or failure.get("submission_id") != binding.submission_id
+            or failure.get("attempt_id") != binding.attempt_id
+            or failure.get("attempt_number") != binding.attempt_number
+            or failure.get("job_id") != binding.job_id
+            or failure.get("request_hash") != binding.request_hash
+            or failure.get("binding_hash") != binding.binding_hash
+            or PLAN_HASH.fullmatch(str(failure.get("ticket_record_hash"))) is None
+            or _sha256_document(payload) != failure.get("proof_hash")
+        ):
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: launch failure proof changed"
+            )
+
+    @staticmethod
+    def _validate_retry_authorization_document(value: Any) -> dict[str, Any]:
+        required = {
+            "schema_version",
+            "intent_id",
+            "previous_attempt_id",
+            "previous_observation_sequence",
+            "failure_kind",
+            "private_proof_hash",
+            "next_attempt_number",
+            "authorized_at",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: retry authorization is invalid"
+            )
+        result = copy.deepcopy(dict(value))
+        if (
+            result.get("schema_version") != "1.0.0"
+            or not isinstance(result.get("intent_id"), str)
+            or OPAQUE_ID.fullmatch(result["intent_id"]) is None
+            or not isinstance(result.get("previous_attempt_id"), str)
+            or MANAGED_ATTEMPT_ID.fullmatch(result["previous_attempt_id"]) is None
+            or type(result.get("previous_observation_sequence")) is not int
+            or result["previous_observation_sequence"] < 1
+            or result.get("failure_kind") != "pre_running_launch_failure"
+            or not isinstance(result.get("private_proof_hash"), str)
+            or PLAN_HASH.fullmatch(result["private_proof_hash"]) is None
+            or result.get("next_attempt_number") != 2
+        ):
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: retry authorization fields changed"
+            )
+        _parse_timestamp(result.get("authorized_at"), code="ADAPTER_RETRY_INVALID")
+        return result
+
+    @staticmethod
+    def _validate_retry_exhaustion_cleanup_document(
+        value: Any,
+    ) -> dict[str, Any]:
+        """Validate the path-free Store token used only by exhausted purge."""
+
+        required = {
+            "schema_version",
+            "purge_id",
+            "intent_id",
+            "task_id",
+            "project_id",
+            "principal_id",
+            "approval_id",
+            "attempt_id",
+            "attempt_number",
+            "observation_sequence",
+            "evidence",
+            "evidence_hash",
+            "private_schema_version",
+            "private_proof_hash",
+            "failure_kind",
+            "previous_attempt_id",
+            "previous_observation_sequence",
+            "previous_private_proof_hash",
+            "retry_reserved_at",
+            "terminal_event_sequence",
+            "terminal_event_hash",
+            "exhausted_at",
+            "proof_hash",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise AdapterPurgeError(
+                "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: cleanup proof is invalid"
+            )
+        result = copy.deepcopy(dict(value))
+        payload = {
+            key: copy.deepcopy(result[key])
+            for key in required - {"proof_hash"}
+        }
+        evidence = result.get("evidence")
+        ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
+        if (
+            result.get("schema_version") != "1.0.0"
+            or any(
+                not isinstance(result.get(key), str)
+                or OPAQUE_ID.fullmatch(result[key]) is None
+                for key in (
+                    "purge_id",
+                    "intent_id",
+                    "task_id",
+                    "project_id",
+                    "principal_id",
+                    "approval_id",
+                )
+            )
+            or not isinstance(result.get("attempt_id"), str)
+            or MANAGED_ATTEMPT_ID.fullmatch(result["attempt_id"]) is None
+            or result.get("attempt_number") != 2
+            or type(result.get("observation_sequence")) is not int
+            or result["observation_sequence"] < 1
+            or not isinstance(evidence, Mapping)
+            or not isinstance(ticket, Mapping)
+            or evidence.get("attempt_id") != result["attempt_id"]
+            or evidence.get("attempt_number") != 2
+            or ticket.get("state") != "failed"
+            or ticket.get("worker_pid") is not None
+            or evidence.get("ready") is not None
+            or evidence.get("heartbeat") is not None
+            or not isinstance(result.get("evidence_hash"), str)
+            or PLAN_HASH.fullmatch(result["evidence_hash"]) is None
+            or _sha256_document(evidence) != result["evidence_hash"]
+            or result.get("private_schema_version") != "1.2.0"
+            or not isinstance(result.get("private_proof_hash"), str)
+            or PLAN_HASH.fullmatch(result["private_proof_hash"]) is None
+            or result.get("failure_kind") != "pre_running_launch_failure"
+            or not isinstance(result.get("previous_attempt_id"), str)
+            or MANAGED_ATTEMPT_ID.fullmatch(result["previous_attempt_id"]) is None
+            or type(result.get("previous_observation_sequence")) is not int
+            or result["previous_observation_sequence"] < 1
+            or not isinstance(result.get("previous_private_proof_hash"), str)
+            or PLAN_HASH.fullmatch(result["previous_private_proof_hash"]) is None
+            or type(result.get("terminal_event_sequence")) is not int
+            or result["terminal_event_sequence"] < 1
+            or not isinstance(result.get("terminal_event_hash"), str)
+            or PLAN_HASH.fullmatch(result["terminal_event_hash"]) is None
+            or not isinstance(result.get("proof_hash"), str)
+            or PLAN_HASH.fullmatch(result["proof_hash"]) is None
+            or _sha256_document(payload) != result["proof_hash"]
+        ):
+            raise AdapterPurgeError(
+                "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: cleanup proof changed"
+            )
+        failure_payload = {
+            "schema_version": "1.0.0",
+            "failure_kind": "pre_running_launch_failure",
+            "submission_id": evidence.get("submission_id"),
+            "attempt_id": evidence.get("attempt_id"),
+            "attempt_number": evidence.get("attempt_number"),
+            "job_id": evidence.get("job_id"),
+            "request_hash": evidence.get("request_hash"),
+            "binding_hash": evidence.get("binding_hash"),
+            "ticket_record_hash": ticket.get("record_hash"),
+        }
+        if _sha256_document(failure_payload) != result["private_proof_hash"]:
+            raise AdapterPurgeError(
+                "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: private proof changed"
+            )
+        _parse_timestamp(
+            result.get("retry_reserved_at"), code="ADAPTER_PURGE_INVALID"
+        )
+        _parse_timestamp(result.get("exhausted_at"), code="ADAPTER_PURGE_INVALID")
+        return result
 
     @staticmethod
     def _read_submission(path: Path) -> dict[str, Any]:
@@ -2269,8 +2662,14 @@ class DeepwaveAdapter:
             "record_hash",
         }
         schema_version = value.get("schema_version")
-        if schema_version == "1.1.0":
+        if schema_version in {"1.1.0", "1.2.0"}:
             required.add("launch_attempt")
+        if schema_version == "1.2.0":
+            required.add("attempt_history")
+            if "retry_authorization" in value:
+                required.add("retry_authorization")
+            if "launch_failure" in value:
+                required.add("launch_failure")
         launch_state = value.get("launch_state")
         if launch_state in {"purging", "purged"}:
             required.add("purge_id")
@@ -2279,7 +2678,7 @@ class DeepwaveAdapter:
                 "ADAPTER_SUBMISSION_INVALID: private record fields are inconsistent"
             )
         if (
-            schema_version not in {"1.0.0", "1.1.0"}
+            schema_version not in {"1.0.0", "1.1.0", "1.2.0"}
             or not is_supported_receipt_binding(
                 value["algorithm"],
                 value["adapter_version"],
@@ -2289,13 +2688,87 @@ class DeepwaveAdapter:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private record version is unsupported"
             )
-        if schema_version == "1.1.0":
+        if schema_version in {"1.1.0", "1.2.0"}:
             try:
-                binding_from_submission_record(value)
+                binding = binding_from_submission_record(value)
             except WorkerControlError as error:
                 raise AdapterHandleError(
                     "ADAPTER_SUBMISSION_INVALID: launch attempt binding is invalid"
                 ) from error
+            if schema_version == "1.1.0" and binding.attempt_number != 1:
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: legacy managed receipt has a retry"
+                )
+            if schema_version == "1.2.0":
+                history = value.get("attempt_history")
+                if not isinstance(history, list) or len(history) != binding.attempt_number - 1:
+                    raise AdapterHandleError(
+                        "ADAPTER_SUBMISSION_INVALID: retry history is not contiguous"
+                    )
+                if binding.attempt_number not in {1, 2}:
+                    raise AdapterHandleError(
+                        "ADAPTER_SUBMISSION_INVALID: retry budget was exceeded"
+                    )
+                if binding.attempt_number == 1:
+                    if "retry_authorization" in value or history:
+                        raise AdapterHandleError(
+                            "ADAPTER_SUBMISSION_INVALID: first attempt has retry state"
+                        )
+                else:
+                    authorization = DeepwaveAdapter._validate_retry_authorization_document(
+                        value.get("retry_authorization")
+                    )
+                    if len(history) != 1 or set(history[0]) != {
+                        "submission_id",
+                        "job_id",
+                        "request_hash",
+                        "created_at",
+                        "launch_attempt",
+                        "launch_failure",
+                        "retired_at",
+                    }:
+                        raise AdapterHandleError(
+                            "ADAPTER_SUBMISSION_INVALID: prior attempt history is invalid"
+                        )
+                    try:
+                        prior = binding_from_submission_record(history[0])
+                    except WorkerControlError as error:
+                        raise AdapterHandleError(
+                            "ADAPTER_SUBMISSION_INVALID: prior attempt binding is invalid"
+                        ) from error
+                    DeepwaveAdapter._validate_failure_document(
+                        history[0]["launch_failure"], prior
+                    )
+                    _parse_timestamp(
+                        history[0]["retired_at"], code="ADAPTER_RETRY_INVALID"
+                    )
+                    if (
+                        prior.submission_id != binding.submission_id
+                        or prior.request_hash != binding.request_hash
+                        or prior.attempt_number != 1
+                        or authorization["previous_attempt_id"] != prior.attempt_id
+                        or authorization["private_proof_hash"]
+                        != history[0]["launch_failure"]["proof_hash"]
+                        or history[0]["retired_at"] != authorization["authorized_at"]
+                    ):
+                        raise AdapterHandleError(
+                            "ADAPTER_SUBMISSION_INVALID: retry chain changed"
+                        )
+                if "launch_failure" in value:
+                    if launch_state not in {"failed", "purging", "purged"}:
+                        raise AdapterHandleError(
+                            "ADAPTER_SUBMISSION_INVALID: nonfailed attempt has failure proof"
+                        )
+                    if (
+                        launch_state in {"purging", "purged"}
+                        and binding.attempt_number != 2
+                    ):
+                        raise AdapterHandleError(
+                            "ADAPTER_SUBMISSION_INVALID: purge failure chain is invalid"
+                        )
+                    DeepwaveAdapter._validate_failure_document(
+                        value["launch_failure"], binding
+                    )
         if launch_state not in {
             "preparing",
             "launching",
@@ -2478,7 +2951,7 @@ class DeepwaveAdapter:
                     "ADAPTER_IDEMPOTENCY_CONFLICT: key is bound to another request"
                 )
             try:
-                expected_job_id = self._job_id(submission_id, record["created_at"])
+                expected_job_id = self._expected_job_id(record)
                 self._validate_fingerprint(record["fingerprint"], validated=validated)
             except AdapterError as error:
                 raise AdapterHandleError(
@@ -2488,7 +2961,7 @@ class DeepwaveAdapter:
                 raise AdapterHandleError(
                     "ADAPTER_SUBMISSION_INVALID: private job identity is invalid"
                 )
-            if record["schema_version"] != "1.1.0":
+            if record["schema_version"] not in {"1.1.0", "1.2.0"}:
                 raise AdapterUnavailable(
                     "WORKER_EVIDENCE_UNAVAILABLE: private receipt has no managed attempt"
                 )
@@ -2539,6 +3012,449 @@ class DeepwaveAdapter:
                 "handle": None if handle is None else handle.as_dict(),
             }
 
+    def probe_pre_running_retry(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterPreRunningRetryProof:
+        """Prove attempt 1 stopped before ready without mutating private state."""
+
+        return self._probe_pre_running_failure(
+            expected_attempt_number=1,
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+        )
+
+    def probe_pre_running_retry_exhaustion(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterPreRunningRetryProof:
+        """Prove exact attempt 2 also stopped before ready, without mutation."""
+
+        return self._probe_pre_running_failure(
+            expected_attempt_number=2,
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+        )
+
+    def _probe_pre_running_failure(
+        self,
+        *,
+        expected_attempt_number: int,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterPreRunningRetryProof:
+        """Read one current exact private failure under its idle fence."""
+
+        if expected_attempt_number not in {1, 2}:
+            raise AdapterUnavailable(
+                "WORKER_RETRY_UNSUPPORTED: attempt is outside the finite budget"
+            )
+
+        (
+            validated,
+            submission_id,
+            request_payload,
+            request_hash,
+            index_path,
+            lock_path,
+        ) = self._retry_request_material(
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+        )
+        with self._lock_submission(lock_path, create=False, timeout_seconds=5.0):
+            if not index_path.exists() and not index_path.is_symlink():
+                raise AdapterUnavailable(
+                    "ADAPTER_SUBMISSION_NOT_FOUND: no private submission record exists"
+                )
+            record = self._read_submission(index_path)
+            if (
+                record["schema_version"] != "1.2.0"
+                or record["adapter_version"] != ADAPTER_VERSION
+                or record["algorithm"] != validated.algorithm
+                or record["submission_id"] != submission_id
+                or record["request_hash"] != request_hash
+                or self._record_request_payload(record) != request_payload
+                or record["launch_state"] != "failed"
+                or (
+                    expected_attempt_number == 1
+                    and (
+                        record.get("attempt_history") != []
+                        or "retry_authorization" in record
+                    )
+                )
+                or (
+                    expected_attempt_number == 2
+                    and (
+                        not isinstance(record.get("attempt_history"), list)
+                        or len(record["attempt_history"]) != 1
+                        or "retry_authorization" not in record
+                    )
+                )
+            ):
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSUPPORTED: no exact stopped attempt exists"
+                )
+            binding = binding_from_submission_record(record)
+            if (
+                binding.attempt_number != expected_attempt_number
+                or record["job_id"] != self._expected_job_id(record)
+            ):
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: failed attempt identity changed"
+                )
+            self._validate_fingerprint(record["fingerprint"], validated=validated)
+            try:
+                with hold_idle_execution_fence(self._run_root, binding):
+                    evidence = read_pre_running_attempt_evidence(
+                        self._run_root,
+                        self._run_root / record["job_id"],
+                        binding,
+                    )
+                    if (
+                        evidence is None
+                        or evidence.ticket_state != "failed"
+                        or evidence.ticket_worker_pid is not None
+                    ):
+                        raise WorkerControlError(
+                            "WORKER_RETRY_UNSAFE: attempt is not exactly pre-running"
+                        )
+                    expected_failure = self._failure_proof(record, evidence)
+                    self._validate_failure_document(
+                        record.get("launch_failure"), binding
+                    )
+                    if record["launch_failure"] != expected_failure:
+                        raise AdapterHandleError(
+                            "ADAPTER_SUBMISSION_INVALID: stopped proof differs "
+                            "from Worker evidence"
+                        )
+                    return AdapterPreRunningRetryProof(
+                        failure_kind="pre_running_launch_failure",
+                        previous_attempt_id=binding.attempt_id,
+                        previous_attempt_number=expected_attempt_number,
+                        private_schema_version="1.2.0",
+                        private_proof_hash=expected_failure["proof_hash"],
+                        evidence=evidence.as_dict(),
+                    )
+            except WorkerControlError as error:
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSAFE: exact pre-running proof is unavailable"
+                ) from error
+
+    def retry_pre_running(
+        self,
+        *,
+        authorization: Mapping[str, Any],
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterHandle:
+        """Append and launch deterministic attempt 2 after SQLite authorization."""
+
+        token = self._validate_retry_authorization_document(authorization)
+        (
+            validated,
+            submission_id,
+            request_payload,
+            request_hash,
+            index_path,
+            lock_path,
+        ) = self._retry_request_material(
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+        )
+        with self._lock_submission(lock_path, create=False, timeout_seconds=5.0):
+            record = self._read_submission(index_path)
+            if (
+                record["schema_version"] != "1.2.0"
+                or record["adapter_version"] != ADAPTER_VERSION
+                or record["algorithm"] != validated.algorithm
+                or record["submission_id"] != submission_id
+                or record["request_hash"] != request_hash
+                or self._record_request_payload(record) != request_payload
+            ):
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSUPPORTED: private submission is not retryable"
+                )
+            current = binding_from_submission_record(record)
+            if current.attempt_number == 2:
+                stored = self._validate_retry_authorization_document(
+                    record.get("retry_authorization")
+                )
+                if stored != token:
+                    raise AdapterIdempotencyConflict(
+                        "ADAPTER_RETRY_CONFLICT: retry authorization changed"
+                    )
+                if record["launch_state"] == "launched":
+                    return self._handle_from_record(record)
+                if record["launch_state"] in {"preparing", "launching"}:
+                    live = self.validate(
+                        project_id=project_id,
+                        principal_id=principal_id,
+                        algorithm=algorithm,
+                        dataset=dataset,
+                        task_type=task_type,
+                        parameters=parameters,
+                        resources=resources,
+                    )
+                    return self._resume_staged_submission(
+                        index_path=index_path, record=record, validated=live
+                    )
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_EXHAUSTED: second attempt is terminal"
+                )
+            if (
+                current.attempt_number != 1
+                or record["launch_state"] != "failed"
+                or record.get("attempt_history") != []
+                or token["previous_attempt_id"] != current.attempt_id
+                or token["private_proof_hash"]
+                != record.get("launch_failure", {}).get("proof_hash")
+            ):
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSAFE: authorization does not bind attempt 1"
+                )
+            old_job_dir = self._run_root / record["job_id"]
+            evidence = read_worker_attempt_evidence(
+                self._run_root, old_job_dir, current
+            )
+            if (
+                evidence is None
+                or evidence.ticket_state != "failed"
+                or evidence.ticket_worker_pid is not None
+                or evidence.ready
+                or evidence.heartbeat_record_hash is not None
+                or self._failure_proof(record, evidence) != record.get("launch_failure")
+            ):
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSAFE: stopped proof no longer matches"
+                )
+            live = self.validate(
+                project_id=project_id,
+                principal_id=principal_id,
+                algorithm=algorithm,
+                dataset=dataset,
+                task_type=task_type,
+                parameters=parameters,
+                resources=resources,
+            )
+            if live.normalized_config_hash != validated.normalized_config_hash:
+                raise AdapterUnavailable(
+                    "ADAPTER_VALIDATION_DRIFT: live validation changed retry identity"
+                )
+            created_at = token["authorized_at"]
+            job_id = self._retry_job_id(
+                submission_id, created_at, token["private_proof_hash"]
+            )
+            attempt_material = _stable_json_bytes(
+                {
+                    "submission_id": submission_id,
+                    "attempt_number": 2,
+                    "private_proof_hash": token["private_proof_hash"],
+                }
+            )
+            retry_binding = LaunchAttemptBinding(
+                submission_id=submission_id,
+                attempt_id="attempt-" + hashlib.sha256(attempt_material).hexdigest()[:32],
+                attempt_number=2,
+                job_id=job_id,
+                request_hash=request_hash,
+                created_at=created_at,
+            )
+            expected_ticket_payload = {
+                **retry_binding.payload(),
+                "binding_hash": retry_binding.binding_hash,
+                "state": "staged",
+                "capacity_slot": None,
+                "capacity_generation": None,
+                "worker_pid": None,
+                "updated_at": created_at,
+            }
+            expected_ticket = {
+                **expected_ticket_payload,
+                "record_hash": _sha256_document(expected_ticket_payload),
+            }
+            expected_config = {"job_id": job_id, **live.worker_config}
+            expected_status = {
+                "job_id": job_id,
+                "status": "queued",
+                "stage": "queued",
+                "iteration": 0,
+                "total_iterations": live.parameters["iterations"],
+                "message": "FWI Adapter job queued",
+                "updated_at": created_at,
+            }
+            retry_job_dir = self._run_root / job_id
+            try:
+                with hold_idle_execution_fence(self._run_root, current):
+                    fenced_evidence = read_pre_running_attempt_evidence(
+                        self._run_root, old_job_dir, current
+                    )
+                    if (
+                        fenced_evidence is None
+                        or fenced_evidence.ticket_state != "failed"
+                        or fenced_evidence.ticket_worker_pid is not None
+                        or self._failure_proof(record, fenced_evidence)
+                        != record.get("launch_failure")
+                    ):
+                        raise WorkerControlError(
+                            "WORKER_RETRY_UNSAFE: stopped proof no longer matches"
+                        )
+                    try:
+                        retry_job_dir = _create_private_directory(retry_job_dir)
+                    except FileExistsError:
+                        retry_job_dir = _require_private_directory(
+                            retry_job_dir, parent=self._run_root
+                        )
+                        descriptor = _open_directory_fd(retry_job_dir)
+                        try:
+                            unexpected = set(os.listdir(descriptor)) - {
+                                ".worker-launch.json",
+                                "config.original.json",
+                                "status.json",
+                            }
+                        finally:
+                            os.close(descriptor)
+                        if unexpected:
+                            raise AdapterHandleError(
+                                "ADAPTER_SUBMISSION_INVALID: retry directory is not staged"
+                            )
+                        for name, expected, private in (
+                            (".worker-launch.json", expected_ticket, True),
+                            ("config.original.json", expected_config, False),
+                            ("status.json", expected_status, False),
+                        ):
+                            path = retry_job_dir / name
+                            if path.exists() or path.is_symlink():
+                                try:
+                                    existing = _read_json_file(
+                                        path,
+                                        code="ADAPTER_SUBMISSION_INVALID",
+                                        private=private,
+                                    )
+                                except AdapterStatusError as error:
+                                    raise AdapterHandleError(str(error)) from error
+                                if existing != expected:
+                                    raise AdapterHandleError(
+                                        "ADAPTER_SUBMISSION_INVALID: retry staging changed"
+                                    )
+                    stage_launch_attempt(
+                        self._run_root, retry_job_dir, retry_binding
+                    )
+                    _atomic_write_json(
+                        retry_job_dir / "config.original.json",
+                        expected_config,
+                    )
+                    _atomic_write_json(
+                        retry_job_dir / "status.json",
+                        expected_status,
+                    )
+                    record["attempt_history"] = [
+                        {
+                            "submission_id": record["submission_id"],
+                            "job_id": record["job_id"],
+                            "request_hash": record["request_hash"],
+                            "created_at": record["created_at"],
+                            "launch_attempt": copy.deepcopy(record["launch_attempt"]),
+                            "launch_failure": copy.deepcopy(record["launch_failure"]),
+                            "retired_at": created_at,
+                        }
+                    ]
+                    record["retry_authorization"] = copy.deepcopy(token)
+                    record.pop("launch_failure", None)
+                    record.update(
+                        {
+                            "job_id": job_id,
+                            "created_at": created_at,
+                            "launch_attempt": retry_binding.record(),
+                            "launch_state": "preparing",
+                        }
+                    )
+                    self._write_submission(index_path, record)
+            except WorkerControlError as error:
+                raise AdapterUnavailable(error.code) from error
+            return self._launch_prepared_submission(
+                index_path=index_path,
+                record=record,
+                validated=live,
+                job_dir=retry_job_dir,
+                launch_binding=retry_binding,
+            )
+
     def probe_existing_dispatch_receipt(
         self, **request: Any
     ) -> AdapterExistingDispatchReceiptProof:
@@ -2578,7 +3494,11 @@ class DeepwaveAdapter:
                 return AdapterExistingDispatchReceiptProof(
                     evidence_kind="managed_worker_receipt",
                     handle=handle,
-                    private_schema_version="1.1.0",
+                    private_schema_version=(
+                        "1.2.0"
+                        if evidence.get("attempt_number") == 2
+                        else "1.1.0"
+                    ),
                     receipt_record_hash=None,
                     worker_evidence=copy.deepcopy(dict(evidence)),
                 )
@@ -2676,9 +3596,7 @@ class DeepwaveAdapter:
                     "ADAPTER_IDEMPOTENCY_CONFLICT: key is bound to another request"
                 )
             try:
-                expected_job_id = self._job_id(
-                    submission_id, record["created_at"]
-                )
+                expected_job_id = self._expected_job_id(record)
                 self._validate_fingerprint(
                     record["fingerprint"], validated=validated
                 )
@@ -2699,7 +3617,10 @@ class DeepwaveAdapter:
                     "ADAPTER_SUBMISSION_PREPARING: Worker launch was not reached"
                 )
             if launch_state == "launching":
-                if allow_managed_promotion and record["schema_version"] == "1.1.0":
+                if allow_managed_promotion and record["schema_version"] in {
+                    "1.1.0",
+                    "1.2.0",
+                }:
                     try:
                         binding = binding_from_submission_record(record)
                         started = worker_attempt_started(
@@ -2804,6 +3725,90 @@ class DeepwaveAdapter:
             )
         return value
 
+    def _record_pre_ready_launch_failure(
+        self,
+        *,
+        index_path: Path,
+        record: dict[str, Any],
+        validated: AdapterValidation,
+        job_dir: Path,
+        launch_binding: LaunchAttemptBinding,
+        stopped_by_production_launcher: bool,
+    ) -> bool:
+        """Persist failure; add retry proof only after exact stopped/idle evidence."""
+
+        failure: dict[str, Any] | None = None
+        try:
+            if stopped_by_production_launcher:
+                with hold_idle_execution_fence(self._run_root, launch_binding):
+                    prior = read_pre_running_attempt_evidence(
+                        self._run_root, job_dir, launch_binding
+                    )
+                    if prior is None:
+                        raise WorkerControlError(
+                            "WORKER_RETRY_UNSAFE: launch ticket is unavailable"
+                        )
+                    mark_launch_failed(job_dir, launch_binding)
+                    evidence = read_pre_running_attempt_evidence(
+                        self._run_root, job_dir, launch_binding
+                    )
+                    if (
+                        evidence is None
+                        or evidence.ticket_state != "failed"
+                        or evidence.ticket_worker_pid is not None
+                        or evidence.ready
+                        or evidence.heartbeat_record_hash is not None
+                    ):
+                        raise WorkerControlError(
+                            "WORKER_RETRY_UNSAFE: failed attempt is not pre-running"
+                        )
+                    failure = self._failure_proof(record, evidence)
+            else:
+                prior = read_pre_running_attempt_evidence(
+                    self._run_root, job_dir, launch_binding
+                )
+                if prior is None:
+                    raise WorkerControlError(
+                        "WORKER_RETRY_UNSAFE: launch ticket is unavailable"
+                    )
+                mark_launch_failed(job_dir, launch_binding)
+                evidence = read_pre_running_attempt_evidence(
+                    self._run_root, job_dir, launch_binding
+                )
+                if (
+                    evidence is None
+                    or evidence.ticket_state != "failed"
+                    or evidence.ticket_worker_pid is not None
+                    or evidence.ready
+                    or evidence.heartbeat_record_hash is not None
+                ):
+                    raise WorkerControlError(
+                        "WORKER_RETRY_UNSAFE: failed attempt is not pre-running"
+                    )
+        except (FileNotFoundError, OSError, WorkerControlError):
+            return False
+        record["launch_state"] = "failed"
+        record.pop("launch_failure", None)
+        if failure is not None:
+            if record["schema_version"] == "1.1.0":
+                record["schema_version"] = "1.2.0"
+                record["attempt_history"] = []
+            record["launch_failure"] = failure
+        self._write_submission(index_path, record)
+        _atomic_write_json(
+            job_dir / "status.json",
+            {
+                "job_id": record["job_id"],
+                "status": "failed",
+                "stage": "submit",
+                "iteration": 0,
+                "total_iterations": validated.parameters["iterations"],
+                "message": "FWI worker could not be started",
+                "updated_at": self._clock(),
+            },
+        )
+        return True
+
     def _launch_prepared_submission(
         self,
         *,
@@ -2829,35 +3834,45 @@ class DeepwaveAdapter:
             # Popen may have succeeded and the child retains both kernel
             # fences.  Keep ``launching`` so exact observation can adopt it.
             raise AdapterUnavailable(str(error)) from error
-        except Exception as error:
-            if (
-                isinstance(error, AdapterUnavailable)
-                and error.code == "ADAPTER_CONCURRENCY_LIMIT"
-            ):
+        except _AdapterLaunchStopped as error:
+            recorded = self._record_pre_ready_launch_failure(
+                index_path=index_path,
+                record=record,
+                validated=validated,
+                job_dir=job_dir,
+                launch_binding=launch_binding,
+                stopped_by_production_launcher=True,
+            )
+            if not recorded:
+                raise AdapterUnavailable(
+                    "SUBMISSION_RECONCILIATION_REQUIRED: stopped launch proof is unavailable"
+                ) from error
+            raise AdapterUnavailable("WORKER_LAUNCH_FAILED: stopped before ready") from error
+        except AdapterUnavailable as error:
+            if error.code == "ADAPTER_CONCURRENCY_LIMIT":
                 # The exact staged attempt remains the queue entry.  A later
                 # active Supervisor term may retry this same pre-Popen attempt.
                 record["launch_state"] = "preparing"
                 self._write_submission(index_path, record)
                 raise
-            try:
-                mark_launch_failed(job_dir, launch_binding)
-            except WorkerControlError:
-                # The private submission record remains fail-closed authority.
-                pass
-            record["launch_state"] = "failed"
-            self._write_submission(index_path, record)
-            _atomic_write_json(
-                job_dir / "status.json",
-                {
-                    "job_id": record["job_id"],
-                    "status": "failed",
-                    "stage": "submit",
-                    "iteration": 0,
-                    "total_iterations": validated.parameters["iterations"],
-                    "message": "FWI worker could not be started",
-                    "updated_at": self._clock(),
-                },
+            raise
+        except Exception as error:
+            if isinstance(self._launcher, SafeSubprocessWorkerLauncher):
+                raise AdapterUnavailable(
+                    "SUBMISSION_RECONCILIATION_REQUIRED: production launch state is uncertain"
+                ) from error
+            recorded = self._record_pre_ready_launch_failure(
+                index_path=index_path,
+                record=record,
+                validated=validated,
+                job_dir=job_dir,
+                launch_binding=launch_binding,
+                stopped_by_production_launcher=False,
             )
+            if not recorded:
+                raise AdapterUnavailable(
+                    "SUBMISSION_RECONCILIATION_REQUIRED: launch failure state is uncertain"
+                ) from error
             raise AdapterUnavailable(
                 f"WORKER_LAUNCH_FAILED: {type(error).__name__}"
             ) from error
@@ -2875,7 +3890,7 @@ class DeepwaveAdapter:
         """Resume only a complete, exact, pre-Popen managed attempt."""
 
         if (
-            record["schema_version"] != "1.1.0"
+            record["schema_version"] not in {"1.1.0", "1.2.0"}
             or record["adapter_version"] != ADAPTER_VERSION
             or record["algorithm"] != validated.algorithm
             or record["launch_state"] not in {"preparing", "launching"}
@@ -2883,7 +3898,7 @@ class DeepwaveAdapter:
             raise AdapterUnavailable(
                 "SUBMISSION_RECONCILIATION_REQUIRED: incomplete submission is not resumable"
             )
-        expected_job_id = self._job_id(record["submission_id"], record["created_at"])
+        expected_job_id = self._expected_job_id(record)
         if record["job_id"] != expected_job_id:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private job identity is invalid"
@@ -3033,6 +4048,14 @@ class DeepwaveAdapter:
                         "WORKER_LAUNCH_FAILED: prior launch failed and P1 does not retry"
                     )
                 if state in {"preparing", "launching"}:
+                    if (
+                        record["schema_version"] == "1.2.0"
+                        and binding_from_submission_record(record).attempt_number == 2
+                    ):
+                        raise AdapterUnavailable(
+                            "WORKER_RETRY_AUTHORIZATION_REQUIRED: attempt 2 must "
+                            "resume through its durable retry authorization"
+                        )
                     return self._resume_staged_submission(
                         index_path=index_path,
                         record=record,
@@ -3306,10 +4329,7 @@ class DeepwaveAdapter:
             )
         pending_cancel = False
         if worker_status == "cancelled":
-            if (
-                record.get("adapter_version") != ADAPTER_VERSION
-                or record.get("schema_version") != "1.1.0"
-            ):
+            if not _is_supported_managed_record(record):
                 raise AdapterStatusError(
                     "ADAPTER_STATUS_INVALID: cancellation proof is unavailable"
                 )
@@ -3364,10 +4384,7 @@ class DeepwaveAdapter:
                     ) from error
         pending_timeout = False
         if worker_status == "failed" and failure_code == "WALL_TIME_EXCEEDED":
-            if (
-                record.get("adapter_version") != ADAPTER_VERSION
-                or record.get("schema_version") != "1.1.0"
-            ):
+            if not _is_supported_managed_record(record):
                 raise AdapterStatusError(
                     "ADAPTER_STATUS_INVALID: timeout proof is unavailable"
                 )
@@ -3512,6 +4529,234 @@ class DeepwaveAdapter:
             if root_fd >= 0:
                 os.close(root_fd)
 
+    def purge_retry_exhausted(
+        self,
+        *,
+        exhaustion: Mapping[str, Any],
+        purge_id: str,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterPurgeResult:
+        """Delete an exact two-attempt stopped chain with no launched handle."""
+
+        if not isinstance(purge_id, str) or OPAQUE_ID.fullmatch(purge_id) is None:
+            raise AdapterPurgeError(
+                "PURGE_ID_INVALID: purge_id must be a v1 opaque identifier"
+            )
+        proof = self._validate_retry_exhaustion_cleanup_document(exhaustion)
+        if (
+            proof["purge_id"] != purge_id
+            or proof["task_id"] != task_id
+            or proof["project_id"] != project_id
+            or proof["principal_id"] != principal_id
+        ):
+            raise AdapterPurgeError(
+                "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: cleanup scope changed"
+            )
+        (
+            validated,
+            submission_id,
+            request_payload,
+            request_hash,
+            index_path,
+            lock_path,
+        ) = self._retry_request_material(
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+        )
+        proof_evidence = proof["evidence"]
+        if (
+            proof_evidence.get("submission_id") != submission_id
+            or proof_evidence.get("request_hash") != request_hash
+        ):
+            raise AdapterPurgeError(
+                "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: cleanup request changed"
+            )
+
+        with self._lock_submission(
+            lock_path, create=False, timeout_seconds=5.0
+        ):
+            if not index_path.exists() and not index_path.is_symlink():
+                raise AdapterPurgeError(
+                    "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: private submission is missing"
+                )
+            record = self._read_submission(index_path)
+            if (
+                record["schema_version"] != "1.2.0"
+                or record["adapter_version"] != ADAPTER_VERSION
+                or record["algorithm"] != validated.algorithm
+                or record["submission_id"] != submission_id
+                or record["task_id"] != task_id
+                or record["project_id"] != project_id
+                or record["principal_id"] != principal_id
+                or record["request_hash"] != request_hash
+                or self._record_request_payload(record) != request_payload
+                or record["launch_state"] not in {"failed", "purging", "purged"}
+            ):
+                raise AdapterPurgeError(
+                    "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: private submission changed"
+                )
+            self._validate_fingerprint(record["fingerprint"], validated=validated)
+            current = binding_from_submission_record(record)
+            history = record.get("attempt_history")
+            authorization = self._validate_retry_authorization_document(
+                record.get("retry_authorization")
+            )
+            if not isinstance(history, list) or len(history) != 1:
+                raise AdapterPurgeError(
+                    "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: retry history changed"
+                )
+            prior_record = history[0]
+            try:
+                prior = binding_from_submission_record(prior_record)
+            except WorkerControlError as error:
+                raise AdapterPurgeError(
+                    "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: prior attempt changed"
+                ) from error
+            if (
+                current.attempt_number != 2
+                or current.attempt_id != proof["attempt_id"]
+                or current.submission_id != submission_id
+                or current.request_hash != request_hash
+                or record["job_id"] != self._expected_job_id(record)
+                or prior.attempt_number != 1
+                or prior.attempt_id != proof["previous_attempt_id"]
+                or prior.submission_id != submission_id
+                or prior.request_hash != request_hash
+                or prior.job_id == current.job_id
+                or authorization["intent_id"] != proof["intent_id"]
+                or authorization["previous_attempt_id"] != prior.attempt_id
+                or authorization["previous_observation_sequence"]
+                != proof["previous_observation_sequence"]
+                or authorization["private_proof_hash"]
+                != proof["previous_private_proof_hash"]
+                or authorization["authorized_at"] != proof["retry_reserved_at"]
+                or prior_record["launch_failure"]["proof_hash"]
+                != proof["previous_private_proof_hash"]
+                or record.get("launch_failure", {}).get("proof_hash")
+                != proof["private_proof_hash"]
+            ):
+                raise AdapterPurgeError(
+                    "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: retry lineage changed"
+                )
+            self._validate_failure_document(
+                prior_record.get("launch_failure"), prior
+            )
+            self._validate_failure_document(record.get("launch_failure"), current)
+
+            launch_state = record["launch_state"]
+            replayed = launch_state != "failed"
+            if launch_state in {"purging", "purged"}:
+                if record.get("purge_id") != purge_id:
+                    raise AdapterIdempotencyConflict(
+                        "PURGE_IDEMPOTENCY_CONFLICT: retry exhaustion is bound to another purge"
+                    )
+                if launch_state == "purged":
+                    return AdapterPurgeResult(
+                        task_id=task_id,
+                        purge_id=purge_id,
+                        local_run_state="deleted",
+                        replayed=True,
+                    )
+
+            def read_exact_failure(
+                attempt_record: Mapping[str, Any],
+                binding: LaunchAttemptBinding,
+            ) -> WorkerAttemptEvidence:
+                job_dir = self._run_root / binding.job_id
+                if not job_dir.exists() and not job_dir.is_symlink():
+                    raise AdapterPurgeError(
+                        "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: stopped attempt is missing"
+                    )
+                try:
+                    evidence = read_pre_running_attempt_evidence(
+                        self._run_root, job_dir, binding
+                    )
+                except (FileNotFoundError, WorkerControlError) as error:
+                    raise AdapterPurgeError(
+                        "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: stopped attempt proof is unavailable"
+                    ) from error
+                expected_failure = attempt_record.get("launch_failure")
+                if (
+                    evidence is None
+                    or evidence.ticket_state != "failed"
+                    or evidence.ticket_worker_pid is not None
+                    or evidence.ready
+                    or evidence.heartbeat_record_hash is not None
+                    or self._failure_proof(attempt_record, evidence)
+                    != expected_failure
+                ):
+                    raise AdapterPurgeError(
+                        "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: stopped attempt proof changed"
+                    )
+                return evidence
+
+            try:
+                # Both attempts share one stable submission execution lock.
+                # The first transition checks both complete proofs before its
+                # tombstone or any delete.  Once that same-purge tombstone is
+                # durable, replay trusts the already-validated immutable
+                # record/token and may finish partially deleted directories.
+                with hold_idle_execution_fence(self._run_root, current):
+                    if launch_state == "failed":
+                        prior_evidence = read_exact_failure(prior_record, prior)
+                        current_evidence = read_exact_failure(record, current)
+                        if (
+                            current_evidence.as_dict() != proof_evidence
+                            or _sha256_document(current_evidence.as_dict())
+                            != proof["evidence_hash"]
+                        ):
+                            raise AdapterPurgeError(
+                                "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: SQLite evidence differs from private state"
+                            )
+                        if self._failure_proof(prior_record, prior_evidence)[
+                            "proof_hash"
+                        ] != proof["previous_private_proof_hash"]:
+                            raise AdapterPurgeError(
+                                "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: prior private proof changed"
+                            )
+                        record["launch_state"] = "purging"
+                        record["purge_id"] = purge_id
+                        self._write_submission(index_path, record)
+
+                    for binding in (prior, current):
+                        self._purge_job_directory({"job_id": binding.job_id})
+                        purge_worker_cancel_control(self._run_root, binding)
+                    record["launch_state"] = "purged"
+                    self._write_submission(index_path, record)
+            except WorkerControlError as error:
+                if error.code == "WORKER_ATTEMPT_BUSY":
+                    raise AdapterPurgeError(
+                        "PURGE_WORKER_STILL_ACTIVE: fenced Worker has not released its execution lease"
+                    ) from error
+                raise AdapterPurgeError(
+                    "PURGE_WORKER_FENCE_INVALID: execution fence or control cleanup is unavailable"
+                ) from error
+            return AdapterPurgeResult(
+                task_id=task_id,
+                purge_id=purge_id,
+                local_run_state="deleted",
+                replayed=replayed,
+            )
+
     def purge(
         self, handle: AdapterHandle, *, purge_id: str
     ) -> AdapterPurgeResult:
@@ -3535,6 +4780,10 @@ class DeepwaveAdapter:
             record = self._record_for_handle(
                 handle, allowed_launch_states=purge_states
             )
+            if "launch_failure" in record:
+                raise AdapterPurgeError(
+                    "PURGE_RECEIPT_INVALID: retry exhaustion requires Store proof"
+                )
             launch_state = record["launch_state"]
             replayed = launch_state != "launched"
             if launch_state in {"purging", "purged"}:
@@ -3551,13 +4800,23 @@ class DeepwaveAdapter:
                     )
             try:
                 fence = contextlib.nullcontext()
-                if record["schema_version"] == "1.1.0":
+                managed_bindings: list[LaunchAttemptBinding] = []
+                if record["schema_version"] in {"1.1.0", "1.2.0"}:
                     binding = binding_from_submission_record(record)
+                    managed_bindings = [
+                        *(
+                            binding_from_submission_record(item)
+                            for item in record.get("attempt_history", [])
+                        ),
+                        binding,
+                    ]
                     fence = hold_idle_execution_fence(self._run_root, binding)
                 with fence:
                     if launch_state == "launched":
                         observed = self._status_for_record(
-                            record, cancellation_fence_held=True
+                            record,
+                            cancellation_fence_held=True,
+                            timeout_fence_held=True,
                         )
                         if not observed.terminal or observed.status not in {
                             "Succeeded",
@@ -3574,18 +4833,17 @@ class DeepwaveAdapter:
                     # A missing directory is accepted only after the durable
                     # purging tombstone exists.  Holding the stable execution
                     # fence prevents a terminal heartbeat from racing delete.
-                    self._purge_job_directory(record)
-                    if record["schema_version"] == "1.1.0":
-                        try:
+                    if managed_bindings:
+                        for managed_binding in managed_bindings:
+                            self._purge_job_directory(
+                                {"job_id": managed_binding.job_id}
+                            )
                             purge_worker_cancel_control(
                                 self._run_root,
-                                binding_from_submission_record(record),
+                                managed_binding,
                             )
-                        except WorkerControlError as error:
-                            raise AdapterPurgeError(
-                                "PURGE_WORKER_CANCEL_CONTROL_INVALID: "
-                                "cancellation control cleanup failed"
-                            ) from error
+                    else:
+                        self._purge_job_directory(record)
                     record["launch_state"] = "purged"
                     self._write_submission(index_path, record)
             except WorkerControlError as error:
@@ -3594,7 +4852,7 @@ class DeepwaveAdapter:
                         "PURGE_WORKER_STILL_ACTIVE: fenced Worker has not released its execution lease"
                     ) from error
                 raise AdapterPurgeError(
-                    "PURGE_WORKER_FENCE_INVALID: execution fence is unavailable"
+                    "PURGE_WORKER_FENCE_INVALID: execution fence or control cleanup is unavailable"
                 ) from error
             return AdapterPurgeResult(
                 task_id=handle.task_id,
@@ -3617,21 +4875,14 @@ class DeepwaveAdapter:
                 ["attempt_id is not an exact managed attempt identifier"],
             )
         initial = self._record_for_handle(handle)
-        if (
-            handle.adapter_version != ADAPTER_VERSION
-            or initial["adapter_version"] != ADAPTER_VERSION
-            or initial["schema_version"] != "1.1.0"
-        ):
+        if not _is_supported_managed_control_record(handle, initial):
             return None
         _, locks = self._control_paths()
         index_name = handle.submission_id.removeprefix("submission-") + ".json"
         lock_path = locks / (index_name + ".lock")
         with self._lock_submission(lock_path, timeout_seconds=5.0):
             record = self._record_for_handle(handle)
-            if (
-                record["adapter_version"] != ADAPTER_VERSION
-                or record["schema_version"] != "1.1.0"
-            ):
+            if not _is_supported_managed_control_record(handle, record):
                 return None
             try:
                 binding = binding_from_submission_record(record)
@@ -3690,7 +4941,7 @@ class DeepwaveAdapter:
                     "user_requested",
                     "wall_time_exceeded",
                 ],
-                "private_schema_version": "1.1.0",
+                "private_schema_version": record["schema_version"],
             }
             return {**payload, "proof_hash": _sha256_document(payload)}
 
@@ -3714,21 +4965,14 @@ class DeepwaveAdapter:
                 ["attempt_id is not an exact managed attempt identifier"],
             )
         initial = self._record_for_handle(handle)
-        if (
-            handle.adapter_version != ADAPTER_VERSION
-            or initial["adapter_version"] != ADAPTER_VERSION
-            or initial["schema_version"] != "1.1.0"
-        ):
+        if not _is_supported_managed_control_record(handle, initial):
             return False
         _, locks = self._control_paths()
         index_name = handle.submission_id.removeprefix("submission-") + ".json"
         lock_path = locks / (index_name + ".lock")
         with self._lock_submission(lock_path, timeout_seconds=5.0):
             record = self._record_for_handle(handle)
-            if (
-                record["adapter_version"] != ADAPTER_VERSION
-                or record["schema_version"] != "1.1.0"
-            ):
+            if not _is_supported_managed_control_record(handle, record):
                 return False
             try:
                 binding = binding_from_submission_record(record)
@@ -3806,11 +5050,7 @@ class DeepwaveAdapter:
                 ["cancel_id, attempt_id, or cancellation reason is invalid"],
             )
         initial = self._record_for_handle(handle)
-        if (
-            handle.adapter_version != ADAPTER_VERSION
-            or initial["adapter_version"] != ADAPTER_VERSION
-            or initial["schema_version"] != "1.1.0"
-        ):
+        if not _is_supported_managed_control_record(handle, initial):
             return _managed_cancel_proof(
                 task_id=handle.task_id,
                 cancel_id=cancel_id,
@@ -3830,7 +5070,7 @@ class DeepwaveAdapter:
         lock_path = locks / (index_name + ".lock")
         with self._lock_submission(lock_path, timeout_seconds=5.0):
             record = self._record_for_handle(handle)
-            if record["schema_version"] != "1.1.0":
+            if record["schema_version"] not in {"1.1.0", "1.2.0"}:
                 return _managed_cancel_proof(
                     task_id=handle.task_id,
                     cancel_id=cancel_id,
@@ -4195,11 +5435,7 @@ class DeepwaveAdapter:
             )
 
         initial = self._record_for_handle(handle)
-        if (
-            handle.adapter_version != ADAPTER_VERSION
-            or initial["adapter_version"] != ADAPTER_VERSION
-            or initial["schema_version"] != "1.1.0"
-        ):
+        if not _is_supported_managed_control_record(handle, initial):
             return _managed_timeout_proof(
                 task_id=handle.task_id,
                 timeout_id=timeout_id,
@@ -4222,7 +5458,7 @@ class DeepwaveAdapter:
         lock_path = locks / (index_name + ".lock")
         with self._lock_submission(lock_path, timeout_seconds=5.0):
             record = self._record_for_handle(handle)
-            if record["schema_version"] != "1.1.0":
+            if record["schema_version"] not in {"1.1.0", "1.2.0"}:
                 return _managed_timeout_proof(
                     task_id=handle.task_id,
                     timeout_id=timeout_id,
@@ -5180,10 +6416,10 @@ class DeepwaveAdapter:
         # Algorithm/Adapter 1.0--1.3 promised only the two primary numerical
         # outputs.  Their immutable receipts remain readable as that exact
         # pair even though the legacy Worker happened to write PNG files too.
-        if record["algorithm"]["version"] != ALGORITHM_VERSION:
+        if record["algorithm"]["version"] not in {"1.4.0", "1.5.0"}:
             return artifacts
 
-        # Algorithm 1.4 promotes the six fixed Worker plots to declared,
+        # Algorithm 1.4/1.5 promote the six fixed Worker plots to declared,
         # hash-bound standard outputs.  Never consume legacy_manifest.figure
         # path/url fields: all paths, identities, titles, dimensions, and
         # ordering come from the Adapter's immutable allowlist above.

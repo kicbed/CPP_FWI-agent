@@ -66,8 +66,8 @@ def legacy_guided_form(**changes):
 
 def development_fingerprint() -> dict:
     value = fingerprint()
-    value["algorithm"]["version"] = "1.4.0"
-    value["adapter_version"] = "1.4.0"
+    value["algorithm"]["version"] = "1.5.0"
+    value["adapter_version"] = "1.5.0"
     value["provenance_mode"] = "development"
     value["source"] = {"identity_complete": False, "dirty": None}
     return value
@@ -90,7 +90,7 @@ class FakeDispatcher:
         ]
         return DispatchPreparation(
             adapter_id="fwi.deepwave_adapter",
-            adapter_version="1.4.0",
+            adapter_version="1.5.0",
             request=request,
             queue_fingerprint=queue_fingerprint,
         )
@@ -306,13 +306,20 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertEqual(
             capabilities["algorithm"],
-            {"id": "deepwave.acoustic_fwi", "version": "1.4.0"},
+            {"id": "deepwave.acoustic_fwi", "version": "1.5.0"},
         )
         self.assertEqual(
             capabilities["capabilities"],
             {
                 "cancel": True,
                 "retry": False,
+                "manual_retry": False,
+                "finite_automatic_retry": {
+                    "max_attempts": 2,
+                    "max_concurrent_attempts": 1,
+                    "pre_running_launch_failure": True,
+                    "worker_exit": False,
+                },
                 "sse": False,
                 "startup_dispatch_recovery": False,
                 "startup_receipt_recovery": False,
@@ -331,7 +338,11 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(catalog["datasets"][0]["id"], "marmousi_94_288")
         self.assertNotIn("access_scope", catalog["datasets"][0])
         self.assertEqual(len(catalog["algorithms"]), 1)
-        self.assertEqual(catalog["algorithms"][0]["version"], "1.4.0")
+        self.assertEqual(catalog["algorithms"][0]["version"], "1.5.0")
+        self.assertEqual(
+            catalog["algorithms"][0]["adapter"],
+            {"protocol": "algorithm-adapter-v1", "version": "1.5.0"},
+        )
         serialized = repr(catalog)
         self.assertNotIn("entrypoint_ref", serialized)
         self.assertNotIn("/root/", serialized)
@@ -447,7 +458,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         current = self.workbench.create_task(legacy_guided_form(), new_key)
         current_snapshot = self.store.get_task(current["task_id"])
         self.assertFalse(current["replayed"])
-        self.assertEqual(current_snapshot.draft["algorithm"]["version"], "1.4.0")
+        self.assertEqual(current_snapshot.draft["algorithm"]["version"], "1.5.0")
         self.assertEqual(current_snapshot.draft["parameters"]["optimizer"], "adam")
         self.assertEqual(current_snapshot.draft["parameters"]["learning_rate_milli"], 10_000)
         current_replay = self.workbench.create_task(legacy_guided_form(), new_key)
@@ -529,7 +540,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertFalse(current["replayed"])
         self.assertEqual(current["draft"]["revision"], 3)
-        self.assertEqual(current["draft"]["algorithm"]["version"], "1.4.0")
+        self.assertEqual(current["draft"]["algorithm"]["version"], "1.5.0")
         self.assertEqual(current["draft"]["parameters"]["optimizer"], "adam")
         current_replay = self.workbench.revise_task(
             created.snapshot.task_id,
@@ -1095,7 +1106,23 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         snapshot = self.store.get_task(created["task_id"])
         self.assertEqual(schema_errors("approval-decision.schema.json", snapshot.approval), [])
+        self.assertEqual(snapshot.approval["schema_version"], "1.1.0")
         self.assertEqual(snapshot.approval["scope"]["max_tasks"], 1)
+        wall_time = snapshot.approval["scope"]["resource_limits"][
+            "wall_time_seconds"
+        ]
+        self.assertEqual(
+            snapshot.approval["scope"]["retry_policy"],
+            {
+                "max_attempts": 2,
+                "max_concurrent_attempts": 1,
+                "max_cumulative_attempt_wall_time_seconds": 2 * wall_time,
+                "retryable_failure_classes": [
+                    "pre_running_launch_failure",
+                    "worker_exit",
+                ],
+            },
+        )
         self.assertEqual(snapshot.approval["plan_hash"], created["plan"]["plan_hash"])
         self.assertEqual(result["status"], "Queued")
         self.assertEqual(result["dispatch"]["state"], "pending")
@@ -1249,6 +1276,71 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                     },
                 },
             )
+
+    def test_retry_exhaustion_projection_is_bounded_and_path_free(self) -> None:
+        created = self.workbench.create_task(
+            guided_form(), "create-retry-exhaustion-projection"
+        )
+        self.workbench.approve_and_submit(
+            created["task_id"],
+            created["plan"]["plan_hash"],
+            "approve-retry-exhaustion-projection",
+        )
+        snapshot = replace(
+            self.store.get_task(created["task_id"]),
+            status="Failed",
+        )
+        base_intent = self.store.get_dispatch_intent(created["task_id"])
+        self.assertIsNotNone(base_intent)
+        assert base_intent is not None
+        exhausted_at = "2026-07-16T12:00:02.000000Z"
+        private_proof_hash = "sha256:" + "d" * 64
+        original_can_cancel = self.tasks.can_cancel_task
+        self.tasks.can_cancel_task = lambda *_args, **_kwargs: False
+        try:
+            projected = self.workbench._project(
+                snapshot,
+                intent={
+                    "state": "retry_exhausted",
+                    "failure_code": "WORKER_RETRY_EXHAUSTED",
+                    "created_at": base_intent.created_at,
+                    "dispatch_claimed_at": base_intent.created_at,
+                    "outcome_recorded_at": exhausted_at,
+                    "reconciliation": None,
+                    "proof": {"attempt_number": 2},
+                    "private_proof_hash": private_proof_hash,
+                    "document_hash": "sha256:" + "e" * 64,
+                    "job_id": "fwi-private-retry-job",
+                    "relative_path": "/root/private/retry",
+                    "handle": {"submission_id": "private-submission"},
+                },
+            )
+        finally:
+            self.tasks.can_cancel_task = original_can_cancel
+
+        self.assertEqual(projected["status"], "Failed")
+        self.assertEqual(
+            projected["dispatch"],
+            {
+                "state": "retry_exhausted",
+                "failure_code": "WORKER_RETRY_EXHAUSTED",
+                "created_at": base_intent.created_at,
+                "dispatch_claimed_at": base_intent.created_at,
+                "outcome_recorded_at": exhausted_at,
+                "reconciliation": None,
+            },
+        )
+        self.assertFalse(projected["can_cancel"])
+        serialized = repr(projected["dispatch"])
+        for private_value in (
+            private_proof_hash,
+            "sha256:" + "e" * 64,
+            "fwi-private-retry-job",
+            "/root/private/retry",
+            "private-submission",
+            "attempt_number",
+        ):
+            self.assertNotIn(private_value, serialized)
 
     def test_concurrent_first_approval_same_key_converges_despite_clock_skew(
         self,
@@ -1629,6 +1721,86 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertNotIn(worker_job_id, repr(manifest))
         self.assertNotIn(old_relative_path, repr(manifest))
         self.assertEqual(data, b"artifact-test-bytes")
+
+    def test_list_events_removes_exact_retry_exhaustion_private_proof(self) -> None:
+        private_extension = {
+            "intent_id": "intent-private-retry-exhaustion",
+            "attempt_id": "attempt-" + "7" * 32,
+            "attempt_number": 2,
+            "observation_sequence": 3,
+            "evidence_hash": "sha256:" + "8" * 64,
+            "private_schema_version": "1.2.0",
+            "private_proof_hash": "sha256:" + "9" * 64,
+            "failure_kind": "pre_running_launch_failure",
+            "max_attempts": 2,
+            "private_path": "/root/private/retry-attempt",
+        }
+        canonical = {
+            "schema_version": "1.0.0",
+            "event_id": "event-retry-exhausted-public",
+            "sequence": 2,
+            "task_id": "task-retry-exhausted-public",
+            "node_id": "invert",
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "retry_exhausted",
+                "message": "FWI Worker exhausted its approved launch attempts",
+                "retryable": False,
+            },
+            "occurred_at": NOW,
+            "fingerprint": {},
+            "extensions": {
+                "org.agent_rpc.retry_exhaustion": private_extension,
+                "org.agent_rpc.adapter_status": {
+                    "stage": "submit",
+                    "job_id": "fwi-private-retry-job",
+                },
+            },
+        }
+
+        class ExactExhaustionEventView:
+            def list_run_events(inner_self, *_args, **_kwargs):
+                return [copy.deepcopy(canonical)]
+
+        facade = GuidedWorkbench(
+            ExactExhaustionEventView(),
+            self.registry,
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            clock=lambda: NOW,
+        )
+        projected = facade.list_events(canonical["task_id"])
+        self.assertEqual(projected[0]["error"]["code"], "retry_exhausted")
+        self.assertNotIn(
+            "org.agent_rpc.retry_exhaustion", projected[0]["extensions"]
+        )
+        self.assertEqual(
+            projected[0]["extensions"]["org.agent_rpc.adapter_status"],
+            {"stage": "submit"},
+        )
+        # Projection is copy-based; the SQLite-owned canonical event remains
+        # untouched for audit and recovery.
+        self.assertEqual(
+            canonical["extensions"]["org.agent_rpc.retry_exhaustion"],
+            private_extension,
+        )
+        serialized = repr(projected)
+        for private in (
+            private_extension["intent_id"],
+            private_extension["attempt_id"],
+            private_extension["evidence_hash"],
+            private_extension["private_proof_hash"],
+            private_extension["private_schema_version"],
+            private_extension["private_path"],
+            "intent_id",
+            "attempt_id",
+            "evidence_hash",
+            "private_proof_hash",
+            "private_schema_version",
+            "fwi-private-retry-job",
+        ):
+            self.assertNotIn(private, serialized)
 
     def test_unknown_task_is_a_stable_not_found(self) -> None:
         with self.assertRaises(WorkbenchNotFound) as caught:

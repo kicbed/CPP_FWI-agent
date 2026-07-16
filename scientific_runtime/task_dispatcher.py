@@ -16,10 +16,16 @@ from .fwi_adapter import (
     AdapterHandle,
     AdapterManagedCancelProof,
     AdapterManagedTimeoutProof,
+    AdapterPreRunningRetryProof,
     DeepwaveAdapter,
     is_supported_receipt_binding,
 )
-from .task_store import DispatchIntentSnapshot, TaskSnapshot, encode_document
+from .task_store import (
+    DispatchIntentSnapshot,
+    RetryExhaustionCleanupProof,
+    TaskSnapshot,
+    encode_document,
+)
 
 
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -68,6 +74,18 @@ class DispatchReceiptProbe:
     receipt_record_hash: str | None
 
 
+@dataclass(frozen=True)
+class DispatchRetryProof:
+    """Path-free exact stopped-attempt proof read from private Adapter state."""
+
+    failure_kind: Literal["pre_running_launch_failure"]
+    previous_attempt_id: str
+    previous_attempt_number: int
+    private_schema_version: str
+    private_proof_hash: str
+    evidence: dict[str, Any]
+
+
 class TaskDispatcher(Protocol):
     """Fixed dispatcher with supervised submit and zero-relaunch receipt paths."""
 
@@ -103,6 +121,21 @@ class TaskDispatcher(Protocol):
     def probe_existing_dispatch_receipt(
         self, intent: DispatchIntentSnapshot
     ) -> DispatchReceiptProbe:
+        ...
+
+    def probe_pre_running_retry(
+        self, intent: DispatchIntentSnapshot
+    ) -> DispatchRetryProof:
+        ...
+
+    def probe_pre_running_retry_exhaustion(
+        self, intent: DispatchIntentSnapshot
+    ) -> DispatchRetryProof:
+        ...
+
+    def retry_pre_running(
+        self, intent: DispatchIntentSnapshot, *, authorization: Mapping[str, Any]
+    ) -> dict[str, Any]:
         ...
 
     def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
@@ -150,6 +183,15 @@ class TaskDispatcher(Protocol):
 
     def purge(
         self, intent: DispatchIntentSnapshot, *, purge_id: str
+    ) -> dict[str, Any]:
+        ...
+
+    def purge_retry_exhausted(
+        self,
+        intent: DispatchIntentSnapshot,
+        *,
+        purge_id: str,
+        exhaustion: RetryExhaustionCleanupProof,
     ) -> dict[str, Any]:
         ...
 
@@ -438,7 +480,7 @@ class DeepwaveTaskDispatcher:
                 evidence.get("heartbeat") if isinstance(evidence, Mapping) else None
             )
             if (
-                proof.private_schema_version != "1.1.0"
+                proof.private_schema_version not in {"1.1.0", "1.2.0"}
                 or proof.receipt_record_hash is not None
                 or not isinstance(ticket, Mapping)
                 or ticket.get("state") != "spawned"
@@ -556,6 +598,187 @@ class DeepwaveTaskDispatcher:
         }
 
     @staticmethod
+    def _pre_dispatch_request(intent: DispatchIntentSnapshot) -> tuple[dict[str, Any], str]:
+        if (
+            intent.adapter_id != LOGICAL_ENTRYPOINT
+            or intent.adapter_version != ADAPTER_VERSION
+            or intent.state != "dispatching"
+            or intent.handle is not None
+            or not isinstance(intent.request, Mapping)
+            or not isinstance(intent.queue_fingerprint, Mapping)
+        ):
+            raise DispatchError("DISPATCH_INTENT_INVALID")
+        request = copy.deepcopy(dict(intent.request))
+        normalized_config_hash = request.pop("normalized_config_hash", None)
+        if (
+            set(request)
+            != {
+                "task_id",
+                "node_id",
+                "plan_hash",
+                "idempotency_key",
+                "project_id",
+                "principal_id",
+                "algorithm",
+                "dataset",
+                "task_type",
+                "parameters",
+                "resources",
+            }
+            or not isinstance(normalized_config_hash, str)
+            or request["task_id"] != intent.task_id
+            or request["node_id"] != intent.node_id
+            or request["plan_hash"] != intent.plan_hash
+            or request["idempotency_key"] != intent.node_idempotency_key
+            or intent.queue_fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+        ):
+            raise DispatchError("DISPATCH_INTENT_INVALID")
+        return request, normalized_config_hash
+
+    def probe_pre_running_retry(
+        self, intent: DispatchIntentSnapshot
+    ) -> DispatchRetryProof:
+        request, _ = self._pre_dispatch_request(intent)
+        try:
+            proof = self._adapter.probe_pre_running_retry(**request)
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("WORKER_RETRY_PROOF_UNAVAILABLE") from error
+        return self._validated_pre_running_failure_proof(
+            proof, expected_attempt_number=1
+        )
+
+    def probe_pre_running_retry_exhaustion(
+        self, intent: DispatchIntentSnapshot
+    ) -> DispatchRetryProof:
+        """Read exact attempt-2 exhaustion proof without launching or mutating."""
+
+        request, _ = self._pre_dispatch_request(intent)
+        try:
+            proof = self._adapter.probe_pre_running_retry_exhaustion(**request)
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError(
+                "WORKER_RETRY_EXHAUSTION_PROOF_UNAVAILABLE"
+            ) from error
+        return self._validated_pre_running_failure_proof(
+            proof, expected_attempt_number=2
+        )
+
+    @staticmethod
+    def _validated_pre_running_failure_proof(
+        proof: Any, *, expected_attempt_number: int
+    ) -> DispatchRetryProof:
+        """Validate one path-free proof independently of Adapter internals."""
+
+        if not isinstance(proof, AdapterPreRunningRetryProof):
+            raise DispatchError("WORKER_RETRY_PROOF_INVALID")
+        evidence = proof.evidence
+        ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
+        try:
+            expected_private_proof_hash = encode_document(
+                {
+                    "schema_version": "1.0.0",
+                    "failure_kind": "pre_running_launch_failure",
+                    "submission_id": evidence["submission_id"],
+                    "attempt_id": evidence["attempt_id"],
+                    "attempt_number": evidence["attempt_number"],
+                    "job_id": evidence["job_id"],
+                    "request_hash": evidence["request_hash"],
+                    "binding_hash": evidence["binding_hash"],
+                    "ticket_record_hash": ticket["record_hash"],
+                }
+            )[1]
+        except (KeyError, TypeError, ValueError):
+            expected_private_proof_hash = None
+        if (
+            proof.failure_kind != "pre_running_launch_failure"
+            or proof.previous_attempt_number != expected_attempt_number
+            or not isinstance(proof.previous_attempt_id, str)
+            or _MANAGED_ATTEMPT_ID.fullmatch(proof.previous_attempt_id) is None
+            or proof.private_schema_version != "1.2.0"
+            or not isinstance(proof.private_proof_hash, str)
+            or _SHA256.fullmatch(proof.private_proof_hash) is None
+            or proof.private_proof_hash != expected_private_proof_hash
+            or not isinstance(ticket, Mapping)
+            or ticket.get("state") != "failed"
+            or ticket.get("worker_pid") is not None
+            or evidence.get("attempt_id") != proof.previous_attempt_id
+            or evidence.get("attempt_number") != expected_attempt_number
+            or evidence.get("ready") is not None
+            or evidence.get("heartbeat") is not None
+        ):
+            raise DispatchError("WORKER_RETRY_PROOF_INVALID")
+        return DispatchRetryProof(
+            failure_kind="pre_running_launch_failure",
+            previous_attempt_id=proof.previous_attempt_id,
+            previous_attempt_number=expected_attempt_number,
+            private_schema_version="1.2.0",
+            private_proof_hash=proof.private_proof_hash,
+            evidence=copy.deepcopy(dict(evidence)),
+        )
+
+    def retry_pre_running(
+        self, intent: DispatchIntentSnapshot, *, authorization: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        request, normalized_config_hash = self._pre_dispatch_request(intent)
+        if not isinstance(authorization, Mapping):
+            raise DispatchError("WORKER_RETRY_AUTHORIZATION_INVALID")
+        token = copy.deepcopy(dict(authorization))
+        if (
+            set(token)
+            != {
+                "schema_version",
+                "intent_id",
+                "previous_attempt_id",
+                "previous_observation_sequence",
+                "failure_kind",
+                "private_proof_hash",
+                "next_attempt_number",
+                "authorized_at",
+            }
+            or token.get("schema_version") != "1.0.0"
+            or token.get("intent_id") != intent.intent_id
+            or not isinstance(token.get("previous_attempt_id"), str)
+            or _MANAGED_ATTEMPT_ID.fullmatch(token["previous_attempt_id"]) is None
+            or type(token.get("previous_observation_sequence")) is not int
+            or token["previous_observation_sequence"] < 1
+            or token.get("failure_kind") != "pre_running_launch_failure"
+            or not isinstance(token.get("private_proof_hash"), str)
+            or _SHA256.fullmatch(token["private_proof_hash"]) is None
+            or token.get("next_attempt_number") != 2
+            or not isinstance(token.get("authorized_at"), str)
+            or not token["authorized_at"].endswith("Z")
+        ):
+            raise DispatchError("WORKER_RETRY_AUTHORIZATION_INVALID")
+        try:
+            handle = self._adapter.retry_pre_running(
+                **request, authorization=token
+            )
+        except AdapterError as error:
+            if error.code in DEFERRED_DISPATCH_CODES:
+                raise DispatchDeferred(error.code) from error
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("WORKER_RETRY_UNAVAILABLE") from error
+        if (
+            not isinstance(handle, AdapterHandle)
+            or handle.adapter_version != ADAPTER_VERSION
+            or handle.task_id != intent.task_id
+            or handle.node_id != intent.node_id
+            or handle.plan_hash != intent.plan_hash
+            or handle.idempotency_key != intent.node_idempotency_key
+            or handle.algorithm != request["algorithm"]
+            or handle.fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+        ):
+            raise DispatchError("DISPATCH_FINGERPRINT_DRIFT")
+        return handle.as_dict()
+
+    @staticmethod
     def _handle_from_intent(intent: DispatchIntentSnapshot) -> AdapterHandle:
         if (
             intent.adapter_id != LOGICAL_ENTRYPOINT
@@ -652,7 +875,7 @@ class DeepwaveTaskDispatcher:
         if (
             set(proof) != expected
             or proof.get("schema_version") != "2.0.0"
-            or proof.get("private_schema_version") != "1.1.0"
+            or proof.get("private_schema_version") not in {"1.1.0", "1.2.0"}
             or proof.get("attempt_id") != attempt_id
             or not isinstance(attempt_id, str)
             or _MANAGED_ATTEMPT_ID.fullmatch(attempt_id) is None
@@ -1054,6 +1277,83 @@ class DeepwaveTaskDispatcher:
             raise DispatchError(error.code) from error
         except Exception as error:
             raise DispatchError("ADAPTER_PURGE_UNAVAILABLE") from error
+        expected = {"task_id", "purge_id", "local_run_state", "replayed"}
+        if (
+            set(result) != expected
+            or result["task_id"] != intent.task_id
+            or result["purge_id"] != purge_id
+            or result["local_run_state"] != "deleted"
+            or type(result["replayed"]) is not bool
+        ):
+            raise DispatchError("ADAPTER_PURGE_RESPONSE_INVALID")
+        return result
+
+    def purge_retry_exhausted(
+        self,
+        intent: DispatchIntentSnapshot,
+        *,
+        purge_id: str,
+        exhaustion: RetryExhaustionCleanupProof,
+    ) -> dict[str, Any]:
+        """Clean an exact exhausted private chain without fabricating a receipt."""
+
+        if (
+            not isinstance(exhaustion, RetryExhaustionCleanupProof)
+            or exhaustion.purge_id != purge_id
+            or exhaustion.intent_id != intent.intent_id
+            or exhaustion.task_id != intent.task_id
+            or exhaustion.approval_id != intent.approval_id
+            or intent.adapter_id != LOGICAL_ENTRYPOINT
+            or intent.adapter_version != ADAPTER_VERSION
+            or intent.state != "retry_exhausted"
+            or intent.handle is not None
+            or intent.failure_code != "WORKER_RETRY_EXHAUSTED"
+            or not isinstance(intent.request, Mapping)
+            or not isinstance(intent.queue_fingerprint, Mapping)
+        ):
+            raise DispatchError("WORKER_RETRY_EXHAUSTION_PURGE_INVALID")
+        request = copy.deepcopy(dict(intent.request))
+        normalized_config_hash = request.pop("normalized_config_hash", None)
+        if (
+            set(request)
+            != {
+                "task_id",
+                "node_id",
+                "plan_hash",
+                "idempotency_key",
+                "project_id",
+                "principal_id",
+                "algorithm",
+                "dataset",
+                "task_type",
+                "parameters",
+                "resources",
+            }
+            or not isinstance(normalized_config_hash, str)
+            or request["task_id"] != intent.task_id
+            or request["node_id"] != intent.node_id
+            or request["plan_hash"] != intent.plan_hash
+            or request["idempotency_key"] != intent.node_idempotency_key
+            or request["project_id"] != exhaustion.project_id
+            or request["principal_id"] != exhaustion.principal_id
+            or request["algorithm"]
+            != {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
+            or intent.queue_fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+        ):
+            raise DispatchError("WORKER_RETRY_EXHAUSTION_PURGE_INVALID")
+        try:
+            result = self._adapter.purge_retry_exhausted(
+                **request,
+                purge_id=purge_id,
+                exhaustion=exhaustion.adapter_token(),
+            ).as_dict()
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError(
+                "ADAPTER_RETRY_EXHAUSTION_PURGE_UNAVAILABLE"
+            ) from error
         expected = {"task_id", "purge_id", "local_run_state", "replayed"}
         if (
             set(result) != expected

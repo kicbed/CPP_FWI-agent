@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import unittest
 from email.message import Message
 
+from scientific_runtime.workbench_service import GuidedWorkbench
 from web.workbench_api import API_PREFIX, MAX_JSON_BYTES, WorkbenchAPI
 
 
@@ -604,6 +606,83 @@ class WorkbenchAPITest(unittest.TestCase):
             self.decode(response)["data"],
             {"artifacts": [{"artifact_id": "loss"}]},
         )
+
+    def test_http_events_do_not_serialize_retry_exhaustion_private_proof(self):
+        private_extension = {
+            "intent_id": "intent-http-private-exhaustion",
+            "attempt_id": "attempt-" + "a" * 32,
+            "attempt_number": 2,
+            "observation_sequence": 4,
+            "evidence_hash": "sha256:" + "b" * 64,
+            "private_schema_version": "1.2.0",
+            "private_proof_hash": "sha256:" + "c" * 64,
+            "failure_kind": "pre_running_launch_failure",
+            "max_attempts": 2,
+            "private_path": "/root/private/http-retry",
+        }
+        canonical = {
+            "schema_version": "1.0.0",
+            "event_id": "event-http-retry-exhausted",
+            "sequence": 2,
+            "task_id": "task-http-retry-exhausted",
+            "node_id": "invert",
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "retry_exhausted",
+                "message": "FWI Worker exhausted its approved launch attempts",
+                "retryable": False,
+            },
+            "occurred_at": "2026-07-17T08:00:00Z",
+            "fingerprint": {},
+            "extensions": {
+                "org.agent_rpc.retry_exhaustion": private_extension,
+            },
+        }
+
+        class ExactExhaustionEventView:
+            def list_run_events(inner_self, *_args, **_kwargs):
+                return [copy.deepcopy(canonical)]
+
+        application = GuidedWorkbench(
+            ExactExhaustionEventView(),
+            object(),
+            project_id="project-http-events",
+            principal_id="user-http-events",
+        )
+        api = WorkbenchAPI(
+            application,
+            CSRF,
+            allowed_hosts={HOST},
+            allowed_origins={ORIGIN},
+        )
+        response = api.dispatch(
+            "GET",
+            f"{API_PREFIX}/tasks/{canonical['task_id']}/events",
+            self.get_headers(),
+            b"",
+        )
+        self.assertEqual(response.status, 200)
+        payload = self.decode(response)
+        event = payload["data"]["events"][0]
+        self.assertEqual(event["error"]["code"], "retry_exhausted")
+        self.assertNotIn("org.agent_rpc.retry_exhaustion", event["extensions"])
+        serialized = response.body.decode("utf-8")
+        for private in (
+            private_extension["intent_id"],
+            private_extension["attempt_id"],
+            private_extension["evidence_hash"],
+            private_extension["private_proof_hash"],
+            private_extension["private_schema_version"],
+            private_extension["private_path"],
+            "intent_id",
+            "attempt_id",
+            "evidence_hash",
+            "private_proof_hash",
+            "private_schema_version",
+            "/root/",
+        ):
+            self.assertNotIn(private, serialized)
 
     def test_mutations_require_exact_origin_csrf_and_idempotency_key(self):
         body = json.dumps(guided_form()).encode("utf-8")

@@ -467,11 +467,32 @@ handle/hash/PID/path 且无浏览器 mutation；session 只声明
 `positive_receipt_reconciliation=true`，继续保持 `automatic_reconciliation=false` 与 `retry=false`，
 不得宣称 full/automatic reconciliation。SQLite v13 以 append-only resolution/effective dispatch
 保留原 outcome；Supervisor 每周期最多 probe 一个 action-required task，managed running 同周期
-arm timeout，terminal receipt 同周期 status catch-up。finite retry 具体策略仍 Pending，须先由用户
-确认次数、预算和可重试失败边界，随后才是其余完整
+arm timeout，terminal receipt 同周期 status catch-up。
+
+2026-07-17 用户已通过 D-012 接受 **P2.9B finite retry**：同一 Task/Plan/Approval/intent 最多
+2 个 append-only Worker attempt，只自动重试 exact stopped 的 pre-running launch failure 与
+post-ready `worker_exit`；Approval 必须显式绑定 `max_attempts=2`、每次资源上限及最坏总预算，
+历史 Approval 默认 1 次。普通数值 `worker_failed`、timeout、cancel、成功、损坏/分歧/模糊状态
+与 reconciliation uncertainty 都不重试；第二次失败后只能新建 Task/Plan/Approval 人工再跑，
+Workbench 不增加 retry mutation。
+
+P2.9B 按同一策略状态机的两个安全出口推进：**P2.9B1** 先处理尚无 dispatched handle 的
+pre-running failure；**P2.9B2** 再处理 post-ready `worker_exit`，后者必须把 status、artifact、
+cancel 与 timeout 原子收敛到同一个 effective handle 后才能启动替代 Worker。该拆分由句柄和产物
+所有权边界决定，不是为 migration/字段制造切片。随后才是其余完整
 reconciliation、SSE 与完整 P2 故障/CPU/CUDA 出口验收。这是当前规划基线而非固定配额；只有具体安全或验证证据才允许继续拆分，
 拆分理由必须写入进度账本，且不得降低上述完整 P2 出口条件。`resources.wall_time_seconds` 的
 runtime enforcement 只在 P2.8 已验证的 exact 边界内成立。
+
+P2.9B1 已于 2026-07-17 **Verified**：SQLite v14 与 Approval 1.1 为 current Deepwave `1.5.0`
+绑定两次串行 attempt、累计 `2W` 和固定失败 allowlist；历史 `1.4.0`/Approval 1.0 保持一次。
+只有 latest failed observation、无 ready/heartbeat 的 private stopped proof、active Supervisor term
+与 idle submission execution fence 同时成立，才能追加 attempt 2；reservation/delivery 可跨 term
+稳定重放且不能 attempt 3。第二次相同失败原子进入 `Failed/retry_exhausted`；无 handle 的双 attempt
+Trash/Purge 以 Store cleanup proof、同一 idle fence 和先墓碑后删除支持崩溃重放。Workbench/API/UI
+只暴露有界终态且无 retry mutation。attempt 2 成功后的 effective status/artifact/cancel/timeout 读取
+统一消费 latest current `1.5.0` handle，并按 attempt 1/private 1.1、attempt 2/private 1.2 验证；这只
+关闭 B1 lineage，P2.9B2 继续 Pending，不能从 B1 推断 post-ready replacement retry 已完成。
 
 完成标准：重复请求不重复建任务；控制面重启后恢复或明确终结任务；取消能到达 Worker；
 已提交任务不依赖浏览器连接存活。
@@ -591,3 +612,5 @@ PlanGraph、批准和资源边界控制。
 | 2026-07-16 | 实现并验证 P2.8 exact-attempt wall-time timeout：SQLite v12 immutable window/authorization/outcome、Store `observed_at` 起算、四态竞争、v2 Worker self-stop 和七字段只读 Workbench 投影；完整 P2 仍 Pending | Runtime 304/304、固定 venv Worker 32/32、launch-control 25/25、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node/governance 与真实 CPU Deepwave timeout E2E PASS；未运行 CUDA，下一步有限 retry 与 reconciliation resolution |
 | 2026-07-16 | 开始 P2.9A 有界 positive receipt resolution/adoption：只接受 current Adapter 1.4 managed spawned + exact ready + heartbeat（含 terminal succeeded/failed）或 current Adapter/legacy-private schema 1.0 exact launched receipt；launch/ticket failed 等其余证据保持 `action_required` | 用户继续 D-003；先关闭严格正向 receipt 已存在但 intent 为 immutable `reconciliation_required` 的窗口，不扩大到公共 Adapter 1.0–1.3、negative reset/refund/retry、reconciliation 合成 Task 终态或 full/automatic reconciliation；finite retry 具体策略仍 Pending |
 | 2026-07-16 | 实现并验证 P2.9A：SQLite v13 append-only authorization/adoption/resolution 与 effective dispatch、managed/private exact positive probe、每周期最多一次、同周期 timeout/status catch-up，以及六字段只读 Workbench 投影；整体验证同时关闭 same-key approve/submit late-replay race | Runtime 319/319、固定 venv Worker 32/32、launch-control 25/25、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node/治理与真实 Adapter 文件/锁专项 PASS；replacement launcher 零调用，并发用例 10 进程重复 PASS，未运行 CUDA；finite retry 仍待用户确认 |
+| 2026-07-17 | 接受 D-012 并开始 P2.9B finite retry：最多 2 次、显式最坏预算、只重试 exact stopped 的 pre-running launch failure 与 post-ready `worker_exit`；B1/B2 以 effective handle/产物/取消/超时目标迁移安全边界拆分 | 用户明确要求按建议继续；旧 Approval 保持一次，普通 worker failure、timeout、cancel、损坏/分歧/不确定 reconciliation 不重试，且不增加浏览器 retry mutation |
+| 2026-07-17 | 实现并验证 P2.9B1 pre-running launch failure retry：SQLite v14/Approval 1.1 两次串行预算、active-term retry reservation/delivery、Adapter 1.5 append-only attempt 2、retry exhaustion、无 handle 双 attempt Trash/Purge 与 bounded public projection | Runtime 343/343、固定 venv Worker 32/32、launch-control 26/26、Web 47/47、Embedding 6/6、CTest 39/39、MCP 1/1、Node/治理和独立最终审计 PASS；未重复数值 FWI/CUDA。B2、剩余 reconciliation、SSE 和完整 P2 出口仍 Pending |

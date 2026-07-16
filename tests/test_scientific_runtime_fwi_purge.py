@@ -34,7 +34,7 @@ ENVIRONMENT_HASH = "sha256:" + "b" * 64
 
 
 def algorithm() -> dict[str, str]:
-    return {"id": "deepwave.acoustic_fwi", "version": "1.4.0"}
+    return {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
 
 
 def dataset() -> dict[str, Any]:
@@ -87,7 +87,7 @@ class FingerprintFactory:
         return {
             "provenance_mode": "development",
             "algorithm": algorithm(),
-            "adapter_version": "1.4.0",
+            "adapter_version": "1.5.0",
             "source": {"identity_complete": False, "dirty": None},
             "environment": {"environment_lock_hash": ENVIRONMENT_HASH},
             "runtime": {
@@ -309,7 +309,7 @@ class ScientificRuntimeFWIPurgeTest(unittest.TestCase):
         )
         record_path = self.record_path(handle)
         record = json.loads(record_path.read_text(encoding="utf-8"))
-        self.assertEqual(record["adapter_version"], "1.4.0")
+        self.assertEqual(record["adapter_version"], "1.5.0")
         record["schema_version"] = "1.0.0"
         record.pop("launch_attempt")
         self.adapter._write_submission(record_path, record)

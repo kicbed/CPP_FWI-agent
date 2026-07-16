@@ -2,7 +2,7 @@
 
 <!-- project-current-state: v1 -->
 
-更新日期：2026-07-16
+更新日期：2026-07-17
 
 这是新 Codex 会话的**短上下文入口**，用于降低重复读取历史文档的 token 和等待时间。
 它不替代长期决策、完整架构计划或进度账本；现场 Git、代码、测试和任务状态与本文冲突时，
@@ -25,14 +25,23 @@
   Guided Web 有界只读 timeout 投影；P2-009A 增加 SQLite v13 append-only positive receipt
   resolution/effective dispatch、current-term managed/private adoption、每周期最多一次 probe、同周期
   timeout/status catch-up 和 Guided Web 六字段只读 reconciliation 投影。
-- 当前阶段：P2-009A positive receipt resolution/adoption 有界切片已 Verified；完整 P2 仍在进行，
+- P2-009B1 已验证 SQLite v14/Approval 1.1 的两次串行预算、current Algorithm/Adapter `1.5.0`
+  的 exact stopped pre-running failure attempt 2、第二次失败终结，以及无 handle 的双 attempt
+  Trash/Purge；历史 `1.4.0`/Approval 1.0 仍只有一次。
+- 当前阶段：D-012 finite retry 已 Accepted，P2-009B1 pre-running launch failure 重试已
+  Verified，P2-009B2 post-ready `worker_exit` Pending；完整 P2 仍在进行，
   上述 P2 子项不得表述为完整 P2 已完成。
-- 下一安全方向：先请用户确认 finite retry 的次数、最坏预算和可重试失败边界，再推进 P2-009B；
-  负向/不确定 reconciliation 与 SSE 继续后置。
+- 下一安全方向：以 effective handle、artifact、cancel 与 timeout 共同迁移为出口推进
+  post-ready `worker_exit` 的 B2；随后依次关闭剩余负向/不确定 reconciliation、SSE 和完整 P2
+  阶段出口。当前是 3 个实现工作流加 1 次阶段出口的弹性估算，不是固定配额。
 - 当前阻塞：无。工作树中的未提交内容可能属于另一个活跃窗口，必须现场检查并保护。
 - 已接受 D-011：继续保留逐切片开发，但采用弹性中等粒度；约十余个剩余切片只是估算，允许
   按真实风险小幅增加，不为 migration/字段/单项测试制造路线切片，也不得无说明膨胀成几十个。
   多算法首先是独立可选工具，自动全流程不是当前验收要求；测试分级执行但阶段质量门不降低。
+- 已接受 D-012：同一 Task/Plan/Approval/intent 最多两个 append-only attempt；新 Approval 绑定
+  每次资源上限与最坏总预算，旧 Approval 只有一次。只自动重试 exact stopped 的 pre-running
+  launch failure 与 post-ready `worker_exit`；普通数值失败、timeout、cancel、成功、损坏/分歧/
+  模糊状态不重试，也不增加浏览器 retry mutation。
 - `D-005` 提示词分类仍是 Proposed，不得表述为 Accepted。
 
 具体状态与测试证据以 `docs/PROJECT_PROGRESS.md` 顶部阶段表、当前 checkpoint 和相应切片
@@ -72,14 +81,16 @@
   current 1.4 legacy private schema 1.0 的 exact launched receipt 可凭只读 proof 受 fence 收养；
   历史 Algorithm/Adapter identity 1.0–1.3、legacy CLI/MCP 仍不在首次派发/容量投影边界，升级前
   已终态任务不保证 evidence backfill。不完整 staging 保持 fail-closed，等待 reconciliation。
-- P2-007 只允许 current Algorithm/Adapter 1.4、private schema 1.1、durable `dispatched`、最新
+- P2-007 当前允许受支持的 managed Algorithm/Adapter 1.4/1.5；private schema 1.1 用于 attempt 1，
+  B1 的 current 1.5 attempt 2 使用 private 1.2。durable `dispatched`、最新
   v9 observation 为 spawned+ready+running 且 exact Worker 已发布 capability 的任务接受取消。
   HTTP 只持久化请求，Task 仍为 Queued/Running；active Supervisor term 只在 exact request +
   Worker ack + stopped heartbeat + idle execution `flock` 全部成立后提交 Cancelled。自然
   Succeeded/Failed 先到则 cancellation 为 superseded 且不改写终态。控制面不根据持久 PID
   发 signal；pending/staged、legacy private schema 1.0、公共历史 1.0–1.3 均不支持该入口。
-- P2-008 已验证：只对 current Algorithm/Adapter 1.4、private schema 1.1、durable dispatched
-  且能证明 v2 exact-stop capability 的最新 managed attempt 自动执行 wall-time timeout。时钟精确
+- P2-008 当前只对受支持的 managed Algorithm/Adapter 1.4/1.5、对应 attempt 的 private 1.1/1.2、
+  durable dispatched 且能证明 v2 exact-stop capability 的最新 managed attempt 自动执行 wall-time
+  timeout。时钟精确
   从 Store 对该 current Worker 的首条 durable `spawned + ready + running` observation 的
   `observed_at` 开始；deadline 到来且 active term 持久授权前 Worker mutation 为零。自然终态在
   authorization 前完成记 `not_triggered`；durable user-cancel admission 先赢记 `suppressed`；
@@ -102,6 +113,13 @@
   也不存在 reconcile/retry/timeout POST mutation。该 checkpoint 的整体验证还修复了 same-key
   approve/submit 在首次 replay lookup 后由并发调用先入队的 late-replay race；不同 key/request
   hash 仍保持冲突。
+- P2-009B1 已验证：只有 current `1.5.0` + Approval 1.1、latest SQLite failed observation、固定
+  Adapter 的 pre-running/stopped 私有证明与空闲 submission execution fence 同时成立，active
+  Supervisor 才能授权 attempt 2；并发/重启只 replay 同一 reservation/delivery，绝不产生 attempt 3。
+  attempt 2 再次 exact pre-running failure 会原子进入 `Failed/retry_exhausted`；Workbench/API/UI
+  不暴露内部 intent/attempt/hash/private proof，也没有 retry mutation。Trash/Purge 以 Store cleanup
+  proof、同一 idle fence 和先墓碑后删除清理两个 attempt，支持目录内部分删除后的同 purge replay。
+  B2 在已 dispatched 场景下仍须统一迁移 effective handle、artifact、cancel 与 timeout 目标。
 - 不读取、打印或提交 `.env`、API Key、凭证、私有 prompt、模型、运行 artifact、数据库、
   日志、构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开报告；科学结论只限实际实验边界。

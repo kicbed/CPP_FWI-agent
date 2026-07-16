@@ -29,6 +29,7 @@ from .task_dispatcher import (
     DispatchError,
     DispatchPreparation,
     DispatchReceiptProbe,
+    DispatchRetryProof,
     TaskDispatcher,
 )
 from .task_store import (
@@ -50,6 +51,9 @@ from .task_store import (
 
 OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 MAX_RUNTIME_EVENT_SCAN = 100_000
+RETRYABLE_FAILURE_CLASSES = frozenset(
+    {"pre_running_launch_failure", "worker_exit"}
+)
 
 RUN_EVENT_STATUS = {
     "node_started": frozenset({"Running"}),
@@ -177,6 +181,9 @@ class TaskWorkerProjectionResult:
     projected: bool
     adopted: bool
     replayed: bool
+    attempt_id: str | None = None
+    observation_sequence: int | None = None
+    document_hash: str | None = None
     deferred_code: str | None = None
     timeout_armed: bool = False
 
@@ -288,6 +295,80 @@ def _validate_idempotency_key(value: str) -> None:
         raise TaskValidationError(
             "INVALID_IDEMPOTENCY_KEY",
             ["idempotency_key cannot contain control characters"],
+        )
+
+
+def _validate_approval_retry_policy(
+    approval: Mapping[str, Any], plan: Mapping[str, Any]
+) -> None:
+    """Keep historical approvals single-attempt and bind v1.1 cumulative budget."""
+
+    version = approval.get("schema_version")
+    scope = approval.get("scope")
+    policy = scope.get("retry_policy") if isinstance(scope, Mapping) else None
+    if version == "1.0.0":
+        if policy is not None:
+            raise TaskValidationError(
+                "APPROVAL_RETRY_POLICY_INVALID",
+                ["ApprovalDecision 1.0 cannot grant retry attempts"],
+            )
+        return
+    if version != "1.1.0":
+        raise TaskValidationError(
+            "APPROVAL_VERSION_UNSUPPORTED",
+            ["ApprovalDecision must use schema_version 1.0.0 or 1.1.0"],
+        )
+    nodes = plan.get("nodes")
+    resources = scope.get("resource_limits") if isinstance(scope, Mapping) else None
+    if (
+        not isinstance(policy, Mapping)
+        or not isinstance(nodes, list)
+        or len(nodes) != 1
+        or not isinstance(nodes[0], Mapping)
+        or nodes[0].get("algorithm")
+        != {
+            "id": DEEPWAVE_ALGORITHM_ID,
+            "version": DEEPWAVE_ALGORITHM_VERSION,
+        }
+        or not isinstance(nodes[0].get("resources"), Mapping)
+        or not isinstance(resources, Mapping)
+    ):
+        raise TaskValidationError(
+            "APPROVAL_RETRY_POLICY_INVALID",
+            [
+                "retry policy requires one current deepwave.acoustic_fwi@1.5.0 "
+                "resource-bound plan node"
+            ],
+        )
+    plan_resources = nodes[0]["resources"]
+    wall_time = plan_resources.get("wall_time_seconds")
+    if resources != plan_resources or type(wall_time) is not int:
+        raise TaskValidationError(
+            "APPROVAL_RETRY_POLICY_INVALID",
+            ["retry resources must exactly match the approved plan node"],
+        )
+    failures = policy.get("retryable_failure_classes")
+    if (
+        set(policy)
+        != {
+            "max_attempts",
+            "max_concurrent_attempts",
+            "max_cumulative_attempt_wall_time_seconds",
+            "retryable_failure_classes",
+        }
+        or policy.get("max_attempts") != 2
+        or policy.get("max_concurrent_attempts") != 1
+        or policy.get("max_cumulative_attempt_wall_time_seconds") != 2 * wall_time
+        or not isinstance(failures, list)
+        or len(failures) != 2
+        or frozenset(failures) != RETRYABLE_FAILURE_CLASSES
+    ):
+        raise TaskValidationError(
+            "APPROVAL_RETRY_POLICY_INVALID",
+            [
+                "retry policy must bind two serial attempts, cumulative 2W, "
+                "and the fixed failure allowlist"
+            ],
         )
 
 
@@ -1185,6 +1266,7 @@ class TaskService:
             or approval["plan_hash"] != current.plan["plan_hash"]
         ):
             raise TaskConflict("approval does not bind the current plan hash")
+        _validate_approval_retry_policy(approval, current.plan)
         try:
             return self._store.store_approval(
                 task_id=task_id,
@@ -1679,18 +1761,39 @@ class TaskService:
         else:
             if self._dispatcher is None:
                 raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
-            if (
-                intent.task_id != task_id
-                or intent.state != "dispatched"
-                or intent.handle is None
-            ):
+            if intent.task_id != task_id:
                 raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
             try:
-                adapter_result = self._dispatcher.purge(
-                    intent, purge_id=reservation.purge_id
-                )
+                if intent.state == "retry_exhausted" and intent.handle is None:
+                    exhaustion = (
+                        self._store.get_retry_exhaustion_cleanup_proof(
+                            purge_id=reservation.purge_id,
+                            task_id=task_id,
+                            project_id=project_id,
+                            principal_id=principal_id,
+                        )
+                    )
+                    if exhaustion is None:
+                        raise TaskDispatchError(
+                            "WORKER_RETRY_EXHAUSTION_PURGE_UNAVAILABLE"
+                        )
+                    adapter_result = self._dispatcher.purge_retry_exhausted(
+                        intent,
+                        purge_id=reservation.purge_id,
+                        exhaustion=exhaustion,
+                    )
+                elif intent.state == "dispatched" and intent.handle is not None:
+                    adapter_result = self._dispatcher.purge(
+                        intent, purge_id=reservation.purge_id
+                    )
+                else:
+                    raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
             except DispatchError as error:
                 raise TaskDispatchError(error.code) from error
+            except TaskStoreConflict as error:
+                raise TaskConflict(str(error)) from error
+            except TaskDispatchError:
+                raise
             except Exception as error:
                 raise TaskDispatchError("ADAPTER_PURGE_UNAVAILABLE") from error
             if (
@@ -2088,7 +2191,8 @@ class TaskService:
             # Capacity pressure or a post-Popen ambiguity has no trustworthy
             # terminal outcome.  Preserve ``dispatching`` so exact startup
             # recovery can adopt a later fenced ready receipt without a second
-            # launch.  Scheduling/retry policy remains a later P2 slice.
+            # launch.  This legacy one-shot path never retries; only the active
+            # supervised scheduler may apply the current finite-retry policy.
             return intent
         except DispatchError as error:
             return self._record_dispatch_reconciliation(
@@ -2685,6 +2789,7 @@ class TaskService:
                 adopted=False,
                 deferred_code={
                     "reconciliation_required": "RECONCILIATION_REQUIRED",
+                    "retry_exhausted": "WORKER_RETRY_EXHAUSTED",
                 }.get(intent.state),
             )
         if snapshot.status != "Queued":
@@ -2818,6 +2923,17 @@ class TaskService:
                     adopted=adoption.adopted,
                     deferred_code=None,
                 )
+            retry_result = self._schedule_pre_running_retry(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                snapshot=snapshot,
+                intent=intent,
+                projection=prior_projection,
+                supervisor_lease=supervisor_lease,
+            )
+            if retry_result is not None:
+                return retry_result
             evidence = prior_projection.evidence
             ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
             staged = (
@@ -2957,6 +3073,517 @@ class TaskService:
             adopted=projection.adopted,
             timeout_armed=projection.timeout_armed,
             deferred_code=None,
+        )
+
+    def _schedule_pre_running_retry(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        projection: TaskWorkerProjectionResult,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskScheduleResult | None:
+        """Authorize and deliver the one approved stopped attempt-1 retry."""
+
+        approval = snapshot.approval
+        retry_policy = (
+            approval.get("scope", {}).get("retry_policy")
+            if isinstance(approval, Mapping)
+            and isinstance(approval.get("scope"), Mapping)
+            else None
+        )
+        retryable_classes = (
+            retry_policy.get("retryable_failure_classes")
+            if isinstance(retry_policy, Mapping)
+            else None
+        )
+        if (
+            not isinstance(approval, Mapping)
+            or approval.get("schema_version") != "1.1.0"
+            or not isinstance(retry_policy, Mapping)
+            or retry_policy.get("max_attempts") != 2
+            or retry_policy.get("max_concurrent_attempts") != 1
+            or not isinstance(retryable_classes, list)
+            or len(retryable_classes) != 2
+            or not all(isinstance(item, str) for item in retryable_classes)
+            or set(retryable_classes) != RETRYABLE_FAILURE_CLASSES
+        ):
+            return None
+        evidence = projection.evidence
+        ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
+        exhausted_retry = (
+            projection.projected
+            and isinstance(evidence, Mapping)
+            and evidence.get("attempt_number") == 2
+            and isinstance(ticket, Mapping)
+            and ticket.get("state") == "failed"
+            and ticket.get("worker_pid") is None
+            and evidence.get("ready") is None
+            and evidence.get("heartbeat") is None
+        )
+        if exhausted_retry:
+            return self._finalize_pre_running_retry_exhaustion(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                snapshot=snapshot,
+                intent=intent,
+                projection=projection,
+                supervisor_lease=supervisor_lease,
+            )
+        staged_retry = (
+            projection.projected
+            and isinstance(evidence, Mapping)
+            and evidence.get("attempt_number") == 2
+            and isinstance(ticket, Mapping)
+            and ticket.get("state") == "staged"
+            and ticket.get("capacity_slot") is None
+            and ticket.get("capacity_generation") is None
+            and ticket.get("worker_pid") is None
+            and evidence.get("ready") is None
+            and evidence.get("heartbeat") is None
+        )
+        if staged_retry:
+            try:
+                authorization = self._store.resume_supervised_retry(
+                    intent_id=intent.intent_id,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+            except RuntimeSupervisorLeaseLost as error:
+                raise TaskSupervisorLeaseLost() from error
+            except TaskStoreConflict:
+                return TaskScheduleResult(
+                    intent=self._store.get_dispatch_intent(task_id) or intent,
+                    authorized=False,
+                    authorization_replayed=False,
+                    dispatch_attempted=False,
+                    projected=True,
+                    adopted=False,
+                    deferred_code="WORKER_RETRY_RESUME_CONFLICT",
+                )
+            if (
+                authorization.intent.intent_id != intent.intent_id
+                or authorization.attempt_number != 2
+                or authorization.failure_kind != "pre_running_launch_failure"
+                or type(authorization.authorization_replayed) is not bool
+            ):
+                raise TaskDispatchError("WORKER_RETRY_AUTHORIZATION_INVALID")
+            return self._deliver_authorized_pre_running_retry(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                snapshot=snapshot,
+                intent=intent,
+                authorization=authorization,
+                supervisor_lease=supervisor_lease,
+            )
+        retry_candidate = (
+            projection.projected
+            and isinstance(evidence, Mapping)
+            and evidence.get("attempt_number") == 1
+            and isinstance(ticket, Mapping)
+            and ticket.get("state") == "failed"
+            and ticket.get("worker_pid") is None
+            and evidence.get("ready") is None
+            and evidence.get("heartbeat") is None
+        )
+        if not retry_candidate:
+            return None
+        if (
+            projection.attempt_id != evidence.get("attempt_id")
+            or type(projection.observation_sequence) is not int
+            or projection.observation_sequence < 1
+            or not isinstance(projection.document_hash, str)
+        ):
+            raise TaskDispatchError("WORKER_RETRY_PROJECTION_INVALID")
+        try:
+            _, calculated_evidence_hash = encode_document(dict(evidence))
+        except TaskStoreConflict as error:
+            raise TaskDispatchError("WORKER_RETRY_PROJECTION_INVALID") from error
+        if calculated_evidence_hash != projection.document_hash:
+            raise TaskDispatchError("WORKER_RETRY_PROJECTION_INVALID")
+
+        try:
+            proof = self._dispatcher.probe_pre_running_retry(intent)
+        except DispatchError as error:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=False,
+                authorization_replayed=False,
+                dispatch_attempted=False,
+                projected=True,
+                adopted=False,
+                deferred_code=error.code,
+            )
+        except Exception:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=False,
+                authorization_replayed=False,
+                dispatch_attempted=False,
+                projected=True,
+                adopted=False,
+                deferred_code="WORKER_RETRY_PROOF_UNAVAILABLE",
+            )
+        if (
+            not isinstance(proof, DispatchRetryProof)
+            or proof.failure_kind != "pre_running_launch_failure"
+            or proof.previous_attempt_id != projection.attempt_id
+            or proof.previous_attempt_number != 1
+            or proof.private_schema_version != "1.2.0"
+            or proof.evidence != evidence
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", proof.private_proof_hash)
+            is None
+        ):
+            raise TaskDispatchError("WORKER_RETRY_PROOF_INVALID")
+
+        try:
+            authorization = self._store.authorize_supervised_retry(
+                intent_id=intent.intent_id,
+                previous_attempt_id=projection.attempt_id,
+                previous_observation_sequence=projection.observation_sequence,
+                failure_kind=proof.failure_kind,
+                private_proof_hash=proof.private_proof_hash,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict:
+            return TaskScheduleResult(
+                intent=self._store.get_dispatch_intent(task_id) or intent,
+                authorized=False,
+                authorization_replayed=False,
+                dispatch_attempted=False,
+                projected=True,
+                adopted=False,
+                deferred_code="WORKER_RETRY_AUTHORIZATION_CONFLICT",
+            )
+        if (
+            authorization.intent.intent_id != intent.intent_id
+            or authorization.attempt_number != 2
+            or authorization.previous_attempt_id != projection.attempt_id
+            or authorization.previous_observation_sequence
+            != projection.observation_sequence
+            or authorization.evidence_hash != projection.document_hash
+            or authorization.private_proof_hash != proof.private_proof_hash
+            or authorization.failure_kind != proof.failure_kind
+            or type(authorization.authorization_replayed) is not bool
+        ):
+            raise TaskDispatchError("WORKER_RETRY_AUTHORIZATION_INVALID")
+        return self._deliver_authorized_pre_running_retry(
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            snapshot=snapshot,
+            intent=intent,
+            authorization=authorization,
+            supervisor_lease=supervisor_lease,
+        )
+
+    def _finalize_pre_running_retry_exhaustion(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        projection: TaskWorkerProjectionResult,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskScheduleResult:
+        """Close exact stopped attempt 2 without authorizing attempt 3."""
+
+        evidence = projection.evidence
+        if (
+            not isinstance(evidence, Mapping)
+            or projection.attempt_id != evidence.get("attempt_id")
+            or evidence.get("attempt_number") != 2
+            or type(projection.observation_sequence) is not int
+            or projection.observation_sequence < 1
+            or not isinstance(projection.document_hash, str)
+        ):
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_PROJECTION_INVALID")
+        try:
+            _, calculated_evidence_hash = encode_document(dict(evidence))
+        except TaskStoreConflict as error:
+            raise TaskDispatchError(
+                "WORKER_RETRY_EXHAUSTION_PROJECTION_INVALID"
+            ) from error
+        if calculated_evidence_hash != projection.document_hash:
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_PROJECTION_INVALID")
+
+        try:
+            proof = self._dispatcher.probe_pre_running_retry_exhaustion(intent)
+        except DispatchError as error:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=False,
+                authorization_replayed=False,
+                dispatch_attempted=False,
+                projected=True,
+                adopted=False,
+                deferred_code=error.code,
+            )
+        except Exception:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=False,
+                authorization_replayed=False,
+                dispatch_attempted=False,
+                projected=True,
+                adopted=False,
+                deferred_code="WORKER_RETRY_EXHAUSTION_PROOF_UNAVAILABLE",
+            )
+        if (
+            not isinstance(proof, DispatchRetryProof)
+            or proof.failure_kind != "pre_running_launch_failure"
+            or proof.previous_attempt_id != projection.attempt_id
+            or proof.previous_attempt_number != 2
+            or proof.private_schema_version != "1.2.0"
+            or proof.evidence != evidence
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", proof.private_proof_hash)
+            is None
+        ):
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_PROOF_INVALID")
+
+        sequence = self._store.latest_run_event_sequence(task_id) + 1
+        extension = {
+            "intent_id": intent.intent_id,
+            "attempt_id": projection.attempt_id,
+            "attempt_number": 2,
+            "observation_sequence": projection.observation_sequence,
+            "evidence_hash": projection.document_hash,
+            "private_schema_version": proof.private_schema_version,
+            "private_proof_hash": proof.private_proof_hash,
+            "failure_kind": proof.failure_kind,
+            "max_attempts": 2,
+        }
+        _, identity_hash = encode_document(
+            {
+                "intent_id": intent.intent_id,
+                "attempt_id": projection.attempt_id,
+                "observation_sequence": projection.observation_sequence,
+                "evidence_hash": projection.document_hash,
+                "private_proof_hash": proof.private_proof_hash,
+                "event_type": "node_failed",
+                "sequence": sequence,
+            }
+        )
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-" + identity_hash.removeprefix("sha256:")[:32],
+            "sequence": sequence,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "retry_exhausted",
+                "message": "FWI Worker exhausted its approved launch attempts",
+                "retryable": False,
+            },
+            "occurred_at": evidence["ticket"]["updated_at"],
+            "fingerprint": copy.deepcopy(intent.queue_fingerprint),
+            "extensions": {
+                "org.agent_rpc.retry_exhaustion": extension,
+            },
+        }
+        self._validate_schema("run-event.schema.json", event)
+        _validate_run_event_semantics(event)
+        _validate_run_event_binding(snapshot, event)
+        try:
+            exhaustion = self._store.finalize_supervised_retry_exhaustion(
+                intent_id=intent.intent_id,
+                attempt_id=projection.attempt_id,
+                observation_sequence=projection.observation_sequence,
+                evidence=evidence,
+                private_schema_version=proof.private_schema_version,
+                private_proof_hash=proof.private_proof_hash,
+                failure_kind=proof.failure_kind,
+                terminal_event=event,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict:
+            current = self._store.get_dispatch_intent(task_id)
+            if (
+                current is not None
+                and current.intent_id == intent.intent_id
+                and current.state == "retry_exhausted"
+                and current.failure_code == "WORKER_RETRY_EXHAUSTED"
+                and current.handle is None
+            ):
+                return TaskScheduleResult(
+                    intent=current,
+                    authorized=False,
+                    authorization_replayed=True,
+                    dispatch_attempted=False,
+                    projected=True,
+                    adopted=False,
+                    deferred_code="WORKER_RETRY_EXHAUSTED",
+                )
+            return TaskScheduleResult(
+                intent=current or intent,
+                authorized=False,
+                authorization_replayed=False,
+                dispatch_attempted=False,
+                projected=True,
+                adopted=False,
+                deferred_code="WORKER_RETRY_EXHAUSTION_CONFLICT",
+            )
+        if (
+            exhaustion.snapshot.status != "Failed"
+            or exhaustion.intent.intent_id != intent.intent_id
+            or exhaustion.intent.state != "retry_exhausted"
+            or exhaustion.intent.failure_code != "WORKER_RETRY_EXHAUSTED"
+            or exhaustion.attempt_id != projection.attempt_id
+            or exhaustion.observation_sequence != projection.observation_sequence
+            or exhaustion.evidence_hash != projection.document_hash
+            or exhaustion.private_proof_hash != proof.private_proof_hash
+        ):
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_OUTCOME_INVALID")
+        return TaskScheduleResult(
+            intent=exhaustion.intent,
+            authorized=False,
+            authorization_replayed=exhaustion.replayed,
+            dispatch_attempted=False,
+            projected=True,
+            adopted=False,
+            deferred_code="WORKER_RETRY_EXHAUSTED",
+        )
+
+    def _deliver_authorized_pre_running_retry(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        authorization: Any,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskScheduleResult:
+        """Deliver one stable SQLite retry token and project its exact result."""
+
+        try:
+            token = authorization.adapter_token()
+        except Exception as error:
+            raise TaskDispatchError("WORKER_RETRY_AUTHORIZATION_INVALID") from error
+        if (
+            not isinstance(token, Mapping)
+            or set(token)
+            != {
+                "schema_version",
+                "intent_id",
+                "previous_attempt_id",
+                "previous_observation_sequence",
+                "failure_kind",
+                "private_proof_hash",
+                "next_attempt_number",
+                "authorized_at",
+            }
+            or token.get("schema_version") != "1.0.0"
+            or token.get("intent_id") != intent.intent_id
+            or token.get("previous_attempt_id")
+            != authorization.previous_attempt_id
+            or token.get("previous_observation_sequence")
+            != authorization.previous_observation_sequence
+            or token.get("failure_kind") != "pre_running_launch_failure"
+            or token.get("private_proof_hash")
+            != authorization.private_proof_hash
+            or token.get("next_attempt_number") != 2
+        ):
+            raise TaskDispatchError("WORKER_RETRY_AUTHORIZATION_INVALID")
+        try:
+            self._parse_gate_time(token.get("authorized_at"))
+        except TaskDispatchError as error:
+            raise TaskDispatchError("WORKER_RETRY_AUTHORIZATION_INVALID") from error
+
+        try:
+            handle = self._dispatcher.retry_pre_running(
+                intent, authorization=token
+            )
+        except DispatchDeferred as error:
+            current = self.project_worker_attempt(
+                task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                supervisor_lease=supervisor_lease,
+            )
+            return TaskScheduleResult(
+                intent=current.intent,
+                authorized=True,
+                authorization_replayed=authorization.authorization_replayed,
+                dispatch_attempted=True,
+                projected=current.projected,
+                adopted=current.adopted,
+                timeout_armed=current.timeout_armed,
+                deferred_code=(
+                    None if current.intent.state == "dispatched" else error.code
+                ),
+            )
+        except DispatchError as error:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=True,
+                authorization_replayed=authorization.authorization_replayed,
+                dispatch_attempted=True,
+                projected=True,
+                adopted=False,
+                deferred_code=error.code,
+            )
+        except Exception:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=True,
+                authorization_replayed=authorization.authorization_replayed,
+                dispatch_attempted=True,
+                projected=True,
+                adopted=False,
+                deferred_code="WORKER_RETRY_UNAVAILABLE",
+            )
+        try:
+            validated_handle = self._validate_dispatch_receipt(
+                snapshot=snapshot,
+                intent=intent,
+                handle=handle,
+            )
+        except TaskValidationError:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=True,
+                authorization_replayed=authorization.authorization_replayed,
+                dispatch_attempted=True,
+                projected=True,
+                adopted=False,
+                deferred_code="DISPATCH_RECEIPT_INVALID",
+            )
+        current = self.project_worker_attempt(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            supervisor_lease=supervisor_lease,
+        )
+        if (
+            current.intent.state != "dispatched"
+            or current.intent.handle != validated_handle
+        ):
+            raise TaskDispatchError("DISPATCH_RECEIPT_NOT_PROJECTED")
+        return TaskScheduleResult(
+            intent=current.intent,
+            authorized=True,
+            authorization_replayed=authorization.authorization_replayed,
+            dispatch_attempted=True,
+            projected=current.projected,
+            adopted=current.adopted,
+            timeout_armed=current.timeout_armed,
         )
 
     def _arm_projected_worker_timeout(
@@ -3140,6 +3767,9 @@ class TaskService:
             projected=True,
             adopted=projection.adopted,
             replayed=projection.replayed,
+            attempt_id=projection.attempt_id,
+            observation_sequence=projection.observation_sequence,
+            document_hash=projection.document_hash,
             timeout_armed=timeout_armed,
         )
 

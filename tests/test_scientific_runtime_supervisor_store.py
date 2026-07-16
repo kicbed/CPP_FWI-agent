@@ -137,6 +137,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         self.registry = RegistryService(self.store, clock=lambda: self.now[0])
         self.registry.register_dataset(dataset=dataset_ref())
         self.registry.register_algorithm(manifest=algorithm_manifest())
+        self.registry.register_algorithm(manifest=load_deepwave_manifest("1.4.0"))
         self.registry.register_algorithm(manifest=load_deepwave_manifest())
         self.next_task_id = 0
 
@@ -164,6 +165,31 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    @staticmethod
+    def _drop_retry_schema(connection: sqlite3.Connection) -> None:
+        for trigger in (
+            "approvals_initialize_retry_budget",
+            "approval_retry_budgets_are_immutable",
+            "approval_retry_budgets_cannot_be_deleted",
+            "worker_retry_reservation_requires_exact_case",
+            "worker_retry_reservation_requires_active_term",
+            "supervised_retry_attempt_requires_active_term",
+            "worker_launch_attempt_requires_retry_reservation",
+            "worker_launch_attempt_rejects_attempt_three",
+            "worker_retry_reservations_are_immutable",
+            "worker_retry_reservations_cannot_be_deleted",
+            "supervised_retry_attempts_are_immutable",
+            "supervised_retry_attempts_cannot_be_deleted",
+            "worker_retry_exhaustion_requires_exact_case",
+            "worker_retry_exhaustions_are_immutable",
+            "worker_retry_exhaustions_cannot_be_deleted",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute("DROP TABLE worker_retry_exhaustions")
+        connection.execute("DROP TABLE supervised_retry_attempts")
+        connection.execute("DROP TABLE worker_retry_reservations")
+        connection.execute("DROP TABLE approval_retry_budgets")
+
     def _acquire(
         self,
         owner_id: str,
@@ -184,9 +210,10 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         key: str,
         deferred: bool = False,
         wall_time_seconds: int | None = None,
+        algorithm_version: str = "1.5.0",
     ):
         token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-        draft = optimizer_task_draft()
+        draft = optimizer_task_draft(algorithm_version=algorithm_version)
         draft["draft_id"] = f"draft-{token}"
         if wall_time_seconds is not None:
             draft["resources"]["wall_time_seconds"] = wall_time_seconds
@@ -197,7 +224,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         )
         task_id = created.snapshot.task_id
 
-        plan = optimizer_plan_graph()
+        plan = optimizer_plan_graph(algorithm_version=algorithm_version)
         plan["plan_id"] = f"plan-{token}"
         plan["draft"] = {
             "draft_id": draft["draft_id"],
@@ -211,6 +238,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         plan["plan_hash"] = compute_plan_hash(plan)
         self.service.persist_plan(task_id=task_id, plan=plan, **self.scope)
         approval = executable_approval_decision(plan)
+        if algorithm_version != "1.5.0":
+            # Historical bindings remain readable, but ApprovalDecision 1.1
+            # grants the finite retry budget only to the current 1.5 pair.
+            approval["schema_version"] = "1.0.0"
+            approval["scope"].pop("retry_policy")
         approval["approval_id"] = f"approval-{token}"
         self.service.persist_approval(
             task_id=task_id,
@@ -221,6 +253,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         dispatcher = FakeDispatcher(
             self.store,
             failure_code=("ADAPTER_CONCURRENCY_LIMIT" if deferred else None),
+            adapter_version=algorithm_version,
         )
         dispatcher.defer_dispatch = deferred
         runtime = TaskService(
@@ -228,12 +261,24 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             clock=lambda: self.now[0],
             dispatcher=dispatcher,
         )
-        submitted = runtime.submit_task(
-            task_id=task_id,
-            approval_id=approval["approval_id"],
-            idempotency_key=f"submit-{key}",
+        submit_arguments = {
+            "task_id": task_id,
+            "approval_id": approval["approval_id"],
+            "idempotency_key": f"submit-{key}",
             **self.scope,
-        )
+        }
+        if algorithm_version == "1.5.0":
+            submitted = runtime.submit_task(**submit_arguments)
+        else:
+            # Reconstruct a receipt admitted while 1.4 was the fixed current
+            # binding so the current Store's read-only compatibility path is
+            # exercised without weakening production admission.
+            runtime._p1_manifest = load_deepwave_manifest(algorithm_version)
+            with mock.patch(
+                "scientific_runtime.task_service.DEEPWAVE_ALGORITHM_VERSION",
+                algorithm_version,
+            ):
+                submitted = runtime.submit_task(**submit_arguments)
         self.assertEqual(submitted.intent.state, "pending")
         return task_id, dispatcher, runtime, submitted.intent
 
@@ -258,8 +303,12 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         )
         return task_id, dispatcher, runtime
 
-    def _reconciliation_runtime(self, *, key: str):
-        task_id, dispatcher, runtime, intent = self._pending_runtime(key=key)
+    def _reconciliation_runtime(
+        self, *, key: str, algorithm_version: str = "1.5.0"
+    ):
+        task_id, dispatcher, runtime, intent = self._pending_runtime(
+            key=key, algorithm_version=algorithm_version
+        )
         claimed, claimed_now = self.store.claim_dispatch(
             intent_id=intent.intent_id,
             now=NOW,
@@ -733,8 +782,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             },
         }
 
-    def test_fresh_v13_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 13)
+    def test_fresh_v14_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 14)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -753,6 +802,9 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "task_timeout_outcomes",
             "supervised_dispatch_reconciliation_attempts",
             "dispatch_reconciliation_resolutions",
+            "approval_retry_budgets",
+            "worker_retry_reservations",
+            "supervised_retry_attempts",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -825,6 +877,18 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "supervised_dispatch_reconciliation_attempts_cannot_be_deleted",
             "dispatch_reconciliation_resolutions_are_immutable",
             "dispatch_reconciliation_resolutions_cannot_be_deleted",
+            "approvals_initialize_retry_budget",
+            "approval_retry_budgets_are_immutable",
+            "approval_retry_budgets_cannot_be_deleted",
+            "worker_retry_reservation_requires_exact_case",
+            "worker_retry_reservation_requires_active_term",
+            "supervised_retry_attempt_requires_active_term",
+            "worker_launch_attempt_requires_retry_reservation",
+            "worker_launch_attempt_rejects_attempt_three",
+            "worker_retry_reservations_are_immutable",
+            "worker_retry_reservations_cannot_be_deleted",
+            "supervised_retry_attempts_are_immutable",
+            "supervised_retry_attempts_cannot_be_deleted",
         }
         expected_indexes = {
             "idx_worker_attempt_timeout_windows_scope_deadline",
@@ -900,6 +964,10 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 reconciliation_migration["name"],
                 "0013_dispatch_reconciliation.sql",
             )
+            retry_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 14"
+            ).fetchone()
+            self.assertEqual(retry_migration["name"], "0014_task_retry.sql")
         finally:
             connection.close()
 
@@ -944,12 +1012,166 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v13(self) -> None:
+    def test_retry_reservation_is_single_use_and_replays_across_terms(self) -> None:
+        task_id, _, _, pending = self._pending_runtime(
+            key="retry-reservation-across-terms"
+        )
+        first = self._acquire("retry-reservation-owner", lease_seconds=30).lease
+        claimed = self.store.authorize_supervised_dispatch(
+            intent_id=pending.intent_id,
+            reason="pending_first_dispatch",
+            supervisor_lease=first,
+            supervisor_clock=lambda: NOW,
+        ).intent
+        self.assertEqual(claimed.state, "dispatching")
+
+        first_attempt_id = "attempt-" + "a" * 32
+        stopped = self.store.record_supervised_worker_observation(
+            intent_id=claimed.intent_id,
+            evidence=managed_worker_evidence(
+                ticket_state="failed",
+                heartbeat_sequence=None,
+                attempt_id=first_attempt_id,
+            ),
+            handle=None,
+            supervisor_lease=first,
+            supervisor_clock=lambda: NOW,
+        )
+        private_proof_hash = "sha256:" + "9" * 64
+        reserved = self.store.authorize_supervised_retry(
+            intent_id=claimed.intent_id,
+            previous_attempt_id=stopped.attempt_id,
+            previous_observation_sequence=stopped.observation_sequence,
+            failure_kind="pre_running_launch_failure",
+            private_proof_hash=private_proof_hash,
+            supervisor_lease=first,
+            supervisor_clock=lambda: NOW,
+        )
+        self.assertFalse(reserved.reservation_replayed)
+        self.assertFalse(reserved.authorization_replayed)
+        stable_token = reserved.adapter_token()
+        self.assertEqual(stable_token["next_attempt_number"], 2)
+
+        replay = self.store.authorize_supervised_retry(
+            intent_id=claimed.intent_id,
+            previous_attempt_id=stopped.attempt_id,
+            previous_observation_sequence=stopped.observation_sequence,
+            failure_kind="pre_running_launch_failure",
+            private_proof_hash=private_proof_hash,
+            supervisor_lease=first,
+            supervisor_clock=lambda: NOW,
+        )
+        self.assertTrue(replay.reservation_replayed)
+        self.assertTrue(replay.authorization_replayed)
+        self.assertEqual(replay.adapter_token(), stable_token)
+        with self.assertRaisesRegex(TaskStoreConflict, "differs"):
+            self.store.authorize_supervised_retry(
+                intent_id=claimed.intent_id,
+                previous_attempt_id=stopped.attempt_id,
+                previous_observation_sequence=stopped.observation_sequence,
+                failure_kind="pre_running_launch_failure",
+                private_proof_hash="sha256:" + "8" * 64,
+                supervisor_lease=first,
+                supervisor_clock=lambda: NOW,
+            )
+
+        self.store.release_runtime_supervisor_lease(
+            lease=first,
+            clock=lambda: T_PLUS_1,
+        )
+        successor = self._acquire(
+            "retry-reservation-successor",
+            now=T_PLUS_1,
+            lease_seconds=30,
+        ).lease
+        redelivered = self.store.authorize_supervised_retry(
+            intent_id=claimed.intent_id,
+            previous_attempt_id=stopped.attempt_id,
+            previous_observation_sequence=stopped.observation_sequence,
+            failure_kind="pre_running_launch_failure",
+            private_proof_hash=private_proof_hash,
+            supervisor_lease=successor,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertTrue(redelivered.reservation_replayed)
+        self.assertFalse(redelivered.authorization_replayed)
+        self.assertEqual(redelivered.adapter_token(), stable_token)
+
+        second_attempt_id = "attempt-" + "b" * 32
+        staged = self.store.record_supervised_worker_observation(
+            intent_id=claimed.intent_id,
+            evidence=managed_worker_evidence(
+                ticket_state="staged",
+                heartbeat_sequence=None,
+                attempt_id=second_attempt_id,
+                attempt_number=2,
+                job_id="fwi-20260715T030001Z-000000000002",
+                created_at=stable_token["authorized_at"],
+            ),
+            handle=None,
+            supervisor_lease=successor,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertEqual(staged.attempt_id, second_attempt_id)
+        with self.assertRaisesRegex(
+            TaskStoreConflict,
+            "staged resume requires exact pre-Popen Worker evidence",
+        ):
+            self.store.authorize_supervised_dispatch(
+                intent_id=claimed.intent_id,
+                reason="staged_attempt_resume",
+                supervisor_lease=successor,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+        resumed = self.store.resume_supervised_retry(
+            intent_id=claimed.intent_id,
+            supervisor_lease=successor,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertTrue(resumed.reservation_replayed)
+        self.assertTrue(resumed.authorization_replayed)
+        self.assertEqual(resumed.adapter_token(), stable_token)
+
+        connection = self._connection()
+        try:
+            attempts = connection.execute(
+                """
+                SELECT attempt_number FROM worker_launch_attempts
+                WHERE intent_id = ? ORDER BY attempt_number
+                """,
+                (claimed.intent_id,),
+            ).fetchall()
+            self.assertEqual([row[0] for row in attempts], [1, 2])
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM worker_retry_reservations
+                    WHERE intent_id = ?
+                    """,
+                    (claimed.intent_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM supervised_retry_attempts
+                    WHERE intent_id = ?
+                    """,
+                    (claimed.intent_id,),
+                ).fetchone()[0],
+                2,
+            )
+        finally:
+            connection.close()
+
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v14(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            self._drop_retry_schema(connection)
             connection.execute("DROP VIEW effective_dispatched_intents")
             connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
             connection.execute(
@@ -979,7 +1201,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 13)
+        self.assertEqual(reopened.migration_version(), 14)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -1018,12 +1240,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v13(self) -> None:
+    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v14(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v12")
         acquired = self._acquire("upgrade-v12-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            self._drop_retry_schema(connection)
             connection.execute("DROP VIEW effective_dispatched_intents")
             connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
             connection.execute(
@@ -1048,7 +1271,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 13)
+        self.assertEqual(reopened.migration_version(), 14)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -1180,7 +1403,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         self,
     ) -> None:
         task_id, dispatcher, _, reconciled = self._reconciliation_runtime(
-            key="private-reconciliation"
+            key="private-reconciliation", algorithm_version="1.4.0"
         )
         connection = self._connection()
         try:
@@ -1269,7 +1492,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         self,
     ) -> None:
         _, dispatcher, _, private_intent = self._reconciliation_runtime(
-            key="private-reconciliation-rollback"
+            key="private-reconciliation-rollback",
+            algorithm_version="1.4.0",
         )
         lease = self._acquire(
             "reconciliation-rollback-owner", lease_seconds=30
@@ -1430,7 +1654,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
 
     def test_committed_dangling_private_adoption_is_corruption(self) -> None:
         _, dispatcher, _, reconciled = self._reconciliation_runtime(
-            key="dangling-private-reconciliation"
+            key="dangling-private-reconciliation",
+            algorithm_version="1.4.0",
         )
         lease = self._acquire(
             "dangling-private-owner", lease_seconds=30
@@ -3309,9 +3534,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
-    def test_direct_sql_cancel_request_rejects_an_older_running_attempt(
-        self,
-    ) -> None:
+    def test_direct_sql_rejects_unreserved_attempt_two(self) -> None:
         task_id, _, runtime, _ = self._pending_runtime(
             key="cancel-reject-older-attempt"
         )
@@ -3327,11 +3550,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             supervisor_lease=acquisition.lease,
         )
         self.assertEqual(scheduled.intent.state, "dispatched")
-        self.assertIsNotNone(scheduled.intent.handle)
 
         new_attempt_id = "attempt-" + "b" * 32
-        request_id = "cancel-" + "c" * 32
-        event_id = "event-direct-sql-older-attempt-cancel"
         connection = self._connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -3345,79 +3565,40 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertIsNotNone(old_attempt)
             assert old_attempt is not None
             old_attempt_id = old_attempt["attempt_id"]
-            connection.execute(
-                """
-                INSERT INTO worker_launch_attempts(
-                    attempt_id, intent_id, task_id, project_id, principal_id,
-                    attempt_number, submission_id, job_id,
-                    adapter_request_hash, binding_hash, created_at,
-                    first_fencing_token, first_observed_at,
-                    first_observed_at_us
-                )
-                SELECT ?, intent_id, task_id, project_id, principal_id,
-                       attempt_number + 1, submission_id, job_id,
-                       adapter_request_hash, ?, created_at,
-                       first_fencing_token, first_observed_at,
-                       first_observed_at_us
-                FROM worker_launch_attempts WHERE attempt_id = ?
-                """,
-                (
-                    new_attempt_id,
-                    "sha256:" + "d" * 64,
-                    old_attempt_id,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO worker_attempt_observations(
-                    attempt_id, observation_sequence, ticket_state,
-                    capacity_slot, capacity_generation, ticket_worker_pid,
-                    ticket_updated_at, ticket_record_hash,
-                    ready_worker_pid, ready_started_at, ready_record_hash,
-                    heartbeat_sequence, heartbeat_state,
-                    heartbeat_updated_at, heartbeat_record_hash,
-                    document_json, document_hash, project_id, principal_id,
-                    fencing_token, observed_at, observed_at_us
-                )
-                SELECT ?, 1, ticket_state,
-                       capacity_slot, capacity_generation, ticket_worker_pid,
-                       ticket_updated_at, ticket_record_hash,
-                       ready_worker_pid, ready_started_at, ready_record_hash,
-                       heartbeat_sequence, heartbeat_state,
-                       heartbeat_updated_at, heartbeat_record_hash,
-                       document_json, document_hash, project_id, principal_id,
-                       fencing_token, observed_at, observed_at_us
-                FROM worker_attempt_observations
-                WHERE attempt_id = ?
-                ORDER BY observation_sequence DESC LIMIT 1
-                """,
-                (new_attempt_id, old_attempt_id),
-            )
-
             with self.assertRaisesRegex(
                 sqlite3.IntegrityError,
-                "cancel request requires an exact running attempt",
+                "retry attempt requires its durable reservation",
             ):
-                self._insert_direct_cancel_request(
-                    connection,
-                    task_id=task_id,
-                    intent=scheduled.intent,
-                    attempt_id=old_attempt_id,
-                    request_id=request_id,
-                    event_id=event_id,
+                connection.execute(
+                    """
+                    INSERT INTO worker_launch_attempts(
+                        attempt_id, intent_id, task_id, project_id,
+                        principal_id, attempt_number, submission_id, job_id,
+                        adapter_request_hash, binding_hash, created_at,
+                        first_fencing_token, first_observed_at,
+                        first_observed_at_us
+                    )
+                    SELECT ?, intent_id, task_id, project_id, principal_id,
+                           attempt_number + 1, submission_id, job_id,
+                           adapter_request_hash, ?, created_at,
+                           first_fencing_token, first_observed_at,
+                           first_observed_at_us
+                    FROM worker_launch_attempts WHERE attempt_id = ?
+                    """,
+                    (
+                        new_attempt_id,
+                        "sha256:" + "d" * 64,
+                        old_attempt_id,
+                    ),
                 )
             connection.rollback()
             self.assertEqual(
                 connection.execute(
-                    "SELECT COUNT(*) FROM task_cancel_requests WHERE request_id = ?",
-                    (request_id,),
-                ).fetchone()[0],
-                0,
-            )
-            self.assertEqual(
-                connection.execute(
-                    "SELECT COUNT(*) FROM run_events WHERE event_id = ?",
-                    (event_id,),
+                    """
+                    SELECT COUNT(*) FROM worker_launch_attempts
+                    WHERE intent_id = ? AND attempt_number = 2
+                    """,
+                    (scheduled.intent.intent_id,),
                 ).fetchone()[0],
                 0,
             )
@@ -3481,7 +3662,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(
                 (binding["algorithm_version"], binding["adapter_version"]),
-                ("1.3.0", "1.4.0"),
+                ("1.3.0", "1.5.0"),
             )
             with self.assertRaisesRegex(
                 sqlite3.IntegrityError,
@@ -3913,7 +4094,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
 
     def test_private_receipt_adoption_is_fenced_atomic_and_immutable(self) -> None:
         _, dispatcher, _, pending = self._pending_runtime(
-            key="private-receipt-adoption"
+            key="private-receipt-adoption", algorithm_version="1.4.0"
         )
         claimed, claimed_now = self.store.claim_dispatch(
             intent_id=pending.intent_id,

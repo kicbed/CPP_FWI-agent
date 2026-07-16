@@ -2073,11 +2073,33 @@
       const featureCapabilities = source.features && typeof source.features === 'object'
         ? Object.entries(source.features).map(([name, enabled]) => `${name}:${enabled === true ? 'on' : 'off'}`)
         : [];
+      const capabilityObject = source.capabilities && typeof source.capabilities === 'object'
+        && !Array.isArray(source.capabilities) ? source.capabilities : null;
       const capabilitiesSource = Array.isArray(source.capabilities)
         ? source.capabilities
-        : (source.capabilities && typeof source.capabilities === 'object'
-          ? Object.keys(source.capabilities).filter(key => source.capabilities[key] === true)
+        : (capabilityObject
+          ? Object.keys(capabilityObject).filter(key => capabilityObject[key] === true)
           : featureCapabilities);
+      const automaticRetrySource = capabilityObject
+        && capabilityObject.finite_automatic_retry
+        && typeof capabilityObject.finite_automatic_retry === 'object'
+        && !Array.isArray(capabilityObject.finite_automatic_retry)
+        ? capabilityObject.finite_automatic_retry : null;
+      const automaticRetryKeys = automaticRetrySource
+        ? Object.keys(automaticRetrySource).sort().join(',') : '';
+      const finiteAutomaticRetry = automaticRetrySource
+        && automaticRetryKeys === 'max_attempts,max_concurrent_attempts,pre_running_launch_failure,worker_exit'
+        && automaticRetrySource.max_attempts === 2
+        && automaticRetrySource.max_concurrent_attempts === 1
+        && automaticRetrySource.pre_running_launch_failure === true
+        && automaticRetrySource.worker_exit === false
+        ? {
+            maxAttempts: 2,
+            maxConcurrentAttempts: 1,
+            preRunningLaunchFailure: true,
+            workerExit: false,
+          }
+        : null;
       const formSource = source.form && typeof source.form === 'object' ? source.form : {};
       const learningSource = formSource.learning_rate && typeof formSource.learning_rate === 'object'
         ? formSource.learning_rate : {};
@@ -2126,6 +2148,8 @@
           .filter(item => typeof item === 'string')
           .slice(0, 20)
           .map(item => item.slice(0, 80)),
+        manualRetry: capabilityObject ? capabilityObject.manual_retry === true : false,
+        finiteAutomaticRetry,
         optimization: {
           optimizers: (Array.isArray(formSource.optimizers) ? formSource.optimizers : [])
             .filter(item => ['adam', 'sgd'].includes(item)),
@@ -2172,13 +2196,24 @@
       const algorithmSource = source.algorithm && typeof source.algorithm === 'object'
         ? source.algorithm
         : (Array.isArray(source.algorithms) ? source.algorithms[0] : null);
-      const algorithm = algorithmSource
+      const adapterSource = algorithmSource && algorithmSource.adapter
+        && typeof algorithmSource.adapter === 'object' && !Array.isArray(algorithmSource.adapter)
+        ? algorithmSource.adapter : null;
+      const supportedBinding = algorithmSource && adapterSource
+        && ['1.4.0', '1.5.0'].includes(algorithmSource.version)
+        && adapterSource.version === algorithmSource.version
+        && adapterSource.protocol === 'algorithm-adapter-v1';
+      const algorithm = supportedBinding
         && isSafeGuidedIdentifier(algorithmSource.id)
         && isSafeGuidedVersion(algorithmSource.version)
         ? { id: algorithmSource.id, version: algorithmSource.version }
         : null;
       if (datasets.length === 0 || !algorithm) return null;
-      return { datasets, algorithm };
+      return {
+        datasets,
+        algorithm,
+        adapter: { protocol: adapterSource.protocol, version: adapterSource.version },
+      };
     }
 
     function guidedIntegerValue(value, minimum, maximum) {
@@ -2304,7 +2339,7 @@
         { port: 'inverted_model', dataType: 'inverted_velocity_model_2d' },
         { port: 'loss', dataType: 'loss_curve' },
       ];
-      if (algorithmVersion === '1.4.0') {
+      if (['1.4.0', '1.5.0'].includes(algorithmVersion)) {
         return [
           ...primary,
           { port: 'true_model_figure', dataType: 'figure' },
@@ -2500,6 +2535,13 @@
         : (source.runtime_status && typeof source.runtime_status === 'object' ? source.runtime_status : {});
       const dispatchState = dispatchSource.state || dispatchSource.status || '';
       if (hasDispatch && !Object.hasOwn(dispatchSource, 'reconciliation')) return null;
+      const privateDispatchKeys = [
+        'attempt_id', 'document_hash', 'evidence_hash', 'handle', 'job_id',
+        'path', 'private_proof_hash', 'proof', 'proof_hash', 'relative_path',
+        'submission_id',
+      ];
+      if (hasDispatch
+          && privateDispatchKeys.some(key => Object.hasOwn(dispatchSource, key))) return null;
       const hasReconciliation = hasDispatch && dispatchSource.reconciliation !== null;
       const normalizedReconciliation = hasReconciliation
         ? normalizeGuidedReconciliationProjection(dispatchSource.reconciliation) : null;
@@ -2552,7 +2594,10 @@
             ? approvalSource.decision : '',
         },
         dispatch: {
-          state: ['pending', 'dispatching', 'dispatched', 'reconciliation_required'].includes(dispatchState)
+          state: [
+            'pending', 'dispatching', 'dispatched', 'reconciliation_required',
+            'retry_exhausted',
+          ].includes(dispatchState)
             ? dispatchState : '',
           failureCode: /^[A-Z0-9_]{1,128}$/.test(dispatchSource.failure_code || '')
             ? dispatchSource.failure_code : '',
@@ -2651,14 +2696,22 @@
       }
 
       if (hasDispatch) {
-        if (!['pending', 'dispatching', 'dispatched', 'reconciliation_required']
+        if (![
+          'pending', 'dispatching', 'dispatched', 'reconciliation_required',
+          'retry_exhausted',
+        ]
           .includes(normalized.dispatch.state)) return null;
+        if (normalized.dispatch.state === 'retry_exhausted'
+            && (normalized.status !== 'Failed'
+              || normalized.dispatch.failureCode !== 'WORKER_RETRY_EXHAUSTED'
+              || normalized.dispatch.reconciliation !== null)) return null;
         if (normalized.dispatch.state === 'reconciliation_required'
             && (!normalized.dispatch.reconciliation
               || normalized.dispatch.reconciliation.state !== 'action_required'
               || normalized.dispatch.failureCode
                 !== normalized.dispatch.reconciliation.failureCode)) return null;
-        if (normalized.dispatch.state !== 'reconciliation_required'
+        if (!['reconciliation_required', 'retry_exhausted']
+          .includes(normalized.dispatch.state)
             && normalized.dispatch.failureCode) return null;
         if (normalized.dispatch.reconciliation?.state === 'action_required'
             && normalized.dispatch.state !== 'reconciliation_required') return null;
@@ -2755,7 +2808,10 @@
         && task.approval.planId === task.plan.id
         && task.approval.planHash === expectedPlanHash
         && task.approval.decision === 'approved'
-        && ['pending', 'dispatching', 'dispatched', 'reconciliation_required']
+        && [
+          'pending', 'dispatching', 'dispatched', 'reconciliation_required',
+          'retry_exhausted',
+        ]
           .includes(task.dispatch.state)
         && ['Queued', 'Running', 'Waiting', 'Retrying', 'Succeeded', 'Failed', 'Cancelled']
           .includes(task.status));
@@ -3382,14 +3438,18 @@
       )) || catalog.datasets[0];
       const metadata = dataset.metadata;
       const scope = session.scope;
+      const retry = session.finiteAutomaticRetry;
+      const retryCapability = retry
+        ? `automatic: max ${retry.maxAttempts} attempts, serial; pre-running launch failure: enabled; worker_exit: pending; manual/browser: ${session.manualRetry ? 'enabled' : 'disabled'}`
+        : `automatic: not declared; manual/browser: ${session.manualRetry ? 'enabled' : 'disabled'}`;
       return `<div class="grid grid-cols-1 md:grid-cols-2 gap-3">
         <section class="rounded-lg border border-slate-200 bg-slate-50 p-3">
           <h4 class="text-xs font-semibold uppercase tracking-wider text-slate-500">Session scope</h4>
-          <dl class="kv-grid mt-2"><dt>mode</dt><dd>${escapeHtml(session.mode || 'guided')}</dd><dt>task type</dt><dd class="font-mono">${escapeHtml(session.taskType || 'acoustic_fwi_2d')}</dd><dt>project</dt><dd class="font-mono">${escapeHtml(scope.projectId || 'server-bound')}</dd><dt>principal</dt><dd class="font-mono">${escapeHtml(scope.principalId || 'server-bound')}</dd><dt>capabilities</dt><dd>${escapeHtml(session.capabilities.join(', ') || 'approval required')}</dd></dl>
+          <dl class="kv-grid mt-2"><dt>mode</dt><dd>${escapeHtml(session.mode || 'guided')}</dd><dt>task type</dt><dd class="font-mono">${escapeHtml(session.taskType || 'acoustic_fwi_2d')}</dd><dt>project</dt><dd class="font-mono">${escapeHtml(scope.projectId || 'server-bound')}</dd><dt>principal</dt><dd class="font-mono">${escapeHtml(scope.principalId || 'server-bound')}</dd><dt>capabilities</dt><dd>${escapeHtml(session.capabilities.join(', ') || 'approval required')}</dd><dt>retry</dt><dd>${escapeHtml(retryCapability)}</dd></dl>
         </section>
         <section class="rounded-lg border border-slate-200 bg-slate-50 p-3">
           <h4 class="text-xs font-semibold uppercase tracking-wider text-slate-500">Immutable catalog metadata</h4>
-          <dl class="kv-grid mt-2"><dt>dataset</dt><dd class="font-mono">${escapeHtml(`${dataset.id}@${dataset.version}`)}</dd><dt>shape</dt><dd>${escapeHtml(metadata.shape.length ? metadata.shape.join(' × ') : '—')}</dd><dt>spacing</dt><dd>${escapeHtml(`${formatGuidedNumber(metadata.dx)} / ${formatGuidedNumber(metadata.dz)} m`)}</dd><dt>value range</dt><dd>${escapeHtml(`${formatGuidedNumber(metadata.minimum)} – ${formatGuidedNumber(metadata.maximum)} ${metadata.units || ''}`.trim())}</dd><dt>algorithm</dt><dd class="font-mono">${escapeHtml(`${catalog.algorithm.id}@${catalog.algorithm.version}`)}</dd></dl>
+          <dl class="kv-grid mt-2"><dt>dataset</dt><dd class="font-mono">${escapeHtml(`${dataset.id}@${dataset.version}`)}</dd><dt>shape</dt><dd>${escapeHtml(metadata.shape.length ? metadata.shape.join(' × ') : '—')}</dd><dt>spacing</dt><dd>${escapeHtml(`${formatGuidedNumber(metadata.dx)} / ${formatGuidedNumber(metadata.dz)} m`)}</dd><dt>value range</dt><dd>${escapeHtml(`${formatGuidedNumber(metadata.minimum)} – ${formatGuidedNumber(metadata.maximum)} ${metadata.units || ''}`.trim())}</dd><dt>algorithm / adapter</dt><dd class="font-mono">${escapeHtml(`${catalog.algorithm.id}@${catalog.algorithm.version} / ${catalog.adapter.version}`)}</dd></dl>
         </section>
       </div>`;
     }
@@ -3562,6 +3622,7 @@
         dispatching: '派发认领已持久化；若回执缺失，结果需要后续核对。',
         dispatched: '固定 Adapter 已返回可验证派发回执。',
         reconciliation_required: '派发结果仍需处理；只有受围栏 Supervisor 的严格正向回执可解决，浏览器不会重试。',
+        retry_exhausted: '两次受控尝试均在进入运行前停止，有限自动重试预算已经耗尽；任务已由服务端关闭为 Failed。浏览器不会重试。',
       };
       return explanations[stateName] || '等待持久派发状态。';
     }
@@ -3836,7 +3897,8 @@
           state.guided.phase = 'succeeded';
           await loadGuidedArtifacts({ render: false });
         } else if (['Failed', 'Cancelled'].includes(task.status)
-            || task.dispatch.state === 'reconciliation_required') {
+            || ['reconciliation_required', 'retry_exhausted']
+              .includes(task.dispatch.state)) {
           state.guided.phase = 'terminal';
         } else {
           state.guided.phase = 'monitoring';
@@ -4032,13 +4094,15 @@
         state.guided.phase = updated.status === 'Succeeded'
           ? 'succeeded'
           : (['Failed', 'Cancelled'].includes(updated.status)
-            || updated.dispatch.state === 'reconciliation_required'
+            || ['reconciliation_required', 'retry_exhausted']
+              .includes(updated.dispatch.state)
             ? 'terminal' : 'monitoring');
         if (updated.status === 'Succeeded') await loadGuidedArtifacts({ render: false });
         renderGuidedFwi();
         if (updated.status === 'Succeeded') return true;
         else if (!['Failed', 'Cancelled'].includes(updated.status)
-            && updated.dispatch.state !== 'reconciliation_required') scheduleGuidedPoll();
+            && !['reconciliation_required', 'retry_exhausted']
+              .includes(updated.dispatch.state)) scheduleGuidedPoll();
         return true;
       } catch (error) {
         state.guided.mutation = '';
@@ -4145,7 +4209,8 @@
           state.guided.phase = 'succeeded';
           await loadGuidedArtifacts({ render: false });
         } else if (['Failed', 'Cancelled'].includes(updated.status)
-            || updated.dispatch.state === 'reconciliation_required') {
+            || ['reconciliation_required', 'retry_exhausted']
+              .includes(updated.dispatch.state)) {
           state.guided.phase = 'terminal';
         } else {
           state.guided.phase = 'monitoring';
@@ -4248,7 +4313,8 @@
           state.guided.phase = 'succeeded';
           await loadGuidedArtifacts({ render: false });
         } else if (['Failed', 'Cancelled'].includes(task.status)
-            || task.dispatch.state === 'reconciliation_required') {
+            || ['reconciliation_required', 'retry_exhausted']
+              .includes(task.dispatch.state)) {
           state.guided.phase = 'terminal';
         } else if (state.guided.outcomeUnknown && task.status === 'AwaitingApproval') {
           state.guided.phase = 'outcome_unknown';

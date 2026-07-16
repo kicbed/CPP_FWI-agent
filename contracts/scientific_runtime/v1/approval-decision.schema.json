@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://agent-rpc.local/schemas/scientific-runtime/v1/approval-decision.schema.json",
-  "title": "ApprovalDecision v1",
+  "title": "ApprovalDecision v1.0/v1.1",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -17,7 +17,7 @@
     "extensions"
   ],
   "properties": {
-    "schema_version": {"$ref": "common.schema.json#/definitions/schema_version"},
+    "schema_version": {"enum": ["1.0.0", "1.1.0"]},
     "approval_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
     "plan_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
     "plan_hash": {"$ref": "common.schema.json#/definitions/sha256"},
@@ -55,7 +55,35 @@
           "uniqueItems": true,
           "items": {"enum": ["compute", "write_artifacts"]}
         },
-        "max_tasks": {"type": "integer", "minimum": 1, "maximum": 100}
+        "max_tasks": {"type": "integer", "minimum": 1, "maximum": 100},
+        "retry_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_attempts",
+            "max_concurrent_attempts",
+            "max_cumulative_attempt_wall_time_seconds",
+            "retryable_failure_classes"
+          ],
+          "properties": {
+            "max_attempts": {"const": 2},
+            "max_concurrent_attempts": {"const": 1},
+            "max_cumulative_attempt_wall_time_seconds": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 172800
+            },
+            "retryable_failure_classes": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "items": {
+                "enum": ["pre_running_launch_failure", "worker_exit"]
+              }
+            }
+          }
+        }
       }
     },
     "delegation": {
@@ -77,6 +105,22 @@
       "if": {"properties": {"actor": {"properties": {"type": {"const": "agent_delegation"}}}}},
       "then": {"required": ["delegation"]},
       "else": {"not": {"required": ["delegation"]}}
+    },
+    {
+      "if": {"properties": {"schema_version": {"const": "1.1.0"}}},
+      "then": {
+        "properties": {
+          "scope": {"required": ["retry_policy"]}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"schema_version": {"const": "1.0.0"}}},
+      "then": {
+        "properties": {
+          "scope": {"not": {"required": ["retry_policy"]}}
+        }
+      }
     }
   ]
 }

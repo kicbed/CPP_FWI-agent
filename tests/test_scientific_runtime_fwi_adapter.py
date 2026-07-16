@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import fcntl
 import hashlib
 import io
 import json
@@ -29,6 +30,7 @@ from scientific_runtime import (
     DispatchError,
     DispatchIntentSnapshot,
     RegistryService,
+    RetryExhaustionCleanupProof,
     SQLiteTaskStore,
     TaskConflict,
     TaskService,
@@ -40,6 +42,7 @@ from scientific_runtime.fwi_adapter import (
     AdapterIdempotencyConflict,
     AdapterManagedCancelProof,
     AdapterManagedTimeoutProof,
+    AdapterPurgeError,
     AdapterUnavailable,
     DeepwaveAdapter,
     SafeSubprocessWorkerLauncher,
@@ -72,7 +75,7 @@ PLAN_HASH = "sha256:" + "d" * 64
 
 
 def algorithm_identity() -> dict[str, Any]:
-    return {"id": "deepwave.acoustic_fwi", "version": "1.4.0"}
+    return {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
 
 
 def dataset_ref(*, content_hash: str = HASH_DATASET) -> dict[str, Any]:
@@ -128,7 +131,7 @@ def development_fingerprint() -> dict[str, Any]:
     return {
         "provenance_mode": "development",
         "algorithm": algorithm_identity(),
-        "adapter_version": "1.4.0",
+        "adapter_version": "1.5.0",
         "source": {"identity_complete": False, "dirty": None},
         "environment": {"environment_lock_hash": HASH_ENVIRONMENT},
         "runtime": {
@@ -241,6 +244,51 @@ class CapacityDeferredLauncher(FakeLauncher):
     def launch(self, **kwargs: Any) -> int:
         super().launch(**kwargs)
         raise AdapterUnavailable("ADAPTER_CONCURRENCY_LIMIT")
+
+
+class StoppedThenSuccessfulSafeLauncher(SafeSubprocessWorkerLauncher):
+    """Production-class launcher with one exact pre-Popen stopped failure."""
+
+    def __init__(self, *, defer_retry: bool = False) -> None:
+        super().__init__(
+            python_executable=fwi_adapter_module.DEFAULT_WORKER_PYTHON
+        )
+        self.calls = 0
+        self.defer_retry = defer_retry
+
+    def _launch_once(self, **kwargs: Any) -> int:
+        self.calls += 1
+        if self.calls == 1:
+            lease = ParentLaunchLease.acquire(
+                kwargs["run_root"],
+                kwargs["run_dir"],
+                max_active=self._max_active,
+            )
+            lease.abort()
+            raise AdapterUnavailable(
+                "WORKER_LAUNCH_FAILED: synthetic stopped infrastructure failure"
+            )
+        if self.defer_retry:
+            raise AdapterUnavailable(
+                "ADAPTER_CONCURRENCY_LIMIT: synthetic retry deferral"
+            )
+        return 4242
+
+
+class StoppedTwiceSafeLauncher(StoppedThenSuccessfulSafeLauncher):
+    """Production-class launcher proving both finite attempts stopped."""
+
+    def _launch_once(self, **kwargs: Any) -> int:
+        self.calls += 1
+        lease = ParentLaunchLease.acquire(
+            kwargs["run_root"],
+            kwargs["run_dir"],
+            max_active=self._max_active,
+        )
+        lease.abort()
+        raise AdapterUnavailable(
+            "WORKER_LAUNCH_FAILED: synthetic stopped infrastructure failure"
+        )
 
 
 class FileMarkerLauncher:
@@ -416,6 +464,86 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             / "submissions"
             / name
         )
+
+    def stopped_retry_exhaustion_fixture(
+        self, *, task_id: str
+    ) -> tuple[DeepwaveAdapter, dict[str, Any], dict[str, Any], Path]:
+        """Create two exact stopped attempts plus a path-free Store-like token."""
+
+        launcher = StoppedTwiceSafeLauncher()
+        adapter = self.make_adapter(launcher=launcher)
+        request = self.submit_kwargs(
+            task_id=task_id,
+            idempotency_key=f"{task_id}:invert:0001",
+        )
+        with self.assertRaises(AdapterUnavailable):
+            adapter.submit(**copy.deepcopy(request))
+        first = adapter.probe_pre_running_retry(**copy.deepcopy(request))
+        authorization = {
+            "schema_version": "1.0.0",
+            "intent_id": f"intent-{task_id}",
+            "previous_attempt_id": first.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "failure_kind": "pre_running_launch_failure",
+            "private_proof_hash": first.private_proof_hash,
+            "next_attempt_number": 2,
+            "authorized_at": "2026-07-15T06:00:01Z",
+        }
+        with self.assertRaises(AdapterUnavailable):
+            adapter.retry_pre_running(
+                **copy.deepcopy(request), authorization=authorization
+            )
+        second = adapter.probe_pre_running_retry_exhaustion(
+            **copy.deepcopy(request)
+        )
+        submission_id = second.evidence["submission_id"]
+        record_path = (
+            self.run_root
+            / fwi_adapter_module.CONTROL_DIRECTORY
+            / "submissions"
+            / f"{submission_id.removeprefix('submission-')}.json"
+        )
+        payload = {
+            "schema_version": "1.0.0",
+            "purge_id": f"purge-{task_id}",
+            "intent_id": authorization["intent_id"],
+            "task_id": task_id,
+            "project_id": "project-1",
+            "principal_id": "user-1",
+            "approval_id": f"approval-{task_id}",
+            "attempt_id": second.previous_attempt_id,
+            "attempt_number": 2,
+            "observation_sequence": 2,
+            "evidence": copy.deepcopy(second.evidence),
+            "evidence_hash": fwi_adapter_module._sha256_document(
+                second.evidence
+            ),
+            "private_schema_version": "1.2.0",
+            "private_proof_hash": second.private_proof_hash,
+            "failure_kind": "pre_running_launch_failure",
+            "previous_attempt_id": first.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "previous_private_proof_hash": first.private_proof_hash,
+            "retry_reserved_at": authorization["authorized_at"],
+            "terminal_event_sequence": 2,
+            "terminal_event_hash": "sha256:" + "f" * 64,
+            "exhausted_at": "2026-07-15T06:00:02Z",
+        }
+        token = {
+            **payload,
+            "proof_hash": fwi_adapter_module._sha256_document(payload),
+        }
+        return adapter, request, token, record_path
+
+    @staticmethod
+    def rebound_cleanup_token(
+        token: dict[str, Any], **changes: Any
+    ) -> dict[str, Any]:
+        value = copy.deepcopy(token)
+        value.update(changes)
+        value.pop("proof_hash", None)
+        value["proof_hash"] = fwi_adapter_module._sha256_document(value)
+        return value
 
     def assert_input_rejected(
         self,
@@ -1792,6 +1920,533 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(len(failing_launcher.calls), 1)
         self.assertEqual(replacement_launcher.calls, [])
 
+    def test_exact_stopped_failure_appends_one_deterministic_retry(self) -> None:
+        retry_root = self.base / "retry-runs"
+        retry_root.mkdir(mode=0o700)
+        launcher = StoppedThenSuccessfulSafeLauncher()
+        adapter = self.make_adapter(run_root=retry_root, launcher=launcher)
+        request = self.submit_kwargs(
+            task_id="task-exact-stopped-retry",
+            idempotency_key="task-exact-stopped-retry:invert:0001",
+        )
+
+        with self.assertRaises(AdapterUnavailable) as stopped:
+            adapter.submit(**copy.deepcopy(request))
+        self.assertEqual(stopped.exception.code, "WORKER_LAUNCH_FAILED")
+        proof = adapter.probe_pre_running_retry(**copy.deepcopy(request))
+        self.assertEqual(proof.previous_attempt_number, 1)
+        self.assertEqual(proof.private_schema_version, "1.2.0")
+        self.assertEqual(proof.evidence["ticket"]["state"], "failed")
+
+        authorization = {
+            "schema_version": "1.0.0",
+            "intent_id": "intent-exact-stopped-retry",
+            "previous_attempt_id": proof.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "failure_kind": "pre_running_launch_failure",
+            "private_proof_hash": proof.private_proof_hash,
+            "next_attempt_number": 2,
+            "authorized_at": "2026-07-15T06:00:01Z",
+        }
+        handle = adapter.retry_pre_running(
+            **copy.deepcopy(request), authorization=authorization
+        )
+        self.assertEqual(launcher.calls, 2)
+        record_path = (
+            retry_root
+            / ".scientific-runtime-adapter-v1"
+            / "submissions"
+            / f"{handle.submission_id.removeprefix('submission-')}.json"
+        )
+        record = adapter._read_submission(record_path)
+        current = binding_from_submission_record(record)
+        self.assertEqual(record["schema_version"], "1.2.0")
+        self.assertEqual(current.attempt_number, 2)
+        self.assertEqual(len(record["attempt_history"]), 1)
+        self.assertEqual(
+            record["attempt_history"][0]["launch_attempt"]["attempt_id"],
+            proof.previous_attempt_id,
+        )
+        self.assertEqual(
+            record["attempt_history"][0]["launch_failure"]["proof_hash"],
+            proof.private_proof_hash,
+        )
+
+        replay = adapter.retry_pre_running(
+            **copy.deepcopy(request), authorization=copy.deepcopy(authorization)
+        )
+        self.assertEqual(replay.as_dict(), handle.as_dict())
+        self.assertEqual(launcher.calls, 2)
+        with self.assertRaises(AdapterUnavailable) as exhausted:
+            adapter.probe_pre_running_retry(**copy.deepcopy(request))
+        self.assertEqual(exhausted.exception.code, "WORKER_RETRY_UNSUPPORTED")
+
+    def test_attempt_two_exhaustion_probe_is_exact_and_read_only(self) -> None:
+        launcher = StoppedTwiceSafeLauncher()
+        adapter = self.make_adapter(launcher=launcher)
+        request = self.submit_kwargs(
+            task_id="task-exact-stopped-exhaustion",
+            idempotency_key="task-exact-stopped-exhaustion:invert:0001",
+        )
+
+        with self.assertRaises(AdapterUnavailable) as first_stopped:
+            adapter.submit(**copy.deepcopy(request))
+        self.assertEqual(first_stopped.exception.code, "WORKER_LAUNCH_FAILED")
+        first = adapter.probe_pre_running_retry(**copy.deepcopy(request))
+        authorization = {
+            "schema_version": "1.0.0",
+            "intent_id": "intent-exact-stopped-exhaustion",
+            "previous_attempt_id": first.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "failure_kind": "pre_running_launch_failure",
+            "private_proof_hash": first.private_proof_hash,
+            "next_attempt_number": 2,
+            "authorized_at": "2026-07-15T06:00:01Z",
+        }
+        with self.assertRaises(AdapterUnavailable) as second_stopped:
+            adapter.retry_pre_running(
+                **copy.deepcopy(request), authorization=authorization
+            )
+        self.assertEqual(second_stopped.exception.code, "WORKER_LAUNCH_FAILED")
+        self.assertEqual(launcher.calls, 2)
+
+        record_path = next(
+            (
+                self.run_root
+                / fwi_adapter_module.CONTROL_DIRECTORY
+                / "submissions"
+            ).glob("*.json")
+        )
+        original_record = adapter._read_submission(record_path)
+        second_binding = binding_from_submission_record(original_record)
+        self.assertEqual(original_record["schema_version"], "1.2.0")
+        self.assertEqual(original_record["launch_state"], "failed")
+        self.assertEqual(second_binding.attempt_number, 2)
+        self.assertEqual(len(original_record["attempt_history"]), 1)
+
+        def private_snapshot() -> dict[str, tuple[str, int, bytes | str | None]]:
+            snapshot: dict[str, tuple[str, int, bytes | str | None]] = {}
+            for path in sorted(self.run_root.rglob("*")):
+                relative = str(path.relative_to(self.run_root))
+                mode = path.lstat().st_mode & 0o777
+                if path.is_symlink():
+                    snapshot[relative] = ("symlink", mode, os.readlink(path))
+                elif path.is_file():
+                    snapshot[relative] = ("file", mode, path.read_bytes())
+                else:
+                    snapshot[relative] = ("directory", mode, None)
+            return snapshot
+
+        before_exact_probe = private_snapshot()
+        exhausted = adapter.probe_pre_running_retry_exhaustion(
+            **copy.deepcopy(request)
+        )
+        self.assertEqual(private_snapshot(), before_exact_probe)
+        self.assertEqual(exhausted.previous_attempt_number, 2)
+        self.assertEqual(exhausted.previous_attempt_id, second_binding.attempt_id)
+        self.assertEqual(exhausted.private_schema_version, "1.2.0")
+        self.assertEqual(
+            exhausted.private_proof_hash,
+            original_record["launch_failure"]["proof_hash"],
+        )
+        self.assertEqual(exhausted.evidence["ticket"]["state"], "failed")
+
+        before_wrong_attempt = private_snapshot()
+        with self.assertRaises(AdapterUnavailable) as wrong_attempt:
+            adapter.probe_pre_running_retry(**copy.deepcopy(request))
+        self.assertEqual(wrong_attempt.exception.code, "WORKER_RETRY_UNSUPPORTED")
+        self.assertEqual(private_snapshot(), before_wrong_attempt)
+
+        mismatched_record = copy.deepcopy(original_record)
+        mismatch = mismatched_record["launch_failure"]
+        mismatch["ticket_record_hash"] = "sha256:" + "e" * 64
+        mismatch["proof_hash"] = fwi_adapter_module._sha256_document(
+            {
+                key: copy.deepcopy(value)
+                for key, value in mismatch.items()
+                if key != "proof_hash"
+            }
+        )
+        adapter._write_submission(record_path, mismatched_record)
+        before_mismatch_probe = private_snapshot()
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError, "stopped proof differs from Worker evidence"
+            ):
+                adapter.probe_pre_running_retry_exhaustion(
+                    **copy.deepcopy(request)
+                )
+            self.assertEqual(private_snapshot(), before_mismatch_probe)
+        finally:
+            adapter._write_submission(record_path, original_record)
+        self.assertEqual(private_snapshot(), before_exact_probe)
+
+    def test_retry_exhaustion_purge_deletes_both_attempts_and_replays(self) -> None:
+        adapter, request, token, record_path = (
+            self.stopped_retry_exhaustion_fixture(
+                task_id="task-retry-exhaustion-purge"
+            )
+        )
+        record = adapter._read_submission(record_path)
+        job_dirs = [
+            self.run_root / record["attempt_history"][0]["job_id"],
+            self.run_root / record["job_id"],
+        ]
+        unrelated = self.run_root / "unrelated-retained"
+        unrelated.mkdir()
+        (unrelated / "sentinel.txt").write_text("keep", encoding="utf-8")
+
+        first = adapter.purge_retry_exhausted(
+            **copy.deepcopy(request),
+            purge_id=token["purge_id"],
+            exhaustion=copy.deepcopy(token),
+        ).as_dict()
+        self.assertEqual(first["local_run_state"], "deleted")
+        self.assertFalse(first["replayed"])
+        self.assertTrue(all(not path.exists() for path in job_dirs))
+        self.assertEqual(
+            (unrelated / "sentinel.txt").read_text(encoding="utf-8"), "keep"
+        )
+        purged_record = adapter._read_submission(record_path)
+        self.assertEqual(purged_record["launch_state"], "purged")
+        self.assertEqual(purged_record["purge_id"], token["purge_id"])
+        self.assertEqual(
+            purged_record["launch_failure"]["proof_hash"],
+            token["private_proof_hash"],
+        )
+
+        replay = adapter.purge_retry_exhausted(
+            **copy.deepcopy(request),
+            purge_id=token["purge_id"],
+            exhaustion=copy.deepcopy(token),
+        ).as_dict()
+        self.assertTrue(replay["replayed"])
+        conflicting = self.rebound_cleanup_token(
+            token, purge_id="purge-retry-exhaustion-other"
+        )
+        with self.assertRaisesRegex(RuntimeError, "PURGE_IDEMPOTENCY_CONFLICT"):
+            adapter.purge_retry_exhausted(
+                **copy.deepcopy(request),
+                purge_id=conflicting["purge_id"],
+                exhaustion=conflicting,
+            )
+
+    def test_dispatcher_consumes_only_store_typed_retry_exhaustion_proof(
+        self,
+    ) -> None:
+        adapter, request, token, record_path = (
+            self.stopped_retry_exhaustion_fixture(
+                task_id="task-retry-exhaustion-dispatcher-purge"
+            )
+        )
+        record = adapter._read_submission(record_path)
+        durable_request = copy.deepcopy(request)
+        durable_request["normalized_config_hash"] = record[
+            "normalized_config_hash"
+        ]
+        intent = DispatchIntentSnapshot(
+            intent_id=token["intent_id"],
+            task_id=token["task_id"],
+            plan_id="plan-retry-exhaustion-dispatcher-purge",
+            plan_hash=request["plan_hash"],
+            approval_id=token["approval_id"],
+            node_id=request["node_id"],
+            node_idempotency_key=request["idempotency_key"],
+            adapter_id="fwi.deepwave_adapter",
+            adapter_version="1.5.0",
+            request=durable_request,
+            request_hash="sha256:" + "e" * 64,
+            queue_fingerprint=copy.deepcopy(record["fingerprint"]),
+            state="retry_exhausted",
+            handle=None,
+            failure_code="WORKER_RETRY_EXHAUSTED",
+            created_at=NOW,
+            dispatch_claimed_at=NOW,
+            outcome_recorded_at=token["exhausted_at"],
+        )
+        proof = RetryExhaustionCleanupProof(
+            **{
+                key: copy.deepcopy(token[key])
+                for key in (
+                    "purge_id",
+                    "intent_id",
+                    "task_id",
+                    "project_id",
+                    "principal_id",
+                    "approval_id",
+                    "attempt_id",
+                    "observation_sequence",
+                    "evidence",
+                    "evidence_hash",
+                    "private_schema_version",
+                    "private_proof_hash",
+                    "failure_kind",
+                    "previous_attempt_id",
+                    "previous_observation_sequence",
+                    "previous_private_proof_hash",
+                    "retry_reserved_at",
+                    "terminal_event_sequence",
+                    "terminal_event_hash",
+                    "exhausted_at",
+                )
+            }
+        )
+        dispatcher = DeepwaveTaskDispatcher(adapter)
+        result = dispatcher.purge_retry_exhausted(
+            intent, purge_id=token["purge_id"], exhaustion=proof
+        )
+        self.assertEqual(result["local_run_state"], "deleted")
+        self.assertFalse(result["replayed"])
+        self.assertFalse((self.run_root / record["job_id"]).exists())
+        self.assertFalse(
+            (self.run_root / record["attempt_history"][0]["job_id"]).exists()
+        )
+        with self.assertRaises(DispatchError) as untyped:
+            dispatcher.purge_retry_exhausted(
+                intent,
+                purge_id=token["purge_id"],
+                exhaustion=token,  # type: ignore[arg-type]
+            )
+        self.assertEqual(
+            untyped.exception.code, "WORKER_RETRY_EXHAUSTION_PURGE_INVALID"
+        )
+
+    def test_retry_exhaustion_purge_mismatches_fail_before_tombstone(self) -> None:
+        cases = (
+            "proof",
+            "attempt",
+            "request",
+            "history",
+            "sidecar",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                task_id = f"task-exhaustion-mismatch-{case}"
+                adapter, request, token, record_path = (
+                    self.stopped_retry_exhaustion_fixture(task_id=task_id)
+                )
+                original = adapter._read_submission(record_path)
+                current_dir = self.run_root / original["job_id"]
+                prior_dir = (
+                    self.run_root / original["attempt_history"][0]["job_id"]
+                )
+                supplied_request = copy.deepcopy(request)
+                supplied_token = copy.deepcopy(token)
+                if case == "proof":
+                    supplied_token = self.rebound_cleanup_token(
+                        token, private_proof_hash="sha256:" + "0" * 64
+                    )
+                elif case == "attempt":
+                    supplied_token = self.rebound_cleanup_token(
+                        token, attempt_id="attempt-" + "0" * 32
+                    )
+                elif case == "request":
+                    supplied_request["node_id"] = "other"
+                elif case == "history":
+                    changed = copy.deepcopy(original)
+                    changed["retry_authorization"][
+                        "previous_observation_sequence"
+                    ] = 2
+                    adapter._write_submission(record_path, changed)
+                else:
+                    (current_dir / ".worker-ready.json").write_text(
+                        "{}", encoding="utf-8"
+                    )
+                    os.chmod(current_dir / ".worker-ready.json", 0o600)
+
+                with self.assertRaises(RuntimeError):
+                    adapter.purge_retry_exhausted(
+                        **supplied_request,
+                        purge_id=supplied_token["purge_id"],
+                        exhaustion=supplied_token,
+                    )
+                persisted = adapter._read_submission(record_path)
+                self.assertEqual(persisted["launch_state"], "failed")
+                self.assertNotIn("purge_id", persisted)
+                self.assertTrue(current_dir.is_dir())
+                self.assertTrue(prior_dir.is_dir())
+
+    def test_retry_exhaustion_purge_busy_fence_mutates_nothing(self) -> None:
+        adapter, request, token, record_path = (
+            self.stopped_retry_exhaustion_fixture(
+                task_id="task-retry-exhaustion-busy"
+            )
+        )
+        record = adapter._read_submission(record_path)
+        attempt_lock = (
+            self.run_root
+            / fwi_adapter_module.CONTROL_DIRECTORY
+            / "worker-capacity"
+            / "attempts"
+            / f"{record['submission_id']}.lock"
+        )
+        descriptor = os.open(attempt_lock, os.O_RDWR)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "PURGE_WORKER_STILL_ACTIVE"):
+                adapter.purge_retry_exhausted(
+                    **copy.deepcopy(request),
+                    purge_id=token["purge_id"],
+                    exhaustion=copy.deepcopy(token),
+                )
+            unchanged = adapter._read_submission(record_path)
+            self.assertEqual(unchanged["launch_state"], "failed")
+            self.assertNotIn("purge_id", unchanged)
+            self.assertTrue((self.run_root / unchanged["job_id"]).is_dir())
+            self.assertTrue(
+                (
+                    self.run_root
+                    / unchanged["attempt_history"][0]["job_id"]
+                ).is_dir()
+            )
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def test_retry_exhaustion_purge_resumes_after_partial_delete(self) -> None:
+        adapter, request, token, record_path = (
+            self.stopped_retry_exhaustion_fixture(
+                task_id="task-retry-exhaustion-partial"
+            )
+        )
+        original = adapter._read_submission(record_path)
+        job_dirs = [
+            self.run_root / original["attempt_history"][0]["job_id"],
+            self.run_root / original["job_id"],
+        ]
+        real_purge = adapter._purge_job_directory
+        calls = 0
+
+        def fail_second(record: dict[str, Any]) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise AdapterPurgeError(
+                    "PURGE_LOCAL_RUN_UNAVAILABLE: synthetic partial delete"
+                )
+            return real_purge(record)
+
+        with patch.object(
+            adapter, "_purge_job_directory", side_effect=fail_second
+        ):
+            with self.assertRaisesRegex(RuntimeError, "synthetic partial delete"):
+                adapter.purge_retry_exhausted(
+                    **copy.deepcopy(request),
+                    purge_id=token["purge_id"],
+                    exhaustion=copy.deepcopy(token),
+                )
+        partial = adapter._read_submission(record_path)
+        self.assertEqual(partial["launch_state"], "purging")
+        self.assertFalse(job_dirs[0].exists())
+        self.assertTrue(job_dirs[1].is_dir())
+
+        replay = adapter.purge_retry_exhausted(
+            **copy.deepcopy(request),
+            purge_id=token["purge_id"],
+            exhaustion=copy.deepcopy(token),
+        ).as_dict()
+        self.assertTrue(replay["replayed"])
+        self.assertTrue(all(not path.exists() for path in job_dirs))
+        self.assertEqual(
+            adapter._read_submission(record_path)["launch_state"], "purged"
+        )
+
+    def test_retry_exhaustion_purge_resumes_mid_directory_partial_unlink(
+        self,
+    ) -> None:
+        adapter, request, token, record_path = (
+            self.stopped_retry_exhaustion_fixture(
+                task_id="task-retry-exhaustion-partial-directory"
+            )
+        )
+        original = adapter._read_submission(record_path)
+        prior_dir = self.run_root / original["attempt_history"][0]["job_id"]
+        current_dir = self.run_root / original["job_id"]
+
+        def unlink_then_crash(record: dict[str, Any]) -> bool:
+            target = self.run_root / record["job_id"] / ".worker-launch.json"
+            target.unlink()
+            raise AdapterPurgeError(
+                "PURGE_LOCAL_RUN_UNAVAILABLE: synthetic mid-directory crash"
+            )
+
+        with patch.object(
+            adapter, "_purge_job_directory", side_effect=unlink_then_crash
+        ):
+            with self.assertRaisesRegex(RuntimeError, "mid-directory crash"):
+                adapter.purge_retry_exhausted(
+                    **copy.deepcopy(request),
+                    purge_id=token["purge_id"],
+                    exhaustion=copy.deepcopy(token),
+                )
+        partial = adapter._read_submission(record_path)
+        self.assertEqual(partial["launch_state"], "purging")
+        self.assertTrue(prior_dir.is_dir())
+        self.assertFalse((prior_dir / ".worker-launch.json").exists())
+        self.assertTrue(current_dir.is_dir())
+
+        replay = adapter.purge_retry_exhausted(
+            **copy.deepcopy(request),
+            purge_id=token["purge_id"],
+            exhaustion=copy.deepcopy(token),
+        ).as_dict()
+        self.assertTrue(replay["replayed"])
+        self.assertFalse(prior_dir.exists())
+        self.assertFalse(current_dir.exists())
+        self.assertEqual(
+            adapter._read_submission(record_path)["launch_state"], "purged"
+        )
+
+    def test_submit_cannot_resume_a_durably_authorized_attempt_two(self) -> None:
+        retry_root = self.base / "retry-submit-guard-runs"
+        retry_root.mkdir(mode=0o700)
+        launcher = StoppedThenSuccessfulSafeLauncher(defer_retry=True)
+        adapter = self.make_adapter(run_root=retry_root, launcher=launcher)
+        request = self.submit_kwargs(
+            task_id="task-retry-submit-guard",
+            idempotency_key="task-retry-submit-guard:invert:0001",
+        )
+
+        with self.assertRaises(AdapterUnavailable):
+            adapter.submit(**copy.deepcopy(request))
+        proof = adapter.probe_pre_running_retry(**copy.deepcopy(request))
+        authorization = {
+            "schema_version": "1.0.0",
+            "intent_id": "intent-retry-submit-guard",
+            "previous_attempt_id": proof.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "failure_kind": "pre_running_launch_failure",
+            "private_proof_hash": proof.private_proof_hash,
+            "next_attempt_number": 2,
+            "authorized_at": "2026-07-15T06:00:01Z",
+        }
+        with self.assertRaises(AdapterUnavailable) as deferred:
+            adapter.retry_pre_running(
+                **copy.deepcopy(request), authorization=authorization
+            )
+        self.assertEqual(deferred.exception.code, "ADAPTER_CONCURRENCY_LIMIT")
+        self.assertEqual(launcher.calls, 2)
+
+        with self.assertRaises(AdapterUnavailable) as denied:
+            adapter.submit(**copy.deepcopy(request))
+        self.assertEqual(
+            denied.exception.code, "WORKER_RETRY_AUTHORIZATION_REQUIRED"
+        )
+        self.assertEqual(launcher.calls, 2)
+
+        record_path = next(
+            (
+                retry_root
+                / fwi_adapter_module.CONTROL_DIRECTORY
+                / "submissions"
+            ).glob("*.json")
+        )
+        record = adapter._read_submission(record_path)
+        self.assertEqual(record["launch_state"], "preparing")
+        self.assertEqual(
+            binding_from_submission_record(record).attempt_number, 2
+        )
+
     def test_only_exact_staged_submission_is_resumed_without_new_attempt(self) -> None:
         for index, launch_state in enumerate(("preparing", "launching"), start=1):
             with self.subTest(launch_state=launch_state):
@@ -2014,9 +2669,154 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                     ("1.2.0", "1.2.0"),
                     ("1.3.0", "1.3.0"),
                     ("1.4.0", "1.4.0"),
+                    ("1.5.0", "1.5.0"),
                 }
             ),
         )
+
+    def test_historical_v1_4_receipt_collects_and_reads_all_declared_outputs(
+        self,
+    ) -> None:
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-historical-v1-4-artifacts",
+            idempotency_key="task-historical-v1-4-artifacts:invert:0001",
+        )
+        expected_paths = self.write_success_artifacts(run_dir)
+        record_path = self.submission_record_path(handle)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["algorithm"]["version"] = "1.4.0"
+        record["adapter_version"] = "1.4.0"
+        record["fingerprint"]["algorithm"]["version"] = "1.4.0"
+        record["fingerprint"]["adapter_version"] = "1.4.0"
+        record["request_hash"] = fwi_adapter_module._sha256_document(
+            self.adapter._record_request_payload(record)
+        )
+        historical_binding = LaunchAttemptBinding(
+            submission_id=record["submission_id"],
+            attempt_id=record["launch_attempt"]["attempt_id"],
+            attempt_number=record["launch_attempt"]["attempt_number"],
+            job_id=record["job_id"],
+            request_hash=record["request_hash"],
+            created_at=record["created_at"],
+        )
+        record["launch_attempt"] = historical_binding.record()
+        self.adapter._write_submission(record_path, record)
+        historical_handle = self.adapter._handle_from_record(record)
+
+        manifests = self.adapter.collect(historical_handle)
+        self.assertEqual(len(manifests), 8)
+        self.assertEqual(
+            {
+                manifest["extensions"]["org.agent_rpc.adapter"][
+                    "output_port"
+                ]
+                for manifest in manifests
+            },
+            set(expected_paths),
+        )
+        for manifest in manifests:
+            with self.subTest(artifact_id=manifest["artifact_id"]):
+                returned, data = self.adapter.read_artifact(
+                    historical_handle, manifest["artifact_id"]
+                )
+                port = returned["extensions"]["org.agent_rpc.adapter"][
+                    "output_port"
+                ]
+                self.assertEqual(returned, manifest)
+                self.assertEqual(data, expected_paths[port].read_bytes())
+                self.assertEqual(
+                    returned["lineage"]["algorithm"]["version"], "1.4.0"
+                )
+                self.assertEqual(
+                    returned["fingerprint"]["adapter_version"], "1.4.0"
+                )
+
+    def test_historical_v1_4_managed_receipt_retains_cancel_and_timeout_probes(
+        self,
+    ) -> None:
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-historical-v1-4-control",
+            idempotency_key="task-historical-v1-4-control:invert:0001",
+        )
+        record_path = self.submission_record_path(handle)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["algorithm"]["version"] = "1.4.0"
+        record["adapter_version"] = "1.4.0"
+        record["fingerprint"]["algorithm"]["version"] = "1.4.0"
+        record["fingerprint"]["adapter_version"] = "1.4.0"
+        record["request_hash"] = fwi_adapter_module._sha256_document(
+            self.adapter._record_request_payload(record)
+        )
+        historical_binding = LaunchAttemptBinding(
+            submission_id=record["submission_id"],
+            attempt_id=record["launch_attempt"]["attempt_id"],
+            attempt_number=record["launch_attempt"]["attempt_number"],
+            job_id=record["job_id"],
+            request_hash=record["request_hash"],
+            created_at=record["created_at"],
+        )
+        record["launch_attempt"] = historical_binding.record()
+        self.adapter._write_submission(record_path, record)
+
+        ticket_path = run_dir / ".worker-launch.json"
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+        ticket["request_hash"] = record["request_hash"]
+        ticket["binding_hash"] = historical_binding.binding_hash
+        ticket.pop("record_hash")
+        ticket["record_hash"] = fwi_adapter_module._sha256_document(ticket)
+        ticket_path.write_text(json.dumps(ticket), encoding="utf-8")
+        ticket_path.chmod(0o600)
+
+        historical_handle = self.adapter._handle_from_record(record)
+        binding, heartbeat = self.start_exact_worker(
+            historical_handle, run_dir
+        )
+        try:
+            self.assertTrue(
+                self.adapter.supports_exact_cancel(
+                    historical_handle, attempt_id=binding.attempt_id
+                )
+            )
+            timeout = self.adapter.supports_exact_timeout(
+                historical_handle, binding.attempt_id
+            )
+            self.assertIsNotNone(timeout)
+            assert timeout is not None
+            self.assertEqual(timeout["private_schema_version"], "1.1.0")
+            self.assertEqual(timeout["attempt_id"], binding.attempt_id)
+
+            cancellation = self.adapter.cancel(
+                historical_handle,
+                cancel_id="cancel-historical-v1-4-control-1",
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(cancellation.state, "requested")
+            for _ in range(200):
+                cancel_evidence = read_worker_cancel_evidence(
+                    self.run_root, binding
+                )
+                if cancel_evidence.acknowledged:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(cancel_evidence.acknowledged)
+            self.write_status(run_dir, "cancelled")
+            with self.assertRaises(WorkerCancellationRequested):
+                heartbeat.raise_if_cancel_requested()
+            heartbeat.stop("stopped")
+            heartbeat = None
+            self.assertEqual(
+                self.adapter.status(historical_handle).status, "Cancelled"
+            )
+            purged = self.adapter.purge(
+                historical_handle,
+                purge_id="purge-historical-v1-4-control-1",
+            )
+            self.assertEqual(purged.local_run_state, "deleted")
+            self.assertFalse(run_dir.exists())
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop("succeeded")
 
     def test_current_dispatcher_reads_true_v1_0_through_v1_3_receipts(self) -> None:
         dispatcher = DeepwaveTaskDispatcher(self.adapter)
@@ -2156,7 +2956,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ADAPTER_HANDLE_INVALID"):
             self.adapter.status(mixed_handle)
 
-    def test_current_v1_4_receipt_reopens_private_schema_v1_0(self) -> None:
+    def test_current_v1_5_receipt_reopens_private_schema_v1_0(self) -> None:
         request = self.submit_kwargs(
             task_id="task-current-private-v1",
             idempotency_key="task-current-private-v1:invert:0001",
@@ -2166,7 +2966,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.write_success_artifacts(run_dir)
         record_path = self.submission_record_path(handle)
         record = json.loads(record_path.read_text(encoding="utf-8"))
-        self.assertEqual(record["adapter_version"], "1.4.0")
+        self.assertEqual(record["adapter_version"], "1.5.0")
         current_binding = binding_from_submission_record(record)
         record["schema_version"] = "1.0.0"
         record.pop("launch_attempt")
@@ -3335,6 +4135,128 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             time.sleep(0.005)
         self.assertEqual(SafeSubprocessWorkerLauncher._process_active, 0)
 
+    def test_ready_attempt_with_reaper_start_failure_is_not_retryable(self) -> None:
+        launcher = SafeSubprocessWorkerLauncher(
+            python_executable=fwi_adapter_module.DEFAULT_WORKER_PYTHON
+        )
+        adapter = self.make_adapter(launcher=launcher)
+        request = self.submit_kwargs(
+            task_id="task-ready-reaper-failure",
+            idempotency_key="task-ready-reaper-failure:invert:0001",
+        )
+        inherited_fds: tuple[int, int] | None = None
+        worker_run_root: Path | None = None
+        worker_run_dir: Path | None = None
+        worker_attempt_id: str | None = None
+        heartbeat: WorkerHeartbeat | None = None
+
+        class SyntheticProcess:
+            pid = os.getpid()
+            terminated = False
+
+            def poll(self) -> int | None:
+                return -15 if self.terminated else None
+
+            def terminate(self) -> None:
+                nonlocal heartbeat
+                self.terminated = True
+                if heartbeat is not None:
+                    heartbeat.stop("stopped")
+
+            def wait(self, timeout: float | None = None) -> int:
+                if not self.terminated:
+                    raise AssertionError("synthetic process was not terminated")
+                return -15
+
+            def kill(self) -> None:
+                self.terminate()
+
+        process = SyntheticProcess()
+
+        def synthetic_popen(arguments: list[str], **options: Any) -> SyntheticProcess:
+            nonlocal inherited_fds, worker_run_root, worker_run_dir
+            nonlocal worker_attempt_id
+            inherited_fds = tuple(
+                os.dup(descriptor) for descriptor in options["pass_fds"]
+            )
+            worker_run_root = Path(
+                arguments[arguments.index("--run-root") + 1]
+            )
+            worker_run_dir = Path(
+                arguments[arguments.index("--run-dir") + 1]
+            )
+            worker_attempt_id = arguments[
+                arguments.index("--launch-attempt-id") + 1
+            ]
+            return process
+
+        def publish_ready(*_arguments: Any, **_options: Any) -> bool:
+            nonlocal heartbeat
+            assert inherited_fds is not None
+            assert worker_run_root is not None
+            assert worker_run_dir is not None
+            assert worker_attempt_id is not None
+            if heartbeat is None:
+                heartbeat = WorkerHeartbeat(
+                    run_root=worker_run_root,
+                    run_dir=worker_run_dir,
+                    attempt_id=worker_attempt_id,
+                    attempt_fd=inherited_fds[0],
+                    capacity_fd=inherited_fds[1],
+                    interval_seconds=10.0,
+                )
+                heartbeat.start()
+            return True
+
+        class FailingReaperThread:
+            def __init__(self, **_options: Any) -> None:
+                pass
+
+            def start(self) -> None:
+                raise RuntimeError("synthetic reaper start failure")
+
+        class ReaperThreading:
+            Thread = FailingReaperThread
+
+        try:
+            with patch(
+                "scientific_runtime.fwi_adapter.subprocess.Popen",
+                side_effect=synthetic_popen,
+            ), patch(
+                "scientific_runtime.fwi_adapter.worker_attempt_started",
+                side_effect=publish_ready,
+            ), patch.object(
+                fwi_adapter_module, "threading", ReaperThreading
+            ), self.assertRaises(AdapterUnavailable) as unavailable:
+                adapter.submit(**copy.deepcopy(request))
+            self.assertEqual(
+                unavailable.exception.code,
+                "SUBMISSION_RECONCILIATION_REQUIRED",
+            )
+            self.assertTrue(process.terminated)
+
+            record_path = next(
+                (
+                    self.run_root
+                    / fwi_adapter_module.CONTROL_DIRECTORY
+                    / "submissions"
+                ).glob("*.json")
+            )
+            record = adapter._read_submission(record_path)
+            self.assertEqual(record["launch_state"], "launching")
+            self.assertNotIn("launch_failure", record)
+            assert worker_run_dir is not None
+            self.assertTrue((worker_run_dir / ".worker-ready.json").is_file())
+            with self.assertRaises(AdapterUnavailable) as unsupported:
+                adapter.probe_pre_running_retry(**copy.deepcopy(request))
+            self.assertEqual(
+                unsupported.exception.code, "WORKER_RETRY_UNSUPPORTED"
+            )
+        finally:
+            if heartbeat is not None and not process.terminated:
+                heartbeat.stop("stopped")
+        self.assertEqual(SafeSubprocessWorkerLauncher._process_active, 0)
+
     def test_launcher_releases_local_slot_when_abort_cleanup_fails(self) -> None:
         launcher_root = self.base / "abort-failure-runs"
         launcher_root.mkdir(mode=0o700)
@@ -3359,13 +4281,14 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         ), patch(
             "scientific_runtime.fwi_adapter.subprocess.Popen",
             side_effect=OSError("synthetic Popen failure"),
-        ), self.assertRaisesRegex(OSError, "synthetic Popen failure"):
+        ), self.assertRaises(AdapterUnavailable) as stopped:
             launcher.launch(
                 command="invert",
                 config_path=config_path,
                 run_dir=run_dir,
                 run_root=launcher_root,
             )
+        self.assertEqual(stopped.exception.code, "WORKER_LAUNCH_FAILED")
         self.assertEqual(SafeSubprocessWorkerLauncher._process_active, 0)
 
     def test_adapter_timeout_keeps_launching_record_and_queued_status(self) -> None:

@@ -21,7 +21,7 @@ HASH_B = "sha256:" + "b" * 64
 HASH_C = "sha256:" + "c" * 64
 HASH_D = "sha256:" + "d" * 64
 ALGORITHM_VERSION = "1.1.0"
-CURRENT_OPTIMIZER_ALGORITHM_VERSION = "1.4.0"
+CURRENT_OPTIMIZER_ALGORITHM_VERSION = "1.5.0"
 LEGACY_OPTIMIZER_ALGORITHM_VERSION = "1.2.0"
 
 
@@ -230,7 +230,7 @@ def optimizer_plan_graph(
     plan["nodes"][0]["parameters"].update(
         optimizer=optimizer, learning_rate_milli=learning_rate_milli
     )
-    if algorithm_version == CURRENT_OPTIMIZER_ALGORITHM_VERSION:
+    if algorithm_version in {"1.4.0", "1.5.0"}:
         plan["nodes"][0]["outputs"] = copy.deepcopy(
             load_deepwave_manifest(algorithm_version)["outputs"]
         )
@@ -266,6 +266,22 @@ def approval_decision(plan: dict | None = None) -> dict:
         "expires_at": "2026-07-15T03:01:00Z",
         "extensions": {},
     }
+
+
+def retry_approval_decision(plan: dict | None = None) -> dict:
+    value = approval_decision(plan)
+    value["schema_version"] = "1.1.0"
+    wall_time = value["scope"]["resource_limits"]["wall_time_seconds"]
+    value["scope"]["retry_policy"] = {
+        "max_attempts": 2,
+        "max_concurrent_attempts": 1,
+        "max_cumulative_attempt_wall_time_seconds": 2 * wall_time,
+        "retryable_failure_classes": [
+            "pre_running_launch_failure",
+            "worker_exit",
+        ],
+    }
+    return value
 
 
 def fingerprint(*, dirty: bool = False) -> dict:
@@ -681,6 +697,34 @@ class ScientificRuntimeSchemaTest(unittest.TestCase):
             "budget_id": "budget-1",
         }
         self.assertEqual(schema_errors("approval-decision.schema.json", approval), [])
+
+    def test_approval_v1_1_requires_exact_finite_retry_shape(self) -> None:
+        approval = retry_approval_decision()
+        self.assertEqual(
+            schema_errors("approval-decision.schema.json", approval), []
+        )
+
+        missing = copy.deepcopy(approval)
+        missing["scope"].pop("retry_policy")
+        self.assertTrue(schema_errors("approval-decision.schema.json", missing))
+
+        legacy_with_retry = copy.deepcopy(approval)
+        legacy_with_retry["schema_version"] = "1.0.0"
+        self.assertTrue(
+            schema_errors("approval-decision.schema.json", legacy_with_retry)
+        )
+
+        for field, invalid in (
+            ("max_attempts", 3),
+            ("max_concurrent_attempts", 2),
+            ("retryable_failure_classes", ["worker_exit", "worker_exit"]),
+        ):
+            with self.subTest(field=field):
+                malformed = copy.deepcopy(approval)
+                malformed["scope"]["retry_policy"][field] = invalid
+                self.assertTrue(
+                    schema_errors("approval-decision.schema.json", malformed)
+                )
 
 
 class ScientificRuntimeCanonicalizationTest(unittest.TestCase):
