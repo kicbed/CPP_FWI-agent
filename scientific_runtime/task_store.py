@@ -258,6 +258,31 @@ class RuntimeSupervisorLeaseAcquisition:
 
 
 @dataclass(frozen=True)
+class SupervisedDispatchAuthorization:
+    """One active Supervisor term authorized to enter Adapter dispatch."""
+
+    intent: DispatchIntentSnapshot
+    reason: str
+    fencing_token: int
+    authorized_at: str
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class SupervisedPrivateReceiptAdoption:
+    """One exact legacy-private receipt adopted by an active term."""
+
+    intent: DispatchIntentSnapshot
+    private_schema_version: str
+    receipt_record_hash: str
+    outcome_document_hash: str
+    fencing_token: int
+    recorded_at: str
+    adopted: bool
+    replayed: bool
+
+
+@dataclass(frozen=True)
 class WorkerAttemptProjection:
     """Durable result of one fenced, observation-only Worker sample."""
 
@@ -569,6 +594,28 @@ class TaskStore(Protocol):
     def get_runtime_supervisor_lease(
         self, *, project_id: str, principal_id: str
     ) -> RuntimeSupervisorLease | None:
+        ...
+
+    def authorize_supervised_dispatch(
+        self,
+        *,
+        intent_id: str,
+        reason: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedDispatchAuthorization:
+        ...
+
+    def record_supervised_private_receipt_adoption(
+        self,
+        *,
+        intent_id: str,
+        handle: Mapping[str, Any],
+        private_schema_version: str,
+        receipt_record_hash: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedPrivateReceiptAdoption:
         ...
 
     def record_supervised_worker_observation(
@@ -5238,6 +5285,35 @@ class SQLiteTaskStore:
             and supplied.acquired_at == current.acquired_at
         )
 
+    def _require_active_runtime_supervisor_lease(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        principal_id: str,
+        supplied: RuntimeSupervisorLease,
+        now_us: int,
+        action: str,
+    ) -> RuntimeSupervisorLease:
+        """Return the current exact term or fail before a supervised write."""
+
+        current = self._load_runtime_supervisor_lease(
+            connection,
+            project_id=project_id,
+            principal_id=principal_id,
+        )
+        if (
+            current is None
+            or current.state != "active"
+            or not self._runtime_supervisor_identity_matches(current, supplied)
+            or _runtime_timestamp(current.heartbeat_at)[1] > now_us
+            or _runtime_timestamp(current.expires_at)[1] <= now_us
+        ):
+            raise RuntimeSupervisorLeaseLost(
+                f"{action} lost its runtime supervisor lease"
+            )
+        return current
+
     @staticmethod
     def _insert_runtime_supervisor_term(
         connection: sqlite3.Connection,
@@ -5302,6 +5378,411 @@ class SQLiteTaskStore:
                 project_id=project_id,
                 principal_id=principal_id,
             )
+        finally:
+            connection.close()
+
+    def authorize_supervised_dispatch(
+        self,
+        *,
+        intent_id: str,
+        reason: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedDispatchAuthorization:
+        """Fence one first-dispatch or exact pre-Popen recovery authorization."""
+
+        allowed_reasons = {
+            "pending_first_dispatch",
+            "dispatching_no_record_takeover",
+            "staged_attempt_resume",
+        }
+        if reason not in allowed_reasons:
+            raise TaskStoreConflict("supervised dispatch reason is invalid")
+        if not isinstance(supervisor_lease, RuntimeSupervisorLease):
+            raise TaskStoreConflict("runtime supervisor lease is invalid")
+        if not callable(supervisor_clock):
+            raise TaskStoreConflict("runtime supervisor clock is invalid")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authorized_at, authorized_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("supervised dispatch task cannot be read")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=authorized_at_us,
+                action="supervised dispatch",
+            )
+            if task["status"] != "Queued":
+                raise TaskStoreConflict(
+                    "only a queued task can receive supervised dispatch"
+                )
+            if connection.execute(
+                "SELECT 1 FROM task_purge_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict("purged task cannot receive supervised dispatch")
+            if intent.state not in {"pending", "dispatching"}:
+                raise TaskStoreConflict(
+                    "dispatch intent is not eligible for supervised dispatch"
+                )
+            if reason == "dispatching_no_record_takeover":
+                if connection.execute(
+                    "SELECT 1 FROM worker_launch_attempts WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchone() is not None:
+                    raise TaskStoreConflict(
+                        "no-record takeover conflicts with Worker evidence"
+                    )
+            elif reason == "staged_attempt_resume":
+                staged = connection.execute(
+                    """
+                    SELECT observation.*
+                    FROM worker_launch_attempts AS attempt
+                    JOIN worker_attempt_observations AS observation
+                      ON observation.attempt_id = attempt.attempt_id
+                    WHERE attempt.intent_id = ?
+                    ORDER BY observation.observation_sequence DESC LIMIT 1
+                    """,
+                    (intent_id,),
+                ).fetchone()
+                if (
+                    staged is None
+                    or staged["ticket_state"] != "staged"
+                    or staged["capacity_slot"] is not None
+                    or staged["capacity_generation"] is not None
+                    or staged["ticket_worker_pid"] is not None
+                    or staged["ready_record_hash"] is not None
+                    or staged["heartbeat_record_hash"] is not None
+                ):
+                    raise TaskStoreConflict(
+                        "staged resume requires exact pre-Popen Worker evidence"
+                    )
+
+            existing = connection.execute(
+                """
+                SELECT * FROM supervised_dispatch_attempts
+                WHERE intent_id = ? AND fencing_token = ?
+                """,
+                (intent_id, supervisor_lease.fencing_token),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["project_id"] != task["project_id"]
+                    or existing["principal_id"] != task["principal_id"]
+                    or existing["reason"] not in allowed_reasons
+                ):
+                    raise TaskStoreCorruption(
+                        "supervised dispatch authorization is inconsistent"
+                    )
+                stored_at, stored_at_us = _runtime_timestamp(
+                    existing["authorized_at"]
+                )
+                if stored_at_us != int(existing["authorized_at_us"]):
+                    raise TaskStoreCorruption(
+                        "supervised dispatch authorization time is inconsistent"
+                    )
+                connection.commit()
+                return SupervisedDispatchAuthorization(
+                    intent=intent,
+                    reason=existing["reason"],
+                    fencing_token=supervisor_lease.fencing_token,
+                    authorized_at=stored_at,
+                    replayed=True,
+                )
+
+            expected_state = {
+                "pending_first_dispatch": "pending",
+                "dispatching_no_record_takeover": "dispatching",
+                "staged_attempt_resume": "dispatching",
+            }[reason]
+            if intent.state != expected_state:
+                raise TaskStoreConflict(
+                    "dispatch intent is not eligible for supervised dispatch"
+                )
+            if reason == "pending_first_dispatch":
+                connection.execute(
+                    "INSERT INTO dispatch_attempts(intent_id, claimed_at) VALUES (?, ?)",
+                    (intent_id, authorized_at),
+                )
+                intent = self._load_dispatch_intent(connection, task_id=task_id)
+                if intent is None or intent.state != "dispatching":
+                    raise TaskStoreCorruption(
+                        "supervised dispatch claim cannot be read"
+                    )
+            connection.execute(
+                """
+                INSERT INTO supervised_dispatch_attempts(
+                    intent_id, project_id, principal_id, fencing_token,
+                    reason, authorized_at, authorized_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    task["project_id"],
+                    task["principal_id"],
+                    supervisor_lease.fencing_token,
+                    reason,
+                    authorized_at,
+                    authorized_at_us,
+                ),
+            )
+            connection.commit()
+            return SupervisedDispatchAuthorization(
+                intent=intent,
+                reason=reason,
+                fencing_token=supervisor_lease.fencing_token,
+                authorized_at=authorized_at,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "supervised dispatch authorization conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def record_supervised_private_receipt_adoption(
+        self,
+        *,
+        intent_id: str,
+        handle: Mapping[str, Any],
+        private_schema_version: str,
+        receipt_record_hash: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedPrivateReceiptAdoption:
+        """Fence adoption of one current receipt without managed evidence."""
+
+        if private_schema_version != "1.0.0":
+            raise TaskStoreConflict("private receipt schema is not adoptable")
+        if not _is_sha256(receipt_record_hash):
+            raise TaskStoreConflict("private receipt hash is invalid")
+        if not isinstance(handle, Mapping):
+            raise TaskStoreConflict("private receipt handle is invalid")
+        normalized_handle = dict(handle)
+        if not isinstance(supervisor_lease, RuntimeSupervisorLease):
+            raise TaskStoreConflict("runtime supervisor lease is invalid")
+        if not callable(supervisor_clock):
+            raise TaskStoreConflict("runtime supervisor clock is invalid")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            recorded_at, recorded_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("private receipt task cannot be read")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=recorded_at_us,
+                action="private receipt adoption",
+            )
+            if (
+                task["status"] != "Queued"
+                or intent.adapter_id != "fwi.deepwave_adapter"
+                or intent.adapter_version != "1.4.0"
+            ):
+                raise TaskStoreConflict(
+                    "dispatch intent cannot adopt a private receipt"
+                )
+            if connection.execute(
+                "SELECT 1 FROM task_purge_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict("purged task cannot adopt a private receipt")
+            if connection.execute(
+                "SELECT 1 FROM worker_launch_attempts WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict(
+                    "managed Worker evidence cannot use private receipt adoption"
+                )
+            self._validate_dispatch_handle(intent, normalized_handle)
+
+            existing = connection.execute(
+                """
+                SELECT * FROM supervised_private_receipt_adoptions
+                WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if intent.state == "dispatched":
+                if intent.handle != normalized_handle:
+                    raise TaskStoreConflict(
+                        "private receipt differs from the dispatch outcome"
+                    )
+                outcome = connection.execute(
+                    "SELECT document_hash FROM dispatch_outcomes WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchone()
+                if outcome is None:
+                    raise TaskStoreCorruption(
+                        "dispatched intent has no durable outcome"
+                    )
+                if existing is None:
+                    connection.commit()
+                    return SupervisedPrivateReceiptAdoption(
+                        intent=intent,
+                        private_schema_version=private_schema_version,
+                        receipt_record_hash=receipt_record_hash,
+                        outcome_document_hash=outcome["document_hash"],
+                        fencing_token=supervisor_lease.fencing_token,
+                        recorded_at=recorded_at,
+                        adopted=False,
+                        replayed=True,
+                    )
+                if (
+                    existing["private_schema_version"] != private_schema_version
+                    or existing["receipt_record_hash"] != receipt_record_hash
+                    or existing["outcome_document_hash"] != outcome["document_hash"]
+                ):
+                    raise TaskStoreConflict(
+                        "private receipt adoption replay differs"
+                    )
+                stored_at, stored_at_us = _runtime_timestamp(existing["recorded_at"])
+                if stored_at_us != int(existing["recorded_at_us"]):
+                    raise TaskStoreCorruption(
+                        "private receipt adoption time is inconsistent"
+                    )
+                connection.commit()
+                return SupervisedPrivateReceiptAdoption(
+                    intent=intent,
+                    private_schema_version=private_schema_version,
+                    receipt_record_hash=receipt_record_hash,
+                    outcome_document_hash=outcome["document_hash"],
+                    fencing_token=int(existing["fencing_token"]),
+                    recorded_at=stored_at,
+                    adopted=False,
+                    replayed=True,
+                )
+            if intent.state != "dispatching" or existing is not None:
+                raise TaskStoreConflict(
+                    "dispatch intent cannot adopt a private receipt"
+                )
+
+            outcome_document = {
+                "status": "dispatched",
+                "handle": normalized_handle,
+                "recorded_at": recorded_at,
+            }
+            outcome_json, outcome_hash = encode_document(outcome_document)
+            connection.execute(
+                """
+                INSERT INTO dispatch_outcomes(
+                    intent_id, outcome, document_json, document_hash, recorded_at
+                ) VALUES (?, 'dispatched', ?, ?, ?)
+                """,
+                (intent_id, outcome_json, outcome_hash, recorded_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO supervised_private_receipt_adoptions(
+                    intent_id, project_id, principal_id, fencing_token,
+                    private_schema_version, receipt_record_hash,
+                    outcome_document_hash, recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    task["project_id"],
+                    task["principal_id"],
+                    supervisor_lease.fencing_token,
+                    private_schema_version,
+                    receipt_record_hash,
+                    outcome_hash,
+                    recorded_at,
+                    recorded_at_us,
+                ),
+            )
+            stored = self._load_dispatch_intent(connection, task_id=task_id)
+            if stored is None or stored.state != "dispatched":
+                raise TaskStoreCorruption(
+                    "private receipt adoption cannot be read"
+                )
+            connection.commit()
+            return SupervisedPrivateReceiptAdoption(
+                intent=stored,
+                private_schema_version=private_schema_version,
+                receipt_record_hash=receipt_record_hash,
+                outcome_document_hash=outcome_hash,
+                fencing_token=supervisor_lease.fencing_token,
+                recorded_at=recorded_at,
+                adopted=True,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "private receipt adoption lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "private receipt adoption conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 

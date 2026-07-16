@@ -19,7 +19,7 @@ from .task_store import DispatchIntentSnapshot, TaskSnapshot
 
 
 class DispatchError(RuntimeError):
-    """A stable, path-free preparation or one-shot dispatch failure."""
+    """A stable, path-free preparation or runtime-dispatch failure."""
 
     def __init__(self, code: str):
         self.code = code
@@ -33,6 +33,7 @@ class DispatchDeferred(DispatchError):
 DEFERRED_DISPATCH_CODES = frozenset(
     {
         "ADAPTER_CONCURRENCY_LIMIT",
+        "ADAPTER_SUBMISSION_BUSY",
         "SUBMISSION_LAUNCH_PENDING",
     }
 )
@@ -49,7 +50,7 @@ class DispatchPreparation:
 
 
 class TaskDispatcher(Protocol):
-    """Fixed dispatcher with separate submit and read-only receipt paths."""
+    """Fixed dispatcher with supervised submit and read-only receipt paths."""
 
     def prepare(self, snapshot: TaskSnapshot) -> DispatchPreparation:
         ...
@@ -57,7 +58,20 @@ class TaskDispatcher(Protocol):
     def dispatch(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
         ...
 
+    def supports_supervised_dispatch(self, intent: DispatchIntentSnapshot) -> bool:
+        ...
+
+    def ensure_first_dispatch(
+        self, intent: DispatchIntentSnapshot
+    ) -> dict[str, Any]:
+        ...
+
     def recover_existing_receipt(
+        self, intent: DispatchIntentSnapshot
+    ) -> dict[str, Any]:
+        ...
+
+    def recover_existing_private_receipt(
         self, intent: DispatchIntentSnapshot
     ) -> dict[str, Any]:
         ...
@@ -159,6 +173,25 @@ class DeepwaveTaskDispatcher:
         )
 
     def dispatch(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
+        """Backward-compatible one-shot entry; production uses the scheduler."""
+
+        return self.ensure_first_dispatch(intent)
+
+    @staticmethod
+    def supports_supervised_dispatch(intent: DispatchIntentSnapshot) -> bool:
+        """Return true only for the current fixed managed Adapter identity."""
+
+        return (
+            isinstance(intent, DispatchIntentSnapshot)
+            and intent.adapter_id == LOGICAL_ENTRYPOINT
+            and intent.adapter_version == ADAPTER_VERSION
+        )
+
+    def ensure_first_dispatch(
+        self, intent: DispatchIntentSnapshot
+    ) -> dict[str, Any]:
+        """Enter the Adapter's lock-protected first-launch state machine."""
+
         if (
             intent.adapter_id != LOGICAL_ENTRYPOINT
             or intent.adapter_version != ADAPTER_VERSION
@@ -193,10 +226,13 @@ class DeepwaveTaskDispatcher:
             raise DispatchError("DISPATCH_FINGERPRINT_DRIFT")
         return handle.as_dict()
 
-    def recover_existing_receipt(
-        self, intent: DispatchIntentSnapshot
+    def _recover_existing_receipt(
+        self,
+        intent: DispatchIntentSnapshot,
+        *,
+        private_proof: bool,
     ) -> dict[str, Any]:
-        """Adopt an exact private launched receipt without first dispatch."""
+        """Read an exact private launched receipt without first dispatch."""
 
         if (
             intent.adapter_id != LOGICAL_ENTRYPOINT
@@ -234,7 +270,12 @@ class DeepwaveTaskDispatcher:
         ):
             raise DispatchError("DISPATCH_INTENT_INVALID")
         try:
-            handle = self._adapter.lookup_existing_handle(**request)
+            if private_proof:
+                proof = self._adapter.lookup_existing_private_receipt(**request)
+                handle = proof.handle
+            else:
+                proof = None
+                handle = self._adapter.lookup_existing_handle(**request)
         except AdapterError as error:
             raise DispatchError(error.code) from error
         except Exception as error:
@@ -249,7 +290,21 @@ class DeepwaveTaskDispatcher:
             != normalized_config_hash
         ):
             raise DispatchError("DISPATCH_FINGERPRINT_DRIFT")
-        return handle.as_dict()
+        return proof.as_dict() if proof is not None else handle.as_dict()
+
+    def recover_existing_receipt(
+        self, intent: DispatchIntentSnapshot
+    ) -> dict[str, Any]:
+        """Read an exact private launched receipt without first dispatch."""
+
+        return self._recover_existing_receipt(intent, private_proof=False)
+
+    def recover_existing_private_receipt(
+        self, intent: DispatchIntentSnapshot
+    ) -> dict[str, Any]:
+        """Prove a current receipt that predates managed Worker evidence."""
+
+        return self._recover_existing_receipt(intent, private_proof=True)
 
     def observe_existing_worker_attempt(
         self, intent: DispatchIntentSnapshot

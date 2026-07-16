@@ -1,4 +1,4 @@
-"""Validated P1 task service with atomic admission and post-commit dispatch."""
+"""Validated task service with atomic admission and fenced runtime scheduling."""
 
 from __future__ import annotations
 
@@ -174,6 +174,19 @@ class TaskWorkerProjectionResult:
     projected: bool
     adopted: bool
     replayed: bool
+    deferred_code: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskScheduleResult:
+    """One Supervisor-owned pass through the first-dispatch state machine."""
+
+    intent: DispatchIntentSnapshot
+    authorized: bool
+    authorization_replayed: bool
+    dispatch_attempted: bool
+    projected: bool
+    adopted: bool
     deferred_code: str | None = None
 
 
@@ -1896,53 +1909,6 @@ class TaskService:
                 ) from error
             raise TaskConflict(str(error)) from error
 
-    def _adopt_existing_dispatch_receipt(
-        self,
-        *,
-        snapshot: TaskSnapshot,
-        intent: DispatchIntentSnapshot,
-    ) -> DispatchIntentSnapshot:
-        """Adopt one already-launched Adapter receipt without dispatching work."""
-
-        if self._dispatcher is None:
-            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
-        try:
-            handle = self._dispatcher.recover_existing_receipt(intent)
-        except DispatchError as error:
-            raise TaskDispatchError(error.code) from error
-        except Exception as error:
-            raise TaskDispatchError("DISPATCH_RECEIPT_RECOVERY_UNAVAILABLE") from error
-        try:
-            validated_handle = self._validate_dispatch_receipt(
-                snapshot=snapshot,
-                intent=intent,
-                handle=handle,
-            )
-        except TaskValidationError as error:
-            raise TaskDispatchError("DISPATCH_RECEIPT_INVALID") from error
-        try:
-            return self._store.record_dispatch_success(
-                intent_id=intent.intent_id,
-                handle=validated_handle,
-                now=self._clock(),
-            )
-        except TaskStoreConflict as error:
-            current = self._store.get_dispatch_intent(intent.task_id)
-            if (
-                current is not None
-                and current.state == "dispatched"
-                and current.handle == validated_handle
-            ):
-                return current
-            if current is not None and current.state in {
-                "dispatched",
-                "reconciliation_required",
-            }:
-                raise TaskConflict(
-                    "concurrent dispatch receipt recovery outcome diverged"
-                ) from error
-            raise TaskConflict(str(error)) from error
-
     def submit_task(
         self,
         *,
@@ -1952,7 +1918,7 @@ class TaskService:
         approval_id: str,
         idempotency_key: str,
     ) -> SubmitTaskResult:
-        """Atomically admit one approved FWI node, then dispatch it once."""
+        """Atomically admit one approved FWI node for fenced scheduling."""
 
         _validate_opaque_id(task_id, field="task_id")
         _validate_opaque_id(project_id, field="project_id")
@@ -2030,28 +1996,11 @@ class TaskService:
                 replayed=True,
                 dispatch_attempted=False,
             )
-        try:
-            claimed, is_new_claim = self._store.claim_dispatch(
-                intent_id=admitted.intent.intent_id, now=self._clock()
-            )
-        except TaskStoreConflict as error:
-            raise TaskConflict(str(error)) from error
-        if not is_new_claim:
-            return SubmitTaskResult(
-                snapshot=admitted.snapshot,
-                intent=claimed,
-                replayed=False,
-                dispatch_attempted=False,
-            )
-        final_intent = self._dispatch_claimed_intent(
-            snapshot=admitted.snapshot,
-            intent=claimed,
-        )
         return SubmitTaskResult(
             snapshot=admitted.snapshot,
-            intent=final_intent,
+            intent=admitted.intent,
             replayed=False,
-            dispatch_attempted=True,
+            dispatch_attempted=False,
         )
 
     def acquire_runtime_supervisor_lease(
@@ -2124,6 +2073,332 @@ class TaskService:
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
 
+    @staticmethod
+    def _worker_projection_deferred_code(
+        projection: TaskWorkerProjectionResult,
+    ) -> str | None:
+        if projection.deferred_code is not None:
+            return projection.deferred_code
+        evidence = projection.evidence
+        ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
+        state = ticket.get("state") if isinstance(ticket, Mapping) else None
+        return {
+            "staged": "WORKER_ATTEMPT_STAGED",
+            "leased": "WORKER_ATTEMPT_STARTING",
+            "spawned": "WORKER_ATTEMPT_STARTING",
+            "failed": "WORKER_ATTEMPT_FAILED",
+        }.get(state, "WORKER_ATTEMPT_STARTING" if evidence is not None else None)
+
+    def schedule_runtime_dispatch(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskScheduleResult:
+        """Ensure one current managed first dispatch under an exact term.
+
+        SQLite authorizes the control-plane attempt.  The fixed Adapter's
+        submission and inherited kernel locks remain the external side-effect
+        fence, and a successful launch becomes ``dispatched`` only through the
+        existing fenced Worker evidence projection transaction.
+        """
+
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        intent = self._store.get_dispatch_intent(task_id)
+        if intent is None:
+            raise TaskConflict("runtime task has no dispatch intent")
+        if intent.state not in {"pending", "dispatching"}:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=False,
+                authorization_replayed=False,
+                dispatch_attempted=False,
+                projected=False,
+                adopted=False,
+                deferred_code={
+                    "reconciliation_required": "RECONCILIATION_REQUIRED",
+                }.get(intent.state),
+            )
+        if snapshot.status != "Queued":
+            raise TaskConflict("only a queued task can receive first dispatch")
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        try:
+            supported = self._dispatcher.supports_supervised_dispatch(intent)
+        except Exception as error:
+            raise TaskDispatchError("DISPATCH_INTENT_UNSUPPORTED") from error
+        if supported is not True:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=False,
+                authorization_replayed=False,
+                dispatch_attempted=False,
+                projected=False,
+                adopted=False,
+                deferred_code="DISPATCH_INTENT_UNSUPPORTED",
+            )
+
+        prior_projection: TaskWorkerProjectionResult | None = None
+        if intent.state == "pending":
+            reason = "pending_first_dispatch"
+        else:
+            prior_projection = self.project_worker_attempt(
+                task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                supervisor_lease=supervisor_lease,
+            )
+            intent = prior_projection.intent
+            if intent.state == "dispatched":
+                return TaskScheduleResult(
+                    intent=intent,
+                    authorized=False,
+                    authorization_replayed=False,
+                    dispatch_attempted=False,
+                    projected=prior_projection.projected,
+                    adopted=prior_projection.adopted,
+                    deferred_code=None,
+                )
+            if prior_projection.deferred_code == "WORKER_EVIDENCE_UNAVAILABLE":
+                try:
+                    proof = self._dispatcher.recover_existing_private_receipt(
+                        intent
+                    )
+                except DispatchError as error:
+                    return TaskScheduleResult(
+                        intent=intent,
+                        authorized=False,
+                        authorization_replayed=False,
+                        dispatch_attempted=False,
+                        projected=prior_projection.projected,
+                        adopted=False,
+                        deferred_code=error.code,
+                    )
+                except Exception:
+                    return TaskScheduleResult(
+                        intent=intent,
+                        authorized=False,
+                        authorization_replayed=False,
+                        dispatch_attempted=False,
+                        projected=prior_projection.projected,
+                        adopted=False,
+                        deferred_code="PRIVATE_RECEIPT_RECOVERY_UNAVAILABLE",
+                    )
+                if (
+                    not isinstance(proof, Mapping)
+                    or set(proof)
+                    != {
+                        "handle",
+                        "private_schema_version",
+                        "receipt_record_hash",
+                    }
+                    or proof.get("private_schema_version") != "1.0.0"
+                    or not isinstance(proof.get("handle"), Mapping)
+                    or not isinstance(proof.get("receipt_record_hash"), str)
+                    or re.fullmatch(
+                        r"sha256:[0-9a-f]{64}", proof["receipt_record_hash"]
+                    )
+                    is None
+                ):
+                    return TaskScheduleResult(
+                        intent=intent,
+                        authorized=False,
+                        authorization_replayed=False,
+                        dispatch_attempted=False,
+                        projected=prior_projection.projected,
+                        adopted=False,
+                        deferred_code="PRIVATE_RECEIPT_PROOF_INVALID",
+                    )
+                try:
+                    validated_handle = self._validate_dispatch_receipt(
+                        snapshot=snapshot,
+                        intent=intent,
+                        handle=proof["handle"],
+                    )
+                    adoption = (
+                        self._store.record_supervised_private_receipt_adoption(
+                            intent_id=intent.intent_id,
+                            handle=validated_handle,
+                            private_schema_version=proof[
+                                "private_schema_version"
+                            ],
+                            receipt_record_hash=proof[
+                                "receipt_record_hash"
+                            ],
+                            supervisor_lease=supervisor_lease,
+                            supervisor_clock=self._runtime_supervisor_clock,
+                        )
+                    )
+                except RuntimeSupervisorLeaseLost as error:
+                    raise TaskSupervisorLeaseLost() from error
+                except (TaskValidationError, TaskStoreConflict):
+                    return TaskScheduleResult(
+                        intent=self._store.get_dispatch_intent(task_id) or intent,
+                        authorized=False,
+                        authorization_replayed=False,
+                        dispatch_attempted=False,
+                        projected=prior_projection.projected,
+                        adopted=False,
+                        deferred_code="PRIVATE_RECEIPT_ADOPTION_CONFLICT",
+                    )
+                return TaskScheduleResult(
+                    intent=adoption.intent,
+                    authorized=False,
+                    authorization_replayed=False,
+                    dispatch_attempted=False,
+                    projected=prior_projection.projected,
+                    adopted=adoption.adopted,
+                    deferred_code=None,
+                )
+            evidence = prior_projection.evidence
+            ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
+            staged = (
+                prior_projection.projected
+                and isinstance(ticket, Mapping)
+                and ticket.get("state") == "staged"
+                and evidence.get("ready") is None
+                and evidence.get("heartbeat") is None
+            )
+            if staged:
+                reason = "staged_attempt_resume"
+            elif prior_projection.deferred_code == "ADAPTER_SUBMISSION_NOT_FOUND":
+                reason = "dispatching_no_record_takeover"
+            else:
+                return TaskScheduleResult(
+                    intent=intent,
+                    authorized=False,
+                    authorization_replayed=False,
+                    dispatch_attempted=False,
+                    projected=prior_projection.projected,
+                    adopted=prior_projection.adopted,
+                    deferred_code=self._worker_projection_deferred_code(
+                        prior_projection
+                    ),
+                )
+
+        try:
+            authorization = self._store.authorize_supervised_dispatch(
+                intent_id=intent.intent_id,
+                reason=reason,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            current = self._store.get_dispatch_intent(task_id)
+            if current is not None and current.state in {
+                "dispatched",
+                "reconciliation_required",
+            }:
+                return TaskScheduleResult(
+                    intent=current,
+                    authorized=False,
+                    authorization_replayed=False,
+                    dispatch_attempted=False,
+                    projected=False,
+                    adopted=False,
+                    deferred_code=(
+                        "RECONCILIATION_REQUIRED"
+                        if current.state == "reconciliation_required"
+                        else None
+                    ),
+                )
+            raise TaskConflict(str(error)) from error
+        intent = authorization.intent
+        if intent.state != "dispatching":
+            raise TaskConflict("supervised dispatch authorization did not claim intent")
+
+        try:
+            handle = self._dispatcher.ensure_first_dispatch(intent)
+        except DispatchDeferred as error:
+            projection = self.project_worker_attempt(
+                task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                supervisor_lease=supervisor_lease,
+            )
+            return TaskScheduleResult(
+                intent=projection.intent,
+                authorized=True,
+                authorization_replayed=authorization.replayed,
+                dispatch_attempted=True,
+                projected=projection.projected,
+                adopted=projection.adopted,
+                deferred_code=(
+                    None
+                    if projection.intent.state == "dispatched"
+                    else error.code
+                ),
+            )
+        except DispatchError as error:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=True,
+                authorization_replayed=authorization.replayed,
+                dispatch_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code=error.code,
+            )
+        except Exception:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=True,
+                authorization_replayed=authorization.replayed,
+                dispatch_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code="DISPATCH_UNAVAILABLE",
+            )
+
+        try:
+            validated_handle = self._validate_dispatch_receipt(
+                snapshot=snapshot,
+                intent=intent,
+                handle=handle,
+            )
+        except TaskValidationError:
+            return TaskScheduleResult(
+                intent=intent,
+                authorized=True,
+                authorization_replayed=authorization.replayed,
+                dispatch_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code="DISPATCH_RECEIPT_INVALID",
+            )
+        projection = self.project_worker_attempt(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            supervisor_lease=supervisor_lease,
+        )
+        if (
+            projection.intent.state != "dispatched"
+            or projection.intent.handle != validated_handle
+        ):
+            raise TaskDispatchError("DISPATCH_RECEIPT_NOT_PROJECTED")
+        return TaskScheduleResult(
+            intent=projection.intent,
+            authorized=True,
+            authorization_replayed=authorization.replayed,
+            dispatch_attempted=True,
+            projected=projection.projected,
+            adopted=projection.adopted,
+            deferred_code=None,
+        )
+
     def project_worker_attempt(
         self,
         task_id: str,
@@ -2164,6 +2439,7 @@ class TaskService:
             observed = self._dispatcher.observe_existing_worker_attempt(intent)
         except DispatchError as error:
             if error.code in {
+                "ADAPTER_SUBMISSION_BUSY",
                 "ADAPTER_SUBMISSION_NOT_FOUND",
                 "ADAPTER_SUBMISSION_PREPARING",
                 "WORKER_EVIDENCE_NOT_READY",
@@ -2227,12 +2503,11 @@ class TaskService:
         principal_id: str,
         max_tasks: int = 10000,
     ) -> RuntimeRecoveryResult:
-        """Run one bounded, scope-local recovery pass over all active tasks.
+        """Run one bounded, read-only startup inventory before lease acquire.
 
-        This deliberately preserves exact submit replay and dispatch semantics.
-        Pending work is never first-launched here.  A dispatching intent may
-        adopt only an exact Adapter receipt that was already durably launched;
-        every other incomplete state remains deferred and fail-closed.
+        First dispatch, exact receipt adoption, Worker evidence projection and
+        status catch-up now belong to the active fenced Supervisor term.  This
+        pre-lease pass never calls the Adapter and never writes runtime state.
         """
 
         _validate_opaque_id(project_id, field="project_id")
@@ -2285,39 +2560,16 @@ class TaskService:
                 reconciliation_required.append(listed.task_id)
                 continue
 
-            final_intent = intent
             if intent.state == "pending":
                 pending_deferred.append(listed.task_id)
                 continue
             elif intent.state == "dispatching":
-                receipt_recovery_attempted.append(listed.task_id)
-                try:
-                    final_intent = self._adopt_existing_dispatch_receipt(
-                        snapshot=listed,
-                        intent=intent,
-                    )
-                except TaskDispatchError as error:
-                    dispatching_deferred.append((listed.task_id, error.code))
-                    continue
-                receipt_recovered.append(listed.task_id)
+                dispatching_deferred.append(
+                    (listed.task_id, "SUPERVISED_DISPATCH_REQUIRED")
+                )
+                continue
             elif intent.state != "dispatched":
                 raise TaskConflict("dispatch intent has an unsupported recovery state")
-
-            if final_intent.state == "dispatched":
-                try:
-                    self.refresh_runtime_status(
-                        listed.task_id,
-                        project_id=project_id,
-                        principal_id=principal_id,
-                    )
-                except TaskDispatchError as error:
-                    status_refresh_failures.append((listed.task_id, error.code))
-                except TaskConflict:
-                    status_refresh_failures.append(
-                        (listed.task_id, "STATUS_CATCHUP_CONFLICT")
-                    )
-                else:
-                    status_refreshed.append(listed.task_id)
 
         return RuntimeRecoveryResult(
             project_id=project_id,

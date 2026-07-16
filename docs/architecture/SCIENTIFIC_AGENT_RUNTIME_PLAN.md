@@ -7,7 +7,7 @@
 - Runtime 实现状态：**P0 + P1 Verified；P2.1 任务发现/重开、P2.2 可恢复回收站、P2.3
   本地结果永久删除、P2.4 启动 receipt 收养/状态追赶、P2.5A 控制面 fenced lease/持续状态泵与
   P2.5B 固定 Adapter 托管 Worker launch fence、P2.5C fenced Worker 证据投影/late adoption
-  均为有界 Verified；完整 P2 仍 Pending**
+  以及 P2.6 可恢复 fenced scheduler/受监督首次派发均为有界 Verified；完整 P2 仍 Pending**
 - 用户确认日期：2026-07-15
 - 实现分支：`feature/scientific-agent-runtime`
 - 基线分支：`feature/fwi-deepwave-2d-acoustic`
@@ -280,7 +280,7 @@ Pending，未因 Guided Web 状态轮询而提前实现恢复语义。后续 D-0
 - SSE 任务事件和浏览器刷新恢复；
 - 多任务列表，不再每个对话只保留一个 FWI job。
 
-当前有七个有界先行切片；它们不改变完整 P2 的出口条件。
+当前有八个有界先行切片；它们不改变完整 P2 的出口条件。
 
 **P2.1 任务发现/重开**：
 
@@ -322,7 +322,8 @@ intent/claim/outcome 和固定 Adapter control record。真实 Adapter 审查证
 也不把普通 dispatch 当 probe。loopback Workbench 先 bind 但不 listen，再完成最多 10000 个
 active task 的 scope-bound 全分页扫描。dispatching 只按 immutable intent 推导单一 current 1.4
 私有 record，在既有 flock 下只读 lookup；仅 durable `launched` 且 request/hash/receipt 全部精确
-匹配时写 `dispatched`。missing/preparing/launching/failed/corrupt/历史版本保持 deferred，既有
+匹配时写 `dispatched`。missing/preparing/launching/failed/corrupt/历史 Algorithm/Adapter identity
+`1.0.0`–`1.3.0` 保持 deferred，既有
 `reconciliation_required` 不自动翻转；lookup 不调用 launcher/readiness、不创建 job 目录、不
 扫描 `FWI_RUN_ROOT`。已有/新收养 dispatched task 做一次 status/event 追赶，1000+ 事件分页，
 单任务 status 脱敏错误/CAS 冲突继续其他任务，receipt 分歧和 Task Store 损坏仍 fail closed。
@@ -330,6 +331,10 @@ active task 的 scope-bound 全分页扫描。dispatching 只按 immutable inten
 Scientific Runtime 201/201、Web 36/36 与全量回归通过；本切片不猜 PID、不创建 watcher，也不
 实现 fenced capacity、lease/heartbeat、持续 supervisor、cancel/timeout/retry 或 SSE，因此
 完整 P2 仍为 **Pending**。
+
+以上是 P2.4 当时的启动写路径。P2.6 已将 lease 前 pass 改为纯只读 inventory；current
+Algorithm/Adapter 1.4 使用 legacy private control schema 1.0 的 exact launched receipt 仍保持
+兼容，但 adoption 现由 active Supervisor term 围栏。
 
 继续 D-003 后实现的有界 **P2.5A 控制面 fenced lease 与持续状态泵** 在 SQLite v8 增加
 `(project_id, principal_id)` scope 的单一当前 lease、连续递增 fencing term、append-only
@@ -392,8 +397,38 @@ P2.5C 没有 dispatch/launcher 接口，不 claim pending，不创建 Adapter re
 启动；随后才安全推进 cancel、timeout、有限 retry、`reconciliation_required` resolution 与
 SSE。完整 P2 仍为 **Pending**。
 
-D-011 之后，P2 剩余工作优先聚合为四类中等切片：可恢复 fenced scheduler/首次派发；
-exact-attempt cancel 与 timeout；有限 retry 与 reconciliation resolution；SSE 与完整 P2 故障/
+继续 D-003 后实现的有界 **P2.6 可恢复 fenced scheduler 与受监督首次派发** 将生产 submit
+收敛为 prepare/Gate + `Queued/pending` 原子 admission；HTTP/Workbench 请求线程不再 claim 或
+启动 Worker。SQLite v10 的 append-only `supervised_dispatch_attempts` 以 exact scope/intent/current
+term 和事务内时钟授权三类动作：`pending_first_dispatch`、`dispatching_no_record_takeover`、
+`staged_attempt_resume`。pending claim 与首条 authorization 同事务；同 term 精确 replay，旧/过期/
+released/ABA term 及 outcome/purge/状态分歧均 fail closed。authorization 只围栏控制面进入 Adapter
+状态机，不替代 P2.5B inherited execution/capacity `flock`。
+
+Supervisor 对 current managed 1.4 的 pending/dispatching 先做 v9 evidence projection：exact ready
+直接 adoption；leased/spawned/failed/corrupt 只观察或 deferred；仅 no-record 或 exact staged
+（无 slot/PID/ready/heartbeat）才调用 lock-protected ensure。Adapter 在 submission lock 内重检，
+复用同一 attempt/job；`preparing` 和尚未取得 launch lease 的 `launching` staged attempt 都可恢复，
+capacity 满或 submission lock busy deferred。一旦 ticket 已 leased/spawned，或 Popen 后结果不明，
+绝不启动替代 Worker；heartbeat age 仍不提供 takeover 权限。
+
+current Algorithm/Adapter 1.4 的 legacy private schema 1.0 没有 managed attempt evidence。专用只读
+proof 在既有 submission lock 内验证 exact `launched` record、record hash 和 handle，随后 Store 在
+active term 事务中原子写 dispatch outcome 与独立 append-only adoption audit；历史
+Algorithm/Adapter identity 1.0–1.3 不进入该旁路。lease 前 startup pass 现只做最多 10000 active
+task 的 scope-bound read-only inventory，不调用 Adapter、不写 outcome/status；Supervisor ready 后
+才首次派发、late/private adoption 和 status pump。
+
+本切片验证 pending 两写故障回滚、并发单 claim、same-term replay、exact expiry/new-term takeover、
+跨 term staged resume、真实 capacity-deferred 与 reset-crash `launching/staged` 恢复、Popen ambiguity
+零 replacement、lost projection adoption 和 legacy-private fenced adoption。数值 Worker、依赖、数据
+与规范化配置未改，只运行轻量真实 exec，按 D-011 未重复 CUDA。缺 job dir/ticket/config/status 或
+内容分歧的不完整 staging 保持 fail-closed，等待 reconciliation；cancel、timeout、有限 retry、
+`reconciliation_required` resolution、SSE、standalone CLI/C++ MCP capacity 与通用 scheduler 仍
+Pending，因此完整 P2 仍为 **Pending**。
+
+D-011 之后规划的四类中等切片中，可恢复 fenced scheduler/首次派发已由 P2.6 关闭；剩余优先
+聚合为 exact-attempt cancel 与 timeout、有限 retry 与 reconciliation resolution、SSE 与完整 P2 故障/
 CPU/CUDA 出口验收。这是当前规划基线而非固定配额；只有具体安全或验证证据才允许继续拆分，
 拆分理由必须写入进度账本，且不得降低上述完整 P2 出口条件。
 
@@ -509,3 +544,4 @@ PlanGraph、批准和资源边界控制。
 | 2026-07-16 | 实现 P2.5B 固定 Adapter 托管 Worker staged launch fence：exec-inherited submission/capacity locks、pre-import ready/heartbeat、exact adoption、post-Popen deferred 与 purge fence；SQLite Worker scheduler 继续延期 | 用户继续 D-003；沿已接受的 Worker 分阶段启动方向关闭控制器崩溃重复启动窗口，同时不扩大到 pending/no-record 首次派发 |
 | 2026-07-16 | 实现 P2.5C fenced Worker 证据投影/late adoption：SQLite v9 exact attempt/heartbeat sample、active-term adoption、dispatching observation 与 dispatched 独立低频 cadence；首次派发与 lifecycle control 继续延期 | 用户继续 D-003；先让 Supervisor 在不拥有 launcher 的边界内消费 P2.5B 证据并证明 late-ready 收养不重复启动 |
 | 2026-07-16 | 采纳 D-011 弹性中等切片、独立多算法选项与分级测试；阶段/质量门保留，P5 不再强制自动端到端算法链 | 用户澄清只希望不降质量地减少过细切片；切片数允许基于真实风险小幅浮动，不固定为 12，也不得无说明膨胀为几十个 |
+| 2026-07-16 | 实现 P2.6 可恢复 fenced scheduler/受监督首次派发：enqueue-only submit、SQLite v10 active-term authorization、pending/no-record 首派、exact staged 同 attempt 恢复与 legacy-private receipt fenced adoption；cancel/timeout/reconciliation/SSE 继续延期 | 用户继续 D-003；按 D-011 将同一调度状态机、Adapter kernel fence 和崩溃出口测试合并为一个中等切片 |

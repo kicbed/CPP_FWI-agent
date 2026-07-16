@@ -273,8 +273,9 @@ def create_workbench_runtime():
         principal_id=principal_id,
         owner_id=f"supervisor-{secrets.token_hex(16)}",
     )
-    # Validate the complete HTTP boundary before receipt adoption can mutate
-    # SQLite, but finish recovery before the composed API is returned or served.
+    # Validate the complete HTTP boundary before the bounded pre-lease
+    # inventory.  It is read-only; all runtime mutations start only after the
+    # composed RuntimeSupervisor acquires its fenced term.
     recovery = application.recover_runtime_on_startup(max_tasks=10000)
     report_runtime_recovery(recovery)
     return WorkbenchRuntime(api=api, supervisor=supervisor)
@@ -827,8 +828,9 @@ def serve_workbench():
         # Bind first to prove that the configured port is available, but do
         # not listen yet: clients cannot connect while recovery is running.
         httpd.server_bind()
-        # A busy-port failure therefore occurs before runtime recovery can
-        # adopt a receipt. No handler can run until activation and serve_forever.
+        # A busy-port failure therefore occurs before even the read-only
+        # startup inventory. No handler can run until activation and
+        # serve_forever.
         # Wildcard binds retain legacy/static Compose behavior but never
         # compose the unauthenticated Guided runtime on that socket.
         runtime = (

@@ -301,7 +301,7 @@ class ScientificRuntimeTaskPurgeStoreTest(unittest.TestCase):
 
 
 class ScientificRuntimeTaskPurgeMigrationTest(unittest.TestCase):
-    def test_v6_database_upgrades_in_place_to_v8(self) -> None:
+    def test_v6_database_upgrades_in_place_to_v10(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "v6.sqlite3"
             migrations = Path(__file__).parents[1] / "scientific_runtime" / "migrations"
@@ -333,7 +333,7 @@ class ScientificRuntimeTaskPurgeMigrationTest(unittest.TestCase):
                 connection.close()
 
             store = SQLiteTaskStore(database_path)
-            self.assertEqual(store.migration_version(), 9)
+            self.assertEqual(store.migration_version(), 10)
             connection = sqlite3.connect(database_path)
             try:
                 tables = {

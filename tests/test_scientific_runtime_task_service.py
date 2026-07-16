@@ -182,6 +182,8 @@ class FakeDispatcher:
         self.dispatch_calls = 0
         self.receipt_recovery_calls = 0
         self.receipt_recovery_failure_code: str | None = None
+        self.private_receipt_recovery_calls = 0
+        self.private_receipt_recovery_failure_code: str | None = None
         self.worker_observation_calls = 0
         self.worker_observation: dict | None = None
         self.worker_observation_failure_code: str | None = None
@@ -224,9 +226,19 @@ class FakeDispatcher:
             self.dispatch_calls += 1
         if self.failure_code is not None:
             if self.defer_dispatch:
+                if self.failure_code == "ADAPTER_CONCURRENCY_LIMIT":
+                    attempt_id = "attempt-" + hashlib.sha256(
+                        intent.task_id.encode("utf-8")
+                    ).hexdigest()[:32]
+                    self.worker_observation = {
+                        "evidence": managed_worker_evidence(
+                            ticket_state="staged", attempt_id=attempt_id
+                        ),
+                        "handle": None,
+                    }
                 raise DispatchDeferred(self.failure_code)
             raise DispatchError(self.failure_code)
-        return {
+        handle = {
             "submission_id": MANAGED_SUBMISSION_ID,
             "task_id": intent.task_id,
             "node_id": intent.node_id,
@@ -240,6 +252,24 @@ class FakeDispatcher:
             "fingerprint": executable_fingerprint(),
             "adapter_version": intent.adapter_version,
         }
+        attempt_id = "attempt-" + hashlib.sha256(
+            intent.task_id.encode("utf-8")
+        ).hexdigest()[:32]
+        self.worker_observation = {
+            "evidence": managed_worker_evidence(attempt_id=attempt_id),
+            "handle": copy.deepcopy(handle),
+        }
+        return handle
+
+    @staticmethod
+    def supports_supervised_dispatch(intent):
+        return (
+            intent.adapter_id == "fwi.deepwave_adapter"
+            and intent.adapter_version == CURRENT_ADAPTER_VERSION
+        )
+
+    def ensure_first_dispatch(self, intent):
+        return self.dispatch(intent)
 
     def recover_existing_receipt(self, intent):
         with self.lock:
@@ -259,6 +289,28 @@ class FakeDispatcher:
             "adapter_version": intent.adapter_version,
         }
 
+    def recover_existing_private_receipt(self, intent):
+        with self.lock:
+            self.private_receipt_recovery_calls += 1
+        if self.private_receipt_recovery_failure_code is not None:
+            raise DispatchError(self.private_receipt_recovery_failure_code)
+        return {
+            "handle": {
+                "submission_id": MANAGED_SUBMISSION_ID,
+                "task_id": intent.task_id,
+                "node_id": intent.node_id,
+                "job_id": MANAGED_JOB_ID,
+                "idempotency_key": intent.node_idempotency_key,
+                "plan_hash": intent.plan_hash,
+                "request_hash": MANAGED_REQUEST_HASH,
+                "algorithm": copy.deepcopy(intent.request["algorithm"]),
+                "fingerprint": executable_fingerprint(),
+                "adapter_version": intent.adapter_version,
+            },
+            "private_schema_version": "1.0.0",
+            "receipt_record_hash": "sha256:" + "b" * 64,
+        }
+
     def observe_existing_worker_attempt(self, intent):
         del intent
         with self.lock:
@@ -266,7 +318,7 @@ class FakeDispatcher:
         if self.worker_observation_failure_code is not None:
             raise DispatchError(self.worker_observation_failure_code)
         if self.worker_observation is None:
-            raise DispatchError("WORKER_EVIDENCE_UNAVAILABLE")
+            raise DispatchError("ADAPTER_SUBMISSION_NOT_FOUND")
         return copy.deepcopy(self.worker_observation)
 
     def status(self, intent):
@@ -415,6 +467,8 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "worker_launch_attempts",
                 "worker_attempt_observations",
                 "supervised_dispatch_adoptions",
+                "supervised_dispatch_attempts",
+                "supervised_private_receipt_adoptions",
             },
         )
         connection = sqlite3.connect(self.database_path)
@@ -437,12 +491,34 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             idempotency_key=f"seed-queue-{task_id}",
             **self.scope,
         )
-        self.assertEqual(result.intent.state, "dispatched")
+        self.assertEqual(result.intent.state, "pending")
+        scheduled, lease = self.schedule_once(service, task_id)
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        service.release_runtime_supervisor_lease(lease)
         return service.list_run_events(task_id, **self.scope)[0]
+
+    def schedule_once(
+        self,
+        service: TaskService,
+        task_id: str,
+        *,
+        owner_id: str = "supervisor-test",
+    ):
+        acquisition = service.acquire_runtime_supervisor_lease(
+            **self.scope,
+            owner_id=owner_id,
+            lease_seconds=30,
+        )
+        scheduled = service.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        return scheduled, acquisition.lease
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 9)
+        self.assertEqual(self.store.migration_version(), 10)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -458,7 +534,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 9)
+        self.assertEqual(reopened.migration_version(), 10)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -545,12 +621,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 9)] * 8)
+        self.assertEqual(results, [("wal", 10)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 10")
+            connection.execute("PRAGMA user_version = 11")
             connection.commit()
         finally:
             connection.close()
@@ -2381,7 +2457,10 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             idempotency_key=f"submit-{key}",
             **self.scope,
         )
-        self.assertEqual(result.intent.state, "dispatched")
+        self.assertEqual(result.intent.state, "pending")
+        scheduled, lease = self.schedule_once(service, task_id)
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        service.release_runtime_supervisor_lease(lease)
         return task_id, plan, dispatcher, service
 
     def approved_runtime(
@@ -2413,6 +2492,31 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             self.submit_service(current_dispatcher),
         )
 
+    def seed_dispatching_intent(
+        self,
+        *,
+        task_id: str,
+        approval: dict,
+        dispatcher: FakeDispatcher,
+        service: TaskService,
+        key: str,
+        launch: bool,
+    ):
+        submitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key=key,
+            **self.scope,
+        )
+        claimed, claimed_now = self.store.claim_dispatch(
+            intent_id=submitted.intent.intent_id,
+            now=NOW,
+        )
+        self.assertTrue(claimed_now)
+        if launch:
+            dispatcher.dispatch(claimed)
+        return claimed
+
     def test_fenced_worker_projection_adopts_once_and_rejects_regression(self) -> None:
         dispatcher = FakeDispatcher(
             self.store, failure_code="ADAPTER_CONCURRENCY_LIMIT"
@@ -2427,7 +2531,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             idempotency_key="submit-worker-projection",
             **self.scope,
         )
-        self.assertEqual(submitted.intent.state, "dispatching")
+        claimed, claimed_now = self.store.claim_dispatch(
+            intent_id=submitted.intent.intent_id,
+            now=NOW,
+        )
+        self.assertTrue(claimed_now)
+        self.assertEqual(claimed.state, "dispatching")
 
         acquisition = service.acquire_runtime_supervisor_lease(
             owner_id="worker-projection-owner",
@@ -2464,7 +2573,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         dispatcher.worker_observation = {
             "evidence": managed_worker_evidence(),
-            "handle": dispatcher.recover_existing_receipt(submitted.intent),
+            "handle": dispatcher.recover_existing_receipt(claimed),
         }
         mismatched = copy.deepcopy(dispatcher.worker_observation)
         mismatched["handle"]["request_hash"] = "sha256:" + "f" * 64
@@ -2480,7 +2589,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         dispatcher.worker_observation = {
             "evidence": managed_worker_evidence(),
-            "handle": dispatcher.recover_existing_receipt(submitted.intent),
+            "handle": dispatcher.recover_existing_receipt(claimed),
         }
         first = service.project_worker_attempt(
             task_id,
@@ -2831,7 +2940,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             )
         return manifests, payloads
 
-    def test_atomic_submit_consumes_budget_queues_and_dispatches_after_commit(
+    def test_atomic_submit_admits_pending_then_fenced_scheduler_dispatches(
         self,
     ) -> None:
         created = self.create_executable()
@@ -2848,15 +2957,15 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
 
         self.assertFalse(result.replayed)
-        self.assertTrue(result.dispatch_attempted)
+        self.assertFalse(result.dispatch_attempted)
         self.assertEqual(result.snapshot.status, "Queued")
-        self.assertEqual(result.intent.state, "dispatched")
-        self.assertIsNotNone(result.intent.dispatch_claimed_at)
-        self.assertIsNotNone(result.intent.outcome_recorded_at)
-        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(result.intent.state, "pending")
+        self.assertIsNone(result.intent.dispatch_claimed_at)
+        self.assertIsNone(result.intent.outcome_recorded_at)
+        self.assertEqual(dispatcher.dispatch_calls, 0)
         self.assertEqual(self.raw_count("dispatch_intents"), 1)
-        self.assertEqual(self.raw_count("dispatch_attempts"), 1)
-        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        self.assertEqual(self.raw_count("dispatch_attempts"), 0)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
         self.assertEqual(self.raw_count("submit_idempotency_links"), 1)
         budget = self.store.get_approval_budget(
             task_id=task_id, approval_id=approval["approval_id"]
@@ -2888,10 +2997,22 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertFalse(replay.dispatch_attempted)
         self.assertEqual(replay.intent, result.intent)
         self.assertEqual(dispatcher.prepare_calls, 1)
-        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(dispatcher.dispatch_calls, 0)
         self.assertEqual(self.raw_count("run_events"), 1)
 
-    def test_submit_adapter_error_is_sticky_reconciliation_not_task_failure(
+        scheduled, lease = self.schedule_once(service, task_id)
+        self.assertTrue(scheduled.authorized)
+        self.assertTrue(scheduled.dispatch_attempted)
+        self.assertTrue(scheduled.projected)
+        self.assertTrue(scheduled.adopted)
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.raw_count("dispatch_attempts"), 1)
+        self.assertEqual(self.raw_count("supervised_dispatch_attempts"), 1)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        service.release_runtime_supervisor_lease(lease)
+
+    def test_scheduler_adapter_error_remains_recoverable_for_reconciliation(
         self,
     ) -> None:
         created = self.create_executable()
@@ -2909,10 +3030,13 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             **self.scope,
         )
         self.assertEqual(result.snapshot.status, "Queued")
-        self.assertEqual(result.intent.state, "reconciliation_required")
+        self.assertEqual(result.intent.state, "pending")
+        scheduled, lease = self.schedule_once(service, task_id)
+        self.assertEqual(scheduled.intent.state, "dispatching")
         self.assertEqual(
-            result.intent.failure_code, "SUBMISSION_RECONCILIATION_REQUIRED"
+            scheduled.deferred_code, "SUBMISSION_RECONCILIATION_REQUIRED"
         )
+        self.assertIsNone(scheduled.intent.failure_code)
         self.assertEqual(len(service.list_run_events(task_id, **self.scope)), 1)
 
         replay = service.submit_task(
@@ -2922,8 +3046,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             **self.scope,
         )
         self.assertTrue(replay.replayed)
-        self.assertEqual(replay.intent.state, "reconciliation_required")
+        self.assertEqual(replay.intent.state, "dispatching")
         self.assertEqual(dispatcher.dispatch_calls, 1)
+        service.release_runtime_supervisor_lease(lease)
 
     def test_invalid_dispatch_receipt_requires_reconciliation(self) -> None:
         created = self.create_executable()
@@ -2938,29 +3063,28 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             return handle
 
         dispatcher.dispatch = invalid_dispatch
-        result = self.submit_service(dispatcher).submit_task(
+        service = self.submit_service(dispatcher)
+        result = service.submit_task(
             task_id=task_id,
             approval_id=approval["approval_id"],
             idempotency_key="submit-invalid-receipt",
             **self.scope,
         )
         self.assertEqual(result.snapshot.status, "Queued")
-        self.assertEqual(result.intent.state, "reconciliation_required")
-        self.assertEqual(result.intent.failure_code, "DISPATCH_RECEIPT_INVALID")
-        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        scheduled, lease = self.schedule_once(service, task_id)
+        self.assertEqual(scheduled.intent.state, "dispatching")
+        self.assertEqual(scheduled.deferred_code, "DISPATCH_RECEIPT_INVALID")
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
+        service.release_runtime_supervisor_lease(lease)
 
     def test_deferred_dispatch_keeps_claim_recoverable_without_outcome(self) -> None:
         created = self.create_executable()
         task_id = created.snapshot.task_id
         _, approval = self.persist_executable_plan_and_approval(task_id)
-        dispatcher = FakeDispatcher(self.store)
-
-        def deferred_dispatch(intent):
-            self.assertEqual(intent.state, "dispatching")
-            dispatcher.dispatch_calls += 1
-            raise DispatchDeferred("ADAPTER_CONCURRENCY_LIMIT")
-
-        dispatcher.dispatch = deferred_dispatch
+        dispatcher = FakeDispatcher(
+            self.store, failure_code="ADAPTER_CONCURRENCY_LIMIT"
+        )
+        dispatcher.defer_dispatch = True
         service = self.submit_service(dispatcher)
         result = service.submit_task(
             task_id=task_id,
@@ -2968,11 +3092,18 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             idempotency_key="submit-capacity-deferred",
             **self.scope,
         )
-        self.assertTrue(result.dispatch_attempted)
+        self.assertFalse(result.dispatch_attempted)
         self.assertEqual(result.snapshot.status, "Queued")
-        self.assertEqual(result.intent.state, "dispatching")
-        self.assertIsNone(result.intent.failure_code)
+        self.assertEqual(result.intent.state, "pending")
+        scheduled, lease = self.schedule_once(service, task_id)
+        self.assertTrue(scheduled.dispatch_attempted)
+        self.assertTrue(scheduled.projected)
+        self.assertEqual(scheduled.intent.state, "dispatching")
+        self.assertEqual(scheduled.deferred_code, "ADAPTER_CONCURRENCY_LIMIT")
+        self.assertIsNone(scheduled.intent.failure_code)
         self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        self.assertEqual(self.raw_count("supervised_dispatch_attempts"), 1)
 
         replay = service.submit_task(
             task_id=task_id,
@@ -2984,6 +3115,41 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertFalse(replay.dispatch_attempted)
         self.assertEqual(replay.intent.state, "dispatching")
         self.assertEqual(dispatcher.dispatch_calls, 1)
+
+        same_term_retry = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+        self.assertTrue(same_term_retry.authorization_replayed)
+        self.assertEqual(same_term_retry.intent.state, "dispatching")
+        self.assertEqual(dispatcher.dispatch_calls, 2)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        self.assertEqual(self.raw_count("supervised_dispatch_attempts"), 1)
+        service.release_runtime_supervisor_lease(lease)
+
+        successor = service.acquire_runtime_supervisor_lease(
+            owner_id="capacity-successor",
+            lease_seconds=30,
+            **self.scope,
+        )
+        dispatcher.failure_code = None
+        resumed = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=successor.lease,
+            **self.scope,
+        )
+        self.assertTrue(resumed.authorized)
+        self.assertFalse(resumed.authorization_replayed)
+        self.assertTrue(resumed.dispatch_attempted)
+        self.assertTrue(resumed.projected)
+        self.assertTrue(resumed.adopted)
+        self.assertEqual(resumed.intent.state, "dispatched")
+        self.assertEqual(dispatcher.dispatch_calls, 3)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        self.assertEqual(self.raw_count("supervised_dispatch_attempts"), 2)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        service.release_runtime_supervisor_lease(successor.lease)
 
     def test_submit_exact_replay_precedes_expiry_budget_and_preflight(self) -> None:
         created = self.create_executable()
@@ -3009,7 +3175,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertTrue(replay.replayed)
         self.assertEqual(replay.intent, first.intent)
         self.assertEqual(dispatcher.prepare_calls, 1)
-        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(dispatcher.dispatch_calls, 0)
 
     def test_submit_gate_time_is_sampled_after_waiting_for_write_lock(self) -> None:
         created = self.create()
@@ -3171,7 +3337,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(store.get_task(task_id).status, "AwaitingApproval")
         self.assertEqual(dispatcher.dispatch_calls, 0)
 
-    def test_concurrent_same_submit_key_converges_to_one_dispatch(self) -> None:
+    def test_concurrent_same_submit_key_converges_to_one_pending_intent(self) -> None:
         created = self.create_executable()
         task_id = created.snapshot.task_id
         _, approval = self.persist_executable_plan_and_approval(task_id)
@@ -3195,10 +3361,10 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(submit, range(8)))
         self.assertEqual(sum(not result.replayed for result in results), 1)
-        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(dispatcher.dispatch_calls, 0)
         self.assertEqual(self.raw_count("dispatch_intents"), 1)
-        self.assertEqual(self.raw_count("dispatch_attempts"), 1)
-        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        self.assertEqual(self.raw_count("dispatch_attempts"), 0)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
         self.assertEqual(self.raw_count("run_events"), 1)
         self.assertEqual(
             self.store.get_approval_budget(
@@ -3236,7 +3402,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             results = list(executor.map(submit, range(8)))
         self.assertEqual(results.count("admitted"), 1)
         self.assertEqual(results.count("conflict"), 7)
-        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(dispatcher.dispatch_calls, 0)
         self.assertEqual(self.raw_count("dispatch_intents"), 1)
         self.assertEqual(self.raw_count("run_events"), 1)
         self.assertEqual(
@@ -3290,32 +3456,24 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
         self.assertEqual(dispatcher.dispatch_calls, 0)
 
-    def test_commit_before_dispatch_crash_stays_pending_and_is_not_retried(self) -> None:
+    def test_admission_commit_stays_pending_until_fenced_scheduler(self) -> None:
         created = self.create_executable()
         task_id = created.snapshot.task_id
         _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(self.store)
-        original_claim = self.store.claim_dispatch
-
-        def simulate_crash(**_kwargs):
-            raise TaskStoreConflict("simulated process loss after commit")
-
-        self.store.claim_dispatch = simulate_crash
-        try:
-            with self.assertRaises(TaskConflict):
-                self.submit_service(dispatcher).submit_task(
-                    task_id=task_id,
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-before-dispatch-crash",
-                    **self.scope,
-                )
-        finally:
-            self.store.claim_dispatch = original_claim
+        service = self.submit_service(dispatcher)
+        admitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-before-dispatch-crash",
+            **self.scope,
+        )
+        self.assertFalse(admitted.dispatch_attempted)
         self.assertEqual(self.store.get_task(task_id).status, "Queued")
         self.assertEqual(self.store.get_dispatch_intent(task_id).state, "pending")
         self.assertEqual(dispatcher.dispatch_calls, 0)
 
-        replay = self.submit_service(dispatcher).submit_task(
+        replay = service.submit_task(
             task_id=task_id,
             approval_id=approval["approval_id"],
             idempotency_key="submit-before-dispatch-crash",
@@ -3325,64 +3483,128 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(replay.intent.state, "pending")
         self.assertEqual(dispatcher.dispatch_calls, 0)
 
-    def test_started_worker_without_receipt_stays_dispatching_and_is_not_retried(
+        scheduled, lease = self.schedule_once(service, task_id)
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        service.release_runtime_supervisor_lease(lease)
+
+    def test_worker_launch_without_projection_is_adopted_without_relaunch(
         self,
     ) -> None:
         created = self.create_executable()
         task_id = created.snapshot.task_id
         _, approval = self.persist_executable_plan_and_approval(task_id)
         dispatcher = FakeDispatcher(self.store)
-        original_record = self.store.record_dispatch_success
+        service = self.submit_service(dispatcher)
+        submitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-after-worker-crash",
+            **self.scope,
+        )
+        acquisition = service.acquire_runtime_supervisor_lease(
+            owner_id="projection-loss-owner",
+            lease_seconds=30,
+            **self.scope,
+        )
+        original_record = self.store.record_supervised_worker_observation
 
         def lose_receipt(**_kwargs):
             raise TaskStoreConflict("simulated receipt persistence loss")
 
-        self.store.record_dispatch_success = lose_receipt
+        self.store.record_supervised_worker_observation = lose_receipt
         try:
             with self.assertRaises(TaskConflict):
-                self.submit_service(dispatcher).submit_task(
-                    task_id=task_id,
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-after-worker-crash",
+                service.schedule_runtime_dispatch(
+                    task_id,
+                    supervisor_lease=acquisition.lease,
                     **self.scope,
                 )
         finally:
-            self.store.record_dispatch_success = original_record
+            self.store.record_supervised_worker_observation = original_record
         self.assertEqual(dispatcher.dispatch_calls, 1)
         self.assertEqual(
             self.store.get_dispatch_intent(task_id).state, "dispatching"
         )
 
-        replay = self.submit_service(dispatcher).submit_task(
+        recovered = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=acquisition.lease,
+            **self.scope,
+        )
+        self.assertEqual(recovered.intent.state, "dispatched")
+        self.assertTrue(recovered.adopted)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        replay = service.submit_task(
             task_id=task_id,
             approval_id=approval["approval_id"],
             idempotency_key="submit-after-worker-crash",
             **self.scope,
         )
         self.assertTrue(replay.replayed)
-        self.assertEqual(replay.intent.state, "dispatching")
-        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(replay.intent.state, "dispatched")
+        service.release_runtime_supervisor_lease(acquisition.lease)
+
+    def test_current_legacy_private_receipt_is_fenced_adopted_without_launch(
+        self,
+    ) -> None:
+        created = self.create_executable(key="create-private-receipt")
+        task_id = created.snapshot.task_id
+        _, approval = self.persist_executable_plan_and_approval(task_id)
+        dispatcher = FakeDispatcher(self.store)
+        dispatcher.worker_observation_failure_code = (
+            "WORKER_EVIDENCE_UNAVAILABLE"
+        )
+        service = self.submit_service(dispatcher)
+        admitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-private-receipt",
+            **self.scope,
+        )
+        claimed, claimed_now = self.store.claim_dispatch(
+            intent_id=admitted.intent.intent_id,
+            now=NOW,
+        )
+        self.assertTrue(claimed_now)
+        self.assertEqual(claimed.state, "dispatching")
+
+        acquisition = service.acquire_runtime_supervisor_lease(
+            owner_id="private-receipt-owner",
+            lease_seconds=30,
+            **self.scope,
+        )
+        scheduled = service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=acquisition.lease,
+            **self.scope,
+        )
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertFalse(scheduled.authorized)
+        self.assertFalse(scheduled.dispatch_attempted)
+        self.assertFalse(scheduled.projected)
+        self.assertTrue(scheduled.adopted)
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+        self.assertEqual(dispatcher.private_receipt_recovery_calls, 1)
+        self.assertEqual(self.raw_count("supervised_dispatch_attempts"), 0)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 0)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        self.assertEqual(
+            self.raw_count("supervised_private_receipt_adoptions"), 1
+        )
+        service.release_runtime_supervisor_lease(acquisition.lease)
 
     def test_startup_recovery_defers_pending_without_claim_or_dispatch(self) -> None:
         task_id, approval, dispatcher, service = self.approved_runtime(
             key="startup-pending"
         )
         original_claim = self.store.claim_dispatch
-
-        def lose_after_admission(**_kwargs):
-            raise TaskStoreConflict("simulated process loss after admission")
-
-        self.store.claim_dispatch = lose_after_admission
-        try:
-            with self.assertRaises(TaskConflict):
-                service.submit_task(
-                    task_id=task_id,
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-startup-pending",
-                    **self.scope,
-                )
-        finally:
-            self.store.claim_dispatch = original_claim
+        service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-startup-pending",
+            **self.scope,
+        )
 
         self.assertEqual(self.store.get_dispatch_intent(task_id).state, "pending")
         self.store.claim_dispatch = lambda **_kwargs: self.fail(
@@ -3419,30 +3641,21 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
     def test_startup_recovery_defers_more_pending_tasks_than_process_capacity(
         self,
     ) -> None:
-        original_claim = self.store.claim_dispatch
         dispatcher = FakeDispatcher(self.store)
         service = self.submit_service(dispatcher)
         task_ids = []
-
-        def lose_after_admission(**_kwargs):
-            raise TaskStoreConflict("simulated process loss after admission")
 
         for index in range(3):
             task_id, approval, _, _ = self.approved_runtime(
                 key=f"startup-pending-capacity-{index}", dispatcher=dispatcher
             )
             task_ids.append(task_id)
-            self.store.claim_dispatch = lose_after_admission
-            try:
-                with self.assertRaises(TaskConflict):
-                    service.submit_task(
-                        task_id=task_id,
-                        approval_id=approval["approval_id"],
-                        idempotency_key=f"submit-startup-pending-capacity-{index}",
-                        **self.scope,
-                    )
-            finally:
-                self.store.claim_dispatch = original_claim
+            service.submit_task(
+                task_id=task_id,
+                approval_id=approval["approval_id"],
+                idempotency_key=f"submit-startup-pending-capacity-{index}",
+                **self.scope,
+            )
 
         recovered = service.recover_runtime_on_startup(PROJECT_ID, PRINCIPAL_ID)
         self.assertEqual(set(recovered.pending_deferred_task_ids), set(task_ids))
@@ -3455,26 +3668,18 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             {"pending"},
         )
 
-    def test_startup_recovery_adopts_a_dispatching_lost_receipt(self) -> None:
+    def test_startup_inventory_defers_lost_receipt_to_fenced_scheduler(self) -> None:
         task_id, approval, dispatcher, service = self.approved_runtime(
             key="startup-lost-receipt"
         )
-        original_record = self.store.record_dispatch_success
-
-        def lose_receipt(**_kwargs):
-            raise TaskStoreConflict("simulated receipt persistence loss")
-
-        self.store.record_dispatch_success = lose_receipt
-        try:
-            with self.assertRaises(TaskConflict):
-                service.submit_task(
-                    task_id=task_id,
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-startup-lost-receipt",
-                    **self.scope,
-                )
-        finally:
-            self.store.record_dispatch_success = original_record
+        self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-startup-lost-receipt",
+            launch=True,
+        )
 
         self.assertEqual(dispatcher.dispatch_calls, 1)
         self.assertEqual(
@@ -3483,15 +3688,22 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         recovered = service.recover_runtime_on_startup(
             PROJECT_ID, PRINCIPAL_ID
         )
+        self.assertEqual(recovered.receipt_recovery_attempted_task_ids, ())
+        self.assertEqual(recovered.receipt_recovered_task_ids, ())
         self.assertEqual(
-            recovered.receipt_recovery_attempted_task_ids, (task_id,)
+            recovered.dispatching_deferred,
+            ((task_id, "SUPERVISED_DISPATCH_REQUIRED"),),
         )
-        self.assertEqual(recovered.receipt_recovered_task_ids, (task_id,))
-        self.assertEqual(recovered.status_refreshed_task_ids, (task_id,))
-        self.assertEqual(self.store.get_dispatch_intent(task_id).state, "dispatched")
+        self.assertEqual(self.store.get_dispatch_intent(task_id).state, "dispatching")
         self.assertEqual(dispatcher.dispatch_calls, 1)
-        self.assertEqual(dispatcher.receipt_recovery_calls, 1)
-        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        self.assertEqual(dispatcher.receipt_recovery_calls, 0)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
+
+        scheduled, lease = self.schedule_once(service, task_id)
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertTrue(scheduled.adopted)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        service.release_runtime_supervisor_lease(lease)
 
     def test_startup_recovery_defers_dispatching_without_existing_receipt(
         self,
@@ -3499,79 +3711,53 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         task_id, approval, dispatcher, service = self.approved_runtime(
             key="startup-no-existing-receipt"
         )
-        original_record = self.store.record_dispatch_success
-
-        def lose_receipt(**_kwargs):
-            raise TaskStoreConflict("simulated receipt persistence loss")
-
-        self.store.record_dispatch_success = lose_receipt
-        try:
-            with self.assertRaises(TaskConflict):
-                service.submit_task(
-                    task_id=task_id,
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-startup-no-existing-receipt",
-                    **self.scope,
-                )
-        finally:
-            self.store.record_dispatch_success = original_record
-
-        dispatcher.receipt_recovery_failure_code = "ADAPTER_SUBMISSION_NOT_FOUND"
+        self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-startup-no-existing-receipt",
+            launch=False,
+        )
         recovered = service.recover_runtime_on_startup(PROJECT_ID, PRINCIPAL_ID)
         self.assertEqual(
             recovered.dispatching_deferred,
-            ((task_id, "ADAPTER_SUBMISSION_NOT_FOUND"),),
+            ((task_id, "SUPERVISED_DISPATCH_REQUIRED"),),
         )
         self.assertEqual(recovered.receipt_recovered_task_ids, ())
         self.assertEqual(self.store.get_dispatch_intent(task_id).state, "dispatching")
-        self.assertEqual(dispatcher.dispatch_calls, 1)
-        self.assertEqual(dispatcher.receipt_recovery_calls, 1)
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+        self.assertEqual(dispatcher.receipt_recovery_calls, 0)
         self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
 
-    def test_startup_recovery_defers_a_malformed_existing_receipt(self) -> None:
+        scheduled, lease = self.schedule_once(service, task_id)
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        service.release_runtime_supervisor_lease(lease)
+
+    def test_startup_inventory_never_reads_or_writes_adapter_receipts(self) -> None:
         task_id, approval, dispatcher, service = self.approved_runtime(
             key="startup-malformed-handle"
         )
-        original_record = self.store.record_dispatch_success
-
-        def lose_receipt(**_kwargs):
-            raise TaskStoreConflict("simulated receipt persistence loss")
-
-        self.store.record_dispatch_success = lose_receipt
-        try:
-            with self.assertRaises(TaskConflict):
-                service.submit_task(
-                    task_id=task_id,
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-startup-malformed-handle",
-                    **self.scope,
-                )
-        finally:
-            self.store.record_dispatch_success = original_record
-
-        valid_recovery = dispatcher.recover_existing_receipt
-
-        def malformed_recovery(intent):
-            handle = valid_recovery(intent)
-            handle.pop("submission_id")
-            return handle
-
-        def unexpected_store_write(**_kwargs):
-            raise AssertionError("malformed receipt reached the success store write")
-
-        dispatcher.recover_existing_receipt = malformed_recovery
-        self.store.record_dispatch_success = unexpected_store_write
-        try:
-            recovered = service.recover_runtime_on_startup(
-                PROJECT_ID, PRINCIPAL_ID
-            )
-        finally:
-            self.store.record_dispatch_success = original_record
+        self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-startup-malformed-handle",
+            launch=True,
+        )
+        dispatcher.recover_existing_receipt = lambda _intent: self.fail(
+            "pre-lease startup inventory must not read Adapter receipts"
+        )
+        recovered = service.recover_runtime_on_startup(
+            PROJECT_ID, PRINCIPAL_ID
+        )
 
         self.assertEqual(recovered.status_refreshed_task_ids, ())
         self.assertEqual(
             recovered.dispatching_deferred,
-            ((task_id, "DISPATCH_RECEIPT_INVALID"),),
+            ((task_id, "SUPERVISED_DISPATCH_REQUIRED"),),
         )
         self.assertEqual(recovered.reconciliation_required_task_ids, ())
         intent = self.store.get_dispatch_intent(task_id)
@@ -3583,32 +3769,14 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         task_id, approval, dispatcher, service = self.approved_runtime(
             key="startup-concurrent"
         )
-        original_record = self.store.record_dispatch_success
-
-        def lose_receipt(**_kwargs):
-            raise TaskStoreConflict("simulated receipt persistence loss")
-
-        self.store.record_dispatch_success = lose_receipt
-        try:
-            with self.assertRaises(TaskConflict):
-                service.submit_task(
-                    task_id=task_id,
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-startup-concurrent",
-                    **self.scope,
-                )
-        finally:
-            self.store.record_dispatch_success = original_record
-
-        barrier = threading.Barrier(2)
-        original_recovery = dispatcher.recover_existing_receipt
-
-        def coordinated_recovery(intent):
-            handle = original_recovery(intent)
-            barrier.wait(timeout=5)
-            return handle
-
-        dispatcher.recover_existing_receipt = coordinated_recovery
+        self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-startup-concurrent",
+            launch=True,
+        )
 
         def recover(_: int):
             recovery = TaskService(
@@ -3623,108 +3791,74 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(recover, range(2)))
         self.assertEqual(
-            [result.receipt_recovery_attempted_task_ids for result in results],
-            [(task_id,), (task_id,)],
+            [result.dispatching_deferred for result in results],
+            [
+                ((task_id, "SUPERVISED_DISPATCH_REQUIRED"),),
+                ((task_id, "SUPERVISED_DISPATCH_REQUIRED"),),
+            ],
         )
-        self.assertEqual(self.store.get_dispatch_intent(task_id).state, "dispatched")
-        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        self.assertEqual(self.store.get_dispatch_intent(task_id).state, "dispatching")
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
         self.assertEqual(dispatcher.dispatch_calls, 1)
-        self.assertEqual(dispatcher.receipt_recovery_calls, 2)
+        self.assertEqual(dispatcher.receipt_recovery_calls, 0)
 
         repeated = service.recover_runtime_on_startup(PROJECT_ID, PRINCIPAL_ID)
         self.assertEqual(repeated.receipt_recovery_attempted_task_ids, ())
-        self.assertEqual(repeated.status_refreshed_task_ids, (task_id,))
-        self.assertEqual(dispatcher.receipt_recovery_calls, 2)
+        self.assertEqual(repeated.status_refreshed_task_ids, ())
+        self.assertEqual(dispatcher.receipt_recovery_calls, 0)
 
-    def test_startup_recovery_surfaces_reconciliation_racing_a_valid_receipt(
+    def test_startup_inventory_preserves_reconciliation_outcome(
         self,
     ) -> None:
         task_id, approval, dispatcher, service = self.approved_runtime(
             key="startup-first-outcome"
         )
-        original_record = self.store.record_dispatch_success
-
-        def lose_receipt(**_kwargs):
-            raise TaskStoreConflict("simulated receipt persistence loss")
-
-        self.store.record_dispatch_success = lose_receipt
-        try:
-            with self.assertRaises(TaskConflict):
-                service.submit_task(
-                    task_id=task_id,
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-startup-first-outcome",
-                    **self.scope,
-                )
-        finally:
-            self.store.record_dispatch_success = original_record
-
-        def reconciliation_wins(*, intent_id, handle, now):
-            self.store.record_dispatch_reconciliation(
-                intent_id=intent_id,
-                failure_code="CONCURRENT_RECOVERY_WON",
-                now=now,
-            )
-            return original_record(intent_id=intent_id, handle=handle, now=now)
-
-        self.store.record_dispatch_success = reconciliation_wins
-        try:
-            with self.assertRaises(TaskConflict) as raised:
-                service.recover_runtime_on_startup(PROJECT_ID, PRINCIPAL_ID)
-        finally:
-            self.store.record_dispatch_success = original_record
-        self.assertIn("receipt recovery outcome diverged", str(raised.exception))
+        claimed = self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-startup-first-outcome",
+            launch=False,
+        )
+        self.store.record_dispatch_reconciliation(
+            intent_id=claimed.intent_id,
+            failure_code="CONCURRENT_RECOVERY_WON",
+            now=NOW,
+        )
+        recovered = service.recover_runtime_on_startup(PROJECT_ID, PRINCIPAL_ID)
+        self.assertEqual(recovered.reconciliation_required_task_ids, (task_id,))
         self.assertEqual(
             self.store.get_dispatch_intent(task_id).state,
             "reconciliation_required",
         )
         self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
 
-    def test_startup_recovery_surfaces_divergent_concurrent_receipts(self) -> None:
+    def test_startup_inventory_ignores_divergent_receipt_callback(self) -> None:
         task_id, approval, dispatcher, service = self.approved_runtime(
             key="startup-divergent-receipts"
         )
-        original_record = self.store.record_dispatch_success
-
-        def lose_receipt(**_kwargs):
-            raise TaskStoreConflict("simulated receipt persistence loss")
-
-        self.store.record_dispatch_success = lose_receipt
-        try:
-            with self.assertRaises(TaskConflict):
-                service.submit_task(
-                    task_id=task_id,
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-startup-divergent-receipts",
-                    **self.scope,
-                )
-        finally:
-            self.store.record_dispatch_success = original_record
-
-        concurrent_handles = []
-
-        def divergent_receipt_wins(*, intent_id, handle, now):
-            concurrent_handle = copy.deepcopy(handle)
-            concurrent_handle["job_id"] = "fwi-20260715T030000Z-000000000002"
-            concurrent_handles.append(concurrent_handle)
-            original_record(
-                intent_id=intent_id, handle=concurrent_handle, now=now
-            )
-            return original_record(intent_id=intent_id, handle=handle, now=now)
-
-        self.store.record_dispatch_success = divergent_receipt_wins
-        try:
-            with self.assertRaises(TaskConflict) as raised:
-                service.recover_runtime_on_startup(PROJECT_ID, PRINCIPAL_ID)
-        finally:
-            self.store.record_dispatch_success = original_record
-
-        self.assertIn("receipt recovery outcome diverged", str(raised.exception))
+        self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-startup-divergent-receipts",
+            launch=True,
+        )
+        dispatcher.recover_existing_receipt = lambda _intent: self.fail(
+            "startup inventory must not compare Adapter receipts"
+        )
+        recovered = service.recover_runtime_on_startup(PROJECT_ID, PRINCIPAL_ID)
+        self.assertEqual(
+            recovered.dispatching_deferred,
+            ((task_id, "SUPERVISED_DISPATCH_REQUIRED"),),
+        )
         intent = self.store.get_dispatch_intent(task_id)
-        self.assertEqual(intent.state, "dispatched")
-        self.assertEqual(intent.handle, concurrent_handles[0])
+        self.assertEqual(intent.state, "dispatching")
+        self.assertIsNone(intent.handle)
         self.assertEqual(dispatcher.status_calls, 0)
-        self.assertEqual(self.raw_count("dispatch_outcomes"), 1)
+        self.assertEqual(self.raw_count("dispatch_outcomes"), 0)
 
     def test_startup_recovery_never_retries_reconciliation_required(self) -> None:
         dispatcher = FakeDispatcher(
@@ -3739,7 +3873,17 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             idempotency_key="submit-startup-reconciliation-required",
             **self.scope,
         )
-        self.assertEqual(submitted.intent.state, "reconciliation_required")
+        claimed, claimed_now = self.store.claim_dispatch(
+            intent_id=submitted.intent.intent_id,
+            now=NOW,
+        )
+        self.assertTrue(claimed_now)
+        reconciled = self.store.record_dispatch_reconciliation(
+            intent_id=claimed.intent_id,
+            failure_code="SUBMISSION_RECONCILIATION_REQUIRED",
+            now=NOW,
+        )
+        self.assertEqual(reconciled.state, "reconciliation_required")
         calls = dispatcher.dispatch_calls
 
         recovered = service.recover_runtime_on_startup(
@@ -3832,7 +3976,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(recovered.status_refreshed_task_ids, ())
         self.assertEqual(recovered.status_refresh_failures, ())
 
-    def test_startup_recovery_catches_up_terminal_worker_state_once(self) -> None:
+    def test_startup_inventory_leaves_terminal_catchup_to_supervisor(self) -> None:
         task_id, _, dispatcher, service = self.submitted_runtime(
             key="startup-terminal-catch-up"
         )
@@ -3849,7 +3993,20 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             PROJECT_ID, PRINCIPAL_ID
         )
         self.assertEqual(recovered.receipt_recovery_attempted_task_ids, ())
-        self.assertEqual(recovered.status_refreshed_task_ids, (task_id,))
+        self.assertEqual(recovered.status_refreshed_task_ids, ())
+        self.assertEqual(service.get_task(task_id, **self.scope).status, "Queued")
+        self.assertEqual(dispatcher.status_calls, 0)
+
+        acquisition = service.acquire_runtime_supervisor_lease(
+            owner_id="terminal-catchup-owner",
+            lease_seconds=30,
+            **self.scope,
+        )
+        service.refresh_runtime_status(
+            task_id,
+            supervisor_lease=acquisition.lease,
+            **self.scope,
+        )
         self.assertEqual(service.get_task(task_id, **self.scope).status, "Succeeded")
         self.assertEqual(dispatcher.status_calls, 1)
         self.assertEqual(
@@ -3860,7 +4017,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             ["task_queued", "node_started", "node_succeeded"],
         )
 
-    def test_startup_recovery_records_status_error_and_continues_scope(self) -> None:
+    def test_startup_inventory_does_not_call_status_for_pending_scope(self) -> None:
         dispatcher = FakeDispatcher(self.store)
         healthy_id, healthy_approval, _, service = self.approved_runtime(
             key="startup-status-healthy", dispatcher=dispatcher
@@ -3880,25 +4037,20 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             idempotency_key="submit-startup-status-broken",
             **self.scope,
         )
-        original_status = dispatcher.status
-
-        def partial_status(intent):
-            if intent.task_id == broken_id:
-                raise DispatchError("ADAPTER_STATUS_UNAVAILABLE")
-            return original_status(intent)
-
-        dispatcher.status = partial_status
+        dispatcher.status = lambda _intent: self.fail(
+            "pre-lease startup inventory must not call Adapter status"
+        )
         recovered = service.recover_runtime_on_startup(
             PROJECT_ID, PRINCIPAL_ID
         )
+        self.assertEqual(recovered.status_refresh_failures, ())
+        self.assertEqual(recovered.status_refreshed_task_ids, ())
         self.assertEqual(
-            recovered.status_refresh_failures,
-            ((broken_id, "ADAPTER_STATUS_UNAVAILABLE"),),
+            set(recovered.pending_deferred_task_ids), {healthy_id, broken_id}
         )
-        self.assertEqual(recovered.status_refreshed_task_ids, (healthy_id,))
-        self.assertEqual(dispatcher.status_calls, 1)
+        self.assertEqual(dispatcher.status_calls, 0)
 
-    def test_startup_recovery_contains_one_status_catchup_conflict(self) -> None:
+    def test_startup_inventory_does_not_enter_status_transition_path(self) -> None:
         dispatcher = FakeDispatcher(self.store)
         first_id, first_approval, _, service = self.approved_runtime(
             key="startup-status-conflict-first", dispatcher=dispatcher
@@ -3918,26 +4070,18 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             idempotency_key="submit-startup-status-conflict-second",
             **self.scope,
         )
-        original_refresh = service.refresh_runtime_status
-
-        def partial_refresh(task_id, **kwargs):
-            if task_id == first_id:
-                raise TaskConflict("simulated concurrent status update")
-            return original_refresh(task_id, **kwargs)
-
-        service.refresh_runtime_status = partial_refresh
-        try:
-            recovered = service.recover_runtime_on_startup(
-                PROJECT_ID, PRINCIPAL_ID
-            )
-        finally:
-            service.refresh_runtime_status = original_refresh
-
-        self.assertEqual(
-            recovered.status_refresh_failures,
-            ((first_id, "STATUS_CATCHUP_CONFLICT"),),
+        service.refresh_runtime_status = lambda *_args, **_kwargs: self.fail(
+            "startup inventory must not enter status transitions"
         )
-        self.assertEqual(recovered.status_refreshed_task_ids, (second_id,))
+        recovered = service.recover_runtime_on_startup(
+            PROJECT_ID, PRINCIPAL_ID
+        )
+
+        self.assertEqual(recovered.status_refresh_failures, ())
+        self.assertEqual(recovered.status_refreshed_task_ids, ())
+        self.assertEqual(
+            set(recovered.pending_deferred_task_ids), {first_id, second_id}
+        )
 
     def test_pre_runtime_abandon_is_exactly_idempotent_and_not_runtime_cancel(
         self,

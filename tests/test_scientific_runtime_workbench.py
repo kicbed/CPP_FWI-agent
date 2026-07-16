@@ -256,8 +256,11 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertFalse(capabilities["features"]["running_cancel"])
         self.assertFalse(capabilities["features"]["automatic_reconciliation"])
         self.assertFalse(capabilities["features"]["startup_dispatch_recovery"])
-        self.assertTrue(capabilities["features"]["startup_receipt_recovery"])
-        self.assertTrue(capabilities["features"]["startup_status_catchup"])
+        self.assertFalse(capabilities["features"]["startup_receipt_recovery"])
+        self.assertFalse(capabilities["features"]["startup_status_catchup"])
+        self.assertTrue(
+            capabilities["features"]["supervised_runtime_scheduling"]
+        )
         self.assertTrue(
             capabilities["features"]["continuous_status_supervision"]
         )
@@ -300,8 +303,9 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                 "retry": False,
                 "sse": False,
                 "startup_dispatch_recovery": False,
-                "startup_receipt_recovery": True,
-                "startup_status_catchup": True,
+                "startup_receipt_recovery": False,
+                "startup_status_catchup": False,
+                "supervised_runtime_scheduling": True,
                 "continuous_status_supervision": True,
                 "supervisor_leases": True,
                 "automatic_reconciliation": False,
@@ -1055,17 +1059,18 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(snapshot.approval["scope"]["max_tasks"], 1)
         self.assertEqual(snapshot.approval["plan_hash"], created["plan"]["plan_hash"])
         self.assertEqual(result["status"], "Queued")
-        self.assertEqual(result["dispatch"]["state"], "dispatched")
+        self.assertEqual(result["dispatch"]["state"], "pending")
+        self.assertFalse(result["dispatch_attempted"])
         self.assertNotIn("handle", repr(result))
         self.assertNotIn("fwi-workbench-test-job", repr(result))
-        self.assertEqual(self.dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.dispatcher.dispatch_calls, 0)
 
         replay = self.workbench.approve_and_submit(
             created["task_id"], created["plan"]["plan_hash"], "approve-001"
         )
         self.assertTrue(replay["replayed"])
         self.assertFalse(replay["dispatch_attempted"])
-        self.assertEqual(self.dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.dispatcher.dispatch_calls, 0)
 
     def test_concurrent_first_approval_same_key_converges_despite_clock_skew(
         self,
@@ -1103,11 +1108,11 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
 
         self.assertEqual(len(set(sampled_times)), 2)
         self.assertEqual([result["status"] for result in results], ["Queued"] * 2)
-        self.assertEqual(self.dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.dispatcher.dispatch_calls, 0)
         self.assertEqual(len(self.store.approval_history(created["task_id"])), 1)
         self.assertEqual(
             self.store.get_dispatch_intent(created["task_id"]).state,
-            "dispatched",
+            "pending",
         )
 
     def test_approve_rejects_stale_plan_hash_before_mutation(self) -> None:
@@ -1140,8 +1145,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             created["task_id"], created["plan"]["plan_hash"], "approve-read"
         )
         refreshed = self.workbench.get_task(created["task_id"])
-        self.assertEqual(refreshed["runtime_status"]["status"], "Queued")
-        self.assertNotIn("job_id", refreshed["runtime_status"])
+        self.assertIsNone(refreshed["runtime_status"])
         events = self.workbench.list_events(created["task_id"])
         self.assertEqual(events[0]["event_type"], "task_queued")
 

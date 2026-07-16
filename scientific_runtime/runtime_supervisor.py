@@ -1,9 +1,8 @@
-"""Fenced, observation-only runtime status supervisor.
+"""Fenced runtime scheduler, Worker evidence projector, and status pump.
 
-The supervisor deliberately has no first-dispatch or Worker-starting
-capability.  It owns one scope-local fenced lease, projects evidence for an
-already staged fixed-Adapter attempt, may adopt its exact late receipt, and
-refreshes tasks that already have a durable ``dispatched`` receipt.
+One scope-local Supervisor term authorizes current managed first dispatch.
+The fixed Adapter's inherited kernel locks remain the external execution and
+capacity authority; SQLite fencing protects claims, evidence, and outcomes.
 """
 
 from __future__ import annotations
@@ -79,6 +78,16 @@ class RuntimeSupervisorTaskService(Protocol):
     ) -> Any:
         ...
 
+    def schedule_runtime_dispatch(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: Any,
+    ) -> Any:
+        ...
+
     def refresh_runtime_status(
         self,
         task_id: str,
@@ -100,6 +109,8 @@ class RuntimeSupervisorCycleResult:
     task_failures: tuple[tuple[str, str], ...]
     projected_task_ids: tuple[str, ...] = ()
     adopted_task_ids: tuple[str, ...] = ()
+    scheduled_task_ids: tuple[str, ...] = ()
+    dispatched_task_ids: tuple[str, ...] = ()
 
 
 class _SupervisorFailure(RuntimeError):
@@ -109,7 +120,7 @@ class _SupervisorFailure(RuntimeError):
 
 
 class RuntimeSupervisor:
-    """Observe staged/dispatched runtime tasks under one fenced supervisor lease.
+    """Schedule and observe runtime tasks under one fenced supervisor lease.
 
     Construction is side-effect free.  :meth:`start` is the only method that
     acquires a lease or creates a thread, and :meth:`stop` is the only normal
@@ -525,6 +536,8 @@ class RuntimeSupervisor:
         refreshed: list[str] = []
         projected: list[str] = []
         adopted: list[str] = []
+        scheduled: list[str] = []
+        dispatched: list[str] = []
         deferred: list[tuple[str, str]] = []
         failures: list[tuple[str, str]] = []
         for snapshot in snapshots:
@@ -559,16 +572,92 @@ class RuntimeSupervisor:
                 deferred.append((task_id, "DISPATCH_INTENT_MISSING"))
                 continue
             intent_state = getattr(intent, "state", None)
-            if intent_state not in {"dispatching", "dispatched"}:
+            schedule_projected = False
+            if intent_state in {"pending", "dispatching"}:
+                lease, next_heartbeat = self._heartbeat_if_due(
+                    lease, next_heartbeat
+                )
+                try:
+                    schedule = self._task_service.schedule_runtime_dispatch(
+                        task_id,
+                        project_id=self._project_id,
+                        principal_id=self._principal_id,
+                        supervisor_lease=lease,
+                    )
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(error, "DISPATCH_SCHEDULE_FAILED"),
+                        )
+                    )
+                    continue
+                scheduled_intent = getattr(schedule, "intent", None)
+                scheduled_state = getattr(scheduled_intent, "state", None)
+                authorized_flag = getattr(schedule, "authorized", None)
+                authorization_replayed = getattr(
+                    schedule, "authorization_replayed", None
+                )
+                attempted_flag = getattr(schedule, "dispatch_attempted", None)
+                schedule_projected = getattr(schedule, "projected", None)
+                schedule_adopted = getattr(schedule, "adopted", None)
+                deferred_code = getattr(schedule, "deferred_code", None)
+                if (
+                    getattr(scheduled_intent, "task_id", None) != task_id
+                    or scheduled_state
+                    not in {
+                        "pending",
+                        "dispatching",
+                        "dispatched",
+                        "reconciliation_required",
+                    }
+                    or type(authorized_flag) is not bool
+                    or type(authorization_replayed) is not bool
+                    or type(attempted_flag) is not bool
+                    or type(schedule_projected) is not bool
+                    or type(schedule_adopted) is not bool
+                    or attempted_flag != authorized_flag
+                    or (authorization_replayed and not authorized_flag)
+                    or (
+                        schedule_adopted
+                        and scheduled_state != "dispatched"
+                    )
+                    or (
+                        deferred_code is not None
+                        and (
+                            not isinstance(deferred_code, str)
+                            or _STABLE_CODE.fullmatch(deferred_code) is None
+                        )
+                    )
+                ):
+                    raise _SupervisorFailure(FATAL)
+                if attempted_flag:
+                    scheduled.append(task_id)
+                if schedule_projected:
+                    projected.append(task_id)
+                if schedule_adopted:
+                    adopted.append(task_id)
+                if scheduled_state != "dispatched":
+                    code = deferred_code or {
+                        "pending": "DISPATCH_PENDING",
+                        "dispatching": "DISPATCH_IN_PROGRESS",
+                        "reconciliation_required": "RECONCILIATION_REQUIRED",
+                    }.get(scheduled_state, "DISPATCH_INTENT_UNSUPPORTED")
+                    deferred.append((task_id, code))
+                    continue
+                dispatched.append(task_id)
+                intent = scheduled_intent
+                intent_state = "dispatched"
+                self._schedule_worker_projection(task_id)
+            elif intent_state != "dispatched":
                 code = {
-                    "pending": "DISPATCH_PENDING",
                     "reconciliation_required": "RECONCILIATION_REQUIRED",
                 }.get(intent_state, "DISPATCH_INTENT_UNSUPPORTED")
                 deferred.append((task_id, code))
                 continue
             projection_due = (
-                intent_state == "dispatching"
-                or self._worker_projection_due(task_id)
+                not schedule_projected and self._worker_projection_due(task_id)
             )
             if projection_due:
                 lease, next_heartbeat = self._heartbeat_if_due(
@@ -591,8 +680,6 @@ class RuntimeSupervisor:
                             ),
                         )
                     )
-                    if intent_state == "dispatching":
-                        continue
                     projection = None
             else:
                 projection = None
@@ -604,11 +691,7 @@ class RuntimeSupervisor:
                 projected_state = getattr(projected_intent, "state", None)
                 if (
                     getattr(projected_intent, "task_id", None) != task_id
-                    or projected_state not in {"dispatching", "dispatched"}
-                    or (
-                        intent_state == "dispatched"
-                        and projected_state != "dispatched"
-                    )
+                    or projected_state != "dispatched"
                     or type(projected_flag) is not bool
                     or type(adopted_flag) is not bool
                     or (
@@ -619,11 +702,7 @@ class RuntimeSupervisor:
                     )
                     or (
                         adopted_flag
-                        and (
-                            not projected_flag
-                            or intent_state != "dispatching"
-                            or projected_state != "dispatched"
-                        )
+                        and (not projected_flag or intent_state != "dispatching")
                     )
                     or (
                         deferred_code is not None
@@ -638,29 +717,8 @@ class RuntimeSupervisor:
                     projected.append(task_id)
                 if adopted_flag:
                     adopted.append(task_id)
-                if intent_state == "dispatching" and projected_state != "dispatched":
-                    if deferred_code is None:
-                        evidence = getattr(projection, "evidence", None)
-                        ticket = (
-                            evidence.get("ticket")
-                            if isinstance(evidence, dict)
-                            else None
-                        )
-                        state = (
-                            ticket.get("state")
-                            if isinstance(ticket, dict)
-                            else None
-                        )
-                        deferred_code = {
-                            "staged": "WORKER_ATTEMPT_STAGED",
-                            "failed": "WORKER_ATTEMPT_FAILED",
-                        }.get(state, "WORKER_ATTEMPT_STARTING")
-                    deferred.append((task_id, deferred_code))
-                    continue
                 if projected_state == "dispatched":
                     intent = projected_intent
-                    if intent_state == "dispatching":
-                        self._schedule_worker_projection(task_id)
             if self._stop_event.is_set():
                 break
             lease, next_heartbeat = self._heartbeat_if_due(
@@ -694,6 +752,8 @@ class RuntimeSupervisor:
                 task_failures=tuple(failures),
                 projected_task_ids=tuple(projected),
                 adopted_task_ids=tuple(adopted),
+                scheduled_task_ids=tuple(scheduled),
+                dispatched_task_ids=tuple(dispatched),
             ),
             lease,
             next_heartbeat,

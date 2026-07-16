@@ -1834,8 +1834,9 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
     features: { approval_required: true, running_cancel: false },
     capabilities: {
       startup_dispatch_recovery: false,
-      startup_receipt_recovery: true,
-      startup_status_catchup: true,
+      startup_receipt_recovery: false,
+      startup_status_catchup: false,
+      supervised_runtime_scheduling: true,
       continuous_status_supervision: true,
       supervisor_leases: true,
       automatic_reconciliation: false,
@@ -1846,8 +1847,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
   assert.deepEqual(
     JSON.parse(JSON.stringify(session.capabilities)),
     [
-      'startup_receipt_recovery',
-      'startup_status_catchup',
+      'supervised_runtime_scheduling',
       'continuous_status_supervision',
       'supervisor_leases',
     ],

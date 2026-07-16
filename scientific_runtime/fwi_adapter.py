@@ -326,6 +326,22 @@ class AdapterHandle:
 
 
 @dataclass(frozen=True)
+class AdapterPrivateReceiptProof:
+    """Exact launched receipt proof read under the private submission lock."""
+
+    handle: AdapterHandle
+    private_schema_version: str
+    receipt_record_hash: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "handle": self.handle.as_dict(),
+            "private_schema_version": self.private_schema_version,
+            "receipt_record_hash": self.receipt_record_hash,
+        }
+
+
+@dataclass(frozen=True)
 class AdapterStatus:
     job_id: str
     task_id: str
@@ -1980,7 +1996,12 @@ class DeepwaveAdapter:
         return value
 
     @staticmethod
-    def _lock_submission(lock_path: Path, *, create: bool = True):
+    def _lock_submission(
+        lock_path: Path,
+        *,
+        create: bool = True,
+        timeout_seconds: float | None = None,
+    ):
         class SubmissionLock:
             def __enter__(self_nonlocal):
                 flags = (
@@ -2004,7 +2025,28 @@ class DeepwaveAdapter:
                         or stat.S_IMODE(lock_status.st_mode) & 0o077
                     ):
                         raise OSError("submission lock is not private")
-                    fcntl.flock(self_nonlocal.descriptor, fcntl.LOCK_EX)
+                    if timeout_seconds is None:
+                        fcntl.flock(self_nonlocal.descriptor, fcntl.LOCK_EX)
+                    else:
+                        deadline: float | None = None
+                        while True:
+                            try:
+                                fcntl.flock(
+                                    self_nonlocal.descriptor,
+                                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                                )
+                                break
+                            except BlockingIOError as error:
+                                now = time.monotonic()
+                                if deadline is None:
+                                    deadline = now + timeout_seconds
+                                if now >= deadline:
+                                    os.close(self_nonlocal.descriptor)
+                                    self_nonlocal.descriptor = -1
+                                    raise AdapterUnavailable(
+                                        "ADAPTER_SUBMISSION_BUSY: submission lock is held"
+                                    ) from error
+                                time.sleep(0.01)
                 except OSError as error:
                     descriptor = getattr(self_nonlocal, "descriptor", -1)
                     if descriptor >= 0:
@@ -2080,7 +2122,9 @@ class DeepwaveAdapter:
         index_path = control / "submissions" / index_name
         lock_path = control / "locks" / (index_name + ".lock")
 
-        with self._lock_submission(lock_path, create=False):
+        with self._lock_submission(
+            lock_path, create=False, timeout_seconds=5.0
+        ):
             if not index_path.exists() and not index_path.is_symlink():
                 raise AdapterUnavailable(
                     "ADAPTER_SUBMISSION_NOT_FOUND: no private submission record exists"
@@ -2163,7 +2207,7 @@ class DeepwaveAdapter:
                 "handle": None if handle is None else handle.as_dict(),
             }
 
-    def lookup_existing_handle(
+    def _lookup_existing_receipt(
         self,
         *,
         task_id: str,
@@ -2177,15 +2221,14 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
-    ) -> AdapterHandle:
-        """Read or fence-adopt one exact current-version Worker receipt.
+        allow_managed_promotion: bool,
+    ) -> tuple[dict[str, Any], AdapterHandle]:
+        """Read one exact current-version receipt under its submission lock.
 
         This path derives the private record name from immutable request
         identity and serializes with ``submit`` on the already-existing lock.
-        A legacy or ordinary launched record is read without side effects.  A
-        v1.1 ``launching`` record is promoted only after the exact inherited-
-        fence Worker has written its first heartbeat.  The path never calls the
-        Worker launcher and never guesses a PID or scans the run root.
+        Managed promotion is an explicit caller choice; neither mode launches,
+        guesses a PID, nor scans the run root.
         """
 
         self._validate_submit_identity(
@@ -2221,7 +2264,9 @@ class DeepwaveAdapter:
         index_path = control / "submissions" / index_name
         lock_path = control / "locks" / (index_name + ".lock")
 
-        with self._lock_submission(lock_path, create=False):
+        with self._lock_submission(
+            lock_path, create=False, timeout_seconds=5.0
+        ):
             if not index_path.exists() and not index_path.is_symlink():
                 raise AdapterUnavailable(
                     "ADAPTER_SUBMISSION_NOT_FOUND: no private submission record exists"
@@ -2260,13 +2305,13 @@ class DeepwaveAdapter:
 
             launch_state = record["launch_state"]
             if launch_state == "launched":
-                return self._handle_from_record(record)
+                return copy.deepcopy(record), self._handle_from_record(record)
             if launch_state == "preparing":
                 raise AdapterUnavailable(
                     "ADAPTER_SUBMISSION_PREPARING: Worker launch was not reached"
                 )
             if launch_state == "launching":
-                if record["schema_version"] == "1.1.0":
+                if allow_managed_promotion and record["schema_version"] == "1.1.0":
                     try:
                         binding = binding_from_submission_record(record)
                         started = worker_attempt_started(
@@ -2281,7 +2326,7 @@ class DeepwaveAdapter:
                     if started:
                         record["launch_state"] = "launched"
                         self._write_submission(index_path, record)
-                        return self._handle_from_record(record)
+                        return copy.deepcopy(record), self._handle_from_record(record)
                 raise AdapterUnavailable(
                     "ADAPTER_SUBMISSION_LAUNCH_AMBIGUOUS: Worker launch outcome is unknown"
                 )
@@ -2296,6 +2341,34 @@ class DeepwaveAdapter:
             raise AdapterUnavailable(
                 "ADAPTER_SUBMISSION_PURGED: private receipt was purged"
             )
+
+    def lookup_existing_handle(self, **request: Any) -> AdapterHandle:
+        """Read or fence-promote one exact current-version Worker receipt."""
+
+        _, handle = self._lookup_existing_receipt(
+            **request,
+            allow_managed_promotion=True,
+        )
+        return handle
+
+    def lookup_existing_private_receipt(
+        self, **request: Any
+    ) -> AdapterPrivateReceiptProof:
+        """Prove an exact launched legacy-private receipt without mutation."""
+
+        record, handle = self._lookup_existing_receipt(
+            **request,
+            allow_managed_promotion=False,
+        )
+        if record["schema_version"] != "1.0.0":
+            raise AdapterUnavailable(
+                "PRIVATE_RECEIPT_PROOF_UNAVAILABLE: receipt has managed evidence"
+            )
+        return AdapterPrivateReceiptProof(
+            handle=handle,
+            private_schema_version=record["schema_version"],
+            receipt_record_hash=record["record_hash"],
+        )
 
     @staticmethod
     def _validate_fingerprint(
@@ -2342,6 +2415,154 @@ class DeepwaveAdapter:
                 + ", ".join(mismatches)
             )
         return value
+
+    def _launch_prepared_submission(
+        self,
+        *,
+        index_path: Path,
+        record: dict[str, Any],
+        validated: AdapterValidation,
+        job_dir: Path,
+        launch_binding: LaunchAttemptBinding,
+    ) -> AdapterHandle:
+        """Launch one exact staged attempt while its submission lock is held."""
+
+        try:
+            record["launch_state"] = "launching"
+            self._write_submission(index_path, record)
+            self._launcher.launch(
+                command=validated.command,
+                config_path=job_dir / "config.original.json",
+                run_dir=job_dir,
+                run_root=self._run_root,
+            )
+        except _AdapterLaunchAmbiguous as error:
+            # Popen may have succeeded and the child retains both kernel
+            # fences.  Keep ``launching`` so exact observation can adopt it.
+            raise AdapterUnavailable(str(error)) from error
+        except Exception as error:
+            if (
+                isinstance(error, AdapterUnavailable)
+                and error.code == "ADAPTER_CONCURRENCY_LIMIT"
+            ):
+                # The exact staged attempt remains the queue entry.  A later
+                # active Supervisor term may retry this same pre-Popen attempt.
+                record["launch_state"] = "preparing"
+                self._write_submission(index_path, record)
+                raise
+            try:
+                mark_launch_failed(job_dir, launch_binding)
+            except WorkerControlError:
+                # The private submission record remains fail-closed authority.
+                pass
+            record["launch_state"] = "failed"
+            self._write_submission(index_path, record)
+            _atomic_write_json(
+                job_dir / "status.json",
+                {
+                    "job_id": record["job_id"],
+                    "status": "failed",
+                    "stage": "submit",
+                    "iteration": 0,
+                    "total_iterations": validated.parameters["iterations"],
+                    "message": "FWI worker could not be started",
+                    "updated_at": self._clock(),
+                },
+            )
+            raise AdapterUnavailable(
+                f"WORKER_LAUNCH_FAILED: {type(error).__name__}"
+            ) from error
+        record["launch_state"] = "launched"
+        self._write_submission(index_path, record)
+        return self._handle_from_record(record)
+
+    def _resume_staged_submission(
+        self,
+        *,
+        index_path: Path,
+        record: dict[str, Any],
+        validated: AdapterValidation,
+    ) -> AdapterHandle:
+        """Resume only a complete, exact, pre-Popen managed attempt."""
+
+        if (
+            record["schema_version"] != "1.1.0"
+            or record["adapter_version"] != ADAPTER_VERSION
+            or record["algorithm"] != validated.algorithm
+            or record["launch_state"] not in {"preparing", "launching"}
+        ):
+            raise AdapterUnavailable(
+                "SUBMISSION_RECONCILIATION_REQUIRED: incomplete submission is not resumable"
+            )
+        expected_job_id = self._job_id(record["submission_id"], record["created_at"])
+        if record["job_id"] != expected_job_id:
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: private job identity is invalid"
+            )
+        fingerprint = self._validate_fingerprint(
+            record["fingerprint"], validated=validated
+        )
+        if (
+            record["worker_config"] != validated.worker_config
+            or fingerprint != record["fingerprint"]
+        ):
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: prepared runtime identity changed"
+            )
+        job_dir = self._job_directory(record)
+        try:
+            launch_binding = binding_from_submission_record(record)
+            evidence = read_worker_attempt_evidence(
+                self._run_root, job_dir, launch_binding
+            )
+        except (FileNotFoundError, WorkerControlError) as error:
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: staged Worker evidence is invalid"
+            ) from error
+        if (
+            evidence is None
+            or evidence.ticket_state != "staged"
+            or evidence.capacity_slot is not None
+            or evidence.capacity_generation is not None
+            or evidence.ticket_worker_pid is not None
+            or evidence.ready
+            or evidence.heartbeat_record_hash is not None
+        ):
+            raise AdapterUnavailable(
+                "SUBMISSION_LAUNCH_PENDING: prepared attempt is not safely resumable"
+            )
+        expected_config = {"job_id": record["job_id"], **validated.worker_config}
+        expected_status = {
+            "job_id": record["job_id"],
+            "status": "queued",
+            "stage": "queued",
+            "iteration": 0,
+            "total_iterations": validated.parameters["iterations"],
+            "message": "FWI Adapter job queued",
+            "updated_at": record["created_at"],
+        }
+        try:
+            stored_config = _read_json_file(
+                job_dir / "config.original.json", code="WORKER_CONFIG_INVALID"
+            )
+            stored_status = _read_json_file(
+                job_dir / "status.json", code="WORKER_STATUS_INVALID"
+            )
+        except AdapterStatusError as error:
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: prepared job evidence is incomplete"
+            ) from error
+        if stored_config != expected_config or stored_status != expected_status:
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: prepared job evidence changed"
+            )
+        return self._launch_prepared_submission(
+            index_path=index_path,
+            record=record,
+            validated=validated,
+            job_dir=job_dir,
+            launch_binding=launch_binding,
+        )
 
     def submit(
         self,
@@ -2391,7 +2612,24 @@ class DeepwaveAdapter:
         index_name = submission_id.removeprefix("submission-") + ".json"
         index_path = submissions / index_name
         lock_path = locks / (index_name + ".lock")
-        with self._lock_submission(lock_path):
+
+        def validate_live_request() -> AdapterValidation:
+            value = self.validate(
+                project_id=project_id,
+                principal_id=principal_id,
+                algorithm=algorithm,
+                dataset=dataset,
+                task_type=task_type,
+                parameters=parameters,
+                resources=resources,
+            )
+            if value.normalized_config_hash != normalized.normalized_config_hash:
+                raise AdapterUnavailable(
+                    "ADAPTER_VALIDATION_DRIFT: live validation changed request identity"
+                )
+            return value
+
+        with self._lock_submission(lock_path, timeout_seconds=5.0):
             if index_path.exists() or index_path.is_symlink():
                 record = self._read_submission(index_path)
                 if record["submission_id"] != submission_id or record["request_hash"] != request_hash:
@@ -2405,6 +2643,12 @@ class DeepwaveAdapter:
                     raise AdapterUnavailable(
                         "WORKER_LAUNCH_FAILED: prior launch failed and P1 does not retry"
                     )
+                if state in {"preparing", "launching"}:
+                    return self._resume_staged_submission(
+                        index_path=index_path,
+                        record=record,
+                        validated=validate_live_request(),
+                    )
                 raise AdapterUnavailable(
                     "SUBMISSION_RECONCILIATION_REQUIRED: incomplete P1 submission is not relaunched"
                 )
@@ -2412,19 +2656,7 @@ class DeepwaveAdapter:
             # Readiness is deliberately evaluated only for a first submission.
             # A byte-identical replay must remain able to recover its handle if
             # the GPU or model mount later becomes temporarily unavailable.
-            validated = self.validate(
-                project_id=project_id,
-                principal_id=principal_id,
-                algorithm=algorithm,
-                dataset=dataset,
-                task_type=task_type,
-                parameters=parameters,
-                resources=resources,
-            )
-            if validated.normalized_config_hash != normalized.normalized_config_hash:
-                raise AdapterUnavailable(
-                    "ADAPTER_VALIDATION_DRIFT: live validation changed request identity"
-                )
+            validated = validate_live_request()
             created_at = self._clock()
             _parse_timestamp(created_at, code="CLOCK_INVALID")
             job_id = self._job_id(submission_id, created_at)
@@ -2492,54 +2724,13 @@ class DeepwaveAdapter:
                     "updated_at": created_at,
                 },
             )
-            try:
-                record["launch_state"] = "launching"
-                self._write_submission(index_path, record)
-                self._launcher.launch(
-                    command=validated.command,
-                    config_path=job_dir / "config.original.json",
-                    run_dir=job_dir,
-                    run_root=self._run_root,
-                )
-            except _AdapterLaunchAmbiguous as error:
-                # Popen may have succeeded and the child retains both kernel
-                # fences.  Keep the durable state at ``launching`` so startup
-                # recovery can adopt only after the exact ready receipt exists.
-                raise AdapterUnavailable(str(error)) from error
-            except Exception as error:
-                if (
-                    isinstance(error, AdapterUnavailable)
-                    and error.code == "ADAPTER_CONCURRENCY_LIMIT"
-                ):
-                    record["launch_state"] = "preparing"
-                    self._write_submission(index_path, record)
-                    raise
-                try:
-                    mark_launch_failed(job_dir, launch_binding)
-                except WorkerControlError:
-                    # The submission record below remains the fail-closed
-                    # authority for the Adapter launch outcome.
-                    pass
-                record["launch_state"] = "failed"
-                self._write_submission(index_path, record)
-                _atomic_write_json(
-                    job_dir / "status.json",
-                    {
-                        "job_id": job_id,
-                        "status": "failed",
-                        "stage": "submit",
-                        "iteration": 0,
-                        "total_iterations": validated.parameters["iterations"],
-                        "message": "FWI worker could not be started",
-                        "updated_at": self._clock(),
-                    },
-                )
-                raise AdapterUnavailable(
-                    f"WORKER_LAUNCH_FAILED: {type(error).__name__}"
-                ) from error
-            record["launch_state"] = "launched"
-            self._write_submission(index_path, record)
-            return self._handle_from_record(record)
+            return self._launch_prepared_submission(
+                index_path=index_path,
+                record=record,
+                validated=validated,
+                job_dir=job_dir,
+                launch_binding=launch_binding,
+            )
 
     def _record_for_handle(
         self,

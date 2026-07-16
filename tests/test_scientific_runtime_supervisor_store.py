@@ -97,9 +97,9 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             clock=lambda: now,
         )
 
-    def _submitted_runtime(
+    def _pending_runtime(
         self, *, key: str, deferred: bool = False
-    ) -> tuple[str, FakeDispatcher, TaskService]:
+    ):
         token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         draft = optimizer_task_draft()
         draft["draft_id"] = f"draft-{token}"
@@ -143,13 +143,32 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             idempotency_key=f"submit-{key}",
             **self.scope,
         )
+        self.assertEqual(submitted.intent.state, "pending")
+        return task_id, dispatcher, runtime, submitted.intent
+
+    def _submitted_runtime(
+        self, *, key: str, deferred: bool = False
+    ) -> tuple[str, FakeDispatcher, TaskService]:
+        task_id, dispatcher, runtime, intent = self._pending_runtime(
+            key=key,
+            deferred=deferred,
+        )
+        claimed, claimed_now = self.store.claim_dispatch(
+            intent_id=intent.intent_id,
+            now=self.now[0],
+        )
+        self.assertTrue(claimed_now)
+        final_intent = runtime._dispatch_claimed_intent(
+            snapshot=self.store.get_task(task_id),
+            intent=claimed,
+        )
         self.assertEqual(
-            submitted.intent.state, "dispatching" if deferred else "dispatched"
+            final_intent.state, "dispatching" if deferred else "dispatched"
         )
         return task_id, dispatcher, runtime
 
-    def test_fresh_v9_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 9)
+    def test_fresh_v10_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 10)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -158,6 +177,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "worker_launch_attempts",
             "worker_attempt_observations",
             "supervised_dispatch_adoptions",
+            "supervised_dispatch_attempts",
+            "supervised_private_receipt_adoptions",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -186,6 +207,17 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "worker_attempt_observations_cannot_be_deleted",
             "supervised_dispatch_adoptions_are_append_only",
             "supervised_dispatch_adoptions_cannot_be_deleted",
+            "supervised_dispatch_attempt_requires_matching_intent",
+            "supervised_pending_dispatch_requires_atomic_claim",
+            "supervised_no_record_takeover_requires_no_worker_projection",
+            "supervised_staged_resume_requires_exact_projection",
+            "supervised_dispatch_attempt_requires_active_term",
+            "supervised_dispatch_attempts_are_immutable",
+            "supervised_dispatch_attempts_cannot_be_deleted",
+            "supervised_private_receipt_requires_exact_outcome",
+            "supervised_private_receipt_requires_active_term",
+            "supervised_private_receipt_adoptions_are_immutable",
+            "supervised_private_receipt_adoptions_cannot_be_deleted",
         }
         connection = self._connection()
         try:
@@ -210,6 +242,12 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(
                 worker_migration["name"], "0009_worker_attempt_projection.sql"
+            )
+            dispatch_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 10"
+            ).fetchone()
+            self.assertEqual(
+                dispatch_migration["name"], "0010_supervised_dispatch.sql"
             )
         finally:
             connection.close()
@@ -255,23 +293,25 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v9(self) -> None:
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v10(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            connection.execute("DROP TABLE supervised_private_receipt_adoptions")
+            connection.execute("DROP TABLE supervised_dispatch_attempts")
             connection.execute("DROP TABLE supervised_dispatch_adoptions")
             connection.execute("DROP TABLE worker_attempt_observations")
             connection.execute("DROP TABLE worker_launch_attempts")
-            connection.execute("DELETE FROM schema_migrations WHERE version = 9")
+            connection.execute("DELETE FROM schema_migrations WHERE version >= 9")
             connection.execute("PRAGMA user_version = 8")
             connection.commit()
         finally:
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 9)
+        self.assertEqual(reopened.migration_version(), 10)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -287,9 +327,442 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 0,
             )
             self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM supervised_dispatch_attempts"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM supervised_private_receipt_adoptions"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
             )
         finally:
+            connection.close()
+
+    def test_supervised_dispatch_authorization_claims_replays_and_is_immutable(
+        self,
+    ) -> None:
+        task_id, _, _, pending = self._pending_runtime(key="dispatch-authorize")
+        acquisition = self._acquire("dispatch-authorize-owner", lease_seconds=30)
+
+        authorized = self.store.authorize_supervised_dispatch(
+            intent_id=pending.intent_id,
+            reason="pending_first_dispatch",
+            supervisor_lease=acquisition.lease,
+            supervisor_clock=lambda: NOW,
+        )
+        self.assertFalse(authorized.replayed)
+        self.assertEqual(authorized.intent.state, "dispatching")
+        self.assertEqual(authorized.reason, "pending_first_dispatch")
+        self.assertEqual(
+            authorized.fencing_token, acquisition.lease.fencing_token
+        )
+
+        replay = self.store.authorize_supervised_dispatch(
+            intent_id=pending.intent_id,
+            reason="pending_first_dispatch",
+            supervisor_lease=acquisition.lease,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.authorized_at, authorized.authorized_at)
+        self.assertEqual(replay.intent.state, "dispatching")
+        with self.assertRaises(RuntimeSupervisorLeaseLost):
+            self.store.authorize_supervised_dispatch(
+                intent_id=pending.intent_id,
+                reason="dispatching_no_record_takeover",
+                supervisor_lease=acquisition.lease,
+                supervisor_clock=lambda: T_PLUS_30,
+            )
+
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_attempts"
+                ).fetchone()[0],
+                1,
+            )
+            audit = connection.execute(
+                """
+                SELECT project_id, principal_id, fencing_token, reason,
+                       authorized_at, authorized_at_us
+                FROM supervised_dispatch_attempts WHERE intent_id = ?
+                """,
+                (pending.intent_id,),
+            ).fetchone()
+            self.assertEqual(audit["project_id"], PROJECT_ID)
+            self.assertEqual(audit["principal_id"], PRINCIPAL_ID)
+            self.assertEqual(
+                audit["fencing_token"], acquisition.lease.fencing_token
+            )
+            self.assertEqual(audit["reason"], "pending_first_dispatch")
+            self.assertEqual(
+                audit["authorized_at"], "2026-07-15T03:00:00.000000Z"
+            )
+            self.assertEqual(audit["authorized_at_us"], 1784084400000000)
+
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute(
+                    """
+                    UPDATE supervised_dispatch_attempts
+                    SET reason = 'staged_attempt_resume'
+                    WHERE intent_id = ?
+                    """,
+                    (pending.intent_id,),
+                )
+            connection.rollback()
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute(
+                    "DELETE FROM supervised_dispatch_attempts WHERE intent_id = ?",
+                    (pending.intent_id,),
+                )
+        finally:
+            connection.rollback()
+            connection.close()
+
+        self.assertEqual(
+            self.store.get_dispatch_intent(task_id).state, "dispatching"
+        )
+
+    def test_direct_sql_cannot_mislabel_an_older_claim_as_pending(self) -> None:
+        _, _, _, pending = self._pending_runtime(key="dispatch-reason-trigger")
+        claimed, claimed_now = self.store.claim_dispatch(
+            intent_id=pending.intent_id,
+            now=NOW,
+        )
+        self.assertTrue(claimed_now)
+        self.assertEqual(claimed.state, "dispatching")
+        acquisition = self._acquire(
+            "dispatch-reason-trigger-owner", lease_seconds=30
+        )
+
+        connection = self._connection()
+        try:
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "pending dispatch requires its atomic claim",
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO supervised_dispatch_attempts(
+                        intent_id, project_id, principal_id, fencing_token,
+                        reason, authorized_at, authorized_at_us
+                    ) VALUES (?, ?, ?, ?, 'pending_first_dispatch', ?, ?)
+                    """,
+                    (
+                        pending.intent_id,
+                        PROJECT_ID,
+                        PRINCIPAL_ID,
+                        acquisition.lease.fencing_token,
+                        T_PLUS_1,
+                        1784084401000000,
+                    ),
+                )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_concurrent_supervised_pending_claim_has_one_audit_row(self) -> None:
+        _, _, _, pending = self._pending_runtime(key="dispatch-concurrent")
+        acquisition = self._acquire("dispatch-concurrent-owner", lease_seconds=30)
+        callers = 8
+        barrier = threading.Barrier(callers)
+
+        def authorize(_index: int):
+            barrier.wait(timeout=5)
+            return self.store.authorize_supervised_dispatch(
+                intent_id=pending.intent_id,
+                reason="pending_first_dispatch",
+                supervisor_lease=acquisition.lease,
+                supervisor_clock=lambda: NOW,
+            )
+
+        with ThreadPoolExecutor(max_workers=callers) as executor:
+            results = list(executor.map(authorize, range(callers)))
+
+        self.assertEqual(sum(not result.replayed for result in results), 1)
+        self.assertTrue(all(result.intent.state == "dispatching" for result in results))
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_attempts"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM supervised_dispatch_attempts"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_supervised_pending_claim_rolls_back_if_audit_insert_fails(
+        self,
+    ) -> None:
+        _, dispatcher, _, pending = self._pending_runtime(
+            key="dispatch-audit-rollback"
+        )
+        acquisition = self._acquire(
+            "dispatch-audit-rollback-owner", lease_seconds=30
+        )
+        connection = self._connection()
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER test_reject_supervised_dispatch_audit
+                BEFORE INSERT ON supervised_dispatch_attempts
+                BEGIN
+                    SELECT RAISE(ABORT, 'synthetic audit failure');
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(TaskStoreConflict):
+            self.store.authorize_supervised_dispatch(
+                intent_id=pending.intent_id,
+                reason="pending_first_dispatch",
+                supervisor_lease=acquisition.lease,
+                supervisor_clock=lambda: NOW,
+            )
+        self.assertEqual(
+            self.store.get_dispatch_intent(pending.task_id).state, "pending"
+        )
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_attempts"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM supervised_dispatch_attempts"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_expired_authorization_rolls_back_and_new_term_can_take_over(
+        self,
+    ) -> None:
+        _, _, _, pending = self._pending_runtime(key="dispatch-takeover")
+        expired = self._acquire("dispatch-expired-owner", lease_seconds=10)
+
+        with self.assertRaises(RuntimeSupervisorLeaseLost):
+            self.store.authorize_supervised_dispatch(
+                intent_id=pending.intent_id,
+                reason="pending_first_dispatch",
+                supervisor_lease=expired.lease,
+                supervisor_clock=lambda: T_PLUS_10,
+            )
+        self.assertEqual(
+            self.store.get_dispatch_intent(pending.task_id).state, "pending"
+        )
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_attempts"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM supervised_dispatch_attempts"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+        first_active = self._acquire(
+            "dispatch-first-active", now=T_PLUS_10, lease_seconds=10
+        )
+        first_authorization = self.store.authorize_supervised_dispatch(
+            intent_id=pending.intent_id,
+            reason="pending_first_dispatch",
+            supervisor_lease=first_active.lease,
+            supervisor_clock=lambda: T_PLUS_10,
+        )
+        self.assertEqual(first_authorization.intent.state, "dispatching")
+
+        takeover = self._acquire(
+            "dispatch-takeover-owner", now=T_PLUS_20, lease_seconds=10
+        )
+        with self.assertRaises(RuntimeSupervisorLeaseLost):
+            self.store.authorize_supervised_dispatch(
+                intent_id=pending.intent_id,
+                reason="dispatching_no_record_takeover",
+                supervisor_lease=first_active.lease,
+                supervisor_clock=lambda: T_PLUS_20,
+            )
+        with self.assertRaises(TaskStoreConflict):
+            self.store.authorize_supervised_dispatch(
+                intent_id=pending.intent_id,
+                reason="staged_attempt_resume",
+                supervisor_lease=takeover.lease,
+                supervisor_clock=lambda: T_PLUS_20,
+            )
+        recovered = self.store.authorize_supervised_dispatch(
+            intent_id=pending.intent_id,
+            reason="dispatching_no_record_takeover",
+            supervisor_lease=takeover.lease,
+            supervisor_clock=lambda: T_PLUS_20,
+        )
+        self.assertFalse(recovered.replayed)
+        self.assertEqual(recovered.intent.state, "dispatching")
+        self.assertEqual(recovered.reason, "dispatching_no_record_takeover")
+
+        connection = self._connection()
+        try:
+            rows = connection.execute(
+                """
+                SELECT fencing_token, reason
+                FROM supervised_dispatch_attempts
+                WHERE intent_id = ? ORDER BY fencing_token
+                """,
+                (pending.intent_id,),
+            ).fetchall()
+            self.assertEqual(
+                [(row["fencing_token"], row["reason"]) for row in rows],
+                [
+                    (
+                        first_active.lease.fencing_token,
+                        "pending_first_dispatch",
+                    ),
+                    (
+                        takeover.lease.fencing_token,
+                        "dispatching_no_record_takeover",
+                    ),
+                ],
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_attempts"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_private_receipt_adoption_is_fenced_atomic_and_immutable(self) -> None:
+        _, dispatcher, _, pending = self._pending_runtime(
+            key="private-receipt-adoption"
+        )
+        claimed, claimed_now = self.store.claim_dispatch(
+            intent_id=pending.intent_id,
+            now=NOW,
+        )
+        self.assertTrue(claimed_now)
+        handle = dispatcher.recover_existing_receipt(claimed)
+        acquisition = self._acquire(
+            "private-receipt-adoption-owner", lease_seconds=30
+        )
+        connection = self._connection()
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER test_reject_private_receipt_audit
+                BEFORE INSERT ON supervised_private_receipt_adoptions
+                BEGIN
+                    SELECT RAISE(ABORT, 'synthetic private audit failure');
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(TaskStoreConflict):
+            self.store.record_supervised_private_receipt_adoption(
+                intent_id=pending.intent_id,
+                handle=handle,
+                private_schema_version="1.0.0",
+                receipt_record_hash="sha256:" + "b" * 64,
+                supervisor_lease=acquisition.lease,
+                supervisor_clock=lambda: NOW,
+            )
+        self.assertEqual(
+            self.store.get_dispatch_intent(pending.task_id).state,
+            "dispatching",
+        )
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_outcomes"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM supervised_private_receipt_adoptions"
+                ).fetchone()[0],
+                0,
+            )
+            connection.execute("DROP TRIGGER test_reject_private_receipt_audit")
+            connection.commit()
+        finally:
+            connection.close()
+
+        adopted = self.store.record_supervised_private_receipt_adoption(
+            intent_id=pending.intent_id,
+            handle=handle,
+            private_schema_version="1.0.0",
+            receipt_record_hash="sha256:" + "b" * 64,
+            supervisor_lease=acquisition.lease,
+            supervisor_clock=lambda: NOW,
+        )
+        self.assertTrue(adopted.adopted)
+        self.assertFalse(adopted.replayed)
+        self.assertEqual(adopted.intent.state, "dispatched")
+        replay = self.store.record_supervised_private_receipt_adoption(
+            intent_id=pending.intent_id,
+            handle=handle,
+            private_schema_version="1.0.0",
+            receipt_record_hash="sha256:" + "b" * 64,
+            supervisor_lease=acquisition.lease,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertFalse(replay.adopted)
+        self.assertTrue(replay.replayed)
+
+        connection = self._connection()
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute(
+                    """
+                    UPDATE supervised_private_receipt_adoptions
+                    SET receipt_record_hash = ? WHERE intent_id = ?
+                    """,
+                    ("sha256:" + "c" * 64, pending.intent_id),
+                )
+            connection.rollback()
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute(
+                    """
+                    DELETE FROM supervised_private_receipt_adoptions
+                    WHERE intent_id = ?
+                    """,
+                    (pending.intent_id,),
+                )
+        finally:
+            connection.rollback()
             connection.close()
 
     def test_stale_supervisor_term_cannot_project_or_adopt_worker(self) -> None:

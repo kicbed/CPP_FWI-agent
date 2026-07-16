@@ -17,11 +17,12 @@
   删除、P2-004 有界启动 receipt 收养/一次状态追赶、P2-005A 控制面 fenced lease 与
   observation-only 持续状态泵、P2-005B 固定 Adapter 托管 Worker 的 staged launch、
   attempt/capacity fence、ready/heartbeat 证据，以及 P2-005C SQLite v9 fenced Worker
-  evidence projection/late adoption。
+  evidence projection/late adoption；P2-006 又增加 SQLite v10 受监督派发授权、enqueue-only
+  submit、可恢复 fenced scheduler、exact staged attempt 恢复与 current 1.4 legacy-private
+  receipt 的受 fence 收养。
 - 当前阶段：完整 P2 仍在进行；上述 P2 子项不得表述为完整 P2 已完成。
-- 下一安全方向：基于 v9 exact Worker projection 设计可恢复 fenced scheduler；先证明
-  pending/no-record 首次派发和控制面重启接管不会重复启动，再处理 cancel/timeout、有限 retry、
-  `reconciliation_required` resolution；SSE 继续后置。
+- 下一安全方向：基于 exact attempt/fence 实现 cancel 与 timeout；随后处理有限 retry、
+  `reconciliation_required` resolution，SSE 继续后置。
 - 当前阻塞：无。工作树中的未提交内容可能属于另一个活跃窗口，必须现场检查并保护。
 - 已接受 D-011：继续保留逐切片开发，但采用弹性中等粒度；约十余个剩余切片只是估算，允许
   按真实风险小幅增加，不为 migration/字段/单项测试制造路线切片，也不得无说明膨胀成几十个。
@@ -58,9 +59,13 @@
 - 批准绑定规范化 `plan_hash`；参数、数据、算法、资源或计划变化使旧批准失效。
 - 保留固定 Marmousi/Deepwave Adapter、MCP 白名单、路径校验和通用 JobBackend dry-run。
 - 不创建扫描 `FWI_RUN_ROOT` 并执行任务的 watcher；运行目录只是受控输出/状态。
-- P2-005B/P2-005C 的执行安全权威仍是同机内核 `flock`，不是 heartbeat 新鲜度；SQLite v9
-  只保存 current managed Adapter 的受 fence 采样与 exact adoption，不提供 takeover 或首次派发。
-  legacy CLI/MCP 仍在该容量/投影边界之外，升级前已终态任务不保证 evidence backfill。
+- P2-005B–P2-006 的执行/容量安全权威仍是同机内核 `flock`，不是 SQLite 授权行或 heartbeat
+  新鲜度。SQLite v10 只允许 active Supervisor term 调度 current managed Adapter：pending 原子
+  claim、dispatching/no-record 接管和 exact staged（`preparing` 或尚未取得 launch lease 的
+  `launching`）同 attempt 恢复；leased/spawned/ready 只观察或收养，绝不二次 `Popen`。
+  current 1.4 legacy private schema 1.0 的 exact launched receipt 可凭只读 proof 受 fence 收养；
+  历史 Algorithm/Adapter identity 1.0–1.3、legacy CLI/MCP 仍不在首次派发/容量投影边界，升级前
+  已终态任务不保证 evidence backfill。不完整 staging 保持 fail-closed，等待 reconciliation。
 - 不读取、打印或提交 `.env`、API Key、凭证、私有 prompt、模型、运行 artifact、数据库、
   日志、构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开报告；科学结论只限实际实验边界。

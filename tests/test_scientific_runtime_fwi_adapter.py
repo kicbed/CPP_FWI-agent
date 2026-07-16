@@ -45,6 +45,7 @@ from worker_launch_control import (
     ParentLaunchLease,
     WorkerHeartbeat,
     binding_from_submission_record,
+    read_worker_attempt_evidence,
     stage_launch_attempt,
 )
 from tests.test_scientific_runtime_contracts import (
@@ -223,6 +224,12 @@ class FailingLauncher(FakeLauncher):
     def launch(self, **kwargs: Any) -> int:
         super().launch(**kwargs)
         raise OSError("synthetic launch failure")
+
+
+class CapacityDeferredLauncher(FakeLauncher):
+    def launch(self, **kwargs: Any) -> int:
+        super().launch(**kwargs)
+        raise AdapterUnavailable("ADAPTER_CONCURRENCY_LIMIT")
 
 
 class FileMarkerLauncher:
@@ -1269,23 +1276,37 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             approval=approval,
         )
 
-        original_record_success = store.record_dispatch_success
+        submitted = service.submit_task(
+            task_id=task_id,
+            project_id="project-1",
+            principal_id="user-1",
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-real-receipt-recovery",
+        )
+        self.assertEqual(submitted.intent.state, "pending")
+        acquisition = service.acquire_runtime_supervisor_lease(
+            project_id="project-1",
+            principal_id="user-1",
+            owner_id="lost-receipt-owner",
+            lease_seconds=30,
+        )
+        original_record_success = store.record_supervised_worker_observation
 
         def lose_sqlite_receipt(**_kwargs: Any) -> Any:
             raise TaskStoreConflict("simulated post-launch receipt loss")
 
-        store.record_dispatch_success = lose_sqlite_receipt
+        store.record_supervised_worker_observation = lose_sqlite_receipt
         try:
             with self.assertRaises(TaskConflict):
-                service.submit_task(
-                    task_id=task_id,
+                service.schedule_runtime_dispatch(
+                    task_id,
                     project_id="project-1",
                     principal_id="user-1",
-                    approval_id=approval["approval_id"],
-                    idempotency_key="submit-real-receipt-recovery",
+                    supervisor_lease=acquisition.lease,
                 )
         finally:
-            store.record_dispatch_success = original_record_success
+            store.record_supervised_worker_observation = original_record_success
+        service.release_runtime_supervisor_lease(acquisition.lease)
 
         self.assertEqual(len(self.launcher.calls), 1)
         lost_intent = store.get_dispatch_intent(task_id)
@@ -1353,16 +1374,38 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             recovered = reopened_service.recover_runtime_on_startup(
                 "project-1", "user-1"
             )
+            resumed_lease = reopened_service.acquire_runtime_supervisor_lease(
+                project_id="project-1",
+                principal_id="user-1",
+                owner_id="reopened-receipt-owner",
+                lease_seconds=30,
+            ).lease
+            scheduled = reopened_service.schedule_runtime_dispatch(
+                task_id,
+                project_id="project-1",
+                principal_id="user-1",
+                supervisor_lease=resumed_lease,
+            )
+            reopened_service.refresh_runtime_status(
+                task_id,
+                project_id="project-1",
+                principal_id="user-1",
+                supervisor_lease=resumed_lease,
+            )
+            reopened_service.release_runtime_supervisor_lease(resumed_lease)
         finally:
             recovery_heartbeat.stop("succeeded")
 
+        self.assertEqual(recovered.receipt_recovery_attempted_task_ids, ())
+        self.assertEqual(recovered.receipt_recovered_task_ids, ())
+        self.assertEqual(recovered.status_refreshed_task_ids, ())
         self.assertEqual(
-            recovered.receipt_recovery_attempted_task_ids, (task_id,)
+            recovered.dispatching_deferred,
+            ((task_id, "SUPERVISED_DISPATCH_REQUIRED"),),
         )
-        self.assertEqual(recovered.receipt_recovered_task_ids, (task_id,))
-        self.assertEqual(recovered.status_refreshed_task_ids, (task_id,))
-        self.assertEqual(recovered.dispatching_deferred, ())
         self.assertEqual(recovered.status_refresh_failures, ())
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertTrue(scheduled.adopted)
         self.assertEqual(replacement_launcher.calls, [])
         adopted = reopened_store.get_dispatch_intent(task_id)
         self.assertIsNotNone(adopted)
@@ -1515,7 +1558,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(len(failing_launcher.calls), 1)
         self.assertEqual(replacement_launcher.calls, [])
 
-    def test_incomplete_submission_requires_reconciliation_without_relaunch(self) -> None:
+    def test_only_exact_staged_submission_is_resumed_without_new_attempt(self) -> None:
         for index, launch_state in enumerate(("preparing", "launching"), start=1):
             with self.subTest(launch_state=launch_state):
                 request = self.submit_kwargs(
@@ -1530,11 +1573,123 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
 
                 replacement_launcher = FakeLauncher()
                 reopened = self.make_adapter(launcher=replacement_launcher)
-                with self.assertRaisesRegex(
-                    RuntimeError, "SUBMISSION_RECONCILIATION_REQUIRED"
-                ):
-                    reopened.submit(**copy.deepcopy(request))
-                self.assertEqual(replacement_launcher.calls, [])
+                resumed = reopened.submit(**copy.deepcopy(request))
+                self.assertEqual(_plain(resumed), _plain(handle))
+                self.assertEqual(len(replacement_launcher.calls), 1)
+                resumed_record = json.loads(
+                    record_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    resumed_record["launch_attempt"], record["launch_attempt"]
+                )
+                self.assertEqual(resumed_record["job_id"], record["job_id"])
+
+    def test_capacity_deferred_submission_resumes_same_staged_attempt(self) -> None:
+        capacity_launcher = CapacityDeferredLauncher()
+        deferred_adapter = self.make_adapter(launcher=capacity_launcher)
+        request = self.submit_kwargs(
+            task_id="task-capacity-resume",
+            idempotency_key="task-capacity-resume:invert:0001",
+        )
+
+        with self.assertRaises(AdapterUnavailable) as raised:
+            deferred_adapter.submit(**copy.deepcopy(request))
+        self.assertEqual(raised.exception.code, "ADAPTER_CONCURRENCY_LIMIT")
+        self.assertEqual(len(capacity_launcher.calls), 1)
+
+        records = list(
+            (
+                self.run_root
+                / fwi_adapter_module.CONTROL_DIRECTORY
+                / "submissions"
+            ).glob("*.json")
+        )
+        self.assertEqual(len(records), 1)
+        original = json.loads(records[0].read_text(encoding="utf-8"))
+        self.assertEqual(original["launch_state"], "preparing")
+        run_dir = capacity_launcher.calls[0]["run_dir"]
+        binding = binding_from_submission_record(original)
+        evidence = read_worker_attempt_evidence(
+            self.run_root, run_dir, binding
+        )
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence.ticket_state, "staged")
+        self.assertIsNone(evidence.capacity_slot)
+        self.assertIsNone(evidence.capacity_generation)
+        self.assertIsNone(evidence.ticket_worker_pid)
+        self.assertFalse(evidence.ready)
+        self.assertIsNone(evidence.heartbeat_record_hash)
+
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        resumed = reopened.submit(**copy.deepcopy(request))
+        self.assertEqual(len(replacement_launcher.calls), 1)
+        self.assertEqual(replacement_launcher.calls[0]["run_dir"], run_dir)
+        current = json.loads(records[0].read_text(encoding="utf-8"))
+        self.assertEqual(current["launch_state"], "launched")
+        self.assertEqual(current["launch_attempt"], original["launch_attempt"])
+        self.assertEqual(current["job_id"], original["job_id"])
+        self.assertEqual(resumed.job_id, original["job_id"])
+        self.assertEqual(
+            [path.name for path in self.run_root.iterdir() if not path.name.startswith(".")],
+            [original["job_id"]],
+        )
+
+    def test_capacity_reset_crash_resumes_exact_launching_staged_attempt(
+        self,
+    ) -> None:
+        capacity_launcher = CapacityDeferredLauncher()
+        deferred_adapter = self.make_adapter(launcher=capacity_launcher)
+        request = self.submit_kwargs(
+            task_id="task-capacity-reset-crash",
+            idempotency_key="task-capacity-reset-crash:invert:0001",
+        )
+        write_submission = deferred_adapter._write_submission
+        writes = 0
+
+        def crash_before_preparing_reset(path: Path, record: dict[str, Any]) -> None:
+            nonlocal writes
+            writes += 1
+            if writes == 3:
+                raise OSError("synthetic reset crash")
+            write_submission(path, record)
+
+        with patch.object(
+            deferred_adapter,
+            "_write_submission",
+            side_effect=crash_before_preparing_reset,
+        ), self.assertRaisesRegex(OSError, "synthetic reset crash"):
+            deferred_adapter.submit(**copy.deepcopy(request))
+
+        record_path = next(
+            (
+                self.run_root
+                / fwi_adapter_module.CONTROL_DIRECTORY
+                / "submissions"
+            ).glob("*.json")
+        )
+        original = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(original["launch_state"], "launching")
+        run_dir = capacity_launcher.calls[0]["run_dir"]
+        evidence = read_worker_attempt_evidence(
+            self.run_root,
+            run_dir,
+            binding_from_submission_record(original),
+        )
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence.ticket_state, "staged")
+        self.assertFalse(evidence.ready)
+
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        resumed = reopened.submit(**copy.deepcopy(request))
+        self.assertEqual(len(replacement_launcher.calls), 1)
+        current = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["launch_state"], "launched")
+        self.assertEqual(current["launch_attempt"], original["launch_attempt"])
+        self.assertEqual(resumed.job_id, original["job_id"])
 
     def test_status_maps_four_states_and_rejects_corruption(self) -> None:
         for index, state in enumerate(
@@ -1786,6 +1941,15 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         reopened = self.make_adapter(launcher=replacement_launcher)
         recovered = reopened.lookup_existing_handle(**copy.deepcopy(request))
         self.assertEqual(recovered.as_dict(), handle.as_dict())
+        proof = reopened.lookup_existing_private_receipt(
+            **copy.deepcopy(request)
+        )
+        self.assertEqual(proof.handle.as_dict(), handle.as_dict())
+        self.assertEqual(proof.private_schema_version, "1.0.0")
+        self.assertEqual(
+            proof.receipt_record_hash,
+            json.loads(record_path.read_text(encoding="utf-8"))["record_hash"],
+        )
         with self.assertRaises(AdapterUnavailable) as unavailable:
             reopened.observe_existing_worker_attempt(**copy.deepcopy(request))
         self.assertEqual(
@@ -2433,6 +2597,13 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                     break
             time.sleep(0.005)
         self.assertEqual(SafeSubprocessWorkerLauncher._process_active, 0)
+        with patch(
+            "scientific_runtime.fwi_adapter.subprocess.Popen"
+        ) as replacement, self.assertRaisesRegex(
+            RuntimeError, "SUBMISSION_LAUNCH_PENDING"
+        ):
+            adapter.submit(**copy.deepcopy(request))
+        replacement.assert_not_called()
 
     def test_default_fixed_venv_probe_is_path_free_and_read_only(self) -> None:
         before = self.root_snapshot()
