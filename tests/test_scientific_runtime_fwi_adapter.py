@@ -25,13 +25,23 @@ from scientific_runtime import (
     DeepwaveTaskDispatcher,
     DispatchError,
     DispatchIntentSnapshot,
+    RegistryService,
+    SQLiteTaskStore,
+    TaskConflict,
+    TaskService,
     TaskSnapshot,
+    TaskStoreConflict,
 )
 from scientific_runtime.fwi_adapter import (
     DeepwaveAdapter,
     SafeSubprocessWorkerLauncher,
 )
-from scientific_runtime_contracts import schema_errors
+from scientific_runtime_contracts import compute_plan_hash, schema_errors
+from tests.test_scientific_runtime_contracts import (
+    approval_decision as contract_approval_decision,
+    optimizer_plan_graph as contract_optimizer_plan_graph,
+    optimizer_task_draft as contract_optimizer_task_draft,
+)
 
 
 NOW = "2026-07-15T06:00:00Z"
@@ -780,6 +790,132 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(_status_name(self.adapter.status(handle)), "queued")
         self.assertEqual(run_dir, call["run_dir"])
 
+    def test_lookup_existing_handle_adopts_only_an_exact_launched_record(self) -> None:
+        request = self.submit_kwargs(
+            task_id="task-receipt-lookup",
+            idempotency_key="task-receipt-lookup:invert:0001",
+        )
+        before_missing = self.root_snapshot()
+        with self.assertRaises(RuntimeError) as missing:
+            self.adapter.lookup_existing_handle(**copy.deepcopy(request))
+        self.assertEqual(
+            getattr(missing.exception, "code", None),
+            "ADAPTER_SUBMISSION_NOT_FOUND",
+        )
+        self.assertNotIn(str(self.run_root), str(missing.exception))
+        self.assertEqual(self.root_snapshot(), before_missing)
+        self.assertEqual(self.launcher.calls, [])
+
+        launched = self.adapter.submit(**copy.deepcopy(request))
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        before_lookup = self.root_snapshot()
+        readiness_counts = (
+            len(self.dataset_provider.calls),
+            len(self.registry_provider.calls),
+            len(self.device_validator.calls),
+            len(self.fingerprint_factory.calls),
+        )
+        recovered = reopened.lookup_existing_handle(**copy.deepcopy(request))
+        self.assertEqual(_plain(recovered), _plain(launched))
+        self.assertEqual(replacement_launcher.calls, [])
+        self.assertEqual(self.root_snapshot(), before_lookup)
+        self.assertEqual(
+            (
+                len(self.dataset_provider.calls),
+                len(self.registry_provider.calls),
+                len(self.device_validator.calls),
+                len(self.fingerprint_factory.calls),
+            ),
+            readiness_counts,
+        )
+
+        changed = copy.deepcopy(request)
+        changed["parameters"]["iterations"] = 3
+        with self.assertRaises(RuntimeError) as conflict:
+            reopened.lookup_existing_handle(**changed)
+        self.assertEqual(
+            getattr(conflict.exception, "code", None),
+            "ADAPTER_IDEMPOTENCY_CONFLICT",
+        )
+        self.assertEqual(replacement_launcher.calls, [])
+
+    def test_lookup_existing_handle_defers_nonlaunched_states_without_launch(self) -> None:
+        expected_codes = {
+            "preparing": "ADAPTER_SUBMISSION_PREPARING",
+            "launching": "ADAPTER_SUBMISSION_LAUNCH_AMBIGUOUS",
+            "failed": "WORKER_LAUNCH_FAILED",
+        }
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        for index, (launch_state, expected_code) in enumerate(
+            expected_codes.items(), start=1
+        ):
+            with self.subTest(launch_state=launch_state):
+                request = self.submit_kwargs(
+                    task_id=f"task-receipt-state-{index}",
+                    idempotency_key=(
+                        f"task-receipt-state-{index}:invert:0001"
+                    ),
+                )
+                handle = self.adapter.submit(**copy.deepcopy(request))
+                record_path = self.submission_record_path(handle)
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                record["launch_state"] = launch_state
+                self.adapter._write_submission(record_path, record)
+                before_lookup = self.root_snapshot()
+
+                with self.assertRaises(RuntimeError) as raised:
+                    reopened.lookup_existing_handle(**copy.deepcopy(request))
+                self.assertEqual(
+                    getattr(raised.exception, "code", None), expected_code
+                )
+                self.assertNotIn(str(self.run_root), str(raised.exception))
+                self.assertEqual(self.root_snapshot(), before_lookup)
+                self.assertEqual(replacement_launcher.calls, [])
+
+    def test_lookup_existing_handle_rejects_malformed_and_symlink_records(self) -> None:
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+
+        malformed_request = self.submit_kwargs(
+            task_id="task-receipt-malformed",
+            idempotency_key="task-receipt-malformed:invert:0001",
+        )
+        malformed_handle = self.adapter.submit(
+            **copy.deepcopy(malformed_request)
+        )
+        malformed_path = self.submission_record_path(malformed_handle)
+        malformed_path.write_text("{not-json", encoding="utf-8")
+        with self.assertRaises(RuntimeError) as malformed:
+            reopened.lookup_existing_handle(
+                **copy.deepcopy(malformed_request)
+            )
+        self.assertEqual(
+            getattr(malformed.exception, "code", None),
+            "ADAPTER_SUBMISSION_INVALID",
+        )
+        self.assertNotIn(str(malformed_path), str(malformed.exception))
+
+        symlink_request = self.submit_kwargs(
+            task_id="task-receipt-symlink",
+            idempotency_key="task-receipt-symlink:invert:0001",
+        )
+        symlink_handle = self.adapter.submit(**copy.deepcopy(symlink_request))
+        symlink_path = self.submission_record_path(symlink_handle)
+        outside = self.base / "outside-submission.json"
+        outside.write_text("{}", encoding="utf-8")
+        symlink_path.unlink()
+        symlink_path.symlink_to(outside)
+        with self.assertRaises(RuntimeError) as symlinked:
+            reopened.lookup_existing_handle(**copy.deepcopy(symlink_request))
+        self.assertEqual(
+            getattr(symlinked.exception, "code", None),
+            "ADAPTER_SUBMISSION_INVALID",
+        )
+        self.assertNotIn(str(outside), str(symlinked.exception))
+        self.assertEqual(replacement_launcher.calls, [])
+
     def test_submit_converts_sgd_milli_units_in_private_worker_config(self) -> None:
         request = self.submit_kwargs(
             task_id="task-sgd-config",
@@ -886,10 +1022,212 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(bridge.dispatch(intent), handle)
         self.assertEqual(len(self.launcher.calls), 1)
 
+        recovery_launcher = FakeLauncher()
+        recovery_bridge = DeepwaveTaskDispatcher(
+            self.make_adapter(launcher=recovery_launcher)
+        )
+        self.assertEqual(recovery_bridge.recover_existing_receipt(intent), handle)
+        self.assertEqual(recovery_launcher.calls, [])
+
+        drift_hash = "sha256:" + "f" * 64
+        drifted_request = copy.deepcopy(intent.request)
+        drifted_request["normalized_config_hash"] = drift_hash
+        drifted_fingerprint = copy.deepcopy(intent.queue_fingerprint)
+        drifted_fingerprint["normalized_config_hash"] = drift_hash
+        drifted = dataclasses.replace(
+            intent,
+            request=drifted_request,
+            queue_fingerprint=drifted_fingerprint,
+        )
+        with self.assertRaises(DispatchError) as drift:
+            recovery_bridge.recover_existing_receipt(drifted)
+        self.assertEqual(drift.exception.code, "DISPATCH_FINGERPRINT_DRIFT")
+        self.assertEqual(recovery_launcher.calls, [])
+
         invalid = dataclasses.replace(intent, adapter_id="untrusted.dynamic")
         with self.assertRaises(DispatchError) as raised:
             bridge.dispatch(invalid)
         self.assertEqual(raised.exception.code, "DISPATCH_INTENT_INVALID")
+
+    def test_task_service_startup_adopts_real_adapter_lost_receipt(self) -> None:
+        database_path = self.base / "receipt-recovery.sqlite3"
+        store = SQLiteTaskStore(database_path)
+        registry = RegistryService(store, clock=lambda: NOW)
+        registry.register_dataset(dataset=copy.deepcopy(self.dataset))
+        registry.register_algorithm(
+            manifest=fwi_adapter_module.load_deepwave_manifest()
+        )
+
+        def registered_adapter(
+            current_registry: RegistryService, launcher: FakeLauncher
+        ) -> DeepwaveAdapter:
+            def registry_snapshot_provider(
+                *,
+                project_id: str,
+                principal_id: str,
+                dataset_id: str,
+                dataset_version: str,
+            ) -> dict[str, Any]:
+                return current_registry.get_dataset(
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    dataset_id=dataset_id,
+                    version=dataset_version,
+                    permission="execute",
+                )
+
+            return DeepwaveAdapter(
+                run_root=self.run_root,
+                launcher=launcher,
+                dataset_identity_provider=self.dataset_provider,
+                registry_snapshot_provider=registry_snapshot_provider,
+                device_validator=self.device_validator,
+                fingerprint_factory=self.fingerprint_factory,
+                clock=lambda: NOW,
+            )
+
+        initial_adapter = registered_adapter(registry, self.launcher)
+        service = TaskService(
+            store,
+            task_id_factory=lambda: "task-real-receipt-recovery",
+            clock=lambda: NOW,
+            dispatcher=DeepwaveTaskDispatcher(initial_adapter),
+        )
+        draft = contract_optimizer_task_draft()
+        draft["draft_id"] = "draft-real-receipt-recovery"
+        draft["datasets"] = [copy.deepcopy(self.dataset)]
+        draft["algorithm"] = algorithm_identity()
+        draft["parameters"] = parameters()
+        draft["resources"] = resources()
+        task_id = service.create_task(
+            project_id="project-1",
+            principal_id="user-1",
+            draft=draft,
+            idempotency_key="create-real-receipt-recovery",
+        ).snapshot.task_id
+
+        plan = contract_optimizer_plan_graph()
+        plan["plan_id"] = "plan-real-receipt-recovery"
+        plan["draft"] = {"draft_id": draft["draft_id"], "revision": 1}
+        node = plan["nodes"][0]
+        node["algorithm"] = algorithm_identity()
+        node["inputs"][0]["dataset"] = {
+            key: self.dataset[key]
+            for key in ("id", "version", "content_hash", "data_type")
+        }
+        node["parameters"] = parameters()
+        node["resources"] = resources()
+        node["idempotency_key"] = (
+            "task-real-receipt-recovery:invert:0001"
+        )
+        plan["plan_hash"] = compute_plan_hash(plan)
+        service.persist_plan(
+            task_id=task_id,
+            project_id="project-1",
+            principal_id="user-1",
+            plan=plan,
+        )
+
+        approval = contract_approval_decision(plan)
+        approval["approval_id"] = "approval-real-receipt-recovery"
+        approval["scope"]["datasets"] = [
+            {
+                key: self.dataset[key]
+                for key in ("id", "version", "content_hash", "data_type")
+            }
+        ]
+        approval["scope"]["algorithms"] = [algorithm_identity()]
+        approval["scope"]["resource_limits"] = resources()
+        approval["decided_at"] = "2026-07-15T05:59:00Z"
+        approval["expires_at"] = "2026-07-15T07:00:00Z"
+        service.persist_approval(
+            task_id=task_id,
+            project_id="project-1",
+            principal_id="user-1",
+            approval=approval,
+        )
+
+        original_record_success = store.record_dispatch_success
+
+        def lose_sqlite_receipt(**_kwargs: Any) -> Any:
+            raise TaskStoreConflict("simulated post-launch receipt loss")
+
+        store.record_dispatch_success = lose_sqlite_receipt
+        try:
+            with self.assertRaises(TaskConflict):
+                service.submit_task(
+                    task_id=task_id,
+                    project_id="project-1",
+                    principal_id="user-1",
+                    approval_id=approval["approval_id"],
+                    idempotency_key="submit-real-receipt-recovery",
+                )
+        finally:
+            store.record_dispatch_success = original_record_success
+
+        self.assertEqual(len(self.launcher.calls), 1)
+        lost_intent = store.get_dispatch_intent(task_id)
+        self.assertIsNotNone(lost_intent)
+        self.assertEqual(lost_intent.state, "dispatching")
+        self.assertIsNone(lost_intent.handle)
+
+        run_dir = self.launcher.calls[0]["run_dir"]
+        worker_config = json.loads(
+            (run_dir / "config.original.json").read_text(encoding="utf-8")
+        )
+        (run_dir / "status.json").write_text(
+            json.dumps(
+                {
+                    "job_id": worker_config["job_id"],
+                    "status": "running",
+                    "stage": "invert",
+                    "iteration": 1,
+                    "total_iterations": 2,
+                    "message": "synthetic recovery progress",
+                    "updated_at": NOW,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        reopened_store = SQLiteTaskStore(database_path)
+        reopened_registry = RegistryService(reopened_store, clock=lambda: NOW)
+        replacement_launcher = FakeLauncher()
+        reopened_service = TaskService(
+            reopened_store,
+            clock=lambda: NOW,
+            dispatcher=DeepwaveTaskDispatcher(
+                registered_adapter(reopened_registry, replacement_launcher)
+            ),
+        )
+        recovered = reopened_service.recover_runtime_on_startup(
+            "project-1", "user-1"
+        )
+
+        self.assertEqual(
+            recovered.receipt_recovery_attempted_task_ids, (task_id,)
+        )
+        self.assertEqual(recovered.receipt_recovered_task_ids, (task_id,))
+        self.assertEqual(recovered.status_refreshed_task_ids, (task_id,))
+        self.assertEqual(recovered.dispatching_deferred, ())
+        self.assertEqual(recovered.status_refresh_failures, ())
+        self.assertEqual(replacement_launcher.calls, [])
+        adopted = reopened_store.get_dispatch_intent(task_id)
+        self.assertIsNotNone(adopted)
+        self.assertEqual(adopted.state, "dispatched")
+        self.assertIsNotNone(adopted.handle)
+        self.assertEqual(reopened_store.get_task(task_id).status, "Running")
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in reopened_service.list_run_events(
+                    task_id,
+                    project_id="project-1",
+                    principal_id="user-1",
+                )
+            ],
+            ["task_queued", "node_started", "node_progress"],
+        )
 
     def test_submit_is_idempotent_sequentially_and_across_instances(self) -> None:
         request = self.submit_kwargs()

@@ -255,6 +255,9 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertFalse(capabilities["features"]["running_cancel"])
         self.assertFalse(capabilities["features"]["automatic_reconciliation"])
+        self.assertFalse(capabilities["features"]["startup_dispatch_recovery"])
+        self.assertTrue(capabilities["features"]["startup_receipt_recovery"])
+        self.assertTrue(capabilities["features"]["startup_status_catchup"])
         self.assertEqual(
             capabilities["form"]["iterations"], {"minimum": 1, "maximum": 10000}
         )
@@ -292,6 +295,9 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                 "cancel": False,
                 "retry": False,
                 "sse": False,
+                "startup_dispatch_recovery": False,
+                "startup_receipt_recovery": True,
+                "startup_status_catchup": True,
                 "automatic_reconciliation": False,
                 "dag": False,
             },
@@ -306,6 +312,37 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         serialized = repr(catalog)
         self.assertNotIn("entrypoint_ref", serialized)
         self.assertNotIn("/root/", serialized)
+
+    def test_startup_recovery_is_internal_bounded_and_scope_bound(self) -> None:
+        calls = []
+        marker = object()
+        original = self.tasks.recover_runtime_on_startup
+
+        def recover_runtime_on_startup(**kwargs):
+            calls.append(kwargs)
+            return marker
+
+        self.tasks.recover_runtime_on_startup = recover_runtime_on_startup
+        try:
+            self.assertIs(
+                self.workbench.recover_runtime_on_startup(max_tasks=321), marker
+            )
+        finally:
+            self.tasks.recover_runtime_on_startup = original
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "project_id": PROJECT_ID,
+                    "principal_id": PRINCIPAL_ID,
+                    "max_tasks": 321,
+                }
+            ],
+        )
+        for invalid in (True, 0, 10001, "100"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(WorkbenchValidationError):
+                    self.workbench.recover_runtime_on_startup(invalid)
 
     def test_create_composes_schema_valid_draft_and_single_node_plan(self) -> None:
         result = self.workbench.create_task(guided_form(), "http-create-001")

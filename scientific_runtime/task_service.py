@@ -40,6 +40,7 @@ from .task_store import (
 
 
 OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+MAX_RUNTIME_EVENT_SCAN = 100_000
 
 RUN_EVENT_STATUS = {
     "node_started": frozenset({"Running"}),
@@ -145,6 +146,22 @@ class TaskRuntimeResult:
     snapshot: TaskSnapshot
     intent: DispatchIntentSnapshot | None
     adapter_status: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class RuntimeRecoveryResult:
+    """Bounded outcome of one scope-wide startup recovery pass."""
+
+    project_id: str
+    principal_id: str
+    scanned_task_ids: tuple[str, ...]
+    receipt_recovery_attempted_task_ids: tuple[str, ...]
+    receipt_recovered_task_ids: tuple[str, ...]
+    pending_deferred_task_ids: tuple[str, ...]
+    dispatching_deferred: tuple[tuple[str, str], ...]
+    status_refreshed_task_ids: tuple[str, ...]
+    status_refresh_failures: tuple[tuple[str, str], ...]
+    reconciliation_required_task_ids: tuple[str, ...]
 
 
 def _utc_now() -> str:
@@ -1663,6 +1680,213 @@ class TaskService:
         self._validate_schema("run-event.schema.json", queued_event)
         return intent, queued_event
 
+    def _validate_dispatch_receipt(
+        self,
+        *,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        handle: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Apply the one receipt boundary shared by submit and recovery."""
+
+        if not isinstance(handle, Mapping):
+            raise TaskValidationError(
+                "DISPATCH_RECEIPT_INVALID",
+                ["receipt must be an immutable handle object"],
+            )
+        try:
+            validated_handle = copy.deepcopy(dict(handle))
+        except Exception as error:
+            raise TaskValidationError(
+                "DISPATCH_RECEIPT_INVALID",
+                ["receipt must be an immutable handle object"],
+            ) from error
+        fingerprint = validated_handle.get("fingerprint")
+        receipt_event = {
+            "schema_version": "1.0.0",
+            "event_id": "dispatch-receipt-validation",
+            "sequence": 2,
+            "task_id": intent.task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_started",
+            "task_status": "Running",
+            "occurred_at": self._clock(),
+            "fingerprint": fingerprint,
+            "extensions": {},
+        }
+        self._validate_schema("run-event.schema.json", receipt_event)
+        required_handle_fields = {
+            "submission_id",
+            "task_id",
+            "node_id",
+            "job_id",
+            "idempotency_key",
+            "plan_hash",
+            "request_hash",
+            "algorithm",
+            "adapter_version",
+            "fingerprint",
+        }
+        request = intent.request
+        if (
+            set(validated_handle) != required_handle_fields
+            or not isinstance(fingerprint, Mapping)
+            or validated_handle.get("task_id") != intent.task_id
+            or validated_handle.get("node_id") != intent.node_id
+            or validated_handle.get("idempotency_key")
+            != intent.node_idempotency_key
+            or validated_handle.get("plan_hash") != intent.plan_hash
+            or validated_handle.get("adapter_version") != intent.adapter_version
+            or fingerprint.get("adapter_version") != intent.adapter_version
+            or validated_handle.get("algorithm") != request.get("algorithm")
+            or fingerprint.get("algorithm") != request.get("algorithm")
+            or fingerprint.get("seed") != request.get("parameters", {}).get("seed")
+            or fingerprint.get("hardware", {}).get("device")
+            != request.get("resources", {}).get("device")
+            or fingerprint.get("normalized_config_hash")
+            != request.get("normalized_config_hash")
+            or fingerprint.get("input_hashes")
+            != [request.get("dataset", {}).get("content_hash")]
+            or not isinstance(validated_handle.get("submission_id"), str)
+            or not isinstance(validated_handle.get("job_id"), str)
+            or not isinstance(validated_handle.get("request_hash"), str)
+        ):
+            raise TaskValidationError(
+                "DISPATCH_RECEIPT_INVALID",
+                ["receipt identity differs from its immutable intent"],
+            )
+        _validate_run_event_binding(snapshot, receipt_event)
+        return validated_handle
+
+    def _record_dispatch_reconciliation(
+        self, *, intent: DispatchIntentSnapshot, failure_code: str
+    ) -> DispatchIntentSnapshot:
+        try:
+            return self._store.record_dispatch_reconciliation(
+                intent_id=intent.intent_id,
+                failure_code=failure_code,
+                now=self._clock(),
+            )
+        except TaskStoreConflict as error:
+            # A concurrent recovery may have persisted the exact idempotent
+            # receipt while this caller observed a transient dispatch error.
+            current = self._store.get_dispatch_intent(intent.task_id)
+            if current is not None and current.state == "dispatched":
+                return current
+            if (
+                current is not None
+                and current.state == "reconciliation_required"
+                and current.failure_code == failure_code
+            ):
+                return current
+            if current is not None and current.state in {
+                "dispatched",
+                "reconciliation_required",
+            }:
+                raise TaskConflict(
+                    "concurrent dispatch reconciliation outcome diverged"
+                ) from error
+            raise TaskConflict(str(error)) from error
+
+    def _dispatch_claimed_intent(
+        self,
+        *,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+    ) -> DispatchIntentSnapshot:
+        """Dispatch or replay one already-claimed immutable intent."""
+
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        try:
+            handle = self._dispatcher.dispatch(intent)
+        except DispatchError as error:
+            return self._record_dispatch_reconciliation(
+                intent=intent, failure_code=error.code
+            )
+        except Exception:
+            return self._record_dispatch_reconciliation(
+                intent=intent, failure_code="DISPATCH_UNAVAILABLE"
+            )
+
+        try:
+            validated_handle = self._validate_dispatch_receipt(
+                snapshot=snapshot, intent=intent, handle=handle
+            )
+        except TaskValidationError:
+            return self._record_dispatch_reconciliation(
+                intent=intent, failure_code="DISPATCH_RECEIPT_INVALID"
+            )
+        try:
+            return self._store.record_dispatch_success(
+                intent_id=intent.intent_id,
+                handle=validated_handle,
+                now=self._clock(),
+            )
+        except TaskStoreConflict as error:
+            current = self._store.get_dispatch_intent(intent.task_id)
+            if (
+                current is not None
+                and current.state == "dispatched"
+                and current.handle == validated_handle
+            ):
+                return current
+            if current is not None and current.state in {
+                "dispatched",
+                "reconciliation_required",
+            }:
+                raise TaskConflict(
+                    "concurrent dispatch success outcome diverged"
+                ) from error
+            raise TaskConflict(str(error)) from error
+
+    def _adopt_existing_dispatch_receipt(
+        self,
+        *,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+    ) -> DispatchIntentSnapshot:
+        """Adopt one already-launched Adapter receipt without dispatching work."""
+
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        try:
+            handle = self._dispatcher.recover_existing_receipt(intent)
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("DISPATCH_RECEIPT_RECOVERY_UNAVAILABLE") from error
+        try:
+            validated_handle = self._validate_dispatch_receipt(
+                snapshot=snapshot,
+                intent=intent,
+                handle=handle,
+            )
+        except TaskValidationError as error:
+            raise TaskDispatchError("DISPATCH_RECEIPT_INVALID") from error
+        try:
+            return self._store.record_dispatch_success(
+                intent_id=intent.intent_id,
+                handle=validated_handle,
+                now=self._clock(),
+            )
+        except TaskStoreConflict as error:
+            current = self._store.get_dispatch_intent(intent.task_id)
+            if (
+                current is not None
+                and current.state == "dispatched"
+                and current.handle == validated_handle
+            ):
+                return current
+            if current is not None and current.state in {
+                "dispatched",
+                "reconciliation_required",
+            }:
+                raise TaskConflict(
+                    "concurrent dispatch receipt recovery outcome diverged"
+                ) from error
+            raise TaskConflict(str(error)) from error
+
     def submit_task(
         self,
         *,
@@ -1763,85 +1987,128 @@ class TaskService:
                 replayed=False,
                 dispatch_attempted=False,
             )
-        try:
-            handle = self._dispatcher.dispatch(claimed)
-        except DispatchError as error:
-            try:
-                final_intent = self._store.record_dispatch_reconciliation(
-                    intent_id=claimed.intent_id,
-                    failure_code=error.code,
-                    now=self._clock(),
-                )
-            except TaskStoreConflict as store_error:
-                raise TaskConflict(str(store_error)) from store_error
-        except Exception:
-            try:
-                final_intent = self._store.record_dispatch_reconciliation(
-                    intent_id=claimed.intent_id,
-                    failure_code="DISPATCH_UNAVAILABLE",
-                    now=self._clock(),
-                )
-            except TaskStoreConflict as store_error:
-                raise TaskConflict(str(store_error)) from store_error
-        else:
-            fingerprint = (
-                handle.get("fingerprint")
-                if isinstance(handle, Mapping)
-                else None
-            )
-            receipt_event = {
-                "schema_version": "1.0.0",
-                "event_id": "dispatch-receipt-validation",
-                "sequence": 2,
-                "task_id": claimed.task_id,
-                "node_id": claimed.node_id,
-                "event_type": "node_started",
-                "task_status": "Running",
-                "occurred_at": self._clock(),
-                "fingerprint": fingerprint,
-                "extensions": {},
-            }
-            try:
-                if (
-                    not isinstance(handle, Mapping)
-                    or not isinstance(fingerprint, Mapping)
-                    or handle.get("adapter_version") != claimed.adapter_version
-                    or fingerprint.get("adapter_version")
-                    != claimed.adapter_version
-                    or handle.get("algorithm")
-                    != claimed.request.get("algorithm")
-                    or fingerprint.get("algorithm")
-                    != claimed.request.get("algorithm")
-                ):
-                    raise TaskValidationError(
-                        "DISPATCH_RECEIPT_INVALID",
-                        ["receipt identity differs from its immutable intent"],
-                    )
-                self._validate_schema("run-event.schema.json", receipt_event)
-                _validate_run_event_binding(admitted.snapshot, receipt_event)
-            except TaskValidationError:
-                try:
-                    final_intent = self._store.record_dispatch_reconciliation(
-                        intent_id=claimed.intent_id,
-                        failure_code="DISPATCH_RECEIPT_INVALID",
-                        now=self._clock(),
-                    )
-                except TaskStoreConflict as store_error:
-                    raise TaskConflict(str(store_error)) from store_error
-            else:
-                try:
-                    final_intent = self._store.record_dispatch_success(
-                        intent_id=claimed.intent_id,
-                        handle=handle,
-                        now=self._clock(),
-                    )
-                except TaskStoreConflict as store_error:
-                    raise TaskConflict(str(store_error)) from store_error
+        final_intent = self._dispatch_claimed_intent(
+            snapshot=admitted.snapshot,
+            intent=claimed,
+        )
         return SubmitTaskResult(
             snapshot=admitted.snapshot,
             intent=final_intent,
             replayed=False,
             dispatch_attempted=True,
+        )
+
+    def recover_runtime_on_startup(
+        self,
+        project_id: str,
+        principal_id: str,
+        max_tasks: int = 10000,
+    ) -> RuntimeRecoveryResult:
+        """Run one bounded, scope-local recovery pass over all active tasks.
+
+        This deliberately preserves exact submit replay and dispatch semantics.
+        Pending work is never first-launched here.  A dispatching intent may
+        adopt only an exact Adapter receipt that was already durably launched;
+        every other incomplete state remains deferred and fail-closed.
+        """
+
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if type(max_tasks) is not int or not 1 <= max_tasks <= 10000:
+            raise TaskValidationError(
+                "INVALID_STARTUP_RECOVERY_LIMIT",
+                ["max_tasks must be an integer from 1 to 10000"],
+            )
+
+        snapshots: list[TaskSnapshot] = []
+        cursor: str | None = None
+        while True:
+            remaining = max_tasks - len(snapshots)
+            page = self.list_tasks(
+                project_id=project_id,
+                principal_id=principal_id,
+                cursor=cursor,
+                limit=min(50, remaining),
+                view="active",
+            )
+            snapshots.extend(page.snapshots)
+            if page.next_cursor is None:
+                break
+            if len(snapshots) >= max_tasks:
+                raise TaskValidationError(
+                    "STARTUP_RECOVERY_LIMIT_EXCEEDED",
+                    ["active task count exceeds the bounded startup recovery limit"],
+                )
+            cursor = page.next_cursor
+
+        receipt_recovery_attempted: list[str] = []
+        receipt_recovered: list[str] = []
+        pending_deferred: list[str] = []
+        dispatching_deferred: list[tuple[str, str]] = []
+        status_refreshed: list[str] = []
+        status_refresh_failures: list[tuple[str, str]] = []
+        reconciliation_required: list[str] = []
+        for listed in snapshots:
+            if listed.status not in {"Queued", "Running"}:
+                continue
+            intent = self._store.get_dispatch_intent(listed.task_id)
+            if intent is None:
+                raise TaskConflict("runtime task has no dispatch intent")
+            if intent.state != "dispatched" and listed.status != "Queued":
+                raise TaskConflict(
+                    "incomplete dispatch intent has an invalid task status"
+                )
+            if intent.state == "reconciliation_required":
+                reconciliation_required.append(listed.task_id)
+                continue
+
+            final_intent = intent
+            if intent.state == "pending":
+                pending_deferred.append(listed.task_id)
+                continue
+            elif intent.state == "dispatching":
+                receipt_recovery_attempted.append(listed.task_id)
+                try:
+                    final_intent = self._adopt_existing_dispatch_receipt(
+                        snapshot=listed,
+                        intent=intent,
+                    )
+                except TaskDispatchError as error:
+                    dispatching_deferred.append((listed.task_id, error.code))
+                    continue
+                receipt_recovered.append(listed.task_id)
+            elif intent.state != "dispatched":
+                raise TaskConflict("dispatch intent has an unsupported recovery state")
+
+            if final_intent.state == "dispatched":
+                try:
+                    self.refresh_runtime_status(
+                        listed.task_id,
+                        project_id=project_id,
+                        principal_id=principal_id,
+                    )
+                except TaskDispatchError as error:
+                    status_refresh_failures.append((listed.task_id, error.code))
+                except TaskConflict:
+                    status_refresh_failures.append(
+                        (listed.task_id, "STATUS_CATCHUP_CONFLICT")
+                    )
+                else:
+                    status_refreshed.append(listed.task_id)
+
+        return RuntimeRecoveryResult(
+            project_id=project_id,
+            principal_id=principal_id,
+            scanned_task_ids=tuple(snapshot.task_id for snapshot in snapshots),
+            receipt_recovery_attempted_task_ids=tuple(
+                receipt_recovery_attempted
+            ),
+            receipt_recovered_task_ids=tuple(receipt_recovered),
+            pending_deferred_task_ids=tuple(pending_deferred),
+            dispatching_deferred=tuple(dispatching_deferred),
+            status_refreshed_task_ids=tuple(status_refreshed),
+            status_refresh_failures=tuple(status_refresh_failures),
+            reconciliation_required_task_ids=tuple(reconciliation_required),
         )
 
     def get_dispatch_intent(
@@ -2100,34 +2367,57 @@ class TaskService:
             snapshot = self.get_task(
                 task_id, project_id=project_id, principal_id=principal_id
             )
-            events = self.list_run_events(
-                task_id,
-                project_id=project_id,
-                principal_id=principal_id,
-                limit=1000,
-            )
-            event_ids = {event["event_id"] for event in events}
-            previous_worker_time = next(
-                (
-                    event.get("extensions", {})
-                    .get("org.agent_rpc.adapter_status", {})
-                    .get("worker_updated_at")
-                    for event in reversed(events)
-                    if isinstance(
-                        event.get("extensions", {}).get(
-                            "org.agent_rpc.adapter_status"
-                        ),
-                        Mapping,
+            event_ids: set[str] = set()
+            last_sequence = 0
+            previous_worker_time: str | None = None
+            previous_progress_completed: int | None = None
+            after_sequence = 0
+            event_high_water = self._store.latest_run_event_sequence(task_id)
+            if event_high_water > MAX_RUNTIME_EVENT_SCAN:
+                raise TaskDispatchError("RUN_EVENT_HISTORY_LIMIT_EXCEEDED")
+            while after_sequence < event_high_water:
+                event_page = self.list_run_events(
+                    task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    after_sequence=after_sequence,
+                    limit=min(1000, event_high_water - after_sequence),
+                )
+                if not event_page:
+                    raise TaskConflict("run event history changed during status scan")
+                page_sequence = after_sequence
+                for event in event_page:
+                    sequence = event.get("sequence")
+                    if (
+                        type(sequence) is not int
+                        or sequence != page_sequence + 1
+                        or sequence > event_high_water
+                    ):
+                        raise TaskConflict(
+                            "run event history did not advance monotonically"
+                        )
+                    page_sequence = sequence
+                    event_ids.add(event["event_id"])
+                    last_sequence = sequence
+                    adapter_observation = event.get("extensions", {}).get(
+                        "org.agent_rpc.adapter_status"
                     )
-                    and isinstance(
-                        event["extensions"]["org.agent_rpc.adapter_status"].get(
+                    if isinstance(adapter_observation, Mapping) and isinstance(
+                        adapter_observation.get("worker_updated_at"), str
+                    ):
+                        previous_worker_time = adapter_observation[
                             "worker_updated_at"
-                        ),
-                        str,
-                    )
-                ),
-                None,
-            )
+                        ]
+                    if (
+                        event.get("event_type") == "node_progress"
+                        and event.get("node_id") == intent.node_id
+                    ):
+                        progress = event.get("progress")
+                        if isinstance(progress, Mapping) and type(
+                            progress.get("completed")
+                        ) is int:
+                            previous_progress_completed = progress["completed"]
+                after_sequence = last_sequence
             if (
                 previous_worker_time is not None
                 and self._parse_gate_time(adapter_status["updated_at"])
@@ -2148,16 +2438,12 @@ class TaskService:
             if snapshot.status == "Queued" and target in {"Running", "Succeeded"}:
                 event_type = "node_started"
             elif target == "Running" and snapshot.status == "Running":
-                previous_progress = [
-                    event
-                    for event in events
-                    if event.get("event_type") == "node_progress"
-                    and event.get("node_id") == intent.node_id
-                ]
-                if previous_progress:
-                    completed = previous_progress[-1]["progress"]["completed"]
-                    if adapter_status["completed"] < completed:
-                        raise TaskDispatchError("ADAPTER_PROGRESS_REGRESSION")
+                if (
+                    previous_progress_completed is not None
+                    and adapter_status["completed"]
+                    < previous_progress_completed
+                ):
+                    raise TaskDispatchError("ADAPTER_PROGRESS_REGRESSION")
                 event_type = "node_progress"
             elif target == "Succeeded" and snapshot.status == "Running":
                 event_type = "node_succeeded"
@@ -2171,7 +2457,7 @@ class TaskService:
                 intent=intent,
                 adapter_status=adapter_status,
                 event_type=event_type,
-                sequence=len(events) + 1,
+                sequence=last_sequence + 1,
             )
             if event["event_id"] in event_ids:
                 return TaskRuntimeResult(snapshot, intent, adapter_status)

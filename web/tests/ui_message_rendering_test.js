@@ -1832,12 +1832,18 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
     mode: 'guided',
     task_type: 'acoustic_fwi_2d',
     features: { approval_required: true, running_cancel: false },
+    capabilities: {
+      startup_dispatch_recovery: false,
+      startup_receipt_recovery: true,
+      startup_status_catchup: true,
+      automatic_reconciliation: false,
+    },
   });
   assert.equal(session.mode, 'guided');
   assert.equal(session.taskType, 'acoustic_fwi_2d');
   assert.deepEqual(
     JSON.parse(JSON.stringify(session.capabilities)),
-    ['approval_required:on', 'running_cancel:off'],
+    ['startup_receipt_recovery', 'startup_status_catchup'],
   );
   const catalog = api.normalizeGuidedCatalog({
     datasets: [{

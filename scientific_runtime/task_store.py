@@ -167,7 +167,7 @@ class SubmitGateContext:
 
 @dataclass(frozen=True)
 class DispatchIntentSnapshot:
-    """Durable P1 dispatch state; pending intents require P2 reconciliation."""
+    """Durable dispatch state projected from immutable intent/claim/outcome rows."""
 
     intent_id: str
     task_id: str
@@ -507,6 +507,9 @@ class TaskStore(Protocol):
     def list_run_events(
         self, task_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[dict[str, Any]]:
+        ...
+
+    def latest_run_event_sequence(self, task_id: str) -> int:
         ...
 
 
@@ -4882,6 +4885,27 @@ class SQLiteTaskStore:
                     )
                 events.append(event)
             return events
+        finally:
+            connection.close()
+
+    def latest_run_event_sequence(self, task_id: str) -> int:
+        """Return a stable high-water mark for one bounded event scan."""
+
+        connection = self._connect()
+        try:
+            if connection.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone() is None:
+                raise TaskStoreConflict("task does not exist")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS sequence "
+                "FROM run_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            sequence = row["sequence"] if row is not None else None
+            if type(sequence) is not int or sequence < 0:
+                raise TaskStoreCorruption("run event high-water mark is invalid")
+            return sequence
         finally:
             connection.close()
 

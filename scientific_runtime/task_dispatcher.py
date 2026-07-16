@@ -1,4 +1,4 @@
-"""Trusted P1 bridge from durable dispatch intents to the fixed FWI Adapter."""
+"""Trusted bridge from durable dispatch intents to the fixed FWI Adapter."""
 
 from __future__ import annotations
 
@@ -37,12 +37,17 @@ class DispatchPreparation:
 
 
 class TaskDispatcher(Protocol):
-    """P1 one-shot dispatcher; automatic reconciliation remains P2."""
+    """Fixed dispatcher with separate submit and read-only receipt paths."""
 
     def prepare(self, snapshot: TaskSnapshot) -> DispatchPreparation:
         ...
 
     def dispatch(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
+        ...
+
+    def recover_existing_receipt(
+        self, intent: DispatchIntentSnapshot
+    ) -> dict[str, Any]:
         ...
 
     def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
@@ -166,6 +171,64 @@ class DeepwaveTaskDispatcher:
         except Exception as error:
             raise DispatchError("DISPATCH_UNAVAILABLE") from error
         if handle.fingerprint.get("normalized_config_hash") != normalized_config_hash:
+            raise DispatchError("DISPATCH_FINGERPRINT_DRIFT")
+        return handle.as_dict()
+
+    def recover_existing_receipt(
+        self, intent: DispatchIntentSnapshot
+    ) -> dict[str, Any]:
+        """Adopt an exact private launched receipt without first dispatch."""
+
+        if (
+            intent.adapter_id != LOGICAL_ENTRYPOINT
+            or intent.adapter_version != ADAPTER_VERSION
+            or intent.state != "dispatching"
+            or intent.handle is not None
+            or not isinstance(intent.request, Mapping)
+            or not isinstance(intent.queue_fingerprint, Mapping)
+        ):
+            raise DispatchError("DISPATCH_INTENT_INVALID")
+        request = copy.deepcopy(dict(intent.request))
+        normalized_config_hash = request.pop("normalized_config_hash", None)
+        expected = {
+            "task_id",
+            "node_id",
+            "plan_hash",
+            "idempotency_key",
+            "project_id",
+            "principal_id",
+            "algorithm",
+            "dataset",
+            "task_type",
+            "parameters",
+            "resources",
+        }
+        if (
+            set(request) != expected
+            or not isinstance(normalized_config_hash, str)
+            or request["task_id"] != intent.task_id
+            or request["node_id"] != intent.node_id
+            or request["plan_hash"] != intent.plan_hash
+            or request["idempotency_key"] != intent.node_idempotency_key
+            or intent.queue_fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+        ):
+            raise DispatchError("DISPATCH_INTENT_INVALID")
+        try:
+            handle = self._adapter.lookup_existing_handle(**request)
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("DISPATCH_RECOVERY_UNAVAILABLE") from error
+        if (
+            handle.adapter_version != ADAPTER_VERSION
+            or handle.task_id != intent.task_id
+            or handle.node_id != intent.node_id
+            or handle.plan_hash != intent.plan_hash
+            or handle.idempotency_key != intent.node_idempotency_key
+            or handle.fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+        ):
             raise DispatchError("DISPATCH_FINGERPRINT_DRIFT")
         return handle.as_dict()
 

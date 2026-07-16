@@ -2,15 +2,15 @@
 
 <!-- project-progress-schema: v1 -->
 
-- 最后更新：2026-07-15
+- 最后更新：2026-07-16
 - 活跃决策：`D-003`、`D-004`、`D-006`、`D-007`、`D-008`、`D-009`；`D-005` 仍为 Proposed
 - 活跃分支：`feature/scientific-agent-runtime`
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
-- 总体状态：**P0 + P1（含 P1-008）已验证；P2-001 有界发现/重开已验证、P2-002 回收站已验证；
-  D-009/P2-003 有界永久删除已验证；完整 P2 Pending**
-- 当前阶段：**D-009/P2-003 已验证；交付并停在完整 P2 后续能力之前**
-- 下一动作：等待用户试用/下一项明确指示；不启动 cancel/lease/retry/reconciliation/SSE，
-  不重复耗时 FWI/CUDA 实验
+- 总体状态：**P0 + P1（含 P1-008）已验证；P2-001 有界发现/重开已验证、P2-002 回收站、
+  P2-003 有界永久删除与 P2-004 有界启动 receipt 收养/状态追赶均已验证；完整 P2 Pending**
+- 当前阶段：**P2-004 有界启动 receipt 收养与一次状态追赶已验证；完整 P2 继续进行**
+- 下一动作：设计带 fencing 的 lease/heartbeat 与持续 Runtime Supervisor；随后才在新的
+  进程身份/控制收据边界上实现 cancel/timeout，retry 和 SSE 继续后置
 - 当前阻塞：无
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
 
@@ -25,7 +25,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
 | P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 31/31；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
 | P1 最小持久垂直切片 | Verified | 既有 P1 Task Store/Registry/Adapter/atomic submit/Guided Web 全闭环及 D-006/D-007；D-008/P1-008 增加 Conversation/Task 可选引用、无级联本地对话删除和当前 Algorithm/Adapter 1.4 的 2 数值 + 6 PNG 结果画廊 | Runtime 165/165、Worker 28/28、Web 29/29、Embedding 6/6、CTest 39/39、MCP 1/1 及 UI/治理 PASS；fresh v6 CUDA 10 events、8 artifacts/6 PNG、数值更新和重启不变性 PASS | —（P1 及当前维护切片完成） |
-| P2 持久可靠性加固 | In progress（P2-001、P2-002、P2-003 Verified；完整 P2 Pending） | P2-001 scope-bound 分页发现/重开；P2-002 append-only CAS/idempotent Trash/Restore；P2-003 SQLite v7 tombstone + receipt-bound 本地 Worker 目录永久删除 | P2-003 Runtime 180/180、Web 29/29、Node UI/治理 PASS；临时 job 树真实删除、pending/崩溃/并发/符号链接边界通过，无真实 FWI/CUDA 重跑 | lease、取消、重试、reconciliation、SSE 及完整刷新恢复通过 |
+| P2 持久可靠性加固 | In progress（P2-001–P2-004 有界切片 Verified；完整 P2 Pending） | 既有发现/重开、回收站、永久删除之外，P2-004 只读收养 Adapter 已持久 `launched` 但 SQLite outcome 丢失的 receipt，并做一次状态追赶 | TaskService 80/80、Adapter 27/27、Runtime 201/201、Worker 28/28、Web 36/36、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI 与治理检查 PASS | fenced capacity/lease/heartbeat、pending/no-record 调度、持续 supervisor、取消、超时、重试、完整 reconciliation 与 SSE |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
 | P5 算法 SDK | Pending | 无 | 无 | 去噪→QC→FWI 多算法流程通过 |
@@ -43,7 +43,9 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 - 现有 FWI 固定白名单、参数校验、独立 Worker 和 artifact 路由是迁移时必须保护的安全边界。
 - 当前通用 Orchestrator 仍以固定/单跳路由为主；P1 已把 SQLite task/registry、完整 Gate、
   approval budget、固定 FWI Adapter、atomic submit/one-shot dispatch 和同源 Guided Web/API 接成最小
-  闭环，但仍无 DAG 调度、运行中取消、lease/retry/SSE 或中断后自动恢复。
+  闭环。P2-004 只收敛“Adapter 已 durable launched、SQLite receipt outcome 丢失”这一
+  dispatching 子窗口；pending、无 Adapter record 与 preparing/launching 均保持 deferred。
+  当前仍无 DAG、运行中取消、fenced capacity、lease/retry/SSE 或持续后台监督。
 - D-006/P1-006 已把固定 FWI 的显式整数上限扩展为 10000；该 checkpoint 使用
   Algorithm/Adapter `1.1.0`。D-007 的 `1.2.0` 是不可变六参数历史快照，`1.3.0` 是已验证
   checkpoint；D-008 当前新提交使用 `1.4.0`，旧 `1.0.0`–`1.3.0` manifest、persisted Plan
@@ -56,6 +58,13 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 - D-009/P2-003 已验证 SQLite v7 两阶段永久删除：只允许已在 Trash 的 resolved terminal
   task；受控 Adapter 根据 durable receipt 删除专属本地 Worker 目录，完成后 active/trash 不再
   列出任务，SQLite 审计历史和 conversation/message 保留，引用显示已永久删除。
+- P2-004 已验证：loopback Workbench 先成功 bind 且尚未 listen，再对最多 10000 个 active task
+  做 scope-bound 全分页扫描。pending 从不 claim/首次派发；dispatching 只通过固定 Adapter 的
+  单一确定性 control record 做无副作用 lookup，只有 current 1.4 `launched` exact receipt 才写
+  唯一 SQLite outcome。missing/preparing/launching/failed/corrupt/历史版本均 deferred，已有
+  `reconciliation_required` 不重试。dispatched task 只追赶一次 status/RunEvent；事件历史跨过
+  1000 条仍分页读取；单任务 status 脱敏错误/CAS 冲突不阻断其他任务，receipt 分歧仍硬失败。
+  随后才 activate、发布 API 和 serve。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
 - 2026-07-15 用户的风险评估已收紧顺序：最小 FWI Schema 先行，最小 SQLite TaskService
   提前到首个垂直切片，Redis 不作为任务事实源，P4 Agent Planner 后置。
@@ -66,12 +75,14 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 
 - P1 已接入根启动器下的本机 Guided Web/API 与默认仓库外 SQLite Task Store；它无用户
   认证，只在 loopback 绑定时启用，不是容器/远程多用户部署方案；
-- P1.1c 已实现后端 submit 幂等、预算消费、durable intent 与 Queued；pending/dispatching 的
-  自动 reconciliation、退款、重试和进程恢复仍未实现；
+- P1.1c 已实现后端 submit 幂等、预算消费、durable intent 与 Queued；P2-004 只在启动时收养
+  已有 exact launched receipt，不 claim pending，也不首次派发 dispatching/no-record。既有
+  immutable `reconciliation_required` outcome、退款、持续监督、重试和通用进程恢复仍未解决；
 - Deepwave Adapter 只覆盖固定 `acoustic_fwi_2d` 单节点，尚未成为通用 Algorithm SDK；旧
   forward 因输出语义不匹配而未接入标准 Adapter；
-- P2-001 只有任务列表发现和由用户点击重开；还没有运行意图自动恢复、取消、
-  lease/heartbeat/retry/reconciliation/SSE，也没有 P3 DAG 或 P4 Agent Planner/子 Agent 调度。
+- P2-001 仍只有任务列表发现和由用户点击重开；P2-004 的启动 pass 之后没有带 lease 的后台
+  status pump，因此浏览器关闭后的新进度要到下一次启动或现有 GET 才进入 SQLite。取消、
+  lease/heartbeat/retry、完整 reconciliation/SSE、P3 DAG 和 P4 Agent Planner 仍未实现。
 - P2-002 的普通“删除”仍只是可恢复 visibility Trash/Restore；D-009/P2-003 另提供强确认的
   本地 Worker 目录/result purge，但不硬删 Draft、Plan、Approval、RunEvent、幂等记录或
   SQLite 审计历史，也不清除备份/外部副本。服务器 transcript 永久删除仍未实现。
@@ -351,13 +362,49 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
   按用户要求没有启动真实 Worker、CUDA 或重复 FWI 实验。SQLite 既有不可变任务审计历史和
   Adapter 最小 control receipt/lock 保留；完整 P2 仍未完成。
 
+### P2-004 有界启动 receipt 收养与状态追赶（2026-07-16）
+
+- `TaskService.recover_runtime_on_startup` 先使用既有 active task keyset API 完成全 scope
+  分页预扫描，默认/硬上限为 10000；超过上限在任何 SQLite 恢复写入前拒绝。它不接受浏览器
+  路径、Worker job ID 或新幂等键，也不重新消费 approval budget。
+- startup pass 从不 claim/首次派发 `pending`。对 `dispatching` 也不调用普通 submit/dispatch，
+  只让固定 Dispatcher 通过 intent 推导单一 Adapter control record，在既有 flock 下执行只读
+  `lookup_existing_handle`。只有 current 1.4 私有记录已经 durable `launched` 且 request/hash/
+  task/node/plan/Algorithm/Adapter/fingerprint 全部精确匹配时，才收养 handle 并写唯一
+  `dispatched` outcome；并发调用只接受相同 handle 收敛，不同 handle 硬失败。
+- missing record、`preparing`、`launching`、`failed`、损坏/符号链接记录及历史 dispatching 版本
+  全部保持原状态并以脱敏 code deferred；不会因启动容量不足新增 immutable
+  `reconciliation_required`。已有 `reconciliation_required` 仍只读、不重试。lookup 不执行
+  readiness probe、不创建 job 目录、不扫描 `FWI_RUN_ROOT`、不猜 PID、也不调用 launcher。
+- 对已有/刚收养的 `dispatched` task 启动时只调用一次现有 status bridge；Worker 在停机期间已
+  终态时按既有单调规则追赶：Queued→Succeeded 补 `node_started`/`node_succeeded`，
+  Queued→Failed 直接写 `node_failed`，Running 再进入对应终态。单任务 Adapter status 错误或
+  status CAS 冲突只以脱敏 code 进入 recovery result 并继续其他任务；receipt/outcome 分歧仍
+  fail closed 并中止启动。事件历史超过 1000 条时
+  先从 Store 固定 high-water 再分页取得正确 sequence，单任务扫描硬上限为 100000，超限以
+  path-free code deferred。Task Store 损坏仍使启动失败。
+- Web 先成功 bind TCP socket 但不 listen，再构造 Host/Origin/CSRF 边界并执行 recovery；成功后
+  才 activate socket、发布 API 并 serve。忙端口执行零 recovery，recovery 失败关闭 socket 且
+  API 保持 `None`。成功 recovery 的 summary 日志只记录数量和稳定 code，不记录
+  task/project/principal/path。session
+  明示 `startup_receipt_recovery=true`、`startup_status_catchup=true`、
+  `startup_dispatch_recovery=false` 与 `automatic_reconciliation=false`。
+- 本项为 **Verified**：TaskService 80/80、Adapter 27/27、Scientific Runtime 201/201、Web
+  36/36、Worker 28/28、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI 与治理检查 PASS。覆盖
+  三项以上 pending 零 claim/零 dispatch、
+  dispatching no-record deferred、真实固定 Adapter launched-lost-receipt 零重启 Worker 收养、
+  malformed/divergent receipt、重复/并发启动、51 task 跨页、scope/limit、1000+ events、status
+  错误继续、终态追赶、bind 顺序/忙端口/失败清理与脱敏 summary。没有运行真实 FWI/CUDA。
+
 ### 完整 P2 仍 Pending
 
 P1 的既有必需交付与退出测试仍为 Verified。用户后续明确授权的 P2-001 任务发现/重开与
-P2-002 可恢复任务回收站、P2-003 本地结果永久删除均已 Verified；这些有界切片都不包含运行中
-cancel、timeout、lease/heartbeat、task retry、自动 reconciliation、SSE 和不依赖用户点击的
-恢复。服务器 transcript 永久删除、SQLite 审计历史硬删除和备份/外部副本清理仍 Pending。
-D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
+P2-002 可恢复任务回收站、P2-003 本地结果永久删除和本次 P2-004 有界 receipt 收养/状态追赶
+均已 Verified。P2-004 只关闭“Adapter 已 durable launched、SQLite outcome 丢失”的一个
+dispatching 子窗口；pending/no-record/preparing/launching 仍 deferred。它没有 fenced capacity、
+lease/heartbeat、持续 supervisor、`reconciliation_required` resolution、cancel、timeout、task
+retry 或 SSE。服务器 transcript 永久删除、SQLite 审计历史硬删除和备份/外部副本清理仍
+Pending。D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 
 ## 新会话恢复协议
 
@@ -395,6 +442,9 @@ D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 | 2026-07-15 | P1-008 / D-008 | Accepted → Implemented → Verified | 浏览器 schema v3 的 Conversation/Task 可选引用与本地无级联对话删除；Algorithm/Adapter `1.4.0` 的持久 Plan 驱动 2 数值 + 6 PNG 标准结果画廊；历史 `1.0.0`–`1.3.0` 精确两 artifact 兼容 | Runtime 165/165（含 1.2/1.3 optimizer-aware lost-response replay）、Worker 28/28、Web 29/29、Embedding 6/6、CTest 39/39、MCP 1/1、UI/治理 PASS；fresh v6 CUDA 10 events、8 artifacts/6 PNG、loss/update/GPU/重启不变性 PASS | 向用户交付实际前端试用说明，并停在完整 P2 前 |
 | 2026-07-15 | P2-002 / D-008 | Accepted → Implemented → Verified；完整 P2 仍 Pending | SQLite v6 resolved-terminal visibility event/projection/mutation、scope/CAS/idempotent Trash/Restore、trash 后审计/结果可读、restore 不重跑、无级联 | 当前 v6 checksum、revision 0→1→2、trash 后 artifact、Restore 不重跑、AwaitingApproval 409、abandon 后 trash、同库重启三类 fingerprint/8 项 bytes+hash 不变及服务清理 PASS | 永久 purge/服务端 transcript 删除与完整 P2 继续 Pending |
 | 2026-07-15 | P2-003 / D-009 | Accepted → Implemented → Verified；完整 P2 仍 Pending | SQLite v7 两阶段 purge/alias/outcome、pending 禁止恢复与读取、receipt-bound FD-relative 本地 job 目录删除、Web 强确认/继续删除、conversation 无级联 | Runtime 180/180、Web 29/29、Node UI/治理 PASS；临时目录 succeeded/failed、queued/running 拒绝、崩溃恢复、并发锁、符号链接和 v6→v7 通过；未运行真实 FWI/CUDA | 等待用户试用；SQLite 审计历史、服务端 transcript、备份/外部副本及完整 P2 后续能力不在本切片 |
+| 2026-07-16 | P2-004 | Pending → In progress；完整 P2 仍 Pending | 初始探索启动时处理既有 pending/dispatching 并追赶一次状态，不扫描 run root | 修改前 Runtime 180/180 现场复验 PASS；真实 Adapter 终审发现 process-local capacity 与 bind-before-side-effect 风险 | 禁止 startup 首次派发；收紧为只读 launched receipt 收养，并把 bind 提到 recovery 前 |
+| 2026-07-16 | P2-004 | In progress（安全范围收紧） | pending/no-record 全部 deferred；只 lookup current 1.4 exact launched record；bind→recovery→activate→publish→serve | 三项以上 pending 零派发、真实 Adapter replacement launcher 零调用、忙端口零 recovery、不同 receipt 硬失败 | 完成全量回归并更新准确计数 |
+| 2026-07-16 | P2-004 | In progress → Verified；完整 P2 仍 Pending | scope/limit pre-scan、只读 launched receipt 收养、共享严格 receipt、相同 handle 并发收敛、1000+ event 分页与一次 status 追赶、安全 server 编排/脱敏 summary | TaskService 80/80、Adapter 27/27、Runtime 201/201、Worker 28/28、Web 36/36、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；未运行真实 FWI/CUDA | 下一步先做 fenced capacity/lease/heartbeat 与持续 supervisor；随后才处理 pending/no-record、cancel/timeout；retry/完整 reconciliation/SSE 仍 Pending |
 
 记录规则：
 

@@ -1,4 +1,4 @@
-"""Durable scientific task runtime components introduced by D-003 P1."""
+"""Durable scientific task runtime components introduced by D-003."""
 
 from .fwi_adapter import (
     AdapterArtifactError,
@@ -37,6 +37,7 @@ from .registry_service import (
 from .task_service import (
     AbandonTaskResult,
     CreateTaskResult,
+    RuntimeRecoveryResult,
     SubmitTaskResult,
     TaskConflict,
     TaskDispatchError,
@@ -112,6 +113,7 @@ __all__ = [
     "RegistrySnapshots",
     "RegistryValidationError",
     "RegistryWriteRecord",
+    "RuntimeRecoveryResult",
     "SafeSubprocessWorkerLauncher",
     "SQLiteTaskStore",
     "TaskConflict",

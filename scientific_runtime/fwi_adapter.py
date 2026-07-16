@@ -1812,10 +1812,14 @@ class DeepwaveAdapter:
         return value
 
     @staticmethod
-    def _lock_submission(lock_path: Path):
+    def _lock_submission(lock_path: Path, *, create: bool = True):
         class SubmissionLock:
             def __enter__(self_nonlocal):
-                flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                flags = (
+                    (os.O_RDWR | os.O_CREAT if create else os.O_RDONLY)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
                 directory_descriptor = -1
                 try:
                     candidate, directory_descriptor = _safe_parent_fd(lock_path)
@@ -1837,6 +1841,10 @@ class DeepwaveAdapter:
                     descriptor = getattr(self_nonlocal, "descriptor", -1)
                     if descriptor >= 0:
                         os.close(descriptor)
+                    if not create and isinstance(error, FileNotFoundError):
+                        raise AdapterUnavailable(
+                            "ADAPTER_SUBMISSION_NOT_FOUND: no private submission record exists"
+                        ) from error
                     raise AdapterUnavailable(
                         "ADAPTER_STATE_UNAVAILABLE: cannot lock submission"
                     ) from error
@@ -1850,6 +1858,122 @@ class DeepwaveAdapter:
                 os.close(self_nonlocal.descriptor)
 
         return SubmissionLock()
+
+    def lookup_existing_handle(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterHandle:
+        """Read one exact current-version launched receipt without submitting.
+
+        This path derives the private record name from immutable request
+        identity and serializes with ``submit`` on the already-existing lock.
+        It does not create control state, inspect job directories, evaluate
+        runtime readiness, or call the Worker launcher.
+        """
+
+        self._validate_submit_identity(
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+        )
+        validated = self._validate_request(
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+            verify_runtime=False,
+        )
+        submission_id = self._submission_id(
+            task_id, plan_hash, idempotency_key
+        )
+        request_payload = self._request_payload(
+            submission_id=submission_id,
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            validated=validated,
+        )
+        request_hash = _sha256_document(request_payload)
+        index_name = submission_id.removeprefix("submission-") + ".json"
+        control = self._run_root / CONTROL_DIRECTORY
+        index_path = control / "submissions" / index_name
+        lock_path = control / "locks" / (index_name + ".lock")
+
+        with self._lock_submission(lock_path, create=False):
+            if not index_path.exists() and not index_path.is_symlink():
+                raise AdapterUnavailable(
+                    "ADAPTER_SUBMISSION_NOT_FOUND: no private submission record exists"
+                )
+            record = self._read_submission(index_path)
+            if (
+                record["adapter_version"] != ADAPTER_VERSION
+                or record["algorithm"] != validated.algorithm
+            ):
+                raise AdapterUnavailable(
+                    "ADAPTER_SUBMISSION_VERSION_UNSUPPORTED: private receipt is not current"
+                )
+            if (
+                record["submission_id"] != submission_id
+                or record["request_hash"] != request_hash
+                or self._record_request_payload(record) != request_payload
+            ):
+                raise AdapterIdempotencyConflict(
+                    "ADAPTER_IDEMPOTENCY_CONFLICT: key is bound to another request"
+                )
+            try:
+                expected_job_id = self._job_id(
+                    submission_id, record["created_at"]
+                )
+                self._validate_fingerprint(
+                    record["fingerprint"], validated=validated
+                )
+            except AdapterError as error:
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: private receipt binding is invalid"
+                ) from error
+            if record["job_id"] != expected_job_id:
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: private job identity is invalid"
+                )
+
+            launch_state = record["launch_state"]
+            if launch_state == "launched":
+                return self._handle_from_record(record)
+            if launch_state == "preparing":
+                raise AdapterUnavailable(
+                    "ADAPTER_SUBMISSION_PREPARING: Worker launch was not reached"
+                )
+            if launch_state == "launching":
+                raise AdapterUnavailable(
+                    "ADAPTER_SUBMISSION_LAUNCH_AMBIGUOUS: Worker launch outcome is unknown"
+                )
+            if launch_state == "failed":
+                raise AdapterUnavailable(
+                    "WORKER_LAUNCH_FAILED: prior launch failed and P1 does not retry"
+                )
+            if launch_state == "purging":
+                raise AdapterUnavailable(
+                    "ADAPTER_SUBMISSION_PURGING: private receipt is being purged"
+                )
+            raise AdapterUnavailable(
+                "ADAPTER_SUBMISSION_PURGED: private receipt was purged"
+            )
 
     @staticmethod
     def _validate_fingerprint(

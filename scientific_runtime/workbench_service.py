@@ -433,6 +433,9 @@ class GuidedWorkbench:
                 "approval_required": True,
                 "abandon_pre_runtime": True,
                 "permanent_delete_from_trash": True,
+                "startup_dispatch_recovery": False,
+                "startup_receipt_recovery": True,
+                "startup_status_catchup": True,
                 "running_cancel": False,
                 "automatic_reconciliation": False,
                 "streaming_events": False,
@@ -441,10 +444,32 @@ class GuidedWorkbench:
                 "cancel": False,
                 "retry": False,
                 "sse": False,
+                "startup_dispatch_recovery": False,
+                "startup_receipt_recovery": True,
+                "startup_status_catchup": True,
                 "automatic_reconciliation": False,
                 "dag": False,
             },
         }
+
+    def recover_runtime_on_startup(self, max_tasks: int = 10000) -> Any:
+        """Run bounded P2-004 receipt adoption/catch-up in this fixed scope.
+
+        This is an internal composition hook, not a browser-triggered mutation.
+        The TaskService retains the authority to decide which durable intents
+        are safe to resume and which states must remain fail-closed.
+        """
+
+        if type(max_tasks) is not int or not 1 <= max_tasks <= 10000:
+            raise WorkbenchValidationError(
+                "INVALID_RECOVERY_LIMIT",
+                ["max_tasks must be an integer from 1 to 10000"],
+            )
+        return self._call(
+            self._tasks.recover_runtime_on_startup,
+            max_tasks=max_tasks,
+            **self._scope,
+        )
 
     def list_catalog(self) -> dict[str, Any]:
         datasets = self._call(

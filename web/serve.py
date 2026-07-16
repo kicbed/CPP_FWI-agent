@@ -32,6 +32,7 @@ from scientific_runtime import (  # noqa: E402
     DeepwaveAdapter,
     DeepwaveTaskDispatcher,
     RegistryService,
+    RuntimeRecoveryResult,
     SQLiteTaskStore,
     TaskService,
     register_verified_fwi_baseline,
@@ -233,12 +234,57 @@ def create_workbench_api():
         browser_host = urlsplit(browser_origin).netloc
     except ValueError as error:
         raise ValueError("AGENT_CORS_ORIGIN is not a valid Workbench origin") from error
-    return WorkbenchAPI(
+    api = WorkbenchAPI(
         application,
         csrf_token=secrets.token_urlsafe(32),
         allowed_hosts={browser_host},
         allowed_origins={browser_origin},
     )
+    # Validate the complete HTTP boundary before receipt adoption can mutate
+    # SQLite, but finish recovery before the composed API is returned or served.
+    recovery = application.recover_runtime_on_startup(max_tasks=10000)
+    report_runtime_recovery(recovery)
+    return api
+
+
+def report_runtime_recovery(recovery):
+    """Write one path-free startup summary to the supervised server log."""
+
+    if not isinstance(recovery, RuntimeRecoveryResult):
+        return
+
+    def code_counts(values):
+        counts = {}
+        for _, code in values:
+            counts[code] = counts.get(code, 0) + 1
+        return dict(sorted(counts.items()))
+
+    summary = {
+        "scanned": len(recovery.scanned_task_ids),
+        "receipt_recovery_attempted": len(
+            recovery.receipt_recovery_attempted_task_ids
+        ),
+        "receipt_recovered": len(recovery.receipt_recovered_task_ids),
+        "pending_deferred": len(recovery.pending_deferred_task_ids),
+        "dispatching_deferred": code_counts(recovery.dispatching_deferred),
+        "status_refreshed": len(recovery.status_refreshed_task_ids),
+        "status_refresh_failures": code_counts(
+            recovery.status_refresh_failures
+        ),
+        "reconciliation_required": len(
+            recovery.reconciliation_required_task_ids
+        ),
+    }
+    try:
+        print(
+            "scientific runtime startup recovery: "
+            + json.dumps(summary, sort_keys=True, separators=(",", ":")),
+            file=sys.stderr,
+        )
+    except (OSError, ValueError):
+        # Runtime state remains in SQLite; a closed supervisor stderr must not
+        # turn a successful, side-effect-free summary into a startup failure.
+        pass
 
 
 def local_embedding_enabled():
@@ -622,40 +668,65 @@ class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def main():
-    # Bind to loopback by default. Failing on a busy port is intentional: the
-    # one-click launcher can then roll back instead of reporting the wrong URL.
+def serve_workbench():
+    """Bind first, then recover the runtime before accepting HTTP requests."""
+
     global WORKBENCH_API
+    # Never retain a previously composed API across a failed restart attempt.
+    WORKBENCH_API = None
     fwi_run_root()
-    # A wildcard bind is retained for legacy/static Compose deployments, but
-    # the unauthenticated P1 Guided runtime is never composed on that socket.
-    WORKBENCH_API = (
-        create_workbench_api() if HOST in {"127.0.0.1", "localhost"} else None
-    )
     # Resolve the accepted localhost spelling ourselves so a resolver/NSS
     # misconfiguration cannot turn the Guided bind into a non-loopback socket.
     bind_host = "127.0.0.1" if HOST == "localhost" else HOST
-    with ReusableThreadingTCPServer((bind_host, PORT), Handler) as httpd:
+    with ReusableThreadingTCPServer(
+        (bind_host, PORT), Handler, bind_and_activate=False
+    ) as httpd:
+        # Bind first to prove that the configured port is available, but do
+        # not listen yet: clients cannot connect while recovery is running.
+        httpd.server_bind()
+        # A busy-port failure therefore occurs before runtime recovery can
+        # adopt a receipt. No handler can run until activation and serve_forever.
+        # Wildcard binds retain legacy/static Compose behavior but never
+        # compose the unauthenticated Guided runtime on that socket.
+        api = (
+            create_workbench_api()
+            if HOST in {"127.0.0.1", "localhost"}
+            else None
+        )
+        # Recovery has completed. Only now activate the listening socket and
+        # publish the API that handlers will see. If either step raises, the
+        # context closes the socket and this global remains fail-closed.
+        httpd.server_activate()
+        WORKBENCH_API = api
         # Keep the browser Origin aligned with AGENT_CORS_ORIGIN. In
         # particular, do not rewrite 127.0.0.1 to localhost after startup.
         display_host = "127.0.0.1" if HOST == "0.0.0.0" else HOST
         url = f"http://{display_host}:{PORT}"
-        print(f"\033[1;36m┌─────────────────────────────────────────┐\033[0m")
-        print(f"\033[1;36m│\033[0m  🌐 Lab Agent Workbench 已启动          \033[1;36m│\033[0m")
-        print(f"\033[1;36m│\033[0m  📍 {url:<33} \033[1;36m│\033[0m")
-        print(f"\033[1;36m│\033[0m  按 Ctrl+C 停止                         \033[1;36m│\033[0m")
-        print(f"\033[1;36m└─────────────────────────────────────────┘\033[0m")
-
         try:
-            webbrowser.open(url)
-        except Exception:
-            pass
+            print(f"\033[1;36m┌─────────────────────────────────────────┐\033[0m")
+            print(f"\033[1;36m│\033[0m  🌐 Lab Agent Workbench 已启动          \033[1;36m│\033[0m")
+            print(f"\033[1;36m│\033[0m  📍 {url:<33} \033[1;36m│\033[0m")
+            print(f"\033[1;36m│\033[0m  按 Ctrl+C 停止                         \033[1;36m│\033[0m")
+            print(f"\033[1;36m└─────────────────────────────────────────┘\033[0m")
 
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\n\033[1;33mWeb UI 服务器已停止\033[0m")
-            httpd.shutdown()
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+            try:
+                httpd.serve_forever()
+            except KeyboardInterrupt:
+                print("\n\033[1;33mWeb UI 服务器已停止\033[0m")
+        finally:
+            # P2-004 has no background supervisor to stop. Removing the HTTP
+            # publication before server_close is the complete cleanup.
+            WORKBENCH_API = None
+
+
+def main():
+    # A busy port aborts before startup runtime recovery has any side effect.
+    serve_workbench()
 
 if __name__ == '__main__':
     main()
