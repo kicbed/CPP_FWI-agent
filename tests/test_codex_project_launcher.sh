@@ -8,6 +8,7 @@ LAUNCHER="$REPO_ROOT/scripts/codex-project.sh"
 PROJECT_AGENTS="$REPO_ROOT/AGENTS.md"
 PROJECT_README="$REPO_ROOT/README.md"
 PROJECT_WORKFLOW="$REPO_ROOT/docs/CODEX_WORKFLOW.md"
+PROJECT_CURRENT_STATE="$REPO_ROOT/docs/PROJECT_CURRENT_STATE.md"
 PROJECT_CONTINUITY="$REPO_ROOT/docs/PROJECT_CONTINUITY.md"
 PROJECT_PLAN="$REPO_ROOT/docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md"
 PROJECT_PROGRESS="$REPO_ROOT/docs/PROJECT_PROGRESS.md"
@@ -30,8 +31,12 @@ bash -n "$LAUNCHER"
 
 # Ordinary Codex sessions must discover the continuity workflow through the
 # repository AGENTS.md; the helper is not a command the user has to remember.
-grep -Fq '<!-- codex-auto-bootstrap: v1 -->' "$PROJECT_AGENTS" || \
+grep -Fq '<!-- codex-auto-bootstrap: v2 -->' "$PROJECT_AGENTS" || \
     fail "AGENTS.md does not declare the automatic bootstrap contract"
+grep -Fq 'Token-efficient code navigation' "$PROJECT_AGENTS" || \
+    fail "AGENTS.md does not define bounded CodeGraph navigation"
+grep -Fq '<!-- project-current-state: v1 -->' "$PROJECT_CURRENT_STATE" || \
+    fail "current-state router does not declare its versioned contract"
 grep -Fq 'Never ask the user to run `scripts/codex-project.sh`' "$PROJECT_AGENTS" || \
     fail "AGENTS.md may delegate the internal helper to the user"
 grep -Fq '正常打开新会话后直接提问即可' "$PROJECT_README" || \
@@ -69,6 +74,7 @@ cp -- "$LAUNCHER" "$FIXTURE/scripts/codex-project.sh"
 chmod 755 "$FIXTURE/scripts/codex-project.sh"
 
 printf '%s\n' '# Fixture instructions' > "$FIXTURE/AGENTS.md"
+printf '%s\n' '# Fixture current state' > "$FIXTURE/docs/PROJECT_CURRENT_STATE.md"
 printf '%s\n' '# Fixture continuity' > "$FIXTURE/docs/PROJECT_CONTINUITY.md"
 printf '%s\n' '# Fixture runtime plan' > "$FIXTURE/docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md"
 printf '%s\n' '# Fixture progress' > "$FIXTURE/docs/PROJECT_PROGRESS.md"
@@ -79,7 +85,7 @@ printf '%s\n' 'safe example' > "$FIXTURE/.env.example"
 git -C "$FIXTURE" init -q
 git -C "$FIXTURE" config user.name 'Launcher Test'
 git -C "$FIXTURE" config user.email 'launcher-test@example.invalid'
-git -C "$FIXTURE" add AGENTS.md docs/PROJECT_CONTINUITY.md \
+git -C "$FIXTURE" add AGENTS.md docs/PROJECT_CURRENT_STATE.md docs/PROJECT_CONTINUITY.md \
     docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md docs/PROJECT_PROGRESS.md \
     docs/GIT_AND_PROMPT_POLICY.md tracked.txt .env.example scripts/codex-project.sh
 git -C "$FIXTURE" commit -qm 'fixture baseline'
@@ -153,6 +159,12 @@ if "$FIXTURE/scripts/codex-project.sh" --print-context >/dev/null 2>&1; then
 fi
 mv -- "$FIXTURE/docs/PROJECT_PROGRESS.md.saved" "$FIXTURE/docs/PROJECT_PROGRESS.md"
 
+mv -- "$FIXTURE/docs/PROJECT_CURRENT_STATE.md" "$FIXTURE/docs/PROJECT_CURRENT_STATE.md.saved"
+if "$FIXTURE/scripts/codex-project.sh" --print-context >/dev/null 2>&1; then
+    fail "launcher accepted a repository with a missing current-state router"
+fi
+mv -- "$FIXTURE/docs/PROJECT_CURRENT_STATE.md.saved" "$FIXTURE/docs/PROJECT_CURRENT_STATE.md"
+
 mv -- "$FIXTURE/docs/architecture" "$TMP_ROOT/fixture-architecture"
 ln -s -- "$TMP_ROOT/fixture-architecture" "$FIXTURE/docs/architecture"
 if "$FIXTURE/scripts/codex-project.sh" --print-context >/dev/null 2>&1; then
@@ -167,9 +179,9 @@ after_status="$(git -C "$FIXTURE" status --short --untracked-files=all)"
 [[ "$before_status" == "$after_status" ]] || fail "context collection changed the worktree"
 
 assert_contains "$context" 'Read AGENTS.md completely.'
-assert_contains "$context" 'Read docs/PROJECT_CONTINUITY.md completely.'
-assert_contains "$context" 'Read docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md completely'
-assert_contains "$context" 'Read docs/PROJECT_PROGRESS.md completely'
+assert_contains "$context" 'Read docs/PROJECT_CURRENT_STATE.md completely.'
+assert_contains "$context" 'read only the active plan phase'
+assert_contains "$context" 'Prefer bounded CodeGraph exploration'
 assert_contains "$context" 'Read docs/GIT_AND_PROMPT_POLICY.md before Git operations'
 assert_contains "$context" 'branch: test/codex-context'
 assert_contains "$context" 'recent_commit:'

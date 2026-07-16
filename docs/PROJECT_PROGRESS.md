@@ -3,7 +3,7 @@
 <!-- project-progress-schema: v1 -->
 
 - 最后更新：2026-07-16
-- 活跃决策：`D-003`、`D-004`、`D-006`、`D-007`、`D-008`、`D-009`；`D-005` 仍为 Proposed
+- 活跃决策：`D-003`、`D-004`、`D-006`、`D-007`、`D-008`、`D-009`、`D-010`；`D-005` 仍为 Proposed
 - 活跃分支：`feature/scientific-agent-runtime`
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
 - 总体状态：**P0 + P1（含 P1-008）已验证；P2-001 有界发现/重开已验证，P2-002 回收站、
@@ -455,16 +455,20 @@ D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 
 新 Codex 在执行 D-003 相关工作前必须：
 
-1. 完整阅读 `AGENTS.md`、`docs/PROJECT_CONTINUITY.md`、本进度账本和完整实施计划；
+1. 完整阅读 `AGENTS.md` 与 `docs/PROJECT_CURRENT_STATE.md`；
 2. 检查当前分支、`git status`、未提交 diff 和最近提交，并验证 `ffeb5bc` 仍是
    当前 D-003 分支的 ancestor；
-3. 如果分支不是 `feature/scientific-agent-runtime`、ancestor 不符或工作树不干净，不得自动
+3. 按短入口定向读取本账本顶部/current checkpoint/当前切片、完整计划的当前阶段和相关
+   `D-*`；阶段/范围变化、冲突 reconciliation、安全审计或持续记录修改时完整深读对应真源；
+4. 如果分支不是 `feature/scientific-agent-runtime`、ancestor 不符或工作树不干净，不得自动
    switch/reset/rebase；先保护现有改动，对照 Git/代码/测试记录 reconciliation；
-4. 运行内部只读状态刷新，核对服务和最近任务，但不把临时快照写成本项目进度；
-5. 对照阶段表检查真实交付物与测试，不能只信状态文本；
-6. 从第一个未满足出口条件的切片继续，不重复已经验证的工作；
-7. 如果当前用户改变范围，以当前对话为准，并按决策协议更新 D-003/计划；
-8. 工作结束前更新本文件的状态、证据、下一动作和阻塞，再按 Git 规则提交。
+5. 代码架构/调用流优先有界 CodeGraph；pending-sync/未索引文件、Git、测试、运行状态和
+   安全证据使用直接工具；
+6. 运行内部只读状态刷新，核对服务和最近任务，但不把临时快照写成本项目进度；
+7. 对照阶段表检查真实交付物与测试，不能只信状态文本；
+8. 从第一个未满足出口条件的切片继续，不重复已经验证的工作；
+9. 如果当前用户改变范围，以当前对话为准，并按决策协议更新 D-003/计划；
+10. 工作结束前同步短入口、本文件的状态/证据/下一动作，再按 Git 规则提交。
 
 ## 每个开发切片的记录格式
 
@@ -491,6 +495,7 @@ D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 | 2026-07-16 | P2-004 | In progress（安全范围收紧） | pending/no-record 全部 deferred；只 lookup current 1.4 exact launched record；bind→recovery→activate→publish→serve | 三项以上 pending 零派发、真实 Adapter replacement launcher 零调用、忙端口零 recovery、不同 receipt 硬失败 | 完成全量回归并更新准确计数 |
 | 2026-07-16 | P2-004 | In progress → Verified；完整 P2 仍 Pending | scope/limit pre-scan、只读 launched receipt 收养、共享严格 receipt、相同 handle 并发收敛、1000+ event 分页与一次 status 追赶、安全 server 编排/脱敏 summary | TaskService 80/80、Adapter 27/27、Runtime 201/201、Worker 28/28、Web 36/36、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；未运行真实 FWI/CUDA | 下一步先做 fenced capacity/lease/heartbeat 与持续 supervisor；随后才处理 pending/no-record、cancel/timeout；retry/完整 reconciliation/SSE 仍 Pending |
 | 2026-07-16 | P2-005A | Pending → Implemented → Verified；完整 P2 仍 Pending | SQLite v8 scope-level fenced 控制面 lease/term/closure/supervised commit audit；observation-only Runtime Supervisor；bind→recovery→lease/ready→listen/publish；cooperative stop 与硬退出边界 | Runtime 226/226、Worker 28/28、Web 45/45、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；并发/expiry/ABA/事务内时钟/迟到写、self-fence、信号/零请求/drain 覆盖；未运行真实 FWI/CUDA | 下一步设计 staged Worker launch、attempt fence、跨进程 capacity lease 与独立 heartbeat；pending/no-record、cancel/timeout/retry/reconciliation/SSE 仍 Pending |
+| 2026-07-16 | D-010 / PREP-004 | Accepted → Implemented → Verified；D-003 runtime phase 不变 | 81 行短入口、AGENTS bootstrap v2、按需深读、CodeGraph 优先/回退、聚焦测试输出策略和同步规则 | launcher/continuity/helper/syntax/diff PASS；CodeGraph 定位 P2-005A RuntimeSupervisor；固定默认读取 201 行后再定向补充 | 新开一次 Codex 会话加载新指令；继续 P2 staged Worker launch 设计 |
 
 记录规则：
 

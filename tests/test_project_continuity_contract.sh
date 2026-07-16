@@ -22,6 +22,7 @@ required_files=(
     .dockerignore
     .gitignore
     AGENTS.md
+    docs/PROJECT_CURRENT_STATE.md
     docs/PROJECT_CONTINUITY.md
     docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md
     docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md
@@ -78,7 +79,21 @@ for file in "${required_files[@]}"; do
         fail "required continuity file is absent or escapes through a symlink: $file"
 done
 
+require_text AGENTS.md '<!-- codex-auto-bootstrap: v2 -->'
+require_text AGENTS.md 'docs/PROJECT_CURRENT_STATE.md'
+require_text AGENTS.md 'codegraph_explore'
+require_text docs/PROJECT_CURRENT_STATE.md '<!-- project-current-state: v1 -->'
+require_text docs/PROJECT_CURRENT_STATE.md '继续 D-003 时的最小读取集'
+require_text docs/PROJECT_CURRENT_STATE.md 'CodeGraph 使用策略'
+require_text docs/PROJECT_CURRENT_STATE.md '完整 P2 仍在进行'
 require_text AGENTS.md 'docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md'
+current_state_lines="$(wc -l < docs/PROJECT_CURRENT_STATE.md)"
+[[ "$current_state_lines" =~ ^[0-9]+$ && "$current_state_lines" -le 160 ]] || \
+    fail "PROJECT_CURRENT_STATE.md exceeds the 160-line bounded bootstrap budget"
+if grep -Fq 'Read `docs/PROJECT_CONTINUITY.md` completely' AGENTS.md || \
+   grep -Fq '`docs/PROJECT_PROGRESS.md` completely' AGENTS.md; then
+    fail 'AGENTS.md restored unconditional long-document bootstrap reads'
+fi
 require_text AGENTS.md 'docs/PROJECT_PROGRESS.md'
 require_text AGENTS.md 'docs/GIT_AND_PROMPT_POLICY.md'
 require_text docs/PROJECT_CONTINUITY.md '## D-003：'
@@ -88,6 +103,8 @@ require_text docs/PROJECT_CONTINUITY.md '## D-006：'
 require_text docs/PROJECT_CONTINUITY.md '## D-007：'
 require_text docs/PROJECT_CONTINUITY.md '## D-008：'
 require_text docs/PROJECT_CONTINUITY.md '## D-009：'
+require_text docs/PROJECT_CONTINUITY.md '## D-010：'
+require_text docs/PROJECT_CONTINUITY.md '低 token 自动接续与 CodeGraph 导航'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
 require_text docs/PROJECT_CONTINUITY.md 'P2.1 有界切片'
@@ -126,6 +143,7 @@ require_text docs/PROJECT_PROGRESS.md '当前新 Guided 任务使用 contract mi
 require_text docs/PROJECT_PROGRESS.md 'P1-008 / D-008'
 require_text docs/PROJECT_PROGRESS.md 'P2-002 / D-008'
 require_text docs/PROJECT_PROGRESS.md 'P2-003 / D-009'
+require_text docs/PROJECT_PROGRESS.md 'D-010 / PREP-004'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'D-005` / **Proposed'
