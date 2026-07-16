@@ -148,6 +148,7 @@ function loadGuidedFunctions() {
     'normalizeGuidedArtifacts',
     'isSafeGuidedBlobUrl',
     'guidedDispatchExplanation',
+    'guidedCancellationExplanation',
     'renderGuidedArtifactsHtml',
   ];
   const source = [
@@ -1266,6 +1267,9 @@ function makeGuidedTask(overrides = {}) {
     approval,
     dispatch: overrides.dispatch || null,
     runtime_status: overrides.adapter_status || null,
+    can_cancel: overrides.can_cancel ?? false,
+    cancellation: Object.hasOwn(overrides, 'cancellation')
+      ? overrides.cancellation : null,
   };
 }
 
@@ -1396,7 +1400,7 @@ function testGuidedFormHasStrictBoundaries() {
   assert.equal(rejectedForward.ok, false);
   assert.match(rejectedForward.errors.join('；'), /P1 Guided 当前不支持正演\/forward/);
   assert.match(html, /id="guidedIterations"[^>]+min="1" max="10000" step="1"/);
-  assert.match(html, /超过 100 次可能长时间占用计算资源；当前不支持运行中取消/);
+  assert.match(html, /受支持的托管 Worker 运行后，任务卡会提供取消，只有状态变为 Cancelled 才表示已经停止/);
   assert.match(html, /自然语言未写 CUDA\/GPU 时安全默认 CPU，不会自动切换/);
   assert.match(html, /不支持：\$\{escapeHtml\(invalidOptimizer\)\}/);
   assert.match(html, /id="guidedSeed"[^>]+min="0" max="2147483647" step="1"/);
@@ -1449,6 +1453,10 @@ function testGuidedIdentifiersAndRoutesAreConstrained() {
     api.guidedApiPath('purge', 'task-safe:1'),
     '/api/scientific-runtime/v1/tasks/task-safe%3A1/purge',
   );
+  assert.equal(
+    api.guidedApiPath('cancel', 'task-safe:1'),
+    '/api/scientific-runtime/v1/tasks/task-safe%3A1/cancel',
+  );
   assert.equal(api.guidedApiPath('artifact', 'task-1', "bad'id"), '');
   assert.equal(api.guidedApiPath('unknown', 'task-1'), '');
 
@@ -1484,6 +1492,75 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   assert.equal(maximumProjection.draft.iterations, 10000);
   assert.equal(maximumProjection.adapter.completed, 9999);
   assert.equal(maximumProjection.adapter.total, 10000);
+  const cancellable = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: true,
+  }));
+  assert.equal(cancellable.canCancel, true);
+  assert.equal(cancellable.cancellation, null);
+  const requestedCancellation = {
+    state: 'requested', reason: 'user_requested',
+    requested_at: '2026-07-16T12:00:00Z', resolved_at: null, failure_code: null,
+  };
+  const cancelling = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: false,
+    cancellation: requestedCancellation,
+  }));
+  assert.equal(cancelling.status, 'Running', 'a durable request is not terminal cancellation');
+  assert.equal(cancelling.cancellation.state, 'requested');
+  assert.match(api.guidedCancellationExplanation(cancelling.cancellation), /不能视为已取消/);
+  const cancelled = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Cancelled',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    adapter_status: {
+      status: 'Cancelled', stage: 'cancelled', completed: 1, total: 2,
+      message: 'FWI job was cancelled',
+    },
+    cancellation: {
+      ...requestedCancellation, state: 'cancelled', resolved_at: '2026-07-16T12:00:05Z',
+    },
+  }));
+  assert.equal(cancelled.cancellation.state, 'cancelled');
+  assert.equal(cancelled.adapter.status, 'Cancelled');
+  const superseded = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Failed',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    cancellation: {
+      ...requestedCancellation, state: 'superseded', resolved_at: '2026-07-16T12:00:03Z',
+    },
+  }));
+  assert.equal(superseded.cancellation.state, 'superseded');
+  for (const malformedCancellation of [
+    { ...requestedCancellation, reason: 'wall_time_exceeded' },
+    { ...requestedCancellation, signal: 'SIGKILL' },
+    { ...requestedCancellation, resolved_at: '2026-07-16T12:00:01Z' },
+    { ...requestedCancellation, failure_code: '/root/private/status' },
+    { ...requestedCancellation, state: 'cancelled' },
+  ]) {
+    assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+      status: 'Running',
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+      dispatch: { state: 'dispatched' },
+      cancellation: malformedCancellation,
+    })), null);
+  }
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: { state: 'dispatched' },
+    can_cancel: true,
+    cancellation: requestedCancellation,
+  })), null, 'the server cannot advertise another cancel after admission');
+  assert.equal(api.normalizeGuidedTaskProjection({
+    ...makeGuidedTask(), can_cancel: 'yes',
+  }), null);
   assert.equal(api.isGuidedReviewReady({
     ...reviewTask, plan: { ...reviewTask.plan, nodeCount: 2 },
   }, catalog), false);
@@ -1565,6 +1642,144 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   assert.match(taskSource, /Adapter status/);
   assert.match(taskSource, /escapeHtml\(adapter\.stage/);
   assert.match(taskSource, /escapeHtml\(adapter\.message/);
+  assert.match(taskSource, /onclick="cancelGuidedTask\(\)"/);
+  assert.match(taskSource, /取消处理中…/);
+  assert.match(taskSource, /task\.canCancel/);
+  assert.match(taskSource, /task\.cancellation/);
+}
+
+async function testGuidedRuntimeCancelUsesOneDurableMutation() {
+  const taskId = 'task-guided-cancel-1';
+  const activeTask = {
+    taskId,
+    status: 'Running',
+    canCancel: true,
+    cancellation: null,
+    dispatch: { state: 'dispatched' },
+  };
+  const requestedTask = {
+    ...activeTask,
+    canCancel: false,
+    cancellation: {
+      state: 'requested', reason: 'user_requested',
+      requestedAt: '2026-07-16T12:00:00Z', resolvedAt: null, failureCode: null,
+    },
+  };
+  const requests = [];
+  const toasts = [];
+  let generatedKeys = 0;
+  let confirmations = 0;
+  let confirmResult = false;
+  let responseMode = 'success';
+  let scheduledPolls = 0;
+  const sandbox = {
+    module: { exports: {} },
+    state: {
+      guided: {
+        task: activeTask,
+        phase: 'monitoring',
+        mutation: '',
+        mutationKeys: Object.create(null),
+        error: '',
+        outcomeUnknown: false,
+        cancelReplayAvailable: false,
+      },
+    },
+    window: {
+      confirm() { confirmations += 1; return confirmResult; },
+    },
+    createStableId(prefix) { generatedKeys += 1; return `${prefix}-stable-${generatedKeys}`; },
+    isSafeGuidedOpaqueId(value) { return typeof value === 'string' && value === taskId; },
+    guidedApiPath(resource, id) {
+      return resource === 'cancel'
+        ? `/api/scientific-runtime/v1/tasks/${id}/cancel` : '';
+    },
+    clearGuidedPoll() {},
+    renderGuidedFwi() {},
+    upsertGuidedTaskIndex() { return true; },
+    async loadGuidedArtifacts() { throw new Error('cancel must not load artifacts'); },
+    scheduleGuidedPoll() { scheduledPolls += 1; },
+    showToast(message) { toasts.push(message); },
+    normalizeGuidedTaskProjection(data, expectedTaskId) {
+      return data && data.taskId === expectedTaskId ? data : null;
+    },
+    guidedInvalidMutationResponse(message) {
+      const error = new Error(message);
+      error.guidedOutcomeUnknown = true;
+      return error;
+    },
+    async guidedApiRequest(path, options) {
+      requests.push({
+        path,
+        method: options.method,
+        body: JSON.parse(JSON.stringify(options.body)),
+        idempotencyKey: options.idempotencyKey,
+      });
+      if (responseMode === 'unknown') {
+        const error = new Error('connection closed');
+        error.guidedOutcomeUnknown = true;
+        throw error;
+      }
+      return requestedTask;
+    },
+  };
+  vm.runInNewContext([
+    extractFunction('guidedMutationKey'),
+    extractFunction('continueGuidedCancel'),
+    `async ${extractFunction('cancelGuidedTask')}`,
+    'module.exports = { cancelGuidedTask, continueGuidedCancel };',
+  ].join('\n'), sandbox);
+  const cancel = sandbox.module.exports.cancelGuidedTask;
+  const continueCancel = sandbox.module.exports.continueGuidedCancel;
+
+  assert.equal(await cancel(), false, 'rejecting confirmation cannot create a mutation');
+  assert.equal(requests.length, 0);
+  assert.equal(generatedKeys, 0);
+
+  confirmResult = true;
+  assert.equal(await cancel(), true);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].body, { reason: 'user_requested' });
+  assert.equal(requests[0].method, 'POST');
+  assert.equal(
+    requests[0].path,
+    `/api/scientific-runtime/v1/tasks/${taskId}/cancel`,
+  );
+  assert.match(requests[0].idempotencyKey, /^guided-cancel:task-guided-cancel-1-stable-1$/);
+  assert.equal(sandbox.state.guided.task.status, 'Running');
+  assert.equal(sandbox.state.guided.task.cancellation.state, 'requested');
+  assert.equal(sandbox.state.guided.phase, 'monitoring');
+  assert.match(toasts.at(-1), /尚未确认停止/);
+  assert.equal(await cancel(), false, 'a requested cancellation cannot submit again');
+  assert.equal(requests.length, 1);
+
+  sandbox.state.guided.task = { ...activeTask };
+  sandbox.state.guided.phase = 'monitoring';
+  sandbox.state.guided.mutationKeys = Object.create(null);
+  sandbox.state.guided.cancelReplayAvailable = false;
+  responseMode = 'unknown';
+  const generatedBeforeUnknown = generatedKeys;
+  const confirmationsBeforeUnknown = confirmations;
+  assert.equal(await cancel(), false);
+  assert.equal(requests.length, 2, 'the unknown path sends exactly one POST');
+  assert.equal(sandbox.state.guided.phase, 'outcome_unknown');
+  assert.equal(sandbox.state.guided.cancelReplayAvailable, true);
+  assert.equal(scheduledPolls >= 1, true, 'unknown outcome schedules only a GET audit');
+  const unknownKey = requests[1].idempotencyKey;
+  assert.equal(generatedKeys, generatedBeforeUnknown + 1);
+
+  responseMode = 'success';
+  assert.equal(await continueCancel(), true);
+  assert.equal(requests.length, 3);
+  assert.equal(requests[2].idempotencyKey, unknownKey, 'explicit replay reuses the original key');
+  assert.equal(generatedKeys, generatedBeforeUnknown + 1, 'replay cannot generate a new key');
+  assert.equal(confirmations, confirmationsBeforeUnknown + 1, 'replay button does not open another confirm');
+  assert.equal(sandbox.state.guided.cancelReplayAvailable, false);
+  assert.equal(sandbox.state.guided.outcomeUnknown, false);
+
+  assert.doesNotMatch(extractFunction('closeGuidedFwi'), /cancelGuidedTask|guidedApiPath\('cancel'/);
+  assert.doesNotMatch(extractFunction('abandonGuidedFwi'), /cancelGuidedTask|guidedApiPath\('cancel'/);
+  assert.doesNotMatch(extractFunction('changeGuidedTaskVisibility'), /cancelGuidedTask|guidedApiPath\('cancel'/);
 }
 
 function testGuidedArtifactManifestsUseControlledDownloads() {
@@ -1831,8 +2046,9 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
     csrf_token: 'csrf-token-1234567890+/=',
     mode: 'guided',
     task_type: 'acoustic_fwi_2d',
-    features: { approval_required: true, running_cancel: false },
+    features: { approval_required: true, running_cancel: true },
     capabilities: {
+      cancel: true,
       startup_dispatch_recovery: false,
       startup_receipt_recovery: false,
       startup_status_catchup: false,
@@ -1847,6 +2063,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
   assert.deepEqual(
     JSON.parse(JSON.stringify(session.capabilities)),
     [
+      'cancel',
       'supervised_runtime_scheduling',
       'continuous_status_supervision',
       'supervisor_leases',
@@ -1925,7 +2142,8 @@ function testGuidedApprovalCannotBeBypassedOrReplayedAutomatically() {
   const unknownSource = extractFunction('renderGuidedFwi');
   assert.match(unknownSource, /不会更换 Idempotency-Key 或自动重发/);
   assert.match(unknownSource, /renderGuidedApprovedSubmitPendingHtml/);
-  assert.doesNotMatch(unknownSource, /cancelGuided|retryGuided|EventSource/);
+  assert.match(unknownSource, /continueGuidedCancel\(\)/);
+  assert.doesNotMatch(unknownSource, /retryGuided|EventSource/);
 
   const pendingSource = extractFunction('renderGuidedApprovedSubmitPendingHtml');
   assert.match(pendingSource, /continueGuidedApprovedSubmit\(\)/);
@@ -3073,6 +3291,7 @@ async function main() {
   testGuidedForwardIsExplicitlyBlocked();
   testGuidedIdentifiersAndRoutesAreConstrained();
   testGuidedTaskAndCrashStatesAreHonest();
+  await testGuidedRuntimeCancelUsesOneDurableMutation();
   testGuidedArtifactManifestsUseControlledDownloads();
   testCurrentEightAndHistoricalTwoArtifactContracts();
   await testGuidedImageBlobLoadingIsBoundedAndRevoked();

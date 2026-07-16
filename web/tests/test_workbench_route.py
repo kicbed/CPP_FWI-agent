@@ -19,13 +19,14 @@ class _Application:
     def __init__(self):
         self.created = []
         self.listed = []
+        self.cancelled = []
         self.purged = []
 
     def session_capabilities(self):
         return {
             "mode": "guided",
             "scope": {"project_id": "local-workbench", "principal_id": "local-user"},
-            "capabilities": {"cancel": False, "retry": False, "sse": False},
+            "capabilities": {"cancel": True, "retry": False, "sse": False},
         }
 
     def list_catalog(self):
@@ -56,6 +57,22 @@ class _Application:
             "purged_at": "2026-07-15T12:00:00Z",
             "local_run_state": "deleted",
             "audit_retained": True,
+            "replayed": False,
+        }
+
+    def cancel_task(self, task_id, key, reason):
+        self.cancelled.append((task_id, key, reason))
+        return {
+            "task_id": task_id,
+            "status": "Running",
+            "can_cancel": False,
+            "cancellation": {
+                "state": "requested",
+                "reason": reason,
+                "requested_at": "2026-07-16T12:00:00Z",
+                "resolved_at": None,
+                "failure_code": None,
+            },
             "replayed": False,
         }
 
@@ -159,6 +176,29 @@ class WorkbenchRouteTest(unittest.TestCase):
         self.assertNotIn("access-control-allow-origin", headers)
         self.assertEqual(json.loads(body)["data"]["task_id"], "task-route-test")
         self.assertEqual(self.application.created, [(form, "route-create-1")])
+
+        cancel = {"reason": "user_requested"}
+        encoded = json.dumps(cancel, separators=(",", ":")).encode("utf-8")
+        status, headers, body = self.request(
+            "POST",
+            "/api/scientific-runtime/v1/tasks/task-route-test/cancel",
+            body=encoded,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "X-Workbench-CSRF": self.csrf,
+                "Idempotency-Key": "route-cancel-1",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("access-control-allow-origin", headers)
+        cancellation = json.loads(body)["data"]["cancellation"]
+        self.assertEqual(cancellation["state"], "requested")
+        self.assertEqual(cancellation["reason"], "user_requested")
+        self.assertEqual(
+            self.application.cancelled,
+            [("task-route-test", "route-cancel-1", "user_requested")],
+        )
 
         purge = {
             "expected_visibility_revision": 1,

@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import tempfile
 import threading
@@ -29,13 +30,14 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 
 CONTROL_DIRECTORY = ".scientific-runtime-adapter-v1"
 LAUNCH_TICKET_NAME = ".worker-launch.json"
 WORKER_READY_NAME = ".worker-ready.json"
 WORKER_HEARTBEAT_NAME = ".worker-heartbeat.json"
+WORKER_CANCEL_DIRECTORY = "worker-cancel"
 CONTROL_SCHEMA_VERSION = "1.0.0"
 MAX_CONTROL_JSON_BYTES = 64 * 1024
 MAX_CAPACITY = 64
@@ -44,6 +46,9 @@ SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
 ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
 JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+CANCEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+CANCEL_CAPABILITY = re.compile(r"^cancel-capability-[0-9a-f]{64}$")
+CANCELLED_WORKER_EXIT_CODE = 75
 
 
 class WorkerControlError(RuntimeError):
@@ -57,6 +62,15 @@ class WorkerControlError(RuntimeError):
             else "WORKER_CONTROL_ERROR"
         )
         super().__init__(message)
+
+
+class WorkerCancellationRequested(BaseException):
+    """Cooperative unwind raised only inside the exact managed Worker."""
+
+    def __init__(self, cancel_id: str, reason: str):
+        self.cancel_id = cancel_id
+        self.reason = reason
+        super().__init__("managed Worker cancellation requested")
 
 
 def _utc_now() -> str:
@@ -262,6 +276,74 @@ def _atomic_write_private_json(path: Path, value: Mapping[str, Any]) -> None:
                 pass
 
 
+def _create_private_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Durably publish one complete append-only private control record.
+
+    The final name is created with a same-directory hard link only after the
+    unique temporary inode has been fully written and fsynced.  Readers can
+    therefore observe either no record or the complete record, never a partial
+    JSON document.  ``link`` also preserves O_EXCL-style no-replacement
+    semantics when concurrent publishers race.
+    """
+
+    data = _stable_json_bytes(value) + b"\n"
+    if len(data) > MAX_CONTROL_JSON_BYTES:
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: private control JSON is too large"
+        )
+    parent = _require_private_directory(path.parent)
+    descriptor = -1
+    directory_descriptor = -1
+    temp_name = ""
+    try:
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=parent
+        )
+        offset = 0
+        while offset < len(data):
+            written = os.write(descriptor, data[offset:])
+            if written <= 0:
+                raise OSError("private control write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        directory_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        temporary_basename = Path(temp_name).name
+        os.link(
+            temporary_basename,
+            path.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_basename, dir_fd=directory_descriptor)
+        temp_name = ""
+        os.fsync(directory_descriptor)
+    except FileExistsError:
+        raise
+    except OSError as error:
+        raise WorkerControlError(
+            "WORKER_CONTROL_UNAVAILABLE: private control create failed"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+
+
 def _read_private_json(path: Path) -> dict[str, Any]:
     flags = (
         os.O_RDONLY
@@ -269,37 +351,48 @@ def _read_private_json(path: Path) -> dict[str, Any]:
         | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )
-    try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
-        raise
-    except OSError as error:
-        raise WorkerControlError(
-            "WORKER_CONTROL_UNAVAILABLE: private control read failed"
-        ) from error
-    try:
-        entry = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(entry.st_mode)
-            or entry.st_uid != os.geteuid()
-            or entry.st_nlink != 1
-            or stat.S_IMODE(entry.st_mode) & 0o077
-            or entry.st_size > MAX_CONTROL_JSON_BYTES
-        ):
+    data: bytes | None = None
+    for publication_attempt in range(11):
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            raise
+        except OSError as error:
             raise WorkerControlError(
-                "WORKER_CONTROL_INVALID: private control file is unsafe"
-            )
-        chunks: list[bytes] = []
-        remaining = MAX_CONTROL_JSON_BYTES + 1
-        while remaining > 0:
-            chunk = os.read(descriptor, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-    finally:
-        os.close(descriptor)
+                "WORKER_CONTROL_UNAVAILABLE: private control read failed"
+            ) from error
+        try:
+            entry = os.fstat(descriptor)
+            if entry.st_nlink == 2 and publication_attempt < 10:
+                # _create_private_json publishes a complete inode with a hard
+                # link and immediately removes its private temporary name.  A
+                # reader that lands in that tiny complete-but-two-link window
+                # retries; a persistent second link still fails closed below.
+                time.sleep(0.001)
+                continue
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or entry.st_uid != os.geteuid()
+                or entry.st_nlink != 1
+                or stat.S_IMODE(entry.st_mode) & 0o077
+                or entry.st_size > MAX_CONTROL_JSON_BYTES
+            ):
+                raise WorkerControlError(
+                    "WORKER_CONTROL_INVALID: private control file is unsafe"
+                )
+            chunks: list[bytes] = []
+            remaining = MAX_CONTROL_JSON_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            break
+        finally:
+            os.close(descriptor)
+    assert data is not None
     if len(data) > MAX_CONTROL_JSON_BYTES:
         raise WorkerControlError(
             "WORKER_CONTROL_INVALID: private control JSON is too large"
@@ -454,6 +547,41 @@ class LaunchAttemptBinding:
 
 
 @dataclass(frozen=True)
+class WorkerCancelEvidence:
+    """Path-free proof for one exact managed-attempt cancellation channel."""
+
+    attempt_id: str
+    capability_record_hash: str
+    cancel_id: str | None = None
+    reason: str | None = None
+    requested_at: str | None = None
+    request_record_hash: str | None = None
+    acknowledged_at: str | None = None
+    acknowledgement_record_hash: str | None = None
+
+    @property
+    def requested(self) -> bool:
+        return self.request_record_hash is not None
+
+    @property
+    def acknowledged(self) -> bool:
+        return self.acknowledgement_record_hash is not None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": CONTROL_SCHEMA_VERSION,
+            "attempt_id": self.attempt_id,
+            "capability_record_hash": self.capability_record_hash,
+            "cancel_id": self.cancel_id,
+            "reason": self.reason,
+            "requested_at": self.requested_at,
+            "request_record_hash": self.request_record_hash,
+            "acknowledged_at": self.acknowledged_at,
+            "acknowledgement_record_hash": self.acknowledgement_record_hash,
+        }
+
+
+@dataclass(frozen=True)
 class WorkerAttemptEvidence:
     """One path-free, exact snapshot of an already staged Worker attempt.
 
@@ -529,6 +657,448 @@ class WorkerAttemptEvidence:
                 }
             ),
         }
+
+
+def _cancel_control_paths(
+    run_root: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    create: bool,
+) -> tuple[Path, Path, Path]:
+    root = Path(run_root)
+    if not root.is_absolute() or root.is_symlink():
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise WorkerControlError(
+            "WORKER_CONTROL_UNAVAILABLE: run root is unavailable"
+        ) from error
+    if resolved != root:
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    _require_protected_directory(root)
+    if create:
+        control = _ensure_private_directory(root / CONTROL_DIRECTORY)
+        cancel = _ensure_private_directory(control / WORKER_CANCEL_DIRECTORY)
+    else:
+        control = _require_private_directory(root / CONTROL_DIRECTORY)
+        cancel = _require_private_directory(control / WORKER_CANCEL_DIRECTORY)
+    prefix = binding.attempt_id
+    return (
+        cancel / f"{prefix}.capability.json",
+        cancel / f"{prefix}.request.json",
+        cancel / f"{prefix}.ack.json",
+    )
+
+
+def _cancel_binding_payload(binding: LaunchAttemptBinding) -> dict[str, Any]:
+    return {
+        **binding.payload(),
+        "binding_hash": binding.binding_hash,
+    }
+
+
+def _validate_cancel_capability(
+    value: Mapping[str, Any], binding: LaunchAttemptBinding
+) -> dict[str, Any]:
+    required = {
+        *binding.payload().keys(),
+        "binding_hash",
+        "capability",
+        "worker_pid",
+        "capacity_slot",
+        "capacity_generation",
+        "issued_at",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_CANCEL_INVALID: cancellation capability fields are invalid"
+        )
+    _validate_record_hash(value)
+    if (
+        any(
+            value.get(key) != expected
+            for key, expected in _cancel_binding_payload(binding).items()
+        )
+        or CANCEL_CAPABILITY.fullmatch(value.get("capability", "")) is None
+        or type(value.get("worker_pid")) is not int
+        or value["worker_pid"] <= 0
+        or type(value.get("capacity_slot")) is not int
+        or not 0 <= value["capacity_slot"] < MAX_CAPACITY
+        or type(value.get("capacity_generation")) is not int
+        or value["capacity_generation"] < 1
+    ):
+        raise WorkerControlError(
+            "WORKER_CANCEL_INVALID: cancellation capability binding changed"
+        )
+    _parse_timestamp(value.get("issued_at"))
+    return copy.deepcopy(dict(value))
+
+
+def ensure_worker_cancel_capability(
+    run_root: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    worker_pid: int,
+    capacity_slot: int,
+    capacity_generation: int,
+) -> dict[str, Any]:
+    """Worker-publish one exact, append-only private stop capability."""
+
+    if (
+        type(worker_pid) is not int
+        or worker_pid != os.getpid()
+        or type(capacity_slot) is not int
+        or not 0 <= capacity_slot < MAX_CAPACITY
+        or type(capacity_generation) is not int
+        or capacity_generation < 1
+    ):
+        raise WorkerControlError(
+            "WORKER_CANCEL_INVALID: Worker capability identity is invalid"
+        )
+
+    capability_path, _, _ = _cancel_control_paths(run_root, binding, create=True)
+    try:
+        existing = _read_private_json(capability_path)
+    except FileNotFoundError:
+        candidate = _record_with_hash(
+            {
+                **_cancel_binding_payload(binding),
+                "capability": "cancel-capability-" + secrets.token_hex(32),
+                "worker_pid": worker_pid,
+                "capacity_slot": capacity_slot,
+                "capacity_generation": capacity_generation,
+                "issued_at": _utc_now(),
+            }
+        )
+        try:
+            _create_private_json(capability_path, candidate)
+            return candidate
+        except FileExistsError:
+            existing = _read_private_json(capability_path)
+    existing = _validate_cancel_capability(existing, binding)
+    if (
+        existing["worker_pid"] != worker_pid
+        or existing["capacity_slot"] != capacity_slot
+        or existing["capacity_generation"] != capacity_generation
+    ):
+        raise WorkerControlError(
+            "WORKER_CANCEL_INVALID: Worker capability identity changed"
+        )
+    return existing
+
+
+def read_worker_cancel_capability(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> dict[str, Any] | None:
+    """Read a Worker-issued capability without creating any control path."""
+
+    root = Path(run_root)
+    if not root.is_absolute() or root.is_symlink():
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise WorkerControlError(
+            "WORKER_CONTROL_UNAVAILABLE: run root is unavailable"
+        ) from error
+    if resolved != root:
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    _require_protected_directory(root)
+    control = _require_private_directory(root / CONTROL_DIRECTORY)
+    cancel_path = control / WORKER_CANCEL_DIRECTORY
+    try:
+        cancel_path.lstat()
+    except FileNotFoundError:
+        return None
+    cancel = _require_private_directory(cancel_path)
+    capability_path = cancel / f"{binding.attempt_id}.capability.json"
+    request_path = cancel / f"{binding.attempt_id}.request.json"
+    acknowledgement_path = cancel / f"{binding.attempt_id}.ack.json"
+    try:
+        capability = _read_private_json(capability_path)
+    except FileNotFoundError:
+        if any(
+            path.exists() or path.is_symlink()
+            for path in (request_path, acknowledgement_path)
+        ):
+            raise WorkerControlError(
+                "WORKER_CANCEL_INVALID: cancellation controls have no capability"
+            )
+        return None
+    return _validate_cancel_capability(capability, binding)
+
+
+def _validate_cancel_request(
+    value: Mapping[str, Any],
+    binding: LaunchAttemptBinding,
+    capability: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        *binding.payload().keys(),
+        "binding_hash",
+        "capability_record_hash",
+        "cancel_id",
+        "reason",
+        "requested_at",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_CANCEL_INVALID: cancellation request fields are invalid"
+        )
+    _validate_record_hash(value)
+    if (
+        any(
+            value.get(key) != expected
+            for key, expected in _cancel_binding_payload(binding).items()
+        )
+        or value.get("capability_record_hash") != capability.get("record_hash")
+        or CANCEL_ID.fullmatch(value.get("cancel_id", "")) is None
+        or value.get("reason") != "user_requested"
+    ):
+        raise WorkerControlError(
+            "WORKER_CANCEL_INVALID: cancellation request binding changed"
+        )
+    _parse_timestamp(value.get("requested_at"))
+    return copy.deepcopy(dict(value))
+
+
+def _validate_cancel_acknowledgement(
+    value: Mapping[str, Any],
+    binding: LaunchAttemptBinding,
+    capability: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        *binding.payload().keys(),
+        "binding_hash",
+        "capability_record_hash",
+        "cancel_id",
+        "reason",
+        "request_record_hash",
+        "acknowledged_at",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_CANCEL_INVALID: cancellation acknowledgement fields are invalid"
+        )
+    _validate_record_hash(value)
+    expected = {
+        **_cancel_binding_payload(binding),
+        "capability_record_hash": capability["record_hash"],
+        "cancel_id": request["cancel_id"],
+        "reason": request["reason"],
+        "request_record_hash": request["record_hash"],
+    }
+    if any(value.get(key) != item for key, item in expected.items()):
+        raise WorkerControlError(
+            "WORKER_CANCEL_INVALID: cancellation acknowledgement binding changed"
+        )
+    _parse_timestamp(value.get("acknowledged_at"))
+    return copy.deepcopy(dict(value))
+
+
+def request_worker_cancel(
+    run_root: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    cancel_id: str,
+    reason: str,
+    requested_at: str,
+) -> tuple[WorkerCancelEvidence, bool]:
+    """Create or exactly replay one append-only cancellation request."""
+
+    if CANCEL_ID.fullmatch(cancel_id) is None or reason != "user_requested":
+        raise WorkerControlError(
+            "WORKER_CANCEL_INVALID: cancellation identity or reason is invalid"
+        )
+    _parse_timestamp(requested_at)
+    capability = read_worker_cancel_capability(run_root, binding)
+    if capability is None:
+        raise WorkerControlError(
+            "WORKER_CANCEL_UNSUPPORTED: exact Worker issued no cancellation capability"
+        )
+    _, request_path, _ = _cancel_control_paths(run_root, binding, create=False)
+    replayed = False
+    try:
+        request = _read_private_json(request_path)
+        replayed = True
+    except FileNotFoundError:
+        candidate = _record_with_hash(
+            {
+                **_cancel_binding_payload(binding),
+                "capability_record_hash": capability["record_hash"],
+                "cancel_id": cancel_id,
+                "reason": reason,
+                "requested_at": requested_at,
+            }
+        )
+        try:
+            _create_private_json(request_path, candidate)
+            request = candidate
+        except FileExistsError:
+            request = _read_private_json(request_path)
+            replayed = True
+    request = _validate_cancel_request(request, binding, capability)
+    if request["cancel_id"] != cancel_id or request["reason"] != reason:
+        raise WorkerControlError(
+            "WORKER_CANCEL_CONFLICT: attempt is bound to another cancellation request"
+        )
+    return read_worker_cancel_evidence(run_root, binding), replayed
+
+
+def read_worker_cancel_evidence(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> WorkerCancelEvidence:
+    capability = read_worker_cancel_capability(run_root, binding)
+    if capability is None:
+        raise WorkerControlError(
+            "WORKER_CANCEL_UNSUPPORTED: exact Worker issued no cancellation capability"
+        )
+    capability_path, request_path, ack_path = _cancel_control_paths(
+        run_root, binding, create=False
+    )
+    del capability_path
+    try:
+        request = _validate_cancel_request(
+            _read_private_json(request_path), binding, capability
+        )
+    except FileNotFoundError:
+        try:
+            _read_private_json(ack_path)
+        except FileNotFoundError:
+            pass
+        else:
+            raise WorkerControlError(
+                "WORKER_CANCEL_INVALID: acknowledgement has no request"
+            )
+        return WorkerCancelEvidence(
+            attempt_id=binding.attempt_id,
+            capability_record_hash=capability["record_hash"],
+        )
+    try:
+        acknowledgement = _validate_cancel_acknowledgement(
+            _read_private_json(ack_path), binding, capability, request
+        )
+    except FileNotFoundError:
+        acknowledgement = None
+    return WorkerCancelEvidence(
+        attempt_id=binding.attempt_id,
+        capability_record_hash=capability["record_hash"],
+        cancel_id=request["cancel_id"],
+        reason=request["reason"],
+        requested_at=request["requested_at"],
+        request_record_hash=request["record_hash"],
+        acknowledged_at=(
+            None if acknowledgement is None else acknowledgement["acknowledged_at"]
+        ),
+        acknowledgement_record_hash=(
+            None if acknowledgement is None else acknowledgement["record_hash"]
+        ),
+    )
+
+
+def _acknowledge_worker_cancel(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> WorkerCancelEvidence:
+    capability = read_worker_cancel_capability(run_root, binding)
+    if capability is None:
+        raise WorkerControlError(
+            "WORKER_CANCEL_UNSUPPORTED: exact Worker issued no cancellation capability"
+        )
+    capability_path, request_path, ack_path = _cancel_control_paths(
+        run_root, binding, create=False
+    )
+    del capability_path
+    request = _validate_cancel_request(
+        _read_private_json(request_path), binding, capability
+    )
+    candidate = _record_with_hash(
+        {
+            **_cancel_binding_payload(binding),
+            "capability_record_hash": capability["record_hash"],
+            "cancel_id": request["cancel_id"],
+            "reason": request["reason"],
+            "request_record_hash": request["record_hash"],
+            "acknowledged_at": _utc_now(),
+        }
+    )
+    try:
+        _create_private_json(ack_path, candidate)
+    except FileExistsError:
+        existing = _read_private_json(ack_path)
+        _validate_cancel_acknowledgement(
+            existing, binding, capability, request
+        )
+    return read_worker_cancel_evidence(run_root, binding)
+
+
+def purge_worker_cancel_control(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> bool:
+    """Delete only the exact attempt's private cancel controls after purge."""
+
+    try:
+        paths = _cancel_control_paths(run_root, binding, create=False)
+    except WorkerControlError as error:
+        if error.code == "WORKER_CONTROL_UNAVAILABLE":
+            return False
+        raise
+    temporary_prefixes = tuple(f".{path.name}." for path in paths)
+    temporary_paths = tuple(
+        candidate
+        for candidate in paths[0].parent.iterdir()
+        if candidate.name.startswith(temporary_prefixes)
+    )
+    canonical_present = any(
+        path.exists() or path.is_symlink() for path in paths
+    )
+    if not canonical_present and not temporary_paths:
+        return False
+    # Validate the whole chain before deleting any member.  A corrupt control
+    # record remains visible for reconciliation instead of being erased.
+    if canonical_present:
+        read_worker_cancel_evidence(run_root, binding)
+    removed = False
+    for path in (*temporary_paths, *reversed(paths)):
+        try:
+            entry = path.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_uid != os.geteuid()
+            or entry.st_nlink != 1
+            or stat.S_IMODE(entry.st_mode) & 0o077
+        ):
+            raise WorkerControlError(
+                "WORKER_CANCEL_INVALID: cancellation control is unsafe"
+            )
+        path.unlink()
+        removed = True
+    if removed:
+        directory_descriptor = os.open(
+            paths[0].parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    return removed
 
 
 def binding_from_submission_record(record: Mapping[str, Any]) -> LaunchAttemptBinding:
@@ -1094,6 +1664,8 @@ class WorkerHeartbeat:
         attempt_fd: int,
         capacity_fd: int,
         interval_seconds: float = 1.0,
+        cancel_grace_seconds: float = 5.0,
+        hard_exit: Callable[[int], Any] | None = None,
     ) -> None:
         if ATTEMPT_ID.fullmatch(attempt_id) is None:
             raise WorkerControlError(
@@ -1107,20 +1679,39 @@ class WorkerHeartbeat:
             raise WorkerControlError(
                 "WORKER_HEARTBEAT_INVALID: heartbeat interval is invalid"
             )
+        if (
+            isinstance(cancel_grace_seconds, bool)
+            or not isinstance(cancel_grace_seconds, (int, float))
+            or not 0.01 <= float(cancel_grace_seconds) <= 300.0
+        ):
+            raise WorkerControlError(
+                "WORKER_CANCEL_INVALID: cancellation grace is invalid"
+            )
+        if hard_exit is not None and not callable(hard_exit):
+            raise WorkerControlError(
+                "WORKER_CANCEL_INVALID: hard-exit callback is invalid"
+            )
         self.root, self.run_dir = _validate_root_and_run(run_root, run_dir)
         self.attempt_id = attempt_id
         self.attempt_fd = attempt_fd
         self.capacity_fd = capacity_fd
         self.interval_seconds = float(interval_seconds)
+        self.cancel_grace_seconds = float(cancel_grace_seconds)
+        self._hard_exit = hard_exit or os._exit
         self._stop = threading.Event()
         self._thread_started = threading.Event()
+        self._ready_published = threading.Event()
+        self._cancel_requested = threading.Event()
         self._thread: threading.Thread | None = None
         self._write_lock = threading.Lock()
+        self._cancel_lock = threading.Lock()
         self._failure: BaseException | None = None
         self._sequence = 0
         self._started_at: str | None = None
         self._ticket: dict[str, Any] | None = None
         self._binding: LaunchAttemptBinding | None = None
+        self._cancel_evidence: WorkerCancelEvidence | None = None
+        self._cancel_deadline: float | None = None
         self._closed = False
 
     def start(self) -> None:
@@ -1212,6 +1803,13 @@ class WorkerHeartbeat:
             )
         self._binding = binding
         self._ticket = ticket
+        ensure_worker_cancel_capability(
+            self.root,
+            binding,
+            worker_pid=worker_pid,
+            capacity_slot=slot,
+            capacity_generation=generation,
+        )
         self._started_at = _utc_now()
         self._write_heartbeat("running")
         thread = threading.Thread(
@@ -1227,12 +1825,52 @@ class WorkerHeartbeat:
                     "WORKER_HEARTBEAT_FAILED: heartbeat thread did not start"
                 )
             self._write_ready()
+            self._ready_published.set()
+            self._observe_cancel_request()
         except Exception:
             self._stop.set()
+            self._ready_published.set()
             if thread.is_alive():
                 thread.join(self.interval_seconds + 1.0)
             self._close_descriptors()
             raise
+
+    def _observe_cancel_request(self) -> None:
+        if self._cancel_requested.is_set():
+            return
+        assert self._binding is not None
+        with self._cancel_lock:
+            if self._cancel_requested.is_set():
+                return
+            evidence = read_worker_cancel_evidence(self.root, self._binding)
+            if not evidence.requested:
+                return
+            evidence = _acknowledge_worker_cancel(self.root, self._binding)
+            if not evidence.acknowledged:
+                raise WorkerControlError(
+                    "WORKER_CANCEL_INVALID: cancellation acknowledgement was not durable"
+                )
+            self._cancel_evidence = evidence
+            self._cancel_deadline = time.monotonic() + self.cancel_grace_seconds
+            self._cancel_requested.set()
+
+    def raise_if_cancel_requested(self) -> None:
+        """Raise only in the managed numerical main thread at a safe checkpoint."""
+
+        if not self._cancel_requested.is_set():
+            return
+        with self._cancel_lock:
+            evidence = self._cancel_evidence
+        if evidence is None or evidence.cancel_id is None or evidence.reason is None:
+            raise WorkerControlError(
+                "WORKER_CANCEL_INVALID: cancellation acknowledgement was lost"
+            )
+        raise WorkerCancellationRequested(evidence.cancel_id, evidence.reason)
+
+    @property
+    def cancel_evidence(self) -> WorkerCancelEvidence | None:
+        with self._cancel_lock:
+            return self._cancel_evidence
 
     def _write_ready(self) -> None:
         assert self._binding is not None
@@ -1302,7 +1940,39 @@ class WorkerHeartbeat:
     def _run(self) -> None:
         try:
             self._thread_started.set()
-            while not self._stop.wait(self.interval_seconds):
+            while not self._ready_published.wait(0.01):
+                if self._stop.is_set():
+                    return
+            while not self._stop.is_set():
+                self._observe_cancel_request()
+                if self._cancel_requested.is_set():
+                    deadline = self._cancel_deadline
+                    assert deadline is not None
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        # This exact process acknowledged the request while it
+                        # still owns both inherited descriptors.  Publish the
+                        # stopped acknowledgement, then let process exit release
+                        # the kernel fences atomically.  Never close them here.
+                        try:
+                            self._write_heartbeat("stopped")
+                        finally:
+                            # Once this exact Worker has acknowledged the
+                            # append-only request, a control-write failure must
+                            # not defeat bounded process termination.  The
+                            # kernel releases both inherited fences on exit;
+                            # missing stopped evidence merely prevents the
+                            # Adapter from claiming terminal Cancelled proof.
+                            self._hard_exit(CANCELLED_WORKER_EXIT_CODE)
+                        raise WorkerControlError(
+                            "WORKER_CANCEL_FAILED: hard-exit callback returned"
+                        )
+                    if self._stop.wait(min(self.interval_seconds, remaining)):
+                        return
+                    self._write_heartbeat("running")
+                    continue
+                if self._stop.wait(self.interval_seconds):
+                    return
                 self._write_heartbeat("running")
         except BaseException as error:
             self._failure = error
@@ -1505,17 +2175,25 @@ def worker_attempt_started(
 
 
 __all__ = [
+    "CANCELLED_WORKER_EXIT_CODE",
     "CONTROL_DIRECTORY",
     "LaunchAttemptBinding",
     "ParentLaunchLease",
     "WorkerAttemptEvidence",
+    "WorkerCancelEvidence",
+    "WorkerCancellationRequested",
     "WorkerControlError",
     "WorkerHeartbeat",
     "binding_from_submission_record",
+    "ensure_worker_cancel_capability",
     "execution_fence_is_held",
     "hold_idle_execution_fence",
     "mark_launch_failed",
+    "purge_worker_cancel_control",
+    "read_worker_cancel_capability",
+    "read_worker_cancel_evidence",
     "read_worker_attempt_evidence",
+    "request_worker_cancel",
     "stage_launch_attempt",
     "worker_attempt_started",
 ]

@@ -301,7 +301,7 @@ class ScientificRuntimeTaskPurgeStoreTest(unittest.TestCase):
 
 
 class ScientificRuntimeTaskPurgeMigrationTest(unittest.TestCase):
-    def test_v6_database_upgrades_in_place_to_v10(self) -> None:
+    def test_v6_database_upgrades_in_place_to_v11(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "v6.sqlite3"
             migrations = Path(__file__).parents[1] / "scientific_runtime" / "migrations"
@@ -333,7 +333,7 @@ class ScientificRuntimeTaskPurgeMigrationTest(unittest.TestCase):
                 connection.close()
 
             store = SQLiteTaskStore(database_path)
-            self.assertEqual(store.migration_version(), 10)
+            self.assertEqual(store.migration_version(), 11)
             connection = sqlite3.connect(database_path)
             try:
                 tables = {
@@ -347,6 +347,9 @@ class ScientificRuntimeTaskPurgeMigrationTest(unittest.TestCase):
                         "task_purge_requests",
                         "task_purge_idempotency",
                         "task_purge_outcomes",
+                        "task_cancel_requests",
+                        "supervised_cancel_attempts",
+                        "task_cancel_outcomes",
                     }.issubset(tables)
                 )
                 connection.execute("PRAGMA foreign_keys = ON")

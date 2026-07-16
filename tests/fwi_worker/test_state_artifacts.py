@@ -45,6 +45,16 @@ class StateAndArtifactsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid status transition"):
                 state.update("running", "retry", 0, 0, "retrying")
 
+    def test_cancelled_is_terminal_from_queued_or_running(self) -> None:
+        for initial in ("queued", "running"):
+            with self.subTest(initial=initial), tempfile.TemporaryDirectory() as directory:
+                state = JobState(Path(directory), "job-123")
+                state.update(initial, initial, 0, 2, initial)
+                state.update("cancelled", "cancelled", 0, 2, "cancelled")
+                self.assertEqual(state.read()["status"], "cancelled")
+                with self.assertRaisesRegex(ValueError, "invalid status transition"):
+                    state.update("running", "retry", 0, 2, "retrying")
+
     def test_run_directory_is_confined_to_configured_root(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with patch.dict(os.environ, {"FWI_RUN_ROOT": root}):

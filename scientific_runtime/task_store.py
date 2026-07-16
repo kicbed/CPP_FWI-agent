@@ -58,6 +58,7 @@ TASK_PURGE_LOCAL_RUN_STATES = frozenset({"deleted", "not_created"})
 WORKER_SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
 WORKER_ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
 WORKER_JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+DOCUMENT_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "Draft": frozenset({"Draft", "NeedsInput", "AwaitingApproval", "Cancelled"}),
@@ -103,6 +104,23 @@ class RuntimeSupervisorLeaseLost(TaskStoreConflict):
 
 
 @dataclass(frozen=True)
+class TaskCancellationSnapshot:
+    """Durable projection of one exact-attempt runtime cancellation."""
+
+    request_id: str
+    task_id: str
+    intent_id: str
+    attempt_id: str
+    reason: str
+    requested_at: str
+    state: str
+    result: str | None = None
+    terminal_status: str | None = None
+    resolved_at: str | None = None
+    adapter_proof: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class TaskSnapshot:
     """Current durable view of one task aggregate."""
 
@@ -122,6 +140,7 @@ class TaskSnapshot:
     purge_requested_at: str | None = None
     purged_at: str | None = None
     purge_local_run_state: str | None = None
+    cancellation: TaskCancellationSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -291,6 +310,25 @@ class WorkerAttemptProjection:
     observation_sequence: int
     document_hash: str
     adopted: bool
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class TaskCancellationRecord:
+    """One durable cancel admission and its current exact outcome."""
+
+    snapshot: TaskSnapshot
+    cancellation: TaskCancellationSnapshot
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class SupervisedCancelAuthorization:
+    """One active Supervisor term authorized to deliver an exact cancel."""
+
+    cancellation: TaskCancellationSnapshot
+    fencing_token: int
+    authorized_at: str
     replayed: bool
 
 
@@ -629,6 +667,66 @@ class TaskStore(Protocol):
     ) -> WorkerAttemptProjection:
         ...
 
+    def lookup_task_cancellation(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_id: str,
+        task_id: str,
+        reason: str,
+        request_hash: str,
+    ) -> TaskCancellationRecord | None:
+        ...
+
+    def can_request_task_cancellation(self, task_id: str) -> bool:
+        ...
+
+    def get_task_cancel_candidate(
+        self, task_id: str
+    ) -> dict[str, Any] | None:
+        ...
+
+    def request_task_cancellation(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        request_id: str,
+        reason: str,
+        idempotency_key: str,
+        request_hash: str,
+        build_documents: Callable[
+            [TaskSnapshot, DispatchIntentSnapshot, Mapping[str, Any], int, str],
+            tuple[Mapping[str, Any], Mapping[str, Any]],
+        ],
+        clock: Callable[[], str],
+    ) -> TaskCancellationRecord:
+        ...
+
+    def authorize_supervised_cancel(
+        self,
+        *,
+        request_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedCancelAuthorization:
+        ...
+
+    def complete_supervised_cancel(
+        self,
+        *,
+        request_id: str,
+        result: str,
+        terminal_event: Mapping[str, Any] | None,
+        adapter_proof: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> TaskCancellationRecord:
+        ...
+
     def commit_runtime_transition(
         self,
         *,
@@ -669,6 +767,97 @@ def encode_document(value: Mapping[str, Any]) -> tuple[str, str]:
         raise TaskStoreConflict(f"document is not finite JSON: {error}") from error
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return text, f"sha256:{digest}"
+
+
+def _validate_cancel_adapter_proof(
+    value: Mapping[str, Any],
+    *,
+    request_id: str,
+    task_id: str,
+    attempt_id: str,
+    reason: str,
+    result: str,
+    terminal_status: str | None = None,
+) -> dict[str, Any]:
+    """Validate the exact Adapter proof before it can become task truth."""
+
+    proof = dict(value)
+    expected_fields = {
+        "schema_version",
+        "task_id",
+        "request_id",
+        "reason",
+        "state",
+        "code",
+        "attempt_id",
+        "capability_record_hash",
+        "request_record_hash",
+        "acknowledgement_record_hash",
+        "terminal_status",
+        "local_run_state",
+        "replayed",
+        "receipt_record_hash",
+        "proof_hash",
+    }
+    capability_hash = proof.get("capability_record_hash")
+    request_hash = proof.get("request_record_hash")
+    acknowledgement_hash = proof.get("acknowledgement_record_hash")
+    chain = (capability_hash, request_hash, acknowledgement_hash)
+    chain_valid = (
+        all(
+            item is None
+            or (isinstance(item, str) and DOCUMENT_HASH.fullmatch(item))
+            for item in chain
+        )
+        and not (capability_hash is None and request_hash is not None)
+        and not (request_hash is None and acknowledgement_hash is not None)
+    )
+    try:
+        _, calculated_proof_hash = encode_document(
+            {key: item for key, item in proof.items() if key != "proof_hash"}
+        )
+    except TaskStoreConflict as error:
+        raise TaskStoreConflict("task cancel Adapter proof is invalid") from error
+    final_shape_valid = False
+    if result == "cancel_confirmed":
+        final_shape_valid = (
+            proof.get("state") == "cancelled"
+            and proof.get("code") == "CANCEL_COMPLETED"
+            and proof.get("terminal_status") == "Cancelled"
+            and all(item is not None for item in chain)
+        )
+    elif result == "terminal_preempted":
+        final_shape_valid = (
+            proof.get("state") == "terminal_won"
+            and proof.get("code") == "CANCEL_TERMINAL_WON"
+            and proof.get("terminal_status") in {"Succeeded", "Failed"}
+        )
+    if (
+        set(proof) != expected_fields
+        or proof.get("schema_version") != "1.0.0"
+        or proof.get("task_id") != task_id
+        or proof.get("request_id") != request_id
+        or proof.get("attempt_id") != attempt_id
+        or not isinstance(attempt_id, str)
+        or WORKER_ATTEMPT_ID.fullmatch(attempt_id) is None
+        or proof.get("reason") != reason
+        or reason != "user_requested"
+        or not chain_valid
+        or not final_shape_valid
+        or (
+            terminal_status is not None
+            and proof.get("terminal_status") != terminal_status
+        )
+        or proof.get("local_run_state") != "retained"
+        or type(proof.get("replayed")) is not bool
+        or not isinstance(proof.get("receipt_record_hash"), str)
+        or DOCUMENT_HASH.fullmatch(proof["receipt_record_hash"]) is None
+        or not isinstance(proof.get("proof_hash"), str)
+        or DOCUMENT_HASH.fullmatch(proof["proof_hash"]) is None
+        or proof["proof_hash"] != calculated_proof_hash
+    ):
+        raise TaskStoreConflict("task cancel Adapter proof is invalid")
+    return proof
 
 
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -1209,6 +1398,892 @@ class SQLiteTaskStore:
             connection.close()
             raise
         return connection
+
+    def lookup_task_cancellation(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_id: str,
+        task_id: str,
+        reason: str,
+        request_hash: str,
+    ) -> TaskCancellationRecord | None:
+        """Look up only one exact scope/key cancellation replay."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT request_id, task_id, reason, request_hash
+                FROM task_cancel_requests
+                WHERE project_id = ? AND principal_id = ?
+                  AND idempotency_key = ?
+                """,
+                (project_id, principal_id, idempotency_key),
+            ).fetchone()
+            if row is None:
+                return None
+            if (
+                row["request_id"] != request_id
+                or row["task_id"] != task_id
+                or row["reason"] != reason
+                or row["request_hash"] != request_hash
+            ):
+                raise IdempotencyConflict(
+                    "idempotency key was already used for another cancel request"
+                )
+            snapshot = self._load_snapshot(connection, task_id)
+            if snapshot is None or snapshot.cancellation is None:
+                raise TaskStoreCorruption("task cancel replay cannot be read")
+            return TaskCancellationRecord(
+                snapshot=snapshot,
+                cancellation=snapshot.cancellation,
+                replayed=True,
+            )
+        except sqlite3.OperationalError as error:
+            _raise_operational_error(error)
+        finally:
+            connection.close()
+
+    def can_request_task_cancellation(self, task_id: str) -> bool:
+        """Return whether the durable view has one cancellable exact attempt."""
+
+        return self.get_task_cancel_candidate(task_id) is not None
+
+    def get_task_cancel_candidate(
+        self, task_id: str
+    ) -> dict[str, Any] | None:
+        """Read the latest exact attempt eligible for cancel admission."""
+
+        if not isinstance(task_id, str) or not task_id:
+            return None
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT observation.*
+                FROM tasks AS task
+                JOIN dispatch_intents AS intent
+                  ON intent.task_id = task.task_id
+                JOIN dispatch_outcomes AS dispatch
+                  ON dispatch.intent_id = intent.intent_id
+                 AND dispatch.outcome = 'dispatched'
+                JOIN worker_launch_attempts AS attempt
+                  ON attempt.intent_id = intent.intent_id
+                JOIN worker_attempt_observations AS observation
+                  ON observation.attempt_id = attempt.attempt_id
+                WHERE task.task_id = ?
+                  AND task.status IN ('Queued', 'Running')
+                  AND intent.adapter_id = 'fwi.deepwave_adapter'
+                  AND intent.adapter_version = '1.4.0'
+                  AND json_extract(
+                      intent.request_json, '$.request.algorithm.id'
+                  ) = 'deepwave.acoustic_fwi'
+                  AND json_extract(
+                      intent.request_json, '$.request.algorithm.version'
+                  ) = '1.4.0'
+                  AND observation.observation_sequence = (
+                      SELECT MAX(latest.observation_sequence)
+                      FROM worker_attempt_observations AS latest
+                      WHERE latest.attempt_id = attempt.attempt_id
+                  )
+                  AND attempt.attempt_number = (
+                      SELECT MAX(latest_attempt.attempt_number)
+                      FROM worker_launch_attempts AS latest_attempt
+                      WHERE latest_attempt.intent_id = intent.intent_id
+                  )
+                  AND observation.ticket_state = 'spawned'
+                  AND observation.ready_record_hash IS NOT NULL
+                  AND observation.heartbeat_state = 'running'
+                  AND observation.heartbeat_record_hash IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_cancel_requests AS cancel
+                      WHERE cancel.task_id = task.task_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_purge_requests AS purge
+                      WHERE purge.task_id = task.task_id
+                  )
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            return None if row is None else _decode_worker_observation_row(row)
+        except sqlite3.OperationalError as error:
+            _raise_operational_error(error)
+        finally:
+            connection.close()
+
+    def request_task_cancellation(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        request_id: str,
+        reason: str,
+        idempotency_key: str,
+        request_hash: str,
+        build_documents: Callable[
+            [TaskSnapshot, DispatchIntentSnapshot, Mapping[str, Any], int, str],
+            tuple[Mapping[str, Any], Mapping[str, Any]],
+        ],
+        clock: Callable[[], str],
+    ) -> TaskCancellationRecord:
+        """Atomically admit one exact running-attempt cancellation request."""
+
+        strings = (
+            task_id,
+            project_id,
+            principal_id,
+            request_id,
+            idempotency_key,
+            request_hash,
+        )
+        if (
+            any(not isinstance(value, str) or not value for value in strings)
+            or reason != "user_requested"
+            or not callable(build_documents)
+            or not callable(clock)
+        ):
+            raise TaskStoreConflict("task cancel request is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT request_id, task_id, reason, request_hash
+                FROM task_cancel_requests
+                WHERE project_id = ? AND principal_id = ?
+                  AND idempotency_key = ?
+                """,
+                (project_id, principal_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["request_id"] != request_id
+                    or existing["task_id"] != task_id
+                    or existing["reason"] != reason
+                    or existing["request_hash"] != request_hash
+                ):
+                    raise IdempotencyConflict(
+                        "idempotency key was already used for another cancel request"
+                    )
+                snapshot = self._load_snapshot(connection, task_id)
+                if snapshot is None or snapshot.cancellation is None:
+                    raise TaskStoreCorruption(
+                        "task cancel replay cannot be read"
+                    )
+                connection.commit()
+                return TaskCancellationRecord(
+                    snapshot=snapshot,
+                    cancellation=snapshot.cancellation,
+                    replayed=True,
+                )
+
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreConflict("task does not exist")
+            if (
+                task["project_id"] != project_id
+                or task["principal_id"] != principal_id
+            ):
+                raise TaskStoreConflict("task cancel crosses task scope")
+            if task["status"] not in {"Queued", "Running"}:
+                raise TaskStoreConflict(
+                    "only a queued or running task can be cancelled"
+                )
+            if connection.execute(
+                "SELECT 1 FROM task_cancel_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict("task already has another cancel request")
+            if connection.execute(
+                "SELECT 1 FROM task_purge_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict("purged task cannot be cancelled")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if (
+                intent is None
+                or intent.state != "dispatched"
+                or intent.handle is None
+                or intent.adapter_id != "fwi.deepwave_adapter"
+                or intent.adapter_version != "1.4.0"
+                or intent.request.get("algorithm")
+                != {"id": "deepwave.acoustic_fwi", "version": "1.4.0"}
+            ):
+                raise TaskStoreConflict(
+                    "task cancellation requires a current dispatched receipt"
+                )
+            observation = connection.execute(
+                """
+                SELECT observation.*
+                FROM worker_launch_attempts AS attempt
+                JOIN worker_attempt_observations AS observation
+                  ON observation.attempt_id = attempt.attempt_id
+                WHERE attempt.intent_id = ?
+                ORDER BY attempt.attempt_number DESC,
+                         observation.observation_sequence DESC
+                LIMIT 1
+                """,
+                (intent.intent_id,),
+            ).fetchone()
+            if observation is None:
+                raise TaskStoreConflict(
+                    "task cancellation requires exact Worker evidence"
+                )
+            evidence = _decode_worker_observation_row(observation)
+            if (
+                evidence["ticket"]["state"] != "spawned"
+                or evidence["ready"] is None
+                or evidence["heartbeat"] is None
+                or evidence["heartbeat"]["state"] != "running"
+            ):
+                raise TaskStoreConflict(
+                    "task cancellation requires an exact running attempt"
+                )
+            next_sequence = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) + 1
+                FROM run_events WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()[0]
+            requested_at, _ = _runtime_timestamp(clock())
+            snapshot = self._load_snapshot(connection, task_id)
+            if snapshot is None:
+                raise TaskStoreCorruption("task cancel target cannot be read")
+            request_value, event_value = build_documents(
+                snapshot, intent, evidence, next_sequence, requested_at
+            )
+            request = dict(request_value)
+            event = dict(event_value)
+            expected_request = {
+                "schema_version": "1.0.0",
+                "request_id": request_id,
+                "task_id": task_id,
+                "intent_id": intent.intent_id,
+                "attempt_id": evidence["attempt_id"],
+                "reason": reason,
+                "actor": {"type": "user", "id": principal_id},
+                "requested_at": requested_at,
+                "extensions": {},
+            }
+            if request != expected_request:
+                raise TaskStoreConflict("task cancel document is invalid")
+            if (
+                event.get("task_id") != task_id
+                or event.get("sequence") != next_sequence
+                or event.get("event_type") != "cancel_requested"
+                or event.get("task_status") != task["status"]
+                or event.get("node_id") != intent.node_id
+                or event.get("occurred_at") != requested_at
+                or event.get("fingerprint") != intent.handle["fingerprint"]
+            ):
+                raise TaskStoreConflict("task cancel event is invalid")
+            request_json, request_document_hash = encode_document(request)
+            event_json, event_hash = encode_document(event)
+            _, fingerprint_hash = encode_document(event["fingerprint"])
+            connection.execute(
+                """
+                INSERT INTO run_events(
+                    task_id, sequence, event_id, event_type, task_status,
+                    node_id, fingerprint_hash, document_json, document_hash,
+                    occurred_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    next_sequence,
+                    event["event_id"],
+                    event["event_type"],
+                    event["task_status"],
+                    event["node_id"],
+                    fingerprint_hash,
+                    event_json,
+                    event_hash,
+                    event["occurred_at"],
+                    requested_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_cancel_requests(
+                    request_id, task_id, project_id, principal_id,
+                    intent_id, attempt_id, reason, idempotency_key,
+                    request_hash, request_event_sequence,
+                    document_json, document_hash, requested_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    task_id,
+                    project_id,
+                    principal_id,
+                    intent.intent_id,
+                    evidence["attempt_id"],
+                    reason,
+                    idempotency_key,
+                    request_hash,
+                    next_sequence,
+                    request_json,
+                    request_document_hash,
+                    requested_at,
+                    requested_at,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET updated_at = ? WHERE task_id = ?",
+                (requested_at, task_id),
+            )
+            snapshot = self._load_snapshot(connection, task_id)
+            if snapshot is None or snapshot.cancellation is None:
+                raise TaskStoreCorruption("task cancel request cannot be read")
+            connection.commit()
+            return TaskCancellationRecord(
+                snapshot=snapshot,
+                cancellation=snapshot.cancellation,
+                replayed=False,
+            )
+        except (IdempotencyConflict, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "task cancel request conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def authorize_supervised_cancel(
+        self,
+        *,
+        request_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedCancelAuthorization:
+        """Authorize one active term to enter the Adapter cancel state machine."""
+
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("supervised cancel authorization is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authorized_at, authorized_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            row = connection.execute(
+                """
+                SELECT task_id, project_id, principal_id, intent_id, attempt_id
+                FROM task_cancel_requests WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskStoreConflict("task cancel request does not exist")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=row["project_id"],
+                principal_id=row["principal_id"],
+                supplied=supervisor_lease,
+                now_us=authorized_at_us,
+                action="supervised cancel",
+            )
+            snapshot = self._load_snapshot(connection, row["task_id"])
+            if snapshot is None or snapshot.cancellation is None:
+                raise TaskStoreCorruption("task cancel request cannot be read")
+            if snapshot.cancellation.state != "requested":
+                connection.commit()
+                return SupervisedCancelAuthorization(
+                    cancellation=snapshot.cancellation,
+                    fencing_token=supervisor_lease.fencing_token,
+                    authorized_at=authorized_at,
+                    replayed=True,
+                )
+            existing = connection.execute(
+                """
+                SELECT authorized_at, authorized_at_us
+                FROM supervised_cancel_attempts
+                WHERE request_id = ? AND fencing_token = ?
+                """,
+                (request_id, supervisor_lease.fencing_token),
+            ).fetchone()
+            replayed = existing is not None
+            if existing is not None:
+                authorized_at, stored_us = _runtime_timestamp(
+                    existing["authorized_at"]
+                )
+                if stored_us != existing["authorized_at_us"]:
+                    raise TaskStoreCorruption(
+                        "supervised cancel authorization time is inconsistent"
+                    )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO supervised_cancel_attempts(
+                        request_id, project_id, principal_id, intent_id,
+                        attempt_id, fencing_token, action,
+                        authorized_at, authorized_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?,
+                              'deliver_exact_attempt_cancel', ?, ?)
+                    """,
+                    (
+                        request_id,
+                        row["project_id"],
+                        row["principal_id"],
+                        row["intent_id"],
+                        row["attempt_id"],
+                        supervisor_lease.fencing_token,
+                        authorized_at,
+                        authorized_at_us,
+                    ),
+                )
+            connection.commit()
+            return SupervisedCancelAuthorization(
+                cancellation=snapshot.cancellation,
+                fencing_token=supervisor_lease.fencing_token,
+                authorized_at=authorized_at,
+                replayed=replayed,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "supervised cancel authorization conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def complete_supervised_cancel(
+        self,
+        *,
+        request_id: str,
+        result: str,
+        terminal_event: Mapping[str, Any] | None,
+        adapter_proof: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> TaskCancellationRecord:
+        """Commit cancellation or its natural-terminal winner under one term."""
+
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or result not in {"cancel_confirmed", "terminal_preempted"}
+            or not isinstance(adapter_proof, Mapping)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("task cancel completion is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            resolved_at, resolved_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            row = connection.execute(
+                """
+                SELECT task_id, project_id, principal_id, intent_id,
+                       attempt_id, reason
+                FROM task_cancel_requests WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskStoreConflict("task cancel request does not exist")
+            proof = _validate_cancel_adapter_proof(
+                adapter_proof,
+                request_id=request_id,
+                task_id=row["task_id"],
+                attempt_id=row["attempt_id"],
+                reason=row["reason"],
+                result=result,
+            )
+            proof_json, proof_hash = encode_document(proof)
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=row["project_id"],
+                principal_id=row["principal_id"],
+                supplied=supervisor_lease,
+                now_us=resolved_at_us,
+                action="task cancel completion",
+            )
+            existing = connection.execute(
+                """
+                SELECT result, adapter_proof_hash
+                FROM task_cancel_outcomes WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["result"] != result
+                    or existing["adapter_proof_hash"] != proof_hash
+                ):
+                    raise TaskStoreConflict(
+                        "task cancel was completed with another outcome"
+                    )
+                snapshot = self._load_snapshot(connection, row["task_id"])
+                if snapshot is None or snapshot.cancellation is None:
+                    raise TaskStoreCorruption("task cancel outcome cannot be read")
+                connection.commit()
+                return TaskCancellationRecord(
+                    snapshot=snapshot,
+                    cancellation=snapshot.cancellation,
+                    replayed=True,
+                )
+            authorization = connection.execute(
+                """
+                SELECT 1 FROM supervised_cancel_attempts
+                WHERE request_id = ? AND fencing_token = ?
+                """,
+                (request_id, supervisor_lease.fencing_token),
+            ).fetchone()
+            if authorization is None:
+                raise TaskStoreConflict(
+                    "task cancel completion lacks current-term authorization"
+                )
+            task = connection.execute(
+                "SELECT status FROM tasks WHERE task_id = ?",
+                (row["task_id"],),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("task cancel target cannot be read")
+            if result == "cancel_confirmed":
+                if task["status"] not in {"Queued", "Running"}:
+                    raise TaskStoreConflict(
+                        "cancel confirmation lost the terminal race"
+                    )
+                if terminal_event is None:
+                    raise TaskStoreConflict(
+                        "cancel confirmation requires its terminal event"
+                    )
+                event = dict(terminal_event)
+                next_sequence = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) + 1
+                    FROM run_events WHERE task_id = ?
+                    """,
+                    (row["task_id"],),
+                ).fetchone()[0]
+                intent = self._load_dispatch_intent(
+                    connection, task_id=row["task_id"]
+                )
+                if (
+                    intent is None
+                    or intent.intent_id != row["intent_id"]
+                    or intent.handle is None
+                    or event.get("task_id") != row["task_id"]
+                    or event.get("sequence") != next_sequence
+                    or event.get("event_type") != "task_cancelled"
+                    or event.get("task_status") != "Cancelled"
+                    or event.get("node_id") != intent.node_id
+                    or event.get("fingerprint") != intent.handle["fingerprint"]
+                ):
+                    raise TaskStoreConflict("task cancel terminal event is invalid")
+                event_json, event_hash = encode_document(event)
+                _, fingerprint_hash = encode_document(event["fingerprint"])
+                connection.execute(
+                    """
+                    INSERT INTO run_events(
+                        task_id, sequence, event_id, event_type, task_status,
+                        node_id, fingerprint_hash, document_json, document_hash,
+                        occurred_at, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["task_id"],
+                        next_sequence,
+                        event["event_id"],
+                        event["event_type"],
+                        event["task_status"],
+                        event["node_id"],
+                        fingerprint_hash,
+                        event_json,
+                        event_hash,
+                        event["occurred_at"],
+                        resolved_at,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE tasks SET status = 'Cancelled', updated_at = ? "
+                    "WHERE task_id = ?",
+                    (resolved_at, row["task_id"]),
+                )
+                terminal_status = "Cancelled"
+                terminal_sequence = next_sequence
+                connection.execute(
+                    """
+                    INSERT INTO supervised_run_event_commits(
+                        task_id, sequence, project_id, principal_id,
+                        fencing_token, recorded_at, recorded_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["task_id"],
+                        next_sequence,
+                        row["project_id"],
+                        row["principal_id"],
+                        supervisor_lease.fencing_token,
+                        resolved_at,
+                        resolved_at_us,
+                    ),
+                )
+            else:
+                if terminal_event is None:
+                    if task["status"] not in {"Succeeded", "Failed"}:
+                        raise TaskStoreConflict(
+                            "terminal-preempted cancel requires a natural terminal task"
+                        )
+                    terminal_status = task["status"]
+                    terminal = connection.execute(
+                        """
+                        SELECT sequence, event_type, task_status
+                        FROM run_events WHERE task_id = ?
+                        ORDER BY sequence DESC LIMIT 1
+                        """,
+                        (row["task_id"],),
+                    ).fetchone()
+                    expected_type = (
+                        "node_succeeded"
+                        if terminal_status == "Succeeded"
+                        else "node_failed"
+                    )
+                    if (
+                        terminal is None
+                        or terminal["event_type"] != expected_type
+                        or terminal["task_status"] != terminal_status
+                    ):
+                        raise TaskStoreCorruption(
+                            "natural terminal cancel winner is inconsistent"
+                        )
+                    terminal_sequence = terminal["sequence"]
+                else:
+                    if task["status"] not in {"Queued", "Running"}:
+                        raise TaskStoreConflict(
+                            "terminal-preempted cancel lost the terminal race"
+                        )
+                    event = dict(terminal_event)
+                    terminal_status = event.get("task_status")
+                    expected_type = {
+                        "Succeeded": "node_succeeded",
+                        "Failed": "node_failed",
+                    }.get(terminal_status)
+                    next_sequence = connection.execute(
+                        """
+                        SELECT COALESCE(MAX(sequence), 0) + 1
+                        FROM run_events WHERE task_id = ?
+                        """,
+                        (row["task_id"],),
+                    ).fetchone()[0]
+                    intent = self._load_dispatch_intent(
+                        connection, task_id=row["task_id"]
+                    )
+                    if (
+                        expected_type is None
+                        or intent is None
+                        or intent.intent_id != row["intent_id"]
+                        or intent.handle is None
+                        or event.get("task_id") != row["task_id"]
+                        or event.get("sequence") != next_sequence
+                        or event.get("event_type") != expected_type
+                        or event.get("node_id") != intent.node_id
+                        or event.get("fingerprint")
+                        != intent.handle["fingerprint"]
+                        or terminal_status
+                        not in ALLOWED_TRANSITIONS.get(
+                            task["status"], frozenset()
+                        )
+                    ):
+                        raise TaskStoreConflict(
+                            "natural terminal cancel event is invalid"
+                        )
+                    event_json, event_hash = encode_document(event)
+                    _, fingerprint_hash = encode_document(
+                        event["fingerprint"]
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO run_events(
+                            task_id, sequence, event_id, event_type,
+                            task_status, node_id, fingerprint_hash,
+                            document_json, document_hash, occurred_at,
+                            recorded_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["task_id"],
+                            next_sequence,
+                            event["event_id"],
+                            event["event_type"],
+                            terminal_status,
+                            event["node_id"],
+                            fingerprint_hash,
+                            event_json,
+                            event_hash,
+                            event["occurred_at"],
+                            resolved_at,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE tasks SET status = ?, updated_at = ? "
+                        "WHERE task_id = ?",
+                        (terminal_status, resolved_at, row["task_id"]),
+                    )
+                    terminal_sequence = next_sequence
+                    connection.execute(
+                        """
+                        INSERT INTO supervised_run_event_commits(
+                            task_id, sequence, project_id, principal_id,
+                            fencing_token, recorded_at, recorded_at_us
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["task_id"],
+                            next_sequence,
+                            row["project_id"],
+                            row["principal_id"],
+                            supervisor_lease.fencing_token,
+                            resolved_at,
+                            resolved_at_us,
+                        ),
+                    )
+            if proof["terminal_status"] != terminal_status:
+                raise TaskStoreConflict(
+                    "task cancel Adapter proof contradicts the terminal outcome"
+                )
+            outcome = {
+                "schema_version": "1.0.0",
+                "request_id": request_id,
+                "task_id": row["task_id"],
+                "result": result,
+                "terminal_status": terminal_status,
+                "adapter_proof": proof,
+                "resolved_at": resolved_at,
+                "extensions": {},
+            }
+            outcome_json, outcome_hash = encode_document(outcome)
+            connection.execute(
+                """
+                INSERT INTO task_cancel_outcomes(
+                    request_id, task_id, project_id, principal_id,
+                    intent_id, attempt_id, result, terminal_status,
+                    terminal_event_sequence, adapter_proof_json,
+                    adapter_proof_hash, document_json, document_hash,
+                    fencing_token, resolved_at, resolved_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    row["task_id"],
+                    row["project_id"],
+                    row["principal_id"],
+                    row["intent_id"],
+                    row["attempt_id"],
+                    result,
+                    terminal_status,
+                    terminal_sequence,
+                    proof_json,
+                    proof_hash,
+                    outcome_json,
+                    outcome_hash,
+                    supervisor_lease.fencing_token,
+                    resolved_at,
+                    resolved_at_us,
+                ),
+            )
+            heartbeat = connection.execute(
+                """
+                UPDATE runtime_supervisor_leases
+                SET heartbeat_at = ?, heartbeat_at_us = ?
+                WHERE project_id = ? AND principal_id = ?
+                  AND fencing_token = ? AND owner_id = ?
+                  AND acquired_at = ?
+                """,
+                (
+                    resolved_at,
+                    resolved_at_us,
+                    row["project_id"],
+                    row["principal_id"],
+                    supervisor_lease.fencing_token,
+                    supervisor_lease.owner_id,
+                    supervisor_lease.acquired_at,
+                ),
+            )
+            if heartbeat.rowcount != 1:
+                raise RuntimeSupervisorLeaseLost(
+                    "task cancel completion lost its supervisor lease"
+                )
+            snapshot = self._load_snapshot(connection, row["task_id"])
+            if snapshot is None or snapshot.cancellation is None:
+                raise TaskStoreCorruption("task cancel outcome cannot be read")
+            connection.commit()
+            return TaskCancellationRecord(
+                snapshot=snapshot,
+                cancellation=snapshot.cancellation,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "task cancel completion lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "task cancel completion conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _initialize_locked(self) -> None:
         migrations = _load_migrations()
@@ -2997,6 +4072,167 @@ class SQLiteTaskStore:
             outcome,
         )
 
+    def _load_task_cancellation(
+        self, connection: sqlite3.Connection, task_id: str
+    ) -> TaskCancellationSnapshot | None:
+        row = connection.execute(
+            """
+            SELECT request.request_id, request.task_id, request.project_id,
+                   request.principal_id, request.intent_id, request.attempt_id,
+                   request.reason, request.request_event_sequence,
+                   request.document_json, request.document_hash,
+                   request.requested_at,
+                   outcome.result, outcome.terminal_status,
+                   outcome.terminal_event_sequence,
+                   outcome.adapter_proof_json, outcome.adapter_proof_hash,
+                   outcome.document_json AS outcome_json,
+                   outcome.document_hash AS outcome_hash,
+                   outcome.resolved_at
+            FROM task_cancel_requests AS request
+            LEFT JOIN task_cancel_outcomes AS outcome
+              ON outcome.request_id = request.request_id
+            WHERE request.task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        request = _decode_hashed_document(row, label="task cancel request")
+        actor = request.get("actor")
+        if (
+            set(request)
+            != {
+                "schema_version",
+                "request_id",
+                "task_id",
+                "intent_id",
+                "attempt_id",
+                "reason",
+                "actor",
+                "requested_at",
+                "extensions",
+            }
+            or request.get("schema_version") != "1.0.0"
+            or request.get("request_id") != row["request_id"]
+            or request.get("task_id") != row["task_id"]
+            or request.get("intent_id") != row["intent_id"]
+            or request.get("attempt_id") != row["attempt_id"]
+            or request.get("reason") != row["reason"]
+            or request.get("requested_at") != row["requested_at"]
+            or actor != {"type": "user", "id": row["principal_id"]}
+            or request.get("extensions") != {}
+            or row["reason"] != "user_requested"
+        ):
+            raise TaskStoreCorruption(
+                "task cancel request differs from its immutable index"
+            )
+        event = connection.execute(
+            """
+            SELECT event_type, task_status FROM run_events
+            WHERE task_id = ? AND sequence = ?
+            """,
+            (task_id, row["request_event_sequence"]),
+        ).fetchone()
+        if event is None or event["event_type"] != "cancel_requested":
+            raise TaskStoreCorruption(
+                "task cancel request lacks its admission event"
+            )
+
+        if row["result"] is None:
+            return TaskCancellationSnapshot(
+                request_id=row["request_id"],
+                task_id=row["task_id"],
+                intent_id=row["intent_id"],
+                attempt_id=row["attempt_id"],
+                reason=row["reason"],
+                requested_at=row["requested_at"],
+                state="requested",
+            )
+
+        try:
+            adapter_proof = _decode_document(
+                row["adapter_proof_json"], label="task cancel adapter proof"
+            )
+            _, adapter_proof_hash = encode_document(adapter_proof)
+            adapter_proof = _validate_cancel_adapter_proof(
+                adapter_proof,
+                request_id=row["request_id"],
+                task_id=row["task_id"],
+                attempt_id=row["attempt_id"],
+                reason=row["reason"],
+                result=row["result"],
+                terminal_status=row["terminal_status"],
+            )
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "task cancel adapter proof is invalid"
+            ) from error
+        if adapter_proof_hash != row["adapter_proof_hash"]:
+            raise TaskStoreCorruption(
+                "task cancel adapter proof hash does not match its content"
+            )
+        outcome_row = {
+            "document_json": row["outcome_json"],
+            "document_hash": row["outcome_hash"],
+        }
+        outcome = _decode_hashed_document(
+            outcome_row, label="task cancel outcome"
+        )
+        expected_state = {
+            "cancel_confirmed": ("Cancelled", "cancelled"),
+            "terminal_preempted": (row["terminal_status"], "superseded"),
+        }.get(row["result"])
+        if (
+            expected_state is None
+            or row["terminal_status"] != expected_state[0]
+            or set(outcome)
+            != {
+                "schema_version",
+                "request_id",
+                "task_id",
+                "result",
+                "terminal_status",
+                "adapter_proof",
+                "resolved_at",
+                "extensions",
+            }
+            or outcome.get("schema_version") != "1.0.0"
+            or outcome.get("request_id") != row["request_id"]
+            or outcome.get("task_id") != row["task_id"]
+            or outcome.get("result") != row["result"]
+            or outcome.get("terminal_status") != row["terminal_status"]
+            or outcome.get("adapter_proof") != adapter_proof
+            or outcome.get("resolved_at") != row["resolved_at"]
+            or outcome.get("extensions") != {}
+        ):
+            raise TaskStoreCorruption(
+                "task cancel outcome differs from its immutable index"
+            )
+        terminal = connection.execute(
+            """
+            SELECT event_type, task_status FROM run_events
+            WHERE task_id = ? AND sequence = ?
+            """,
+            (task_id, row["terminal_event_sequence"]),
+        ).fetchone()
+        if terminal is None or terminal["task_status"] != row["terminal_status"]:
+            raise TaskStoreCorruption(
+                "task cancel outcome lacks its exact terminal event"
+            )
+        return TaskCancellationSnapshot(
+            request_id=row["request_id"],
+            task_id=row["task_id"],
+            intent_id=row["intent_id"],
+            attempt_id=row["attempt_id"],
+            reason=row["reason"],
+            requested_at=row["requested_at"],
+            state=expected_state[1],
+            result=row["result"],
+            terminal_status=row["terminal_status"],
+            resolved_at=row["resolved_at"],
+            adapter_proof=adapter_proof,
+        )
+
     def _load_snapshot(
         self, connection: sqlite3.Connection, task_id: str
     ) -> TaskSnapshot | None:
@@ -3005,6 +4241,29 @@ class SQLiteTaskStore:
         ).fetchone()
         if row is None:
             return None
+        cancellation = self._load_task_cancellation(connection, task_id)
+        if cancellation is not None:
+            if cancellation.state == "requested" and row["status"] not in {
+                "Queued",
+                "Running",
+            }:
+                raise TaskStoreCorruption(
+                    "pending cancellation has an unresolved terminal task"
+                )
+            if (
+                cancellation.state == "cancelled"
+                and row["status"] != "Cancelled"
+            ):
+                raise TaskStoreCorruption(
+                    "confirmed cancellation differs from task status"
+                )
+            if (
+                cancellation.state == "superseded"
+                and row["status"] != cancellation.terminal_status
+            ):
+                raise TaskStoreCorruption(
+                    "superseded cancellation differs from task status"
+                )
         visibility_revision, trashed_at = self._load_task_visibility(
             connection, row
         )
@@ -3064,7 +4323,22 @@ class SQLiteTaskStore:
                     "task abandonment differs from its immutable index"
                 )
         pre_runtime_abandoned = row["status"] == "Cancelled" and abandonment is not None
-        if (abandonment is None) != (not pre_runtime_abandoned):
+        runtime_cancelled = (
+            row["status"] == "Cancelled"
+            and cancellation is not None
+            and cancellation.result == "cancel_confirmed"
+        )
+        if abandonment is not None and runtime_cancelled:
+            raise TaskStoreCorruption(
+                "task cannot be both abandoned and runtime-cancelled"
+            )
+        if row["status"] == "Cancelled" and not (
+            pre_runtime_abandoned or runtime_cancelled
+        ):
+            raise TaskStoreCorruption(
+                "Cancelled task lacks abandonment or runtime cancellation evidence"
+            )
+        if row["status"] != "Cancelled" and abandonment is not None:
             raise TaskStoreCorruption(
                 "task abandonment does not match the Cancelled state"
             )
@@ -3195,10 +4469,15 @@ class SQLiteTaskStore:
             "Retrying",
             "Succeeded",
             "Failed",
-        } and (plan is None or approval is None or approval.get("decision") != "approved"):
-            raise TaskStoreCorruption(
-                "submitted task lacks its approved current plan"
-            )
+        } or runtime_cancelled:
+            if (
+                plan is None
+                or approval is None
+                or approval.get("decision") != "approved"
+            ):
+                raise TaskStoreCorruption(
+                    "submitted task lacks its approved current plan"
+                )
         event_summary = connection.execute(
             """
             SELECT COUNT(*) AS event_count,
@@ -3291,6 +4570,7 @@ class SQLiteTaskStore:
             purge_requested_at=purge_requested_at,
             purged_at=purged_at,
             purge_local_run_state=purge_local_run_state,
+            cancellation=cancellation,
         )
 
     def _load_task_purge_record(
@@ -5441,6 +6721,13 @@ class SQLiteTaskStore:
                 (task_id,),
             ).fetchone() is not None:
                 raise TaskStoreConflict("purged task cannot receive supervised dispatch")
+            if connection.execute(
+                "SELECT 1 FROM task_cancel_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict(
+                    "task with a cancel request cannot receive supervised dispatch"
+                )
             if intent.state not in {"pending", "dispatching"}:
                 raise TaskStoreConflict(
                     "dispatch intent is not eligible for supervised dispatch"

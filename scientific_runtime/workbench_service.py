@@ -439,12 +439,12 @@ class GuidedWorkbench:
                 "supervised_runtime_scheduling": True,
                 "continuous_status_supervision": True,
                 "supervisor_leases": True,
-                "running_cancel": False,
+                "running_cancel": True,
                 "automatic_reconciliation": False,
                 "streaming_events": False,
             },
             "capabilities": {
-                "cancel": False,
+                "cancel": True,
                 "retry": False,
                 "sse": False,
                 "startup_dispatch_recovery": False,
@@ -1304,6 +1304,28 @@ class GuidedWorkbench:
         response["replayed"] = bool(_value(result, "replayed", False))
         return response
 
+    def cancel_task(
+        self, task_id: str, key: str, reason: str
+    ) -> dict[str, Any]:
+        if reason != "user_requested":
+            raise WorkbenchValidationError(
+                "INVALID_CANCEL_REASON", ["reason must be user_requested"]
+            )
+        result = self._call(
+            self._tasks.cancel_task,
+            task_id=task_id,
+            reason=reason,
+            idempotency_key=self._mutation_key("cancel", key),
+            **self._scope,
+        )
+        snapshot = _value(result, "snapshot", result)
+        intent = self._call(
+            self._tasks.get_dispatch_intent, task_id, **self._scope
+        )
+        response = self._project(snapshot, intent=intent)
+        response["replayed"] = bool(_value(result, "replayed", False))
+        return response
+
     def _project(
         self,
         snapshot: TaskSnapshot,
@@ -1327,6 +1349,28 @@ class GuidedWorkbench:
         if status is not None:
             for internal in ("job_id", "handle", "submission_id", "relative_path"):
                 status.pop(internal, None)
+        cancellation = snapshot.cancellation
+        cancellation_projection = (
+            None
+            if cancellation is None
+            else {
+                "state": cancellation.state,
+                "reason": cancellation.reason,
+                "requested_at": cancellation.requested_at,
+                "resolved_at": cancellation.resolved_at,
+                "failure_code": None,
+            }
+        )
+        can_cancel = False
+        can_cancel_task = getattr(self._tasks, "can_cancel_task", None)
+        if cancellation is None and callable(can_cancel_task):
+            can_cancel = bool(
+                self._call(
+                    can_cancel_task,
+                    snapshot.task_id,
+                    **self._scope,
+                )
+            )
         return {
             "task_id": snapshot.task_id,
             "status": snapshot.status,
@@ -1369,6 +1413,8 @@ class GuidedWorkbench:
             ),
             "dispatch": dispatch,
             "runtime_status": status,
+            "can_cancel": can_cancel,
+            "cancellation": cancellation_projection,
             "created_at": snapshot.created_at,
             "updated_at": snapshot.updated_at,
             "visibility_revision": snapshot.visibility_revision,
@@ -1457,6 +1503,21 @@ class GuidedWorkbench:
                         "pending" if snapshot.purge_id is not None else None
                     ),
                     "purge_requested_at": snapshot.purge_requested_at,
+                    # Discovery stays a bounded SQLite-only read.  The detail
+                    # projection performs the exact Adapter capability probe
+                    # before it exposes the mutating action.
+                    "can_cancel": False,
+                    "cancellation": (
+                        None
+                        if snapshot.cancellation is None
+                        else {
+                            "state": snapshot.cancellation.state,
+                            "reason": snapshot.cancellation.reason,
+                            "requested_at": snapshot.cancellation.requested_at,
+                            "resolved_at": snapshot.cancellation.resolved_at,
+                            "failure_code": None,
+                        }
+                    ),
                 }
             )
         return {

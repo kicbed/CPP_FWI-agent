@@ -52,6 +52,21 @@ class FakeSnapshot:
     project_id: str
     principal_id: str
     status: str
+    cancellation: "FakeCancellation | None" = None
+
+
+@dataclass(frozen=True)
+class FakeCancellation:
+    state: str
+
+
+@dataclass(frozen=True)
+class FakeCancelProcess:
+    snapshot: FakeSnapshot
+    state: str
+    adapter_result: dict | None
+    replayed: bool
+    deferred_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +144,7 @@ class FakeTaskService:
         self.projection_calls: list[str] = []
         self.schedule_calls: list[str] = []
         self.refresh_calls: list[str] = []
+        self.cancel_calls: list[str] = []
         self.dispatch_calls = 0
         self.lease_held = False
         self.lose_on_heartbeat = False
@@ -138,6 +154,8 @@ class FakeTaskService:
         self.projection_results: dict[str, FakeProjection] = {}
         self.schedule_failures: dict[str, Exception] = {}
         self.schedule_results: dict[str, FakeSchedule] = {}
+        self.cancel_failures: dict[str, Exception] = {}
+        self.cancel_results: dict[str, FakeCancelProcess] = {}
         self.refresh_hook: Callable[[str], None] | None = None
         self.release_failures_remaining = 0
         self.active_lease: FakeLease | None = None
@@ -359,13 +377,54 @@ class FakeTaskService:
             raise failure
         return object()
 
+    def process_runtime_cancellation(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: FakeLease,
+    ) -> FakeCancelProcess:
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        with self.lock:
+            if supervisor_lease != self.active_lease:
+                raise RuntimeSupervisorLeaseLost("simulated stale cancel write")
+            self.calls.append("cancel")
+            self.cancel_calls.append(task_id)
+        failure = self.cancel_failures.get(task_id)
+        if failure is not None:
+            raise failure
+        configured = self.cancel_results.get(task_id)
+        if configured is not None:
+            return configured
+        current = next(value for value in self.snapshots if value.task_id == task_id)
+        resolved = replace(
+            current,
+            status="Cancelled",
+            cancellation=FakeCancellation("cancelled"),
+        )
+        return FakeCancelProcess(
+            snapshot=resolved,
+            state="cancelled",
+            adapter_result={"state": "cancelled"},
+            replayed=False,
+        )
+
     def dispatch(self) -> None:
         self.dispatch_calls += 1
         raise AssertionError("the observation-only supervisor must not dispatch")
 
 
-def snapshot(task_id: str, status: str) -> FakeSnapshot:
-    return FakeSnapshot(task_id, PROJECT_ID, PRINCIPAL_ID, status)
+def snapshot(
+    task_id: str,
+    status: str,
+    cancellation_state: str | None = None,
+) -> FakeSnapshot:
+    cancellation = (
+        None if cancellation_state is None else FakeCancellation(cancellation_state)
+    )
+    return FakeSnapshot(task_id, PROJECT_ID, PRINCIPAL_ID, status, cancellation)
 
 
 def supervisor(
@@ -467,6 +526,41 @@ class RuntimeSupervisorTests(unittest.TestCase):
         self.assertIsNone(service.active_lease)
         self.assertTrue(runtime.stop())
         self.assertEqual(service.release_calls, 1)
+
+    def test_pending_cancellation_preempts_dispatch_and_status_in_same_cycle(
+        self,
+    ) -> None:
+        task_id = "cancel-first"
+        service = FakeTaskService(
+            [snapshot(task_id, "Running", "requested")],
+            {task_id: FakeIntent(task_id, "dispatched")},
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(cycle.scanned_task_ids, (task_id,))
+            self.assertEqual(cycle.cancel_processed_task_ids, (task_id,))
+            self.assertEqual(cycle.cancel_resolved_task_ids, (task_id,))
+            self.assertEqual(cycle.refreshed_task_ids, ())
+            self.assertEqual(cycle.projected_task_ids, ())
+            self.assertEqual(cycle.scheduled_task_ids, ())
+            self.assertEqual(cycle.dispatched_task_ids, ())
+            self.assertEqual(cycle.deferred, ())
+            self.assertEqual(cycle.task_failures, ())
+            self.assertEqual(service.cancel_calls, [task_id])
+            self.assertEqual(service.intent_calls, [])
+            self.assertEqual(service.projection_calls, [])
+            self.assertEqual(service.schedule_calls, [])
+            self.assertEqual(service.refresh_calls, [])
+            self.assertNotIn("intent", service.calls)
+            self.assertNotIn("schedule", service.calls)
+            self.assertNotIn("refresh", service.calls)
+        finally:
+            runtime.stop()
 
     def test_schedules_pending_and_observes_active_queued_or_running_tasks(self) -> None:
         snapshots = [

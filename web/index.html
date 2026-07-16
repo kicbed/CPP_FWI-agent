@@ -1973,6 +1973,7 @@
       if (resource === 'draft') return `${GUIDED_API_PREFIX}/tasks/${task}/draft`;
       if (resource === 'approve') return `${GUIDED_API_PREFIX}/tasks/${task}/approve`;
       if (resource === 'abandon') return `${GUIDED_API_PREFIX}/tasks/${task}/abandon`;
+      if (resource === 'cancel') return `${GUIDED_API_PREFIX}/tasks/${task}/cancel`;
       if (resource === 'trash') return `${GUIDED_API_PREFIX}/tasks/${task}/trash`;
       if (resource === 'restore') return `${GUIDED_API_PREFIX}/tasks/${task}/restore`;
       if (resource === 'purge') return `${GUIDED_API_PREFIX}/tasks/${task}/purge`;
@@ -2004,6 +2005,7 @@
         error: '',
         outcomeUnknown: false,
         approvalReplayAvailable: false,
+        cancelReplayAvailable: false,
         taskIndex: Array.isArray(previous.taskIndex) ? previous.taskIndex : [],
         taskIndexCursor: typeof previous.taskIndexCursor === 'string'
           ? previous.taskIndexCursor : '',
@@ -2349,19 +2351,50 @@
       const hasPlan = source.plan !== null && source.plan !== undefined;
       const hasApproval = source.approval !== null && source.approval !== undefined;
       const hasDispatch = source.dispatch !== null && source.dispatch !== undefined;
+      const hasCancellation = source.cancellation !== null;
       if ((hasPlan && (typeof source.plan !== 'object' || Array.isArray(source.plan)))
           || (hasApproval && (typeof source.approval !== 'object' || Array.isArray(source.approval)))
-          || (hasDispatch && (typeof source.dispatch !== 'object' || Array.isArray(source.dispatch)))) {
+          || (hasDispatch && (typeof source.dispatch !== 'object' || Array.isArray(source.dispatch)))
+          || !Object.hasOwn(source, 'cancellation')
+          || !Object.hasOwn(source, 'can_cancel')
+          || typeof source.can_cancel !== 'boolean'
+          || (hasCancellation
+            && (typeof source.cancellation !== 'object'
+              || Array.isArray(source.cancellation)))) {
         return null;
       }
       const planSource = hasPlan ? source.plan : {};
       const approvalSource = hasApproval ? source.approval : {};
       const dispatchSource = hasDispatch ? source.dispatch : {};
+      const cancellationSource = hasCancellation ? source.cancellation : {};
+      const cancellationKeys = hasCancellation
+        ? Object.keys(cancellationSource).sort().join(',') : '';
+      const cancellationState = ['requested', 'cancelled', 'superseded']
+        .includes(cancellationSource.state) ? cancellationSource.state : '';
+      const cancellationReason = cancellationSource.reason === 'user_requested'
+        ? cancellationSource.reason : '';
+      const cancellationRequestedAt = boundedGuidedText(
+        cancellationSource.requested_at, 80,
+      );
+      const cancellationResolvedAt = cancellationSource.resolved_at === null
+        ? null : boundedGuidedText(cancellationSource.resolved_at, 80);
+      const cancellationFailureCode = cancellationSource.failure_code === null
+        ? null : (/^[A-Z0-9_]{1,128}$/.test(cancellationSource.failure_code || '')
+          ? cancellationSource.failure_code : '');
+      if (hasCancellation
+          && (cancellationKeys !== 'failure_code,reason,requested_at,resolved_at,state'
+            || !cancellationState
+            || !cancellationReason
+            || !cancellationRequestedAt
+            || cancellationResolvedAt === ''
+            || cancellationFailureCode === '')) {
+        return null;
+      }
       const adapterSource = source.adapter_status && typeof source.adapter_status === 'object'
         ? source.adapter_status
         : (source.runtime_status && typeof source.runtime_status === 'object' ? source.runtime_status : {});
       const dispatchState = dispatchSource.state || dispatchSource.status || '';
-      const adapterStatus = ['Queued', 'Running', 'Succeeded', 'Failed'].includes(adapterSource.status)
+      const adapterStatus = ['Queued', 'Running', 'Succeeded', 'Failed', 'Cancelled'].includes(adapterSource.status)
         ? adapterSource.status : '';
       const planNodeSource = Array.isArray(planSource.nodes) && planSource.nodes.length === 1
         && planSource.nodes[0] && typeof planSource.nodes[0] === 'object'
@@ -2413,6 +2446,14 @@
           failureCode: /^[A-Z0-9_]{1,128}$/.test(dispatchSource.failure_code || '')
             ? dispatchSource.failure_code : '',
         },
+        canCancel: source.can_cancel,
+        cancellation: hasCancellation ? {
+          state: cancellationState,
+          reason: cancellationReason,
+          requestedAt: cancellationRequestedAt,
+          resolvedAt: cancellationResolvedAt,
+          failureCode: cancellationFailureCode,
+        } : null,
         adapter: {
           status: adapterStatus,
           stage: boundedGuidedText(adapterSource.stage, 80),
@@ -2514,6 +2555,22 @@
         const runtimeCancellation = hasPlan && hasApproval
           && normalized.approval.decision === 'approved' && hasDispatch;
         if (!preRuntimeCancellation && !runtimeCancellation) return null;
+      }
+      const cancellableState = ['Queued', 'Running', 'Waiting', 'Retrying']
+        .includes(normalized.status);
+      if (normalized.canCancel && (!cancellableState || normalized.cancellation !== null)) {
+        return null;
+      }
+      if (normalized.cancellation) {
+        if (normalized.canCancel) return null;
+        if (normalized.cancellation.state === 'requested'
+            && (!cancellableState || normalized.cancellation.resolvedAt !== null)) return null;
+        if (normalized.cancellation.state === 'cancelled'
+            && (normalized.status !== 'Cancelled'
+              || !normalized.cancellation.resolvedAt)) return null;
+        if (normalized.cancellation.state === 'superseded'
+            && (!['Succeeded', 'Failed'].includes(normalized.status)
+              || !normalized.cancellation.resolvedAt)) return null;
       }
       return normalized;
     }
@@ -2776,6 +2833,8 @@
         learningRateMilli: task.draft.learningRateMilli,
         progressCompleted: adapter.completed ?? null,
         progressTotal: adapter.total ?? null,
+        canCancel: task.canCancel === true,
+        cancellation: task.cancellation ? { ...task.cancellation } : null,
         resultReady: task.status === 'Succeeded',
         visibilityRevision: task.visibilityRevision,
         trashedAt: task.trashedAt,
@@ -3296,7 +3355,7 @@
           ${renderGuidedOptimizationAdviceHtml(form)}
           <label class="text-xs font-semibold text-slate-600">迭代次数（1–10000）
             <input id="guidedIterations" type="number" min="1" max="10000" step="1" value="${escapeHtml(String(form.iterations))}" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm" required>
-            <span class="mt-1 block font-normal text-amber-700">超过 100 次可能长时间占用计算资源；当前不支持运行中取消。</span>
+            <span class="mt-1 block font-normal text-amber-700">超过 100 次可能长时间占用计算资源；受支持的托管 Worker 运行后，任务卡会提供取消，只有状态变为 Cancelled 才表示已经停止。</span>
           </label>
           <label class="text-xs font-semibold text-slate-600">随机种子（0–2147483647）
             <input id="guidedSeed" type="number" min="0" max="2147483647" step="1" value="${escapeHtml(String(form.seed))}" class="mt-1 w-full rounded-lg border border-slate-200 p-2 text-sm" required>
@@ -3361,6 +3420,16 @@
       return explanations[stateName] || '等待持久派发状态。';
     }
 
+    function guidedCancellationExplanation(cancellation) {
+      if (!cancellation) return '';
+      const explanations = {
+        requested: '用户取消请求已持久化，正在等待受控 Worker 安全停止；当前状态不能视为已取消。',
+        cancelled: '取消已完成，任务状态已由服务端确认变为 Cancelled。',
+        superseded: '取消请求到达前任务已经自然终结；原终态保持不变。',
+      };
+      return explanations[cancellation.state] || '';
+    }
+
     function renderGuidedTaskHtml() {
       const task = state.guided.task;
       if (!task) return '';
@@ -3369,12 +3438,21 @@
       const total = adapter.total === null ? '—' : adapter.total;
       const isCrashState = ['pending', 'dispatching', 'reconciliation_required'].includes(task.dispatch.state);
       const linkedToCurrent = isTaskReferencedByChat(state.chats[state.chatId], task.taskId);
+      const cancellationPending = task.cancellation?.state === 'requested';
+      const cancellationHtml = task.cancellation
+        ? `<dt>取消状态</dt><dd>${escapeHtml(task.cancellation.state)}</dd><dt>取消说明</dt><dd>${escapeHtml(guidedCancellationExplanation(task.cancellation))}</dd><dt>取消请求时间</dt><dd>${escapeHtml(task.cancellation.requestedAt || '—')}</dd>${task.cancellation.resolvedAt ? `<dt>取消解决时间</dt><dd>${escapeHtml(task.cancellation.resolvedAt)}</dd>` : ''}${task.cancellation.failureCode ? `<dt>取消状态码</dt><dd class="font-mono">${escapeHtml(task.cancellation.failureCode)}</dd>` : ''}`
+        : '';
+      const cancelButton = cancellationPending
+        ? '<button type="button" disabled class="px-3 py-2 rounded-lg border border-amber-300 bg-amber-50 text-sm text-amber-800 opacity-70">取消处理中…</button>'
+        : (task.canCancel
+          ? `<button type="button" onclick="cancelGuidedTask()"${state.guided.mutation ? ' disabled' : ''} class="px-3 py-2 rounded-lg border border-red-200 bg-white text-sm text-red-700 disabled:opacity-40">${state.guided.mutation === 'cancel' ? '正在请求取消…' : '取消任务'}</button>`
+          : '');
       const error = state.guided.error
         ? `<p class="mt-3 text-sm text-red-700" role="alert">${escapeHtml(state.guided.error)}</p>` : '';
       return `<section class="rounded-lg border ${isCrashState ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-white'} p-4" data-guided-view="task">
         <div class="flex flex-wrap items-start justify-between gap-3"><div><h4 class="font-heading font-semibold text-slate-900">Scientific Runtime task</h4><p class="text-xs text-slate-500 mt-1">SQLite 是任务状态真源；轮询只执行 GET</p></div><span class="data-pill ${task.status === 'Succeeded' ? '' : 'warning'}">${escapeHtml(task.status)}</span></div>
-        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd><dt>optimizer / LR</dt><dd class="font-mono">${escapeHtml(`${(task.draft.optimizer || 'legacy').toUpperCase()} / ${task.draft.learningRate || 'preset default'}`)}</dd><dt>dispatch</dt><dd>${escapeHtml(task.dispatch.state || 'not recorded')}</dd><dt>dispatch evidence</dt><dd>${escapeHtml(guidedDispatchExplanation(task.dispatch.state))}</dd><dt>Adapter status</dt><dd>${escapeHtml(adapter.status || 'not available')}</dd><dt>stage</dt><dd>${escapeHtml(adapter.stage || '—')}</dd><dt>progress</dt><dd>${escapeHtml(`${completed} / ${total}`)}</dd><dt>message</dt><dd>${escapeHtml(adapter.message || task.dispatch.failureCode || '等待状态更新')}</dd></dl>
-        <div class="mt-3 flex flex-wrap gap-2">${task.status === 'Succeeded' ? '' : '<button type="button" onclick="refreshGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">刷新状态（GET）</button>'}${linkedToCurrent ? '<button type="button" onclick="unlinkCurrentConversationFromGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">从当前对话移除引用</button>' : '<button type="button" onclick="linkCurrentConversationToGuidedTask()" class="px-3 py-2 rounded-lg border border-accent/40 bg-accent/5 text-sm text-accent">关联当前对话</button>'}</div>${error}
+        <dl class="kv-grid mt-4"><dt>task_id</dt><dd class="font-mono">${escapeHtml(task.taskId)}</dd><dt>SQLite status</dt><dd>${escapeHtml(task.status)}</dd><dt>optimizer / LR</dt><dd class="font-mono">${escapeHtml(`${(task.draft.optimizer || 'legacy').toUpperCase()} / ${task.draft.learningRate || 'preset default'}`)}</dd><dt>dispatch</dt><dd>${escapeHtml(task.dispatch.state || 'not recorded')}</dd><dt>dispatch evidence</dt><dd>${escapeHtml(guidedDispatchExplanation(task.dispatch.state))}</dd><dt>Adapter status</dt><dd>${escapeHtml(adapter.status || 'not available')}</dd><dt>stage</dt><dd>${escapeHtml(adapter.stage || '—')}</dd><dt>progress</dt><dd>${escapeHtml(`${completed} / ${total}`)}</dd><dt>message</dt><dd>${escapeHtml(adapter.message || task.dispatch.failureCode || '等待状态更新')}</dd>${cancellationHtml}</dl>
+        <div class="mt-3 flex flex-wrap gap-2">${cancelButton}${task.status === 'Succeeded' ? '' : '<button type="button" onclick="refreshGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">刷新状态（GET）</button>'}${linkedToCurrent ? '<button type="button" onclick="unlinkCurrentConversationFromGuidedTask()" class="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm">从当前对话移除引用</button>' : '<button type="button" onclick="linkCurrentConversationToGuidedTask()" class="px-3 py-2 rounded-lg border border-accent/40 bg-accent/5 text-sm text-accent">关联当前对话</button>'}</div>${error}
       </section>`;
     }
 
@@ -3437,7 +3515,8 @@
       } else if (state.guided.phase === 'abandoned') {
         content = `<div class="rounded-lg border border-slate-200 bg-slate-50 p-4" data-guided-view="abandoned"><p class="font-semibold text-slate-800">草稿已放弃</p><p class="text-sm text-slate-500 mt-1">仅终止了 pre-runtime 草稿；没有发送运行中取消请求。</p></div>`;
       } else if (state.guided.phase === 'outcome_unknown') {
-        content = `<div class="rounded-lg border border-red-200 bg-red-50 p-4" data-guided-view="outcome-unknown" role="alert"><h4 class="font-semibold text-red-800">Mutation 结果未知</h4><p class="text-sm text-red-700 mt-1">${escapeHtml(state.guided.error || '连接在确认响应前中断。')}</p><p class="text-xs text-red-600 mt-2">不会更换 Idempotency-Key 或自动重发。${state.guided.taskId ? '仅用 GET 查询已有 task。' : '请由服务端审计确认 mutation 结果。'}</p>${state.guided.taskId ? '<button type="button" onclick="refreshGuidedTask()" class="mt-3 px-3 py-2 rounded-lg border border-red-300 bg-white text-sm text-red-700">仅查询 task（GET）</button>' : ''}</div>`;
+        const cancelReplay = state.guided.cancelReplayAvailable === true;
+        content = `<div class="rounded-lg border border-red-200 bg-red-50 p-4" data-guided-view="outcome-unknown" role="alert"><h4 class="font-semibold text-red-800">Mutation 结果未知</h4><p class="text-sm text-red-700 mt-1">${escapeHtml(state.guided.error || '连接在确认响应前中断。')}</p><p class="text-xs text-red-600 mt-2">不会更换 Idempotency-Key 或自动重发。${state.guided.taskId ? '仅用 GET 查询已有 task。' : '请由服务端审计确认 mutation 结果。'}</p><div class="mt-3 flex flex-wrap gap-2">${state.guided.taskId ? '<button type="button" onclick="refreshGuidedTask()" class="px-3 py-2 rounded-lg border border-red-300 bg-white text-sm text-red-700">仅查询 task（GET）</button>' : ''}${cancelReplay ? '<button type="button" onclick="continueGuidedCancel()" class="px-3 py-2 rounded-lg bg-red-700 text-sm text-white">继续取消（复用原 Idempotency-Key）</button>' : ''}</div></div>`;
       } else if (state.guided.phase === 'error') {
         content = `<div class="rounded-lg border border-red-200 bg-red-50 p-4" role="alert"><h4 class="font-semibold text-red-800">Guided FWI 暂不可用</h4><p class="text-sm text-red-700 mt-1">${escapeHtml(state.guided.error || '未知错误')}</p><button type="button" onclick="closeGuidedFwi()" class="mt-3 px-3 py-2 rounded-lg border border-red-300 bg-white text-sm">关闭</button></div>`;
       } else {
@@ -3840,11 +3919,92 @@
       }
     }
 
+    function continueGuidedCancel() {
+      if (state.guided.phase !== 'outcome_unknown'
+          || state.guided.cancelReplayAvailable !== true) return false;
+      return cancelGuidedTask({ replay: true });
+    }
+
+    async function cancelGuidedTask(options) {
+      options = options || {};
+      const task = state.guided.task;
+      const replay = options.replay === true;
+      if (state.guided.mutation || !task || !isSafeGuidedOpaqueId(task.taskId)) return false;
+      if (replay) {
+        if (state.guided.phase !== 'outcome_unknown'
+            || state.guided.cancelReplayAvailable !== true
+            || task.cancellation !== null) return false;
+      } else {
+        if (task.canCancel !== true || task.cancellation !== null) return false;
+        if (typeof window.confirm === 'function'
+            && !window.confirm('请求取消这个运行中任务？请求会持久化并由服务端安全终止 Worker；只有状态变为 Cancelled 才表示已经停止。关闭任务视图、删除对话或移除引用都不会取消任务。')) {
+          return false;
+        }
+      }
+      const returnPhase = replay ? 'monitoring' : state.guided.phase;
+      const body = { reason: 'user_requested' };
+      const key = guidedMutationKey(`cancel:${task.taskId}`, body);
+      state.guided.mutation = 'cancel';
+      state.guided.error = '';
+      clearGuidedPoll();
+      renderGuidedFwi();
+      try {
+        const data = await guidedApiRequest(guidedApiPath('cancel', task.taskId), {
+          method: 'POST', body, idempotencyKey: key,
+        });
+        const updated = normalizeGuidedTaskProjection(data, task.taskId);
+        if (!updated || !updated.cancellation
+            || updated.cancellation.reason !== 'user_requested') {
+          throw guidedInvalidMutationResponse('cancel response 未确认持久取消请求');
+        }
+        state.guided.task = updated;
+        state.guided.mutation = '';
+        state.guided.error = '';
+        state.guided.outcomeUnknown = false;
+        state.guided.cancelReplayAvailable = false;
+        upsertGuidedTaskIndex(updated);
+        if (updated.status === 'Succeeded') {
+          state.guided.phase = 'succeeded';
+          await loadGuidedArtifacts({ render: false });
+        } else if (['Failed', 'Cancelled'].includes(updated.status)
+            || updated.dispatch.state === 'reconciliation_required') {
+          state.guided.phase = 'terminal';
+        } else {
+          state.guided.phase = 'monitoring';
+          scheduleGuidedPoll();
+        }
+        renderGuidedFwi();
+        showToast(updated.cancellation.state === 'requested'
+          ? '取消请求已持久化；任务尚未确认停止'
+          : (updated.cancellation.state === 'cancelled'
+            ? '任务已确认取消' : '任务已自然终结，取消请求未改写终态'));
+        return true;
+      } catch (error) {
+        state.guided.mutation = '';
+        state.guided.error = error && error.message ? error.message : '取消请求失败';
+        if (error && error.guidedOutcomeUnknown) {
+          state.guided.phase = 'outcome_unknown';
+          state.guided.outcomeUnknown = true;
+          state.guided.cancelReplayAvailable = true;
+          scheduleGuidedPoll(0);
+        } else {
+          state.guided.phase = returnPhase;
+          state.guided.cancelReplayAvailable = false;
+          if (!['terminal', 'succeeded', 'closed'].includes(returnPhase)) {
+            scheduleGuidedPoll();
+          }
+        }
+        renderGuidedFwi();
+        return false;
+      }
+    }
+
     async function refreshGuidedTask() {
       const taskId = state.guided.taskId;
       if (!isSafeGuidedOpaqueId(taskId) || state.guided.pollInFlight) return false;
       const generation = state.guided.generation;
       const protectedApproval = state.guided.approvalReplayAvailable === true;
+      const protectedCancel = state.guided.cancelReplayAvailable === true;
       const protectedPlanHash = protectedApproval
         && isSafeGuidedPlanHash(state.guided.task?.plan?.hash)
         ? state.guided.task.plan.hash : '';
@@ -3867,6 +4027,13 @@
         const approvalStillUnproven = protectedApproval
           && !protectedSubmitPending
           && !protectedApprovalCompleted;
+        const protectedCancelCompleted = protectedCancel && task.cancellation !== null;
+        const protectedCancelNaturallyTerminal = protectedCancel
+          && task.cancellation === null
+          && ['Succeeded', 'Failed', 'Cancelled'].includes(task.status);
+        const cancelStillUnproven = protectedCancel
+          && !protectedCancelCompleted
+          && !protectedCancelNaturallyTerminal;
         if (protectedApprovalCompleted) {
           state.guided.outcomeUnknown = false;
           state.guided.approvalReplayAvailable = false;
@@ -3881,7 +4048,16 @@
         } else if (!protectedApproval && approvedSubmitPending) {
           state.guided.outcomeUnknown = false;
         }
-        if (approvalStillUnproven) {
+        if (protectedCancelCompleted || protectedCancelNaturallyTerminal) {
+          state.guided.outcomeUnknown = false;
+          state.guided.cancelReplayAvailable = false;
+        }
+        if (cancelStillUnproven) {
+          state.guided.outcomeUnknown = true;
+          state.guided.cancelReplayAvailable = true;
+          state.guided.phase = 'outcome_unknown';
+          state.guided.error = 'GET 尚未证明原 cancel mutation 已持久化；保留原 Idempotency-Key，不会自动重发。';
+        } else if (approvalStillUnproven) {
           state.guided.outcomeUnknown = true;
           state.guided.approvalReplayAvailable = true;
           state.guided.phase = 'outcome_unknown';

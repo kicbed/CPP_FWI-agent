@@ -8,9 +8,37 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fwi_worker.__main__ import run_worker
+from worker_launch_control import WorkerCancellationRequested
 
 
 class WorkerFailureArtifactsTest(unittest.TestCase):
+    def test_cooperative_cancel_bypasses_failure_artifact_path(self) -> None:
+        config_path = Path(__file__).parent / "fixtures" / "homogeneous_cuda.json"
+
+        def cancel() -> None:
+            raise WorkerCancellationRequested(
+                "cancel-worker-checkpoint-1", "user_requested"
+            )
+
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            os.environ, {"FWI_RUN_ROOT": root}
+        ):
+            with self.assertRaises(WorkerCancellationRequested):
+                run_worker(
+                    "forward",
+                    str(config_path),
+                    None,
+                    cancel_check=cancel,
+                )
+            jobs = list(Path(root).iterdir())
+            self.assertEqual(len(jobs), 1)
+            run_dir = jobs[0]
+            self.assertFalse((run_dir / "metrics.json").exists())
+            self.assertFalse((run_dir / "manifest.json").exists())
+            status = json.loads((run_dir / "status.json").read_text())
+            self.assertEqual(status["status"], "cancelled")
+            self.assertEqual(status["stage"], "cancelled")
+
     def test_device_failure_writes_structured_partial_result(self) -> None:
         config_path = Path(__file__).parent / "fixtures" / "homogeneous_cuda.json"
         with tempfile.TemporaryDirectory() as root, patch.dict(

@@ -10,22 +10,28 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import worker_launch_bootstrap
+import worker_launch_control as worker_control
 from worker_launch_control import (
+    CANCELLED_WORKER_EXIT_CODE,
     CONTROL_DIRECTORY,
     WORKER_HEARTBEAT_NAME,
     WORKER_READY_NAME,
     LaunchAttemptBinding,
     ParentLaunchLease,
+    WorkerCancellationRequested,
     WorkerControlError,
     WorkerHeartbeat,
     execution_fence_is_held,
+    read_worker_cancel_evidence,
     read_worker_attempt_evidence,
+    request_worker_cancel,
     stage_launch_attempt,
     worker_attempt_started,
 )
@@ -64,6 +70,30 @@ def _hold_fenced_worker(
                 heartbeat.stop("failed")
             except Exception:
                 pass
+
+
+def _hard_exit_on_cancel(
+    run_root: str,
+    run_dir: str,
+    attempt_id: str,
+    attempt_fd: int,
+    capacity_fd: int,
+    ready: multiprocessing.Queue,
+) -> None:
+    heartbeat = WorkerHeartbeat(
+        run_root=run_root,
+        run_dir=run_dir,
+        attempt_id=attempt_id,
+        attempt_fd=attempt_fd,
+        capacity_fd=capacity_fd,
+        interval_seconds=0.02,
+        cancel_grace_seconds=0.1,
+    )
+    heartbeat.start()
+    ready.put(os.getpid())
+    # No numerical checkpoint cooperates.  The heartbeat's bounded grace path
+    # must terminate this exact process while the inherited fences are held.
+    time.sleep(10.0)
 
 
 class WorkerLaunchControlTest(unittest.TestCase):
@@ -206,6 +236,241 @@ class WorkerLaunchControlTest(unittest.TestCase):
         finally:
             heartbeat.stop("succeeded")
 
+    def test_exact_cancel_is_acknowledged_and_cooperatively_releases_fences(
+        self,
+    ) -> None:
+        binding, run_dir = self.binding(2)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        hard_exits: list[int] = []
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=1.0,
+            hard_exit=hard_exits.append,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        evidence, replayed = request_worker_cancel(
+            self.root,
+            binding,
+            cancel_id="cancel-cooperative-1",
+            reason="user_requested",
+            requested_at=NOW,
+        )
+        self.assertFalse(replayed)
+        self.assertTrue(evidence.requested)
+        self.assertTrue(execution_fence_is_held(self.root, binding))
+
+        for _ in range(200):
+            evidence = read_worker_cancel_evidence(self.root, binding)
+            if evidence.acknowledged:
+                break
+            time.sleep(0.01)
+        self.assertTrue(evidence.acknowledged)
+        with self.assertRaises(WorkerCancellationRequested) as raised:
+            heartbeat.raise_if_cancel_requested()
+        self.assertEqual(raised.exception.cancel_id, "cancel-cooperative-1")
+        self.assertEqual(raised.exception.reason, "user_requested")
+        self.assertTrue(execution_fence_is_held(self.root, binding))
+
+        heartbeat.stop("stopped")
+        self.assertEqual(hard_exits, [])
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+        attempt = read_worker_attempt_evidence(self.root, run_dir, binding)
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertEqual(attempt.heartbeat_state, "stopped")
+        replay, was_replayed = request_worker_cancel(
+            self.root,
+            binding,
+            cancel_id="cancel-cooperative-1",
+            reason="user_requested",
+            requested_at="2026-07-16T08:01:00Z",
+        )
+        self.assertTrue(was_replayed)
+        self.assertEqual(replay.request_record_hash, evidence.request_record_hash)
+        with self.assertRaisesRegex(WorkerControlError, "WORKER_CANCEL_CONFLICT"):
+            request_worker_cancel(
+                self.root,
+                binding,
+                cancel_id="cancel-conflict-2",
+                reason="user_requested",
+                requested_at=NOW,
+            )
+        self.assertFalse(
+            any("cancel" in path.name for path in run_dir.iterdir())
+        )
+
+    def test_uncooperative_worker_self_exits_after_bounded_cancel_grace(self) -> None:
+        binding, run_dir = self.binding(3)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        context = multiprocessing.get_context("fork")
+        ready = context.Queue()
+        process = context.Process(
+            target=_hard_exit_on_cancel,
+            args=(
+                str(self.root),
+                str(run_dir),
+                binding.attempt_id,
+                lease.attempt_fd,
+                lease.capacity_fd,
+                ready,
+            ),
+        )
+        process.start()
+        try:
+            lease.mark_spawned(process.pid)
+            lease.close_parent()
+            self.assertEqual(ready.get(timeout=5.0), process.pid)
+            request_worker_cancel(
+                self.root,
+                binding,
+                cancel_id="cancel-hard-exit-1",
+                reason="user_requested",
+                requested_at=NOW,
+            )
+            process.join(5.0)
+            self.assertFalse(process.is_alive())
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join(5.0)
+        self.assertEqual(process.exitcode, CANCELLED_WORKER_EXIT_CODE)
+        evidence = read_worker_cancel_evidence(self.root, binding)
+        self.assertTrue(evidence.acknowledged)
+        attempt = read_worker_attempt_evidence(self.root, run_dir, binding)
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertEqual(attempt.heartbeat_state, "stopped")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_hard_exit_is_called_even_if_stopped_heartbeat_write_fails(self) -> None:
+        binding, run_dir = self.binding(6)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        hard_exits: list[int] = []
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=0.1,
+            hard_exit=hard_exits.append,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        original_write = heartbeat._write_heartbeat
+
+        def fail_stopped(state: str) -> None:
+            if state == "stopped":
+                raise WorkerControlError(
+                    "WORKER_HEARTBEAT_FAILED: synthetic stopped write failure"
+                )
+            original_write(state)
+
+        with patch.object(
+            heartbeat, "_write_heartbeat", side_effect=fail_stopped
+        ):
+            request_worker_cancel(
+                self.root,
+                binding,
+                cancel_id="cancel-hard-write-failure-1",
+                reason="user_requested",
+                requested_at=NOW,
+            )
+            for _ in range(200):
+                if hard_exits:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(hard_exits, [CANCELLED_WORKER_EXIT_CODE])
+            # The injected callback returned instead of terminating this test
+            # process, so stop() reports the heartbeat failure but still closes
+            # both inherited descriptors in its finally block.
+            with self.assertRaisesRegex(
+                WorkerControlError, "WORKER_HEARTBEAT_FAILED"
+            ):
+                heartbeat.stop("stopped")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_append_only_request_name_never_exposes_partial_json(self) -> None:
+        binding, run_dir = self.binding(5)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=300.0,
+            hard_exit=lambda _code: None,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        first_write = threading.Event()
+        release_write = threading.Event()
+        real_write = worker_control.os.write
+        result: list[object] = []
+
+        def delayed_write(descriptor: int, data: bytes) -> int:
+            if not first_write.is_set():
+                size = max(1, len(data) // 2)
+                written = real_write(descriptor, data[:size])
+                first_write.set()
+                release_write.wait(2.0)
+                return written
+            return real_write(descriptor, data)
+
+        def publish() -> None:
+            try:
+                result.append(
+                    request_worker_cancel(
+                        self.root,
+                        binding,
+                        cancel_id="cancel-atomic-publication-1",
+                        reason="user_requested",
+                        requested_at=NOW,
+                    )
+                )
+            except BaseException as error:  # pragma: no cover - asserted below
+                result.append(error)
+
+        thread = threading.Thread(target=publish)
+        try:
+            with patch.object(
+                worker_control.os, "write", side_effect=delayed_write
+            ):
+                thread.start()
+                self.assertTrue(first_write.wait(2.0))
+                while_the_writer_is_blocked = read_worker_cancel_evidence(
+                    self.root, binding
+                )
+                self.assertFalse(while_the_writer_is_blocked.requested)
+                release_write.set()
+                thread.join(2.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(result), 1)
+            self.assertIsInstance(result[0], tuple)
+            for _ in range(200):
+                evidence = read_worker_cancel_evidence(self.root, binding)
+                if evidence.acknowledged:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(evidence.acknowledged)
+        finally:
+            release_write.set()
+            if thread.is_alive():
+                thread.join(2.0)
+            heartbeat.stop("stopped")
+
     def test_staged_attempt_evidence_is_not_a_liveness_decision(self) -> None:
         binding, run_dir = self.binding(8)
         evidence = read_worker_attempt_evidence(self.root, run_dir, binding)
@@ -311,10 +576,17 @@ class WorkerLaunchControlTest(unittest.TestCase):
         observed_ready: list[bool] = []
 
         def synthetic_run_worker(
-            command, config, requested_run_dir, *, managed_launch=False
+            command,
+            config,
+            requested_run_dir,
+            *,
+            managed_launch=False,
+            cancel_check=None,
         ):
             observed_ready.append(
-                (run_dir / WORKER_READY_NAME).is_file() and managed_launch
+                (run_dir / WORKER_READY_NAME).is_file()
+                and managed_launch
+                and callable(cancel_check)
             )
             return {"status": "synthetic", "command": command}
 
@@ -358,6 +630,133 @@ class WorkerLaunchControlTest(unittest.TestCase):
                 ".worker-ready.json",
             ],
         )
+
+    def test_staged_attempt_cannot_receive_cancel_before_worker_capability(
+        self,
+    ) -> None:
+        binding, run_dir = self.binding(4)
+        with self.assertRaisesRegex(
+            WorkerControlError, "WORKER_CANCEL_UNSUPPORTED"
+        ):
+            read_worker_cancel_evidence(self.root, binding)
+        with self.assertRaisesRegex(
+            WorkerControlError, "WORKER_CANCEL_UNSUPPORTED"
+        ):
+            request_worker_cancel(
+                self.root,
+                binding,
+                cancel_id="cancel-before-capability-1",
+                reason="user_requested",
+                requested_at=NOW,
+            )
+        self.assertFalse(
+            (self.root / CONTROL_DIRECTORY / "worker-cancel").exists()
+        )
+
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        try:
+            evidence = read_worker_cancel_evidence(self.root, binding)
+            self.assertFalse(evidence.requested)
+        finally:
+            heartbeat.stop("succeeded")
+
+    def test_bootstrap_releases_fences_only_after_worker_unwind_finishes(
+        self,
+    ) -> None:
+        binding, run_dir = self.binding(7)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        attempt_fd = os.dup(lease.attempt_fd)
+        capacity_fd = os.dup(lease.capacity_fd)
+        lease.close_parent()
+        entered = threading.Event()
+        unwinding = threading.Event()
+        finish_unwind = threading.Event()
+        results: list[int] = []
+
+        def synthetic_run_worker(
+            _command,
+            _config,
+            _requested_run_dir,
+            *,
+            managed_launch=False,
+            cancel_check=None,
+        ):
+            self.assertTrue(managed_launch)
+            self.assertTrue(callable(cancel_check))
+            entered.set()
+            try:
+                while True:
+                    cancel_check()
+                    time.sleep(0.005)
+            finally:
+                unwinding.set()
+                finish_unwind.wait(2.0)
+
+        arguments = [
+            "--command",
+            "invert",
+            "--config",
+            str(run_dir / "config.original.json"),
+            "--run-dir",
+            str(run_dir),
+            "--run-root",
+            str(self.root),
+            "--launch-attempt-id",
+            binding.attempt_id,
+            "--launch-attempt-fd",
+            str(attempt_fd),
+            "--capacity-lease-fd",
+            str(capacity_fd),
+        ]
+        with patch.object(
+            worker_launch_bootstrap,
+            "_load_run_worker",
+            return_value=synthetic_run_worker,
+        ):
+            thread = threading.Thread(
+                target=lambda: results.append(
+                    worker_launch_bootstrap.main(arguments)
+                )
+            )
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2.0))
+                request_worker_cancel(
+                    self.root,
+                    binding,
+                    cancel_id="cancel-bootstrap-unwind-1",
+                    reason="user_requested",
+                    requested_at=NOW,
+                )
+                self.assertTrue(unwinding.wait(2.0))
+                self.assertTrue(execution_fence_is_held(self.root, binding))
+                finish_unwind.set()
+                thread.join(2.0)
+            finally:
+                finish_unwind.set()
+                if thread.is_alive():
+                    thread.join(2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [CANCELLED_WORKER_EXIT_CODE])
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+        evidence = read_worker_cancel_evidence(self.root, binding)
+        self.assertTrue(evidence.acknowledged)
+        attempt = read_worker_attempt_evidence(self.root, run_dir, binding)
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertEqual(attempt.heartbeat_state, "stopped")
 
     def test_real_exec_inherits_fds_and_releases_capacity_after_failure(self) -> None:
         binding, run_dir = self.binding(9)

@@ -35,6 +35,8 @@ from scientific_runtime import (
     TaskStoreConflict,
 )
 from scientific_runtime.fwi_adapter import (
+    AdapterIdempotencyConflict,
+    AdapterManagedCancelProof,
     AdapterUnavailable,
     DeepwaveAdapter,
     SafeSubprocessWorkerLauncher,
@@ -43,8 +45,10 @@ from scientific_runtime_contracts import compute_plan_hash, schema_errors
 from worker_launch_control import (
     LaunchAttemptBinding,
     ParentLaunchLease,
+    WorkerCancellationRequested,
     WorkerHeartbeat,
     binding_from_submission_record,
+    read_worker_cancel_evidence,
     read_worker_attempt_evidence,
     stage_launch_attempt,
 )
@@ -432,6 +436,53 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         )
         self.assertTrue(self.launcher.calls)
         return handle, self.launcher.calls[-1]["run_dir"]
+
+    def start_exact_worker(
+        self, handle: Any, run_dir: Path
+    ) -> tuple[LaunchAttemptBinding, WorkerHeartbeat]:
+        record = json.loads(
+            self.submission_record_path(handle).read_text(encoding="utf-8")
+        )
+        binding = binding_from_submission_record(record)
+        lease = ParentLaunchLease.acquire(
+            self.run_root, run_dir, max_active=2
+        )
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.run_root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+            cancel_grace_seconds=300.0,
+            hard_exit=lambda _code: None,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        return binding, heartbeat
+
+    def dispatched_intent(self, handle: Any) -> DispatchIntentSnapshot:
+        return DispatchIntentSnapshot(
+            intent_id=f"dispatch-{handle.task_id}",
+            task_id=handle.task_id,
+            plan_id=f"plan-{handle.task_id}",
+            plan_hash=handle.plan_hash,
+            approval_id=f"approval-{handle.task_id}",
+            node_id=handle.node_id,
+            node_idempotency_key=handle.idempotency_key,
+            adapter_id="fwi.deepwave_adapter",
+            adapter_version=handle.adapter_version,
+            request={"algorithm": copy.deepcopy(handle.algorithm)},
+            request_hash="sha256:" + "e" * 64,
+            queue_fingerprint=copy.deepcopy(handle.fingerprint),
+            state="dispatched",
+            handle=handle.as_dict(),
+            failure_code=None,
+            created_at=NOW,
+            dispatch_claimed_at=NOW,
+            outcome_recorded_at=NOW,
+        )
 
     def write_status(self, run_dir: Path, status: str) -> None:
         config = json.loads(
@@ -1933,6 +1984,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         record_path = self.submission_record_path(handle)
         record = json.loads(record_path.read_text(encoding="utf-8"))
         self.assertEqual(record["adapter_version"], "1.4.0")
+        current_binding = binding_from_submission_record(record)
         record["schema_version"] = "1.0.0"
         record.pop("launch_attempt")
         self.adapter._write_submission(record_path, record)
@@ -1949,6 +2001,28 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(
             proof.receipt_record_hash,
             json.loads(record_path.read_text(encoding="utf-8"))["record_hash"],
+        )
+        self.assertFalse(
+            reopened.supports_exact_cancel(
+                recovered, attempt_id=current_binding.attempt_id
+            )
+        )
+        cancel = reopened.cancel(
+            recovered,
+            cancel_id="cancel-private-v1-deferred-1",
+            attempt_id=current_binding.attempt_id,
+            reason="user_requested",
+        )
+        self.assertIsInstance(cancel, AdapterManagedCancelProof)
+        self.assertEqual(cancel.state, "deferred")
+        self.assertEqual(cancel.code, "CANCEL_MANAGED_ATTEMPT_UNAVAILABLE")
+        cancel_dir = (
+            self.run_root
+            / fwi_adapter_module.CONTROL_DIRECTORY
+            / "worker-cancel"
+        )
+        self.assertFalse(
+            (cancel_dir / f"{current_binding.attempt_id}.request.json").exists()
         )
         with self.assertRaises(AdapterUnavailable) as unavailable:
             reopened.observe_existing_worker_attempt(**copy.deepcopy(request))
@@ -1973,6 +2047,255 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertIn("CANCEL_NOT_SUPPORTED", encoded)
         self.assertEqual(_status_name(self.adapter.status(handle)), "queued")
         self.assertEqual(len(self.launcher.calls), 1)
+
+    def test_dispatcher_cancel_is_exact_idempotent_and_fence_proven(self) -> None:
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-managed-cancel",
+            idempotency_key="task-managed-cancel:invert:0001",
+        )
+        binding, heartbeat = self.start_exact_worker(handle, run_dir)
+        dispatcher = DeepwaveTaskDispatcher(self.adapter)
+        intent = self.dispatched_intent(handle)
+        request_id = "cancel-managed-request-1"
+        wrong_attempt = "attempt-" + "f" * 32
+        try:
+            self.assertTrue(
+                dispatcher.supports_exact_cancel(
+                    intent, attempt_id=binding.attempt_id
+                )
+            )
+            self.assertFalse(
+                dispatcher.supports_exact_cancel(
+                    intent, attempt_id=wrong_attempt
+                )
+            )
+            mismatch = dispatcher.cancel(
+                intent,
+                request_id="cancel-wrong-attempt-1",
+                attempt_id=wrong_attempt,
+                reason="user_requested",
+            )
+            self.assertEqual(mismatch["state"], "deferred")
+            self.assertEqual(mismatch["code"], "CANCEL_ATTEMPT_MISMATCH")
+            self.assertFalse(
+                read_worker_cancel_evidence(
+                    self.run_root, binding
+                ).requested
+            )
+
+            requested = dispatcher.cancel(
+                intent,
+                request_id=request_id,
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(requested["state"], "requested")
+            self.assertEqual(requested["reason"], "user_requested")
+            self.assertFalse(requested["replayed"])
+            self.assertNotIn(str(self.run_root), json.dumps(requested))
+
+            for _ in range(200):
+                evidence = read_worker_cancel_evidence(
+                    self.run_root, binding
+                )
+                if evidence.acknowledged:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(evidence.acknowledged)
+            self.write_status(run_dir, "cancelled")
+            with self.assertRaises(RuntimeError):
+                self.adapter.status(handle)
+            pending = dispatcher.cancel(
+                intent,
+                request_id=request_id,
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(pending["state"], "pending")
+            self.assertTrue(pending["replayed"])
+            with self.assertRaises(AdapterIdempotencyConflict):
+                self.adapter.cancel(
+                    handle,
+                    cancel_id="cancel-conflicting-request-2",
+                    attempt_id=binding.attempt_id,
+                    reason="user_requested",
+                )
+
+            with self.assertRaises(WorkerCancellationRequested):
+                heartbeat.raise_if_cancel_requested()
+            heartbeat.stop("stopped")
+            heartbeat = None
+            self.assertEqual(self.adapter.status(handle).status, "Cancelled")
+            completed = dispatcher.cancel(
+                intent,
+                request_id=request_id,
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(completed["state"], "cancelled")
+            self.assertEqual(completed["terminal_status"], "Cancelled")
+            self.assertEqual(_status_name(self.adapter.status(handle)), "cancelled")
+            replay = dispatcher.cancel(
+                intent,
+                request_id=request_id,
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(replay["state"], "cancelled")
+            self.assertTrue(replay["replayed"])
+
+            cancel_dir = (
+                self.run_root
+                / fwi_adapter_module.CONTROL_DIRECTORY
+                / "worker-cancel"
+            )
+            interrupted_temp = cancel_dir / (
+                f".{binding.attempt_id}.request.json.interrupted"
+            )
+            interrupted_temp.write_text("inert unpublished bytes", encoding="utf-8")
+            interrupted_temp.chmod(0o600)
+            purged = self.adapter.purge(
+                handle, purge_id="purge-managed-cancel-1"
+            )
+            self.assertEqual(purged.local_run_state, "deleted")
+            self.assertFalse(run_dir.exists())
+            self.assertEqual(
+                list(cancel_dir.glob(f"{binding.attempt_id}.*")), []
+            )
+            self.assertFalse(interrupted_temp.exists())
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop("stopped")
+
+    def test_current_schema_without_worker_capability_defers_without_request(
+        self,
+    ) -> None:
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-no-cancel-capability",
+            idempotency_key="task-no-cancel-capability:invert:0001",
+        )
+        record = json.loads(
+            self.submission_record_path(handle).read_text(encoding="utf-8")
+        )
+        binding = binding_from_submission_record(record)
+        lease = ParentLaunchLease.acquire(
+            self.run_root, run_dir, max_active=2
+        )
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.run_root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=60.0,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        # Let the current heartbeat enter its long wait, then remove the
+        # capability to model a still-running pre-capability schema-1.1 Worker.
+        time.sleep(0.05)
+        cancel_dir = (
+            self.run_root
+            / fwi_adapter_module.CONTROL_DIRECTORY
+            / "worker-cancel"
+        )
+        capability = cancel_dir / f"{binding.attempt_id}.capability.json"
+        capability.unlink()
+        intent = self.dispatched_intent(handle)
+        dispatcher = DeepwaveTaskDispatcher(self.adapter)
+        try:
+            self.assertFalse(
+                dispatcher.supports_exact_cancel(
+                    intent, attempt_id=binding.attempt_id
+                )
+            )
+            deferred = dispatcher.cancel(
+                intent,
+                request_id="cancel-no-capability-1",
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(deferred["state"], "deferred")
+            self.assertEqual(
+                deferred["code"], "CANCEL_WORKER_CAPABILITY_UNAVAILABLE"
+            )
+            self.assertFalse(
+                (cancel_dir / f"{binding.attempt_id}.request.json").exists()
+            )
+        finally:
+            heartbeat.stop("succeeded")
+
+    def test_natural_terminal_wins_without_creating_cancel_request(self) -> None:
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-natural-terminal-cancel",
+            idempotency_key="task-natural-terminal-cancel:invert:0001",
+        )
+        record = json.loads(
+            self.submission_record_path(handle).read_text(encoding="utf-8")
+        )
+        binding = binding_from_submission_record(record)
+        self.write_success_artifacts(run_dir)
+        proof = self.adapter.cancel(
+            handle,
+            cancel_id="cancel-after-success-1",
+            attempt_id=binding.attempt_id,
+            reason="user_requested",
+        )
+        self.assertIsInstance(proof, AdapterManagedCancelProof)
+        document = proof.as_dict()
+        self.assertEqual(document["state"], "terminal_won")
+        self.assertEqual(document["terminal_status"], "Succeeded")
+        with self.assertRaisesRegex(
+            RuntimeError, "WORKER_CANCEL_UNSUPPORTED"
+        ):
+            read_worker_cancel_evidence(self.run_root, binding)
+        cancel_dir = (
+            self.run_root
+            / fwi_adapter_module.CONTROL_DIRECTORY
+            / "worker-cancel"
+        )
+        self.assertFalse(
+            (cancel_dir / f"{binding.attempt_id}.request.json").exists()
+        )
+        self.assertEqual(self.adapter.status(handle).status, "Succeeded")
+
+    def test_natural_success_after_cancel_request_is_never_overwritten(self) -> None:
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-natural-terminal-race",
+            idempotency_key="task-natural-terminal-race:invert:0001",
+        )
+        binding, heartbeat = self.start_exact_worker(handle, run_dir)
+        dispatcher = DeepwaveTaskDispatcher(self.adapter)
+        intent = self.dispatched_intent(handle)
+        request_id = "cancel-natural-terminal-race-1"
+        try:
+            requested = dispatcher.cancel(
+                intent,
+                request_id=request_id,
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(requested["state"], "requested")
+            self.write_success_artifacts(run_dir)
+            heartbeat.stop("succeeded")
+            heartbeat = None
+            terminal = dispatcher.cancel(
+                intent,
+                request_id=request_id,
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(terminal["state"], "terminal_won")
+            self.assertEqual(terminal["terminal_status"], "Succeeded")
+            self.assertEqual(self.adapter.status(handle).status, "Succeeded")
+            status = json.loads(
+                (run_dir / "status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["status"], "succeeded")
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop("succeeded")
 
     def test_status_redacts_worker_errors_and_cancel_ignores_status_corruption(self) -> None:
         handle, run_dir = self.submit_and_run_dir(
@@ -2391,8 +2714,8 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         corrected = json.loads(
             (run_dir / "status.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(corrected["status"], "failed")
-        self.assertEqual(corrected["stage"], "worker_exit")
+        self.assertEqual(corrected["status"], "succeeded")
+        self.assertEqual(corrected["stage"], "complete")
 
     def test_run_root_swap_race_is_rejected_by_openat_boundary(self) -> None:
         race_root = self.base / "race-target"

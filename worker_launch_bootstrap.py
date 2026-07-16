@@ -14,7 +14,11 @@ import json
 import sys
 from typing import Any
 
-from worker_launch_control import WorkerHeartbeat
+from worker_launch_control import (
+    CANCELLED_WORKER_EXIT_CODE,
+    WorkerCancellationRequested,
+    WorkerHeartbeat,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,17 +53,24 @@ def main(argv: list[str] | None = None) -> int:
             capacity_fd=args.capacity_lease_fd,
         )
         heartbeat.start()
+        heartbeat.raise_if_cancel_requested()
         run_worker = _load_run_worker()
         result = run_worker(
             args.command,
             args.config,
             args.run_dir,
             managed_launch=True,
+            cancel_check=heartbeat.raise_if_cancel_requested,
         )
         heartbeat.stop("succeeded")
         heartbeat = None
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
+    except WorkerCancellationRequested:
+        if heartbeat is not None:
+            heartbeat.stop("stopped")
+            heartbeat = None
+        return CANCELLED_WORKER_EXIT_CODE
     except BaseException as error:
         if heartbeat is not None:
             try:

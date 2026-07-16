@@ -98,6 +98,16 @@ class RuntimeSupervisorTaskService(Protocol):
     ) -> Any:
         ...
 
+    def process_runtime_cancellation(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: Any,
+    ) -> Any:
+        ...
+
 
 @dataclass(frozen=True)
 class RuntimeSupervisorCycleResult:
@@ -111,6 +121,8 @@ class RuntimeSupervisorCycleResult:
     adopted_task_ids: tuple[str, ...] = ()
     scheduled_task_ids: tuple[str, ...] = ()
     dispatched_task_ids: tuple[str, ...] = ()
+    cancel_processed_task_ids: tuple[str, ...] = ()
+    cancel_resolved_task_ids: tuple[str, ...] = ()
 
 
 class _SupervisorFailure(RuntimeError):
@@ -538,6 +550,8 @@ class RuntimeSupervisor:
         adopted: list[str] = []
         scheduled: list[str] = []
         dispatched: list[str] = []
+        cancel_processed: list[str] = []
+        cancel_resolved: list[str] = []
         deferred: list[tuple[str, str]] = []
         failures: list[tuple[str, str]] = []
         for snapshot in snapshots:
@@ -551,6 +565,61 @@ class RuntimeSupervisor:
             lease, next_heartbeat = self._heartbeat_if_due(
                 lease, next_heartbeat
             )
+            cancellation = getattr(snapshot, "cancellation", None)
+            if getattr(cancellation, "state", None) == "requested":
+                try:
+                    cancellation_result = (
+                        self._task_service.process_runtime_cancellation(
+                            task_id,
+                            project_id=self._project_id,
+                            principal_id=self._principal_id,
+                            supervisor_lease=lease,
+                        )
+                    )
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "CANCEL_PROCESS_FAILED"
+                            ),
+                        )
+                    )
+                    continue
+                cancellation_state = getattr(
+                    cancellation_result, "state", None
+                )
+                cancellation_snapshot = getattr(
+                    cancellation_result, "snapshot", None
+                )
+                deferred_code = getattr(
+                    cancellation_result, "deferred_code", None
+                )
+                if (
+                    getattr(cancellation_snapshot, "task_id", None) != task_id
+                    or cancellation_state
+                    not in {"requested", "cancelled", "superseded"}
+                    or (
+                        deferred_code is not None
+                        and (
+                            not isinstance(deferred_code, str)
+                            or _STABLE_CODE.fullmatch(deferred_code) is None
+                        )
+                    )
+                ):
+                    raise _SupervisorFailure(FATAL)
+                cancel_processed.append(task_id)
+                if cancellation_state == "requested":
+                    deferred.append(
+                        (task_id, deferred_code or "CANCEL_IN_PROGRESS")
+                    )
+                else:
+                    cancel_resolved.append(task_id)
+                # A durable request owns this task's terminal race.  Neither
+                # first dispatch nor the ordinary status pump may run in the
+                # same cycle after cancellation processing.
+                continue
             try:
                 intent = self._task_service.get_dispatch_intent(
                     task_id,
@@ -754,6 +823,8 @@ class RuntimeSupervisor:
                 adopted_task_ids=tuple(adopted),
                 scheduled_task_ids=tuple(scheduled),
                 dispatched_task_ids=tuple(dispatched),
+                cancel_processed_task_ids=tuple(cancel_processed),
+                cancel_resolved_task_ids=tuple(cancel_resolved),
             ),
             lease,
             next_heartbeat,

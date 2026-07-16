@@ -24,6 +24,7 @@ class InversionResult:
 
 
 ProgressCallback = Callable[[int, float, float | None], None]
+CancellationCheck = Callable[[], None]
 
 
 def run_inversion(
@@ -32,6 +33,7 @@ def run_inversion(
     config: FWIConfig,
     geometry: AcquisitionGeometry,
     progress: ProgressCallback | None = None,
+    cancel_check: CancellationCheck | None = None,
 ) -> InversionResult:
     if config.iterations < 1:
         raise ValueError("inversion requires iterations >= 1")
@@ -66,12 +68,16 @@ def run_inversion(
     # State k is the model after k updates.  Recording k=0 and k=N makes the
     # initial/final comparison explicit without hiding the last model update.
     for state_index in range(config.iterations + 1):
+        if cancel_check is not None:
+            cancel_check()
         needs_gradient = state_index < config.iterations
         if needs_gradient:
             optimizer.zero_grad(set_to_none=True)
         predictions: list[torch.Tensor] = []
         total_loss_value = 0.0
         for shot_slice in shot_slices(config.n_shots, config.shot_batch_size):
+            if cancel_check is not None:
+                cancel_check()
             # Use a batch-specific geometry to avoid propagating all shots at
             # once while retaining one shared model parameter.
             batch_geometry = AcquisitionGeometry(
@@ -91,6 +97,8 @@ def run_inversion(
                 prediction = simulate_tensor(
                     velocity, batch_config, batch_geometry, wavelet=wavelet
                 )
+                if cancel_check is not None:
+                    cancel_check()
                 residual = prediction - observed[shot_slice]
                 batch_loss = torch.sum(residual.square()) / observed_energy
             if not torch.isfinite(prediction).all().item():
@@ -136,6 +144,8 @@ def run_inversion(
             clip_values.append(clip_value)
         if progress is not None:
             progress(state_index, total_loss_value, clip_value)
+        if cancel_check is not None:
+            cancel_check()
 
     assert final_predicted is not None
     inverted = velocity.detach().cpu().numpy().astype(np.float32, copy=False)

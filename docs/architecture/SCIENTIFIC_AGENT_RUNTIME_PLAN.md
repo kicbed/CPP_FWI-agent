@@ -6,8 +6,9 @@
 - 决策状态：**Accepted**
 - Runtime 实现状态：**P0 + P1 Verified；P2.1 任务发现/重开、P2.2 可恢复回收站、P2.3
   本地结果永久删除、P2.4 启动 receipt 收养/状态追赶、P2.5A 控制面 fenced lease/持续状态泵与
-  P2.5B 固定 Adapter 托管 Worker launch fence、P2.5C fenced Worker 证据投影/late adoption
-  以及 P2.6 可恢复 fenced scheduler/受监督首次派发均为有界 Verified；完整 P2 仍 Pending**
+  P2.5B 固定 Adapter 托管 Worker launch fence、P2.5C fenced Worker 证据投影/late adoption、
+  P2.6 可恢复 fenced scheduler/受监督首次派发以及 P2.7 exact-attempt user cancellation 均为
+  有界 Verified；完整 P2 仍 Pending**
 - 用户确认日期：2026-07-15
 - 实现分支：`feature/scientific-agent-runtime`
 - 基线分支：`feature/fwi-deepwave-2d-acoustic`
@@ -280,7 +281,7 @@ Pending，未因 Guided Web 状态轮询而提前实现恢复语义。后续 D-0
 - SSE 任务事件和浏览器刷新恢复；
 - 多任务列表，不再每个对话只保留一个 FWI job。
 
-当前有八个有界先行切片；它们不改变完整 P2 的出口条件。
+当前有九个有界先行切片；它们不改变完整 P2 的出口条件。
 
 **P2.1 任务发现/重开**：
 
@@ -427,10 +428,24 @@ task 的 scope-bound read-only inventory，不调用 Adapter、不写 outcome/st
 `reconciliation_required` resolution、SSE、standalone CLI/C++ MCP capacity 与通用 scheduler 仍
 Pending，因此完整 P2 仍为 **Pending**。
 
-D-011 之后规划的四类中等切片中，可恢复 fenced scheduler/首次派发已由 P2.6 关闭；剩余优先
-聚合为 exact-attempt cancel 与 timeout、有限 retry 与 reconciliation resolution、SSE 与完整 P2 故障/
-CPU/CUDA 出口验收。这是当前规划基线而非固定配额；只有具体安全或验证证据才允许继续拆分，
-拆分理由必须写入进度账本，且不得降低上述完整 P2 出口条件。
+继续 D-003 后实现的有界 **P2.7 exact-attempt user cancellation** 在 SQLite v11 增加不可变
+request、active-term delivery authorization 和 terminal outcome。只有 current Algorithm/Adapter
+1.4、private schema 1.1、durable dispatched、最新 v9 spawned+ready+running observation 且 exact
+Worker 已发布 capability 的任务可 admission。HTTP 只做只读 probe 与持久化；Task 在请求期仍为
+Queued/Running，active Supervisor term 才发布 append-only request。
+
+Worker 持有 inherited execution/capacity fence 时自行 ack，并在安全点 cooperative unwind；宽限
+耗尽时由该 exact process `os._exit(75)`，控制面不信任持久 PID，也不发送 kill。Adapter 只有在
+request + ack + stopped heartbeat + idle execution `flock` 全部成立后才证明 Cancelled；自然
+Succeeded/Failed 抢先则保持原终态并把 cancellation 标为 superseded。pending/staged、legacy
+private schema 1.0 和公共 Adapter 1.0–1.3 不进入该边界。
+
+D-011 之后规划的四类中等切片中，可恢复 fenced scheduler/首次派发已由 P2.6 关闭，exact-attempt
+user cancel 已由 P2.7 关闭。timeout 因仍需决定终态语义、计时起点和 force policy，与 cancel
+分开保持 Pending；其后依次为有限 retry 与 reconciliation resolution、SSE 与完整 P2 故障/CPU/CUDA
+出口验收。这是当前规划基线而非固定配额；只有具体安全或验证证据才允许继续拆分，拆分理由
+必须写入进度账本，且不得降低上述完整 P2 出口条件。`resources.wall_time_seconds` 仍只是资源
+策略字段，不是 runtime timeout。
 
 完成标准：重复请求不重复建任务；控制面重启后恢复或明确终结任务；取消能到达 Worker；
 已提交任务不依赖浏览器连接存活。
@@ -545,3 +560,4 @@ PlanGraph、批准和资源边界控制。
 | 2026-07-16 | 实现 P2.5C fenced Worker 证据投影/late adoption：SQLite v9 exact attempt/heartbeat sample、active-term adoption、dispatching observation 与 dispatched 独立低频 cadence；首次派发与 lifecycle control 继续延期 | 用户继续 D-003；先让 Supervisor 在不拥有 launcher 的边界内消费 P2.5B 证据并证明 late-ready 收养不重复启动 |
 | 2026-07-16 | 采纳 D-011 弹性中等切片、独立多算法选项与分级测试；阶段/质量门保留，P5 不再强制自动端到端算法链 | 用户澄清只希望不降质量地减少过细切片；切片数允许基于真实风险小幅浮动，不固定为 12，也不得无说明膨胀为几十个 |
 | 2026-07-16 | 实现 P2.6 可恢复 fenced scheduler/受监督首次派发：enqueue-only submit、SQLite v10 active-term authorization、pending/no-record 首派、exact staged 同 attempt 恢复与 legacy-private receipt fenced adoption；cancel/timeout/reconciliation/SSE 继续延期 | 用户继续 D-003；按 D-011 将同一调度状态机、Adapter kernel fence 和崩溃出口测试合并为一个中等切片 |
+| 2026-07-16 | 实现 P2.7 exact-attempt user cancellation：SQLite v11 durable admission/active-term delivery/outcome、Worker self-cancel、ack + stopped heartbeat + idle execution fence 终态证明及 Guided Web 状态；timeout 单独延期 | 用户继续 D-003；基于 P2.6 已验证的 exact managed attempt 与 kernel fence 关闭用户取消窗口，同时因终态语义、计时起点和 force policy 尚未决定而不把 timeout 混入本切片 |

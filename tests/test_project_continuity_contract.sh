@@ -58,6 +58,8 @@ required_files=(
     scientific_runtime/migrations/0007_task_purge.sql
     scientific_runtime/migrations/0008_runtime_supervisor.sql
     scientific_runtime/migrations/0009_worker_attempt_projection.sql
+    scientific_runtime/migrations/0010_supervised_dispatch.sql
+    scientific_runtime/migrations/0011_task_cancellation.sql
     tests/test_scientific_runtime_registry.py
     tests/test_scientific_runtime_fwi_adapter.py
     tests/test_scientific_runtime_fwi_purge.py
@@ -78,7 +80,10 @@ required_files=(
     fwi_worker/adapter_probe.py
     fwi_worker/__main__.py
     fwi_worker/artifacts.py
+    fwi_worker/inversion.py
+    fwi_worker/job_state.py
     tests/fwi_worker/test_state_artifacts.py
+    tests/fwi_worker/test_worker_failure.py
     web/serve.py
     web/workbench_api.py
     web/tests/test_artifact_route.py
@@ -120,12 +125,13 @@ require_text docs/PROJECT_CONTINUITY.md '## D-010：'
 require_text docs/PROJECT_CONTINUITY.md '低 token 自动接续与 CodeGraph 导航'
 require_text docs/PROJECT_CONTINUITY.md 'D-003 是 D-001 的通用化，不替代 D-001'
 require_text docs/PROJECT_CONTINUITY.md 'Proposed / awaiting user confirmation'
-require_text docs/PROJECT_CONTINUITY.md 'P2.1–P2.6 有界切片'
+require_text docs/PROJECT_CONTINUITY.md 'P2.1–P2.7 有界切片'
 require_text docs/PROJECT_CONTINUITY.md '完整 P2 Pending'
 require_text docs/PROJECT_CONTINUITY.md '精确历史七个 form 字段'
 require_text docs/PROJECT_CONTINUITY.md '当前 Algorithm/Adapter `deepwave.acoustic_fwi@1.4.0`/`1.4.0`'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '<!-- scientific-agent-runtime-plan: v1 -->'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '完整 P2 仍 Pending'
+require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md 'P2.7 exact-attempt user cancellation'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md '<!-- scientific-runtime-p0-contracts: v1 -->'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'P1.1a TaskStore、P1.1b Registry 与 P1.2a 固定 Deepwave'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md 'submit/API/调度仍未实现'
@@ -146,7 +152,7 @@ require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '实现状态
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md 'Guided 路由 fail closed 为 503'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '当前浏览器的 create/revise mutation 始终发送完整九个 form 字段'
 require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '不广告 legacy Worker/MCP `forward`'
-require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '仍属 Pending：运行中 cancel'
+require_text docs/architecture/SCIENTIFIC_RUNTIME_P1_GUIDED_WEB.md '`P2-007` 已实现有界 exact-attempt user cancellation'
 require_text docs/PROJECT_PROGRESS.md '<!-- project-progress-schema: v1 -->'
 require_text docs/PROJECT_PROGRESS.md 'P2-001 有界发现/重开已验证'
 require_text docs/PROJECT_PROGRESS.md '完整 P2 Pending'
@@ -157,6 +163,11 @@ require_text docs/PROJECT_PROGRESS.md 'P1-008 / D-008'
 require_text docs/PROJECT_PROGRESS.md 'P2-002 / D-008'
 require_text docs/PROJECT_PROGRESS.md 'P2-003 / D-009'
 require_text docs/PROJECT_PROGRESS.md 'P2-005C fenced Worker 证据投影与 late adoption'
+require_text docs/PROJECT_PROGRESS.md 'P2-007 exact-attempt user cancellation'
+require_text docs/PROJECT_CURRENT_STATE.md '不是 runtime timeout；timeout 尚未实现'
+require_text docs/PROJECT_PROGRESS.md 'timeout、有限 retry、完整 reconciliation/SSE'
+require_text scientific_runtime/migrations/0011_task_cancellation.sql 'CREATE TABLE task_cancel_requests'
+require_text scientific_runtime/migrations/0011_task_cancellation.sql 'deliver_exact_attempt_cancel'
 require_text docs/PROJECT_PROGRESS.md 'D-010 / PREP-004'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'

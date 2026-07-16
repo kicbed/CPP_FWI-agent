@@ -75,6 +75,9 @@ class FakeApplication:
     def abandon_task(self, task_id, key):
         return self._call("abandon_task", task_id, key)
 
+    def cancel_task(self, task_id, key, reason):
+        return self._call("cancel_task", task_id, key, reason)
+
     def trash_task(self, task_id, expected_visibility_revision, key):
         return self._call(
             "trash_task", task_id, expected_visibility_revision, key
@@ -450,6 +453,42 @@ class WorkbenchAPITest(unittest.TestCase):
             self.application.calls[-1],
             ("abandon_task", ("task-1", "browser-mutation-0001"), {}),
         )
+
+        response = self.mutation(
+            "POST", f"{task_path}/cancel", {"reason": "user_requested"}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            self.application.calls[-1],
+            (
+                "cancel_task",
+                ("task-1", "browser-mutation-0001", "user_requested"),
+                {},
+            ),
+        )
+
+        for payload in (
+            {},
+            {"reason": "wall_time_exceeded"},
+            {"reason": True},
+            {"reason": "user_requested", "task_id": "other"},
+        ):
+            with self.subTest(cancel_payload=payload):
+                previous_calls = len(self.application.calls)
+                response = self.mutation("POST", f"{task_path}/cancel", payload)
+                self.assertEqual(response.status, 422)
+                self.assertEqual(
+                    self.decode(response)["error"]["code"], "INVALID_CANCEL"
+                )
+                self.assertEqual(len(self.application.calls), previous_calls)
+
+        previous_calls = len(self.application.calls)
+        response = self.api.dispatch(
+            "GET", f"{task_path}/cancel", self.get_headers(), b""
+        )
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.headers["Allow"], "POST")
+        self.assertEqual(len(self.application.calls), previous_calls)
 
         response = self.mutation(
             "POST", f"{task_path}/trash", {"expected_visibility_revision": 0}

@@ -9,13 +9,14 @@
 - 总体状态：**P0 + P1（含 P1-008）已验证；P2-001 有界发现/重开已验证，P2-002 回收站、
   P2-003 永久删除、P2-004 启动 receipt 收养、P2-005A 控制面 Supervisor lease/连续状态泵与
   P2-005B 固定 Adapter 托管 Worker launch fence、P2-005C fenced Worker 证据投影/late adoption、
-  P2-006 可恢复 fenced scheduler/受监督首次派发均为有界 Verified；完整 P2 Pending**
-- 当前阶段：**P2-006 可恢复 fenced scheduler 与受监督首次派发已验证；完整 P2 继续进行**
-- 下一动作：基于 exact attempt 与 kernel fence 实现 cancel/timeout；随后推进有限 retry 与
-  reconciliation resolution
+  P2-006 可恢复 fenced scheduler/受监督首次派发与 P2-007 exact-attempt user cancellation 均为
+  有界 Verified；完整 P2 Pending**
+- 当前阶段：**P2-007 exact-attempt user cancellation 已验证；完整 P2 继续进行**
+- 下一动作：先确认 timeout 的终态语义、计时起点和 force policy，再实现 timeout；随后推进
+  有限 retry 与 reconciliation resolution
 - 交付粒度：D-011 采用弹性中等切片，约十余个只是估算；保留逐切片验证和阶段质量门，不为
   migration/字段/单项测试单独制造路线切片，确有安全/验证证据时允许合理增加并记录原因
-- 当前阻塞：无
+- 当前阻塞：P2-007 无阻塞；timeout 产品语义等待用户决定
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
 
 本文是跨 Codex 会话的**执行进度真源**，但不是实时进程数据库。每个新会话必须先核对
@@ -29,7 +30,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
 | P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 31/31；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
 | P1 最小持久垂直切片 | Verified | 既有 P1 Task Store/Registry/Adapter/atomic submit/Guided Web 全闭环及 D-006/D-007；D-008/P1-008 增加 Conversation/Task 可选引用、无级联本地对话删除和当前 Algorithm/Adapter 1.4 的 2 数值 + 6 PNG 结果画廊 | Runtime 165/165、Worker 28/28、Web 29/29、Embedding 6/6、CTest 39/39、MCP 1/1 及 UI/治理 PASS；fresh v6 CUDA 10 events、8 artifacts/6 PNG、数值更新和重启不变性 PASS | —（P1 及当前维护切片完成） |
-| P2 持久可靠性加固 | In progress（P2-001–P2-006 有界切片 Verified；完整 P2 Pending） | 在既有发现/回收、控制面 lease 与 Worker kernel fence 上，P2-006 增加 SQLite v10 active-term 派发授权、enqueue-only submit、pending/no-record 首派、exact staged 同 attempt 恢复及 legacy-private receipt fenced adoption | P2-006 最终自动化/治理证据见本页对应小节；只运行轻量真实 exec，未重跑数值 FWI/CUDA | exact-attempt cancel、timeout、有限重试、完整 reconciliation 与 SSE |
+| P2 持久可靠性加固 | In progress（P2-001–P2-007 有界切片 Verified；完整 P2 Pending） | 在既有调度、控制面 lease 与 Worker kernel fence 上，P2-007 增加 SQLite v11 durable cancel、active-term delivery、exact Worker self-cancel 证明及 Guided Web 状态 | P2-007 最终自动化/治理证据见本页对应小节；运行 CPU smoke，未运行 CUDA | timeout、有限重试、完整 reconciliation 与 SSE |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
 | P5 算法 SDK | Pending | 无 | 无 | 受控数据可匹配多个独立算法；新增真实插件无需 Orchestrator 关键词且 conformance 通过 |
@@ -48,8 +49,9 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 - 当前通用 Orchestrator 仍以固定/单跳路由为主；P1 的历史 checkpoint 以 atomic submit 后的
   one-shot dispatch 形成最小闭环。P2-006 当前产品路径已经改为 HTTP submit 只做 prepare/Gate 与
   `Queued/pending` 原子 admission，active-term Runtime Supervisor 才能首次派发 current 1.4。
-  Worker 执行和同机容量仍由 P2-005B inherited `flock` 围栏；SQLite v10 不是 Worker lease。
-  当前仍无 DAG、运行中取消、timeout、task retry、reconciliation resolution 或 SSE。
+  Worker 执行和同机容量仍由 P2-005B inherited `flock` 围栏；SQLite v10/v11 不是 Worker lease。
+  P2-007 已提供有界 exact-attempt user cancel；当前仍无 DAG、timeout、task retry、
+  reconciliation resolution 或 SSE。
 - D-006/P1-006 已把固定 FWI 的显式整数上限扩展为 10000；该 checkpoint 使用
   Algorithm/Adapter `1.1.0`。D-007 的 `1.2.0` 是不可变六参数历史快照，`1.3.0` 是已验证
   checkpoint；D-008 当前新提交使用 `1.4.0`，旧 `1.0.0`–`1.3.0` manifest、persisted Plan
@@ -96,6 +98,13 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   adoption。Supervisor 负责 pending 首派、dispatching/no-record 接管和 exact staged 同 attempt
   恢复；submission lock 与 inherited execution/capacity `flock` 关闭 SQLite 与文件系统之间的竞态。
   startup pass 已收敛为 lease 前只读 inventory，不再调用 Adapter 或写 outcome/status。
+- P2-007 已验证：SQLite v11 以 request/authorization/outcome 三组 append-only 记录把 user cancel
+  绑定到 current Algorithm/Adapter 1.4、private schema 1.1、durable dispatched intent、最新 v9
+  spawned+ready+running observation 与 Worker-published capability。HTTP admission 只做只读能力
+  probe 和持久化，不发布 Worker request；active Supervisor term 才投递。Worker 通过 append-only
+  request/ack 自行 cooperative unwind，宽限耗尽则 exact process `os._exit(75)`，控制面从不根据
+  持久 PID 发 signal。只有 ack、stopped heartbeat 与 idle execution `flock` 同时成立才提交
+  Task/RunEvent `Cancelled`；自然 Succeeded/Failed 抢先则 cancellation 记为 superseded。
 - D-003 已批准“双模式单任务内核、动态规划控制面 + 确定性执行面”。
 - D-011 已批准：保持阶段、依赖、测试和安全质量，减少过细切片但不取消慢速逐步开发；切片数
   是弹性估算而非固定 12。多算法表示多个独立可选工具，自动串联完整处理流程不作为当前出口。
@@ -118,8 +127,9 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   声称所有 runtime write 都由唯一 Supervisor 独占。kernel `flock` 仍是执行/容量权威，heartbeat
   不是 lease 或 takeover 信号；standalone CLI/C++ MCP 不在该投影/容量边界，升级前或首次扫描前
   已终态的 task 不保证 evidence backfill。不完整 staging、确定性 Adapter/receipt 错误仍需未来
-  reconciliation；取消、超时、有限 retry、完整 reconciliation/SSE、P3 DAG 和 P4 Agent Planner
-  仍未实现。
+  reconciliation；timeout、有限 retry、完整 reconciliation/SSE、P3 DAG 和 P4 Agent Planner
+  仍未实现。P2-007 不支持 pending/staged、legacy private schema 1.0 或公共 Adapter 1.0–1.3；
+  `resources.wall_time_seconds` 只是资源策略字段，不是 runtime timeout。
 - P2-002 的普通“删除”仍只是可恢复 visibility Trash/Restore；D-009/P2-003 另提供强确认的
   本地 Worker 目录/result purge，但不硬删 Draft、Plan、Approval、RunEvent、幂等记录或
   SQLite 审计历史，也不清除备份/外部副本。服务器 transcript 永久删除仍未实现。
@@ -573,18 +583,52 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
   exec，按 D-011 未重复 CUDA。
 - 本切片不修复不完整 staging（缺 job dir/ticket/config/status 或内容分歧），也不把确定性 launch/
   receipt 错误自动写成已解决状态；这些保持 fail-closed，等待 `reconciliation_required` resolution。
-  cancel、timeout、有限 task retry、SSE、standalone CLI/C++ MCP capacity 和通用 Algorithm scheduler
-  仍 Pending，因此完整 P2 未完成。
+  P2-007 已在下一切片关闭 exact current managed attempt 的 user cancel；timeout、有限 task retry、
+  SSE、standalone CLI/C++ MCP capacity 和通用 Algorithm scheduler 仍 Pending，因此完整 P2 未完成。
+
+### P2-007 exact-attempt user cancellation（2026-07-16）
+
+- SQLite v11 新增 append-only `task_cancel_requests`、`supervised_cancel_attempts` 与
+  `task_cancel_outcomes`。admission 在同一事务内绑定 current Algorithm/Adapter `1.4.0`、private
+  schema `1.1.0`、durable `dispatched` intent、最新 v9 `spawned + ready + running` exact attempt 和
+  Worker 已发布的 capability；同一任务只允许一个 immutable request，精确 idempotency replay
+  返回原记录，stale/expired/released/ABA Supervisor term 不能交付或提交 outcome。
+- HTTP `POST /api/scientific-runtime/v1/tasks/{task_id}/cancel` 只接受
+  `{"reason":"user_requested"}`，复用同源、CSRF 与 Idempotency-Key 边界。请求线程只做 Adapter
+  capability 的只读 probe 和 durable admission，不发布 Worker request、不读取持久 PID、更不发送
+  signal；请求期 Task 继续保持 `Queued/Running`。
+- active Runtime Supervisor term 先于普通 scheduling/projection/status 处理取消，并只向 exact
+  attempt 发布 append-only request。Worker 验证 inherited submission/execution/capacity fences 后
+  自行 ack，在数值安全点 cooperative unwind；宽限耗尽时由该 exact process `os._exit(75)`，控制面
+  没有 PID kill 路径。Adapter/Store 双重验证 request/capability/ack/receipt 哈希链和终态 proof。
+- 只有 exact acknowledgement、`stopped` heartbeat 与 idle execution `flock` 同时成立，Supervisor
+  才原子提交 `task_cancelled` RunEvent、Task `Cancelled` 和 cancellation outcome。自然
+  `Succeeded/Failed` 先完成时保留其终态并把取消记为 `superseded`；二者的竞争只允许一个 durable
+  winner，proof 的 terminal status 必须与该 winner 一致。
+- Guided Web 只在详情页 exact probe 成功时显示取消能力，并区分 `requested`、`cancelled`、
+  `superseded`；未知响应保留原 Idempotency-Key，只允许用户显式重试。关闭任务视图、放弃待批准
+  草稿、移入回收站和永久删除都不会冒充 runtime cancel。列表查询继续保持 SQLite-only，避免
+  N 次文件系统 probe。
+- 本项为 **Verified**：Scientific Runtime 271/271、固定 venv Worker 31/31（含 CPU Deepwave
+  smoke 3/3）与 launch-control 17/17、Web 46/46、Embedding 6/6、根 CTest 39/39、MCP 1/1、
+  Node UI、continuity/launcher/runtime-secret/helper、shell syntax、`py_compile` 与 diff check
+  均 PASS。覆盖空/跨 request/跨终态 proof、direct-SQL bypass、历史/latest attempt、stale term、
+  取消与自然终态竞争、宽限后 Worker 自退出、未知 HTTP 响应及 v10→v11 原位升级；本切片运行
+  CPU 数值 smoke，未运行 CUDA。
+- 本切片不支持 dispatch pending、staged attempt、legacy private schema `1.0.0`、公共
+  Adapter/Algorithm `1.0.0`–`1.3.0` 或历史 attempt；也不把 `resources.wall_time_seconds` 当作
+  runtime timeout。最终分级回归证据见本页末尾 P2-007 checkpoint 行。
 
 ### 完整 P2 仍 Pending
 
 P1 的既有必需交付与退出测试仍为 Verified。用户后续明确授权的 P2-001 任务发现/重开与
 P2-002 可恢复任务回收站、P2-003 本地结果永久删除和本次 P2-004 有界 receipt 收养/状态追赶
 以及 P2-005A 控制面 Supervisor、P2-005B 固定 Adapter 托管 Worker launch fence、P2-005C
-fenced Worker 证据投影/late adoption、P2-006 fenced scheduler/受监督首次派发均已 Verified。
-P2-006 已关闭 current managed pending/no-record 首派和 exact staged 同 attempt 恢复，但
-`reconciliation_required` resolution、
-cancel、timeout、task retry 与 SSE 也未实现。服务器 transcript 永久删除、SQLite 审计历史硬
+fenced Worker 证据投影/late adoption、P2-006 fenced scheduler/受监督首次派发和 P2-007
+exact-attempt user cancellation 均已 Verified。P2-006 已关闭 current managed pending/no-record
+首派和 exact staged 同 attempt 恢复；P2-007 只关闭上述 exact current managed attempt 的用户取消。
+timeout、task retry、`reconciliation_required` resolution 与 SSE 仍未实现。服务器 transcript
+永久删除、SQLite 审计历史硬
 删除和备份/外部副本清理仍 Pending。
 D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 
@@ -637,6 +681,7 @@ D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 | 2026-07-16 | P2-005C | Pending → Implemented → Verified；完整 P2 仍 Pending | SQLite v9 exact Worker attempt/heartbeat samples、active-term/monotonic/JSON-column fence、latest-only replay、atomic late adoption；Adapter/Dispatcher observation 与 Supervisor dispatching/60s dispatched cadence，零 launcher | TaskService 82/82、Adapter + launch-control 44/44、Runtime 241/241、Worker 非数值 26/26、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；未运行 Deepwave 数值 FWI/CUDA | 下一步实现可恢复 fenced scheduler，先证明 pending/no-record 首次派发/重启不重复；cancel/timeout/有限 retry/reconciliation/SSE 仍 Pending |
 | 2026-07-16 | D-011 / PLAN-002 | Proposed → Accepted → Implemented / Verified（governance）；运行时阶段不变 | 弹性中等切片、独立多算法选项、显式工作流与分级测试规则；P5 不再强制自动去噪/QC/FWI 链 | continuity、launcher、helper、runtime-secret isolation、diff check：PASS；仅文档/治理变更，未运行数值 FWI/CUDA | 继续当前 P2 可恢复 fenced scheduler；仅在真实安全/验证边界出现时增加切片并记录依据 |
 | 2026-07-16 | P2-006 | Pending → Implemented → Verified；完整 P2 仍 Pending | enqueue-only submit、SQLite v10 active-term dispatch authorization、pending/no-record 首派、exact staged 同 attempt 恢复、current 1.4 legacy-private receipt fenced adoption 与 lease 前只读 inventory | Runtime 251/251、固定 venv Worker 非数值 + launch-control 37/37、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI、continuity/launcher/runtime-secret/helper/diff PASS；未运行数值 FWI/CUDA | 下一步基于 exact attempt/kernel fence 实现 cancel/timeout；随后有限 retry、reconciliation resolution 与 SSE |
+| 2026-07-16 | P2-007 | Pending → Implemented → Verified；完整 P2 仍 Pending | SQLite v11 exact request/active-term authorization/outcome、Worker-published capability 与 self-cancel、ack + stopped heartbeat + idle execution fence 终态证明、自然终态 superseded 竞争和 Guided Web requested/cancelled/superseded | Runtime 271/271、固定 venv Worker 31/31（CPU smoke 3/3）+ launch-control 17/17、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI、治理/编译/diff PASS；未运行 CUDA | 先由用户确认 timeout 的终态语义、计时起点和 force policy；随后有限 retry、reconciliation resolution 与 SSE |
 
 记录规则：
 

@@ -11,7 +11,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -37,6 +37,7 @@ from .job_state import JobState
 from .metrics import calculate_metrics, environment_info
 from .model_io import load_model, make_initial_model
 from .plots import generate_all_plots
+from worker_launch_control import WorkerCancellationRequested
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -139,12 +140,18 @@ def _save_arrays(
         save_npy(run_dir / relative, value.astype(np.float32, copy=False))
 
 
+def _check_cancel(cancel_check: Callable[[], None] | None) -> None:
+    if cancel_check is not None:
+        cancel_check()
+
+
 def run_worker(
     command: str,
     config_path: str,
     requested_run_dir: str | None,
     *,
     managed_launch: bool = False,
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     raw, config = load_config(config_path)
     if command == "forward":
@@ -171,6 +178,7 @@ def run_worker(
     completed_losses: list[float] = []
     numerical_failure_reason: str | None = None
     try:
+        _check_cancel(cancel_check)
         write_json(run_dir / "config.original.json", raw)
         state.update(
             "running",
@@ -190,6 +198,7 @@ def run_worker(
         )
         _write_loss_csv(run_dir / "loss.csv", [], config.source_frequency_hz)
         validate_device(config.device)
+        _check_cancel(cancel_check)
         loaded = load_model(config)
         true_velocity = loaded.velocity
         initial_velocity = make_initial_model(true_velocity, config)
@@ -198,6 +207,7 @@ def run_worker(
         write_json(run_dir / "config.resolved.json", resolved)
         save_npy(run_dir / "models/true.npy", true_velocity)
         save_npy(run_dir / "models/initial.npy", initial_velocity)
+        _check_cancel(cancel_check)
 
         if config.device == "cuda":
             torch.cuda.reset_peak_memory_stats(0)
@@ -209,6 +219,7 @@ def run_worker(
             "Generating synthetic observed data with the true model",
         )
         observed_result = forward_model(true_velocity, config, geometry)
+        _check_cancel(cancel_check)
         observed = observed_result.receiver_amplitudes
         save_npy(run_dir / "data/observed.npy", observed)
         first_arrival = (
@@ -253,6 +264,7 @@ def run_worker(
                     "Running a small-model directional derivative check before demo FWI",
                 )
                 gradient_check = small_model_gradient_check(config.device)
+                _check_cancel(cancel_check)
                 state.append_progress(
                     {
                         "event": "gradient_check",
@@ -291,7 +303,12 @@ def run_worker(
                 )
 
             inversion = run_inversion(
-                initial_velocity, observed, config, geometry, progress=progress
+                initial_velocity,
+                observed,
+                config,
+                geometry,
+                progress=progress,
+                cancel_check=cancel_check,
             )
             inverted = inversion.inverted_velocity
             predicted = inversion.predicted_data
@@ -309,6 +326,7 @@ def run_worker(
 
         if config.device == "cuda":
             torch.cuda.synchronize(0)
+        _check_cancel(cancel_check)
         _save_arrays(
             run_dir,
             true_velocity,
@@ -337,6 +355,7 @@ def run_worker(
             config=config,
             geometry=geometry,
         )
+        _check_cancel(cancel_check)
         elapsed = time.perf_counter() - start
         metrics = calculate_metrics(
             config=config,
@@ -378,6 +397,16 @@ def run_worker(
             manifest_url=f"/fwi-artifacts/{job_id}/manifest.json",
         )
         return manifest
+    except WorkerCancellationRequested:
+        previous = state.read() or {}
+        state.update(
+            "cancelled",
+            "cancelled",
+            int(previous.get("iteration", 0)),
+            config.iterations,
+            "FWI Worker cancellation acknowledged",
+        )
+        raise
     except Exception as error:
         state.append_log(traceback.format_exc().rstrip())
         try:

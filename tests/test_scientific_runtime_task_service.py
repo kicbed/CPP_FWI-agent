@@ -188,6 +188,13 @@ class FakeDispatcher:
         self.worker_observation: dict | None = None
         self.worker_observation_failure_code: str | None = None
         self.status_calls = 0
+        self.exact_cancel_supported = True
+        self.exact_cancel_barrier: threading.Barrier | None = None
+        self.cancel_calls = 0
+        self.cancel_requests: list[tuple[str, str, str]] = []
+        self.cancel_result_state = "cancelled"
+        self.cancel_terminal_status: str | None = "Cancelled"
+        self.cancel_code: str | None = None
         self.collect_calls = 0
         self.read_calls = 0
         self.purge_calls = 0
@@ -342,6 +349,52 @@ class FakeDispatcher:
         )
         return value
 
+    def supports_exact_cancel(self, intent, *, attempt_id):
+        if self.exact_cancel_barrier is not None:
+            self.exact_cancel_barrier.wait(timeout=5)
+        return (
+            self.exact_cancel_supported
+            and intent.adapter_id == "fwi.deepwave_adapter"
+            and intent.adapter_version == CURRENT_ADAPTER_VERSION
+            and isinstance(attempt_id, str)
+            and attempt_id.startswith("attempt-")
+        )
+
+    def cancel(self, intent, *, request_id, attempt_id, reason):
+        with self.lock:
+            self.cancel_calls += 1
+            self.cancel_requests.append((request_id, attempt_id, reason))
+        code = self.cancel_code or {
+            "requested": "CANCEL_REQUESTED",
+            "pending": "CANCEL_PENDING",
+            "cancelled": "CANCEL_COMPLETED",
+            "terminal_won": "CANCEL_TERMINAL_WON",
+            "deferred": "CANCEL_WORKER_NOT_RUNNING",
+        }[self.cancel_result_state]
+        requested = self.cancel_result_state in {"requested", "pending", "cancelled"}
+        acknowledged = self.cancel_result_state == "cancelled"
+        payload = {
+            "schema_version": "1.0.0",
+            "task_id": intent.task_id,
+            "request_id": request_id,
+            "reason": reason,
+            "state": self.cancel_result_state,
+            "code": code,
+            "attempt_id": attempt_id,
+            "capability_record_hash": (
+                "sha256:" + "a" * 64 if requested else None
+            ),
+            "request_record_hash": "sha256:" + "b" * 64 if requested else None,
+            "acknowledgement_record_hash": (
+                "sha256:" + "c" * 64 if acknowledged else None
+            ),
+            "terminal_status": self.cancel_terminal_status,
+            "local_run_state": "retained",
+            "replayed": self.cancel_result_state == "pending",
+            "receipt_record_hash": "sha256:" + "d" * 64,
+        }
+        return {**payload, "proof_hash": encode_document(payload)[1]}
+
     def collect(self, intent):
         with self.lock:
             self.collect_calls += 1
@@ -469,6 +522,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "supervised_dispatch_adoptions",
                 "supervised_dispatch_attempts",
                 "supervised_private_receipt_adoptions",
+                "task_cancel_requests",
+                "supervised_cancel_attempts",
+                "task_cancel_outcomes",
             },
         )
         connection = sqlite3.connect(self.database_path)
@@ -518,7 +574,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 10)
+        self.assertEqual(self.store.migration_version(), 11)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -534,7 +590,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 10)
+        self.assertEqual(reopened.migration_version(), 11)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -621,12 +677,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 10)] * 8)
+        self.assertEqual(results, [("wal", 11)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 11")
+            connection.execute("PRAGMA user_version = 12")
             connection.commit()
         finally:
             connection.close()
@@ -2491,6 +2547,253 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             current_dispatcher,
             self.submit_service(current_dispatcher),
         )
+
+    def test_runtime_cancel_is_durable_supervised_and_exactly_replayable(
+        self,
+    ) -> None:
+        task_id, _, dispatcher, service = self.submitted_runtime(
+            key="runtime-cancel-happy"
+        )
+        self.assertTrue(service.can_cancel_task(task_id, **self.scope))
+
+        admitted = service.cancel_task(
+            task_id=task_id,
+            reason="user_requested",
+            idempotency_key="cancel-runtime-happy",
+            **self.scope,
+        )
+        self.assertFalse(admitted.replayed)
+        self.assertEqual(admitted.snapshot.status, "Queued")
+        self.assertIsNotNone(admitted.snapshot.cancellation)
+        cancellation = admitted.snapshot.cancellation
+        assert cancellation is not None
+        self.assertEqual(cancellation.state, "requested")
+        self.assertEqual(cancellation.reason, "user_requested")
+        self.assertEqual(dispatcher.cancel_calls, 0)
+        self.assertFalse(service.can_cancel_task(task_id, **self.scope))
+        self.assertEqual(self.raw_count("task_cancel_requests"), 1)
+        self.assertEqual(self.raw_count("supervised_cancel_attempts"), 0)
+        self.assertEqual(self.raw_count("task_cancel_outcomes"), 0)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            ["task_queued", "cancel_requested"],
+        )
+
+        admission_replay = service.cancel_task(
+            task_id=task_id,
+            reason="user_requested",
+            idempotency_key="cancel-runtime-happy",
+            **self.scope,
+        )
+        self.assertTrue(admission_replay.replayed)
+        self.assertEqual(self.raw_count("task_cancel_requests"), 1)
+
+        browser_poll = service.refresh_runtime_status(task_id, **self.scope)
+        self.assertEqual(browser_poll.snapshot.cancellation.state, "requested")
+        self.assertIsNone(browser_poll.adapter_status)
+        self.assertEqual(dispatcher.status_calls, 0)
+
+        acquisition = service.acquire_runtime_supervisor_lease(
+            owner_id="cancel-runtime-owner",
+            lease_seconds=30,
+            **self.scope,
+        )
+        try:
+            completed = service.process_runtime_cancellation(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+            self.assertEqual(completed.state, "cancelled")
+            self.assertFalse(completed.replayed)
+            self.assertEqual(completed.snapshot.status, "Cancelled")
+            self.assertEqual(completed.snapshot.cancellation.result, "cancel_confirmed")
+            self.assertEqual(dispatcher.cancel_calls, 1)
+            self.assertEqual(
+                dispatcher.cancel_requests,
+                [(cancellation.request_id, cancellation.attempt_id, "user_requested")],
+            )
+            self.assertEqual(self.raw_count("supervised_cancel_attempts"), 1)
+            self.assertEqual(self.raw_count("task_cancel_outcomes"), 1)
+            self.assertEqual(
+                [
+                    event["event_type"]
+                    for event in service.list_run_events(task_id, **self.scope)
+                ],
+                ["task_queued", "cancel_requested", "task_cancelled"],
+            )
+
+            process_replay = service.process_runtime_cancellation(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+            self.assertTrue(process_replay.replayed)
+            self.assertEqual(process_replay.state, "cancelled")
+            self.assertEqual(dispatcher.cancel_calls, 1)
+        finally:
+            service.release_runtime_supervisor_lease(acquisition.lease)
+
+        completed_admission_replay = service.cancel_task(
+            task_id=task_id,
+            reason="user_requested",
+            idempotency_key="cancel-runtime-happy",
+            **self.scope,
+        )
+        self.assertTrue(completed_admission_replay.replayed)
+        self.assertEqual(completed_admission_replay.snapshot.status, "Cancelled")
+        self.assertEqual(self.raw_count("task_cancel_requests"), 1)
+        self.assertEqual(self.raw_count("task_cancel_outcomes"), 1)
+
+    def test_runtime_cancel_requires_one_exact_managed_running_attempt(self) -> None:
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="runtime-cancel-no-attempt"
+        )
+        submitted = service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-runtime-cancel-no-attempt",
+            **self.scope,
+        )
+        self.assertEqual(submitted.intent.state, "pending")
+        self.assertFalse(service.can_cancel_task(task_id, **self.scope))
+        with self.assertRaises(TaskConflict):
+            service.cancel_task(
+                task_id=task_id,
+                reason="user_requested",
+                idempotency_key="cancel-runtime-no-attempt",
+                **self.scope,
+            )
+        self.assertEqual(dispatcher.cancel_calls, 0)
+        self.assertEqual(self.raw_count("task_cancel_requests"), 0)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            ["task_queued"],
+        )
+
+        exact_task_id, _, exact_dispatcher, exact_service = self.submitted_runtime(
+            key="runtime-cancel-unsupported"
+        )
+        exact_dispatcher.exact_cancel_supported = False
+        self.assertFalse(exact_service.can_cancel_task(exact_task_id, **self.scope))
+        with self.assertRaises(TaskConflict):
+            exact_service.cancel_task(
+                task_id=exact_task_id,
+                reason="user_requested",
+                idempotency_key="cancel-runtime-unsupported",
+                **self.scope,
+            )
+        self.assertEqual(exact_dispatcher.cancel_calls, 0)
+        self.assertEqual(self.raw_count("task_cancel_requests"), 0)
+
+    def test_concurrent_runtime_cancel_admission_has_one_write_and_replays(
+        self,
+    ) -> None:
+        task_id, _, dispatcher, _ = self.submitted_runtime(
+            key="runtime-cancel-concurrent"
+        )
+        workers = 8
+        dispatcher.exact_cancel_barrier = threading.Barrier(workers)
+
+        def admit(_: int) -> bool:
+            service = TaskService(
+                SQLiteTaskStore(self.database_path),
+                clock=lambda: NOW,
+                dispatcher=dispatcher,
+            )
+            return service.cancel_task(
+                task_id=task_id,
+                reason="user_requested",
+                idempotency_key="cancel-runtime-concurrent",
+                **self.scope,
+            ).replayed
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            replays = list(executor.map(admit, range(workers)))
+        self.assertEqual(replays.count(False), 1)
+        self.assertEqual(replays.count(True), workers - 1)
+        self.assertEqual(self.raw_count("task_cancel_requests"), 1)
+        self.assertEqual(self.raw_count("supervised_cancel_attempts"), 0)
+        self.assertEqual(self.raw_count("task_cancel_outcomes"), 0)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in self.service.list_run_events(task_id, **self.scope)
+            ],
+            ["task_queued", "cancel_requested"],
+        )
+        self.assertEqual(dispatcher.cancel_calls, 0)
+
+    def test_natural_terminal_wins_cancel_race_atomically(self) -> None:
+        task_id, _, dispatcher, service = self.submitted_runtime(
+            key="runtime-cancel-terminal-race"
+        )
+        admitted = service.cancel_task(
+            task_id=task_id,
+            reason="user_requested",
+            idempotency_key="cancel-runtime-terminal-race",
+            **self.scope,
+        )
+        dispatcher.cancel_result_state = "terminal_won"
+        dispatcher.cancel_terminal_status = "Succeeded"
+        dispatcher.adapter_status = {
+            "status": "Succeeded",
+            "stage": "complete",
+            "completed": 2,
+            "total": 2,
+            "message": "completed before cancellation won",
+            "updated_at": "2026-07-15T03:00:05Z",
+            "terminal": True,
+        }
+        acquisition = service.acquire_runtime_supervisor_lease(
+            owner_id="cancel-terminal-owner",
+            lease_seconds=30,
+            **self.scope,
+        )
+        try:
+            completed = service.process_runtime_cancellation(
+                task_id,
+                supervisor_lease=acquisition.lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(acquisition.lease)
+
+        self.assertEqual(completed.state, "superseded")
+        self.assertEqual(completed.snapshot.status, "Succeeded")
+        self.assertEqual(completed.snapshot.cancellation.result, "terminal_preempted")
+        self.assertEqual(completed.snapshot.cancellation.terminal_status, "Succeeded")
+        self.assertEqual(dispatcher.cancel_calls, 1)
+        self.assertEqual(dispatcher.status_calls, 1)
+        self.assertEqual(self.raw_count("task_cancel_requests"), 1)
+        self.assertEqual(self.raw_count("supervised_cancel_attempts"), 1)
+        self.assertEqual(self.raw_count("task_cancel_outcomes"), 1)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            [
+                "task_queued",
+                "cancel_requested",
+                "node_started",
+                "node_succeeded",
+            ],
+        )
+        admission_replay = service.cancel_task(
+            task_id=task_id,
+            reason="user_requested",
+            idempotency_key="cancel-runtime-terminal-race",
+            **self.scope,
+        )
+        self.assertTrue(admission_replay.replayed)
+        self.assertEqual(admission_replay.snapshot.status, "Succeeded")
 
     def seed_dispatching_intent(
         self,

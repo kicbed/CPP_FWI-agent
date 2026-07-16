@@ -10,14 +10,15 @@ from pathlib import Path
 from typing import Any
 
 
-TERMINAL_STATUSES = {"succeeded", "failed"}
+TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 VALID_STATUSES = {"queued", "running", *TERMINAL_STATUSES}
 VALID_TRANSITIONS = {
-    None: {"queued", "running"},
-    "queued": {"queued", "running", "failed"},
-    "running": {"running", "succeeded", "failed"},
+    None: {"queued", "running", "cancelled"},
+    "queued": {"queued", "running", "failed", "cancelled"},
+    "running": {"running", "succeeded", "failed", "cancelled"},
     "succeeded": {"succeeded"},
     "failed": {"failed"},
+    "cancelled": {"cancelled"},
 }
 
 

@@ -45,11 +45,16 @@ from worker_launch_control import (
     CONTROL_DIRECTORY,
     LaunchAttemptBinding,
     ParentLaunchLease,
+    WorkerCancelEvidence,
     WorkerControlError,
     binding_from_submission_record,
     hold_idle_execution_fence,
     mark_launch_failed,
+    purge_worker_cancel_control,
+    read_worker_cancel_capability,
+    read_worker_cancel_evidence,
     read_worker_attempt_evidence,
+    request_worker_cancel,
     stage_launch_attempt,
     worker_attempt_started,
 )
@@ -103,6 +108,7 @@ NODE_IDEMPOTENCY_KEY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
 )
 JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+MANAGED_ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
 
 # These plots are fixed Algorithm 1.4 outputs, not paths copied from the
 # legacy Worker manifest.  Dimensions follow the version-bound Matplotlib
@@ -383,6 +389,100 @@ class AdapterCancelResult:
             "code": self.code,
             "status": self.status,
         }
+
+
+@dataclass(frozen=True)
+class AdapterManagedCancelProof:
+    """Path-free proof for one exact current managed-Worker cancellation."""
+
+    task_id: str
+    cancel_id: str
+    reason: str
+    state: str
+    code: str
+    attempt_id: str | None
+    capability_record_hash: str | None
+    request_record_hash: str | None
+    acknowledgement_record_hash: str | None
+    terminal_status: str | None
+    local_run_state: str
+    replayed: bool
+    receipt_record_hash: str
+    proof_hash: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0.0",
+            "task_id": self.task_id,
+            "request_id": self.cancel_id,
+            "reason": self.reason,
+            "state": self.state,
+            "code": self.code,
+            "attempt_id": self.attempt_id,
+            "capability_record_hash": self.capability_record_hash,
+            "request_record_hash": self.request_record_hash,
+            "acknowledgement_record_hash": self.acknowledgement_record_hash,
+            "terminal_status": self.terminal_status,
+            "local_run_state": self.local_run_state,
+            "replayed": self.replayed,
+            "receipt_record_hash": self.receipt_record_hash,
+            "proof_hash": self.proof_hash,
+        }
+
+
+def _managed_cancel_proof(
+    *,
+    task_id: str,
+    cancel_id: str,
+    reason: str,
+    state: str,
+    code: str,
+    attempt_id: str | None,
+    evidence: WorkerCancelEvidence | None,
+    terminal_status: str | None,
+    replayed: bool,
+    receipt_record_hash: str,
+) -> AdapterManagedCancelProof:
+    payload = {
+        "schema_version": "1.0.0",
+        "task_id": task_id,
+        "request_id": cancel_id,
+        "reason": reason,
+        "state": state,
+        "code": code,
+        "attempt_id": attempt_id,
+        "capability_record_hash": (
+            None if evidence is None else evidence.capability_record_hash
+        ),
+        "request_record_hash": (
+            None if evidence is None else evidence.request_record_hash
+        ),
+        "acknowledgement_record_hash": (
+            None if evidence is None else evidence.acknowledgement_record_hash
+        ),
+        "terminal_status": terminal_status,
+        "local_run_state": "retained",
+        "replayed": replayed,
+        "receipt_record_hash": receipt_record_hash,
+    }
+    return AdapterManagedCancelProof(
+        task_id=task_id,
+        cancel_id=cancel_id,
+        reason=reason,
+        state=state,
+        code=code,
+        attempt_id=attempt_id,
+        capability_record_hash=payload["capability_record_hash"],
+        request_record_hash=payload["request_record_hash"],
+        acknowledgement_record_hash=payload[
+            "acknowledgement_record_hash"
+        ],
+        terminal_status=terminal_status,
+        local_run_state="retained",
+        replayed=replayed,
+        receipt_record_hash=receipt_record_hash,
+        proof_hash=_sha256_document(payload),
+    )
 
 
 @dataclass(frozen=True)
@@ -955,6 +1055,7 @@ class SafeSubprocessWorkerLauncher:
         run_root: Path | None = None,
         launch_binding: LaunchAttemptBinding | None = None,
     ) -> None:
+        cancellation_acknowledged = False
         if run_root is not None or launch_binding is not None:
             if run_root is None or launch_binding is None:
                 return
@@ -965,27 +1066,62 @@ class SafeSubprocessWorkerLauncher:
                 # A stale/corrupt attempt must never let an old reaper mutate a
                 # newer attempt's status evidence.
                 return
+            try:
+                cancel_evidence = read_worker_cancel_evidence(
+                    run_root, launch_binding
+                )
+                attempt_evidence = read_worker_attempt_evidence(
+                    run_root, run_dir, launch_binding
+                )
+                if (
+                    cancel_evidence.acknowledged
+                    and attempt_evidence is not None
+                    and attempt_evidence.heartbeat_state == "stopped"
+                ):
+                    cancellation_acknowledged = True
+            except (FileNotFoundError, WorkerControlError):
+                cancellation_acknowledged = False
         status_path = run_dir / "status.json"
-        try:
-            value = _read_json_file(status_path, code="WORKER_STATUS_INVALID")
-            if value.get("status") == "failed" or (
-                value.get("status") == "succeeded" and return_code == 0
-            ):
+
+        def write_terminal(*, cancelled: bool) -> None:
+            try:
+                value = _read_json_file(
+                    status_path, code="WORKER_STATUS_INVALID"
+                )
+                # Natural or already-finalized terminal evidence always wins,
+                # even if a later process exit code is nonzero.
+                if value.get("status") in {"succeeded", "failed", "cancelled"}:
+                    return
+                value.update(
+                    {
+                        "status": "cancelled" if cancelled else "failed",
+                        "stage": "cancelled" if cancelled else "worker_exit",
+                        "message": (
+                            "FWI Worker cancellation completed"
+                            if cancelled
+                            else f"FWI worker exited with code {return_code}"
+                        ),
+                        "updated_at": _utc_now(),
+                    }
+                )
+                _atomic_write_json(status_path, value)
+            except Exception:
+                # Status is Worker evidence, while SQLite remains task truth.  A
+                # malformed/missing file is surfaced by status() rather than
+                # being replaced with invented success evidence.
                 return
-            value.update(
-                {
-                    "status": "failed",
-                    "stage": "worker_exit",
-                    "message": f"FWI worker exited with code {return_code}",
-                    "updated_at": _utc_now(),
-                }
-            )
-            _atomic_write_json(status_path, value)
-        except Exception:
-            # Status is Worker evidence, while SQLite remains task truth.  A
-            # malformed/missing file is surfaced by status() rather than being
-            # replaced with invented success evidence.
-            return
+
+        if cancellation_acknowledged:
+            assert run_root is not None and launch_binding is not None
+            try:
+                with hold_idle_execution_fence(run_root, launch_binding):
+                    write_terminal(cancelled=True)
+            except WorkerControlError:
+                # A descendant or still-exiting Worker retained the exact
+                # execution fence.  Leave finalization to a later observer.
+                return
+        else:
+            write_terminal(cancelled=False)
 
     @staticmethod
     def _terminate_before_ready(process: subprocess.Popen[Any]) -> bool:
@@ -2808,7 +2944,13 @@ class DeepwaveAdapter:
             )
         return unresolved
 
-    def _status_for_record(self, record: Mapping[str, Any]) -> AdapterStatus:
+    def _status_for_record(
+        self,
+        record: Mapping[str, Any],
+        *,
+        cancellation_fence_held: bool = False,
+        allow_pending_cancel: bool = False,
+    ) -> AdapterStatus:
         job_dir = self._job_directory(record)
         value = _read_json_file(job_dir / "status.json", code="ADAPTER_STATUS_INVALID")
         if value.get("job_id") != record["job_id"]:
@@ -2821,6 +2963,7 @@ class DeepwaveAdapter:
             "running": "Running",
             "succeeded": "Succeeded",
             "failed": "Failed",
+            "cancelled": "Cancelled",
         }
         if worker_status not in mapping:
             raise AdapterStatusError(
@@ -2842,6 +2985,7 @@ class DeepwaveAdapter:
             "complete",
             "failed",
             "worker_exit",
+            "cancelled",
         }
         if value["stage"] not in allowed_stages or len(value["message"]) > 1000:
             raise AdapterStatusError(
@@ -2872,7 +3016,13 @@ class DeepwaveAdapter:
             or (
                 worker_status == "running"
                 and value["stage"]
-                not in {"queued", "complete", "failed", "worker_exit"}
+                not in {
+                    "queued",
+                    "complete",
+                    "failed",
+                    "worker_exit",
+                    "cancelled",
+                }
             )
             or (
                 worker_status == "succeeded"
@@ -2883,18 +3033,80 @@ class DeepwaveAdapter:
                 worker_status == "failed"
                 and value["stage"] in {"failed", "worker_exit"}
             )
+            or (
+                worker_status == "cancelled"
+                and value["stage"] == "cancelled"
+            )
         )
         if not combinations_valid:
             raise AdapterStatusError(
                 "ADAPTER_STATUS_INVALID: status, stage, and progress contradict one another"
             )
+        pending_cancel = False
+        if worker_status == "cancelled":
+            if (
+                record.get("adapter_version") != ADAPTER_VERSION
+                or record.get("schema_version") != "1.1.0"
+            ):
+                raise AdapterStatusError(
+                    "ADAPTER_STATUS_INVALID: cancellation proof is unavailable"
+                )
+
+            def prove_cancelled() -> None:
+                binding = binding_from_submission_record(record)
+                evidence = read_worker_cancel_evidence(
+                    self._run_root, binding
+                )
+                attempt = read_worker_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+                capability = read_worker_cancel_capability(
+                    self._run_root, binding
+                )
+                current = _read_json_file(
+                    job_dir / "status.json", code="ADAPTER_STATUS_INVALID"
+                )
+                if (
+                    current != value
+                    or capability is None
+                    or not evidence.requested
+                    or not evidence.acknowledged
+                    or attempt is None
+                    or attempt.ticket_state != "spawned"
+                    or not attempt.ready
+                    or attempt.heartbeat_state != "stopped"
+                    or capability["worker_pid"] != attempt.ticket_worker_pid
+                    or capability["worker_pid"] != attempt.ready_worker_pid
+                    or capability["capacity_slot"] != attempt.capacity_slot
+                    or capability["capacity_generation"]
+                    != attempt.capacity_generation
+                ):
+                    raise WorkerControlError(
+                        "WORKER_CANCEL_INVALID: terminal cancellation is unproven"
+                    )
+
+            try:
+                if cancellation_fence_held:
+                    prove_cancelled()
+                else:
+                    binding = binding_from_submission_record(record)
+                    with hold_idle_execution_fence(self._run_root, binding):
+                        prove_cancelled()
+            except (FileNotFoundError, WorkerControlError, AdapterStatusError) as error:
+                if allow_pending_cancel:
+                    pending_cancel = True
+                else:
+                    raise AdapterStatusError(
+                        "ADAPTER_STATUS_INVALID: cancellation is not terminal"
+                    ) from error
         _parse_timestamp(value["updated_at"], code="ADAPTER_STATUS_INVALID")
-        status = mapping[worker_status]
+        status = "Running" if pending_cancel else mapping[worker_status]
         controlled_messages = {
             "Queued": "FWI job is queued",
             "Running": f"FWI job is running ({value['stage']})",
             "Succeeded": "FWI job succeeded",
             "Failed": "FWI Worker reported a failure",
+            "Cancelled": "FWI job was cancelled",
         }
         return AdapterStatus(
             job_id=record["job_id"],
@@ -2909,7 +3121,10 @@ class DeepwaveAdapter:
             # legacy exceptions can contain server-side paths.
             message=controlled_messages[status],
             updated_at=value["updated_at"],
-            terminal=status in {"Succeeded", "Failed"},
+            terminal=(
+                not pending_cancel
+                and status in {"Succeeded", "Failed", "Cancelled"}
+            ),
         )
 
     def status(self, handle: AdapterHandle) -> AdapterStatus:
@@ -3012,10 +3227,13 @@ class DeepwaveAdapter:
                     fence = hold_idle_execution_fence(self._run_root, binding)
                 with fence:
                     if launch_state == "launched":
-                        observed = self._status_for_record(record)
+                        observed = self._status_for_record(
+                            record, cancellation_fence_held=True
+                        )
                         if not observed.terminal or observed.status not in {
                             "Succeeded",
                             "Failed",
+                            "Cancelled",
                         }:
                             raise AdapterPurgeError(
                                 "PURGE_REQUIRES_TERMINAL_STATUS: Worker is not succeeded or failed"
@@ -3028,6 +3246,17 @@ class DeepwaveAdapter:
                     # purging tombstone exists.  Holding the stable execution
                     # fence prevents a terminal heartbeat from racing delete.
                     self._purge_job_directory(record)
+                    if record["schema_version"] == "1.1.0":
+                        try:
+                            purge_worker_cancel_control(
+                                self._run_root,
+                                binding_from_submission_record(record),
+                            )
+                        except WorkerControlError as error:
+                            raise AdapterPurgeError(
+                                "PURGE_WORKER_CANCEL_CONTROL_INVALID: "
+                                "cancellation control cleanup failed"
+                            ) from error
                     record["launch_state"] = "purged"
                     self._write_submission(index_path, record)
             except WorkerControlError as error:
@@ -3045,17 +3274,469 @@ class DeepwaveAdapter:
                 replayed=replayed,
             )
 
-    def cancel(self, handle: AdapterHandle) -> AdapterCancelResult:
-        # P1 intentionally has no process cancellation protocol.  Validate the
-        # controlled handle, but do not depend on mutable Worker status evidence
-        # and do not signal or rewrite the job.
-        self._record_for_handle(handle)
-        return AdapterCancelResult(
-            supported=False,
-            accepted=False,
-            code="CANCEL_NOT_SUPPORTED_IN_P1",
-            status="Unsupported",
-        )
+    def supports_exact_cancel(
+        self, handle: AdapterHandle, *, attempt_id: str
+    ) -> bool:
+        """Read-only proof that the exact live Worker supports self-cancel.
+
+        This probe never creates a capability or request.  The capability is
+        append-only and is published only by the Worker after it has validated
+        both inherited kernel fences, so a positive result remains meaningful
+        across the Store admission transaction that follows.
+        """
+
+        if (
+            not isinstance(attempt_id, str)
+            or MANAGED_ATTEMPT_ID.fullmatch(attempt_id) is None
+        ):
+            raise AdapterValidationError(
+                "CANCEL_REQUEST_INVALID",
+                ["attempt_id is not an exact managed attempt identifier"],
+            )
+        initial = self._record_for_handle(handle)
+        if (
+            handle.adapter_version != ADAPTER_VERSION
+            or initial["adapter_version"] != ADAPTER_VERSION
+            or initial["schema_version"] != "1.1.0"
+        ):
+            return False
+        _, locks = self._control_paths()
+        index_name = handle.submission_id.removeprefix("submission-") + ".json"
+        lock_path = locks / (index_name + ".lock")
+        with self._lock_submission(lock_path, timeout_seconds=5.0):
+            record = self._record_for_handle(handle)
+            if (
+                record["adapter_version"] != ADAPTER_VERSION
+                or record["schema_version"] != "1.1.0"
+            ):
+                return False
+            try:
+                binding = binding_from_submission_record(record)
+                if binding.attempt_id != attempt_id:
+                    return False
+                job_dir = self._job_directory(record)
+                attempt = read_worker_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+                if (
+                    attempt is None
+                    or attempt.ticket_state != "spawned"
+                    or not attempt.ready
+                    or attempt.heartbeat_state != "running"
+                ):
+                    return False
+                capability = read_worker_cancel_capability(
+                    self._run_root, binding
+                )
+                if capability is None:
+                    return False
+                if (
+                    capability["worker_pid"] != attempt.ticket_worker_pid
+                    or capability["worker_pid"] != attempt.ready_worker_pid
+                    or capability["capacity_slot"] != attempt.capacity_slot
+                    or capability["capacity_generation"]
+                    != attempt.capacity_generation
+                ):
+                    raise WorkerControlError(
+                        "WORKER_CANCEL_INVALID: capability Worker identity changed"
+                    )
+                # Validate any already-published request/ack chain as well;
+                # capability probing must fail closed on partial corruption.
+                read_worker_cancel_evidence(self._run_root, binding)
+            except (FileNotFoundError, WorkerControlError) as error:
+                raise AdapterHandleError(
+                    "ADAPTER_CANCEL_INVALID: exact cancellation capability is invalid"
+                ) from error
+            return True
+
+    def cancel(
+        self,
+        handle: AdapterHandle,
+        *,
+        cancel_id: str | None = None,
+        attempt_id: str | None = None,
+        reason: str = "user_requested",
+    ) -> AdapterCancelResult | AdapterManagedCancelProof:
+        """Request or finalize one exact current managed-Worker cancellation.
+
+        Persisted Worker PIDs are deliberately never signalled.  The Adapter
+        publishes an append-only request which only the exact Worker holding the
+        inherited kernel fences can acknowledge.  Terminal Cancelled is written
+        only while the same stable execution fence is proven idle.
+        """
+
+        if cancel_id is None:
+            # Preserve the original six-method compatibility surface for callers
+            # that have not supplied the durable P2 cancellation identity.
+            self._record_for_handle(handle)
+            return AdapterCancelResult(
+                supported=False,
+                accepted=False,
+                code="CANCEL_NOT_SUPPORTED_WITHOUT_ID",
+                status="Unsupported",
+            )
+        if (
+            OPAQUE_ID.fullmatch(cancel_id) is None
+            or not isinstance(attempt_id, str)
+            or MANAGED_ATTEMPT_ID.fullmatch(attempt_id) is None
+            or reason != "user_requested"
+        ):
+            raise AdapterValidationError(
+                "CANCEL_REQUEST_INVALID",
+                ["cancel_id, attempt_id, or cancellation reason is invalid"],
+            )
+        initial = self._record_for_handle(handle)
+        if (
+            handle.adapter_version != ADAPTER_VERSION
+            or initial["adapter_version"] != ADAPTER_VERSION
+            or initial["schema_version"] != "1.1.0"
+        ):
+            return _managed_cancel_proof(
+                task_id=handle.task_id,
+                cancel_id=cancel_id,
+                reason=reason,
+                state="deferred",
+                code="CANCEL_MANAGED_ATTEMPT_UNAVAILABLE",
+                attempt_id=attempt_id,
+                evidence=None,
+                terminal_status=None,
+                replayed=False,
+                receipt_record_hash=initial["record_hash"],
+            )
+
+        submissions, locks = self._control_paths()
+        index_name = handle.submission_id.removeprefix("submission-") + ".json"
+        index_path = submissions / index_name
+        lock_path = locks / (index_name + ".lock")
+        with self._lock_submission(lock_path, timeout_seconds=5.0):
+            record = self._record_for_handle(handle)
+            if record["schema_version"] != "1.1.0":
+                return _managed_cancel_proof(
+                    task_id=handle.task_id,
+                    cancel_id=cancel_id,
+                    reason=reason,
+                    state="deferred",
+                    code="CANCEL_MANAGED_ATTEMPT_UNAVAILABLE",
+                    attempt_id=attempt_id,
+                    evidence=None,
+                    terminal_status=None,
+                    replayed=False,
+                    receipt_record_hash=record["record_hash"],
+                )
+            try:
+                binding = binding_from_submission_record(record)
+                job_dir = self._job_directory(record)
+                observed = self._status_for_record(
+                    record, allow_pending_cancel=True
+                )
+            except (WorkerControlError, AdapterStatusError) as error:
+                raise AdapterHandleError(
+                    "ADAPTER_CANCEL_INVALID: managed attempt evidence is invalid"
+                ) from error
+            if binding.attempt_id != attempt_id:
+                return _managed_cancel_proof(
+                    task_id=handle.task_id,
+                    cancel_id=cancel_id,
+                    reason=reason,
+                    state="deferred",
+                    code="CANCEL_ATTEMPT_MISMATCH",
+                    attempt_id=attempt_id,
+                    evidence=None,
+                    terminal_status=None,
+                    replayed=False,
+                    receipt_record_hash=record["record_hash"],
+                )
+
+            # A natural terminal written before request publication always
+            # wins, and needs no cancellation capability.  Raw Cancelled is
+            # not included here: _status_for_record proves its exact
+            # request/ack/stopped/idle chain before exposing it.
+            if observed.terminal and observed.status in {"Succeeded", "Failed"}:
+                terminal_evidence: WorkerCancelEvidence | None = None
+                try:
+                    terminal_evidence = read_worker_cancel_evidence(
+                        self._run_root, binding
+                    )
+                except WorkerControlError as error:
+                    if error.code != "WORKER_CANCEL_UNSUPPORTED":
+                        raise AdapterHandleError(
+                            "ADAPTER_CANCEL_INVALID: cancellation control is invalid"
+                        ) from error
+                except FileNotFoundError as error:
+                    raise AdapterHandleError(
+                        "ADAPTER_CANCEL_INVALID: cancellation control is invalid"
+                    ) from error
+                if terminal_evidence is not None and terminal_evidence.requested and (
+                    terminal_evidence.cancel_id != cancel_id
+                    or terminal_evidence.reason != reason
+                ):
+                    raise AdapterIdempotencyConflict(
+                        "CANCEL_IDEMPOTENCY_CONFLICT: attempt has another cancellation"
+                    )
+                return _managed_cancel_proof(
+                    task_id=handle.task_id,
+                    cancel_id=cancel_id,
+                    reason=reason,
+                    state="terminal_won",
+                    code="CANCEL_TERMINAL_WON",
+                    attempt_id=binding.attempt_id,
+                    evidence=terminal_evidence,
+                    terminal_status=observed.status,
+                    replayed=(
+                        terminal_evidence is not None
+                        and terminal_evidence.requested
+                    ),
+                    receipt_record_hash=record["record_hash"],
+                )
+
+            try:
+                existing_cancel = read_worker_cancel_evidence(
+                    self._run_root, binding
+                )
+            except WorkerControlError as error:
+                if error.code == "WORKER_CANCEL_UNSUPPORTED":
+                    return _managed_cancel_proof(
+                        task_id=handle.task_id,
+                        cancel_id=cancel_id,
+                        reason=reason,
+                        state="deferred",
+                        code="CANCEL_WORKER_CAPABILITY_UNAVAILABLE",
+                        attempt_id=binding.attempt_id,
+                        evidence=None,
+                        terminal_status=None,
+                        replayed=False,
+                        receipt_record_hash=record["record_hash"],
+                    )
+                raise AdapterHandleError(
+                    "ADAPTER_CANCEL_INVALID: cancellation control is invalid"
+                ) from error
+            except FileNotFoundError as error:
+                raise AdapterHandleError(
+                    "ADAPTER_CANCEL_INVALID: cancellation control is invalid"
+                ) from error
+            if existing_cancel.requested and (
+                existing_cancel.cancel_id != cancel_id
+                or existing_cancel.reason != reason
+            ):
+                raise AdapterIdempotencyConflict(
+                    "CANCEL_IDEMPOTENCY_CONFLICT: attempt has another cancellation"
+                )
+
+            if observed.terminal:
+                if observed.status == "Cancelled":
+                    if (
+                        existing_cancel is None
+                        or existing_cancel.cancel_id != cancel_id
+                        or not existing_cancel.acknowledged
+                    ):
+                        return _managed_cancel_proof(
+                            task_id=handle.task_id,
+                            cancel_id=cancel_id,
+                            reason=reason,
+                            state="deferred",
+                            code="CANCEL_TERMINAL_PROOF_UNAVAILABLE",
+                            attempt_id=binding.attempt_id,
+                            evidence=existing_cancel,
+                            terminal_status="Cancelled",
+                            replayed=True,
+                            receipt_record_hash=record["record_hash"],
+                        )
+                    return _managed_cancel_proof(
+                        task_id=handle.task_id,
+                        cancel_id=cancel_id,
+                        reason=reason,
+                        state="cancelled",
+                        code="CANCEL_COMPLETED",
+                        attempt_id=binding.attempt_id,
+                        evidence=existing_cancel,
+                        terminal_status="Cancelled",
+                        replayed=True,
+                        receipt_record_hash=record["record_hash"],
+                    )
+                raise AdapterHandleError(
+                    "ADAPTER_CANCEL_INVALID: terminal cancellation state is invalid"
+                )
+
+            try:
+                attempt = read_worker_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+            except (FileNotFoundError, WorkerControlError) as error:
+                raise AdapterHandleError(
+                    "ADAPTER_CANCEL_INVALID: Worker attempt evidence is invalid"
+                ) from error
+            if (
+                attempt is None
+                or attempt.ticket_state != "spawned"
+                or not attempt.ready
+                or (
+                    attempt.heartbeat_state
+                    not in (
+                        {"running", "stopped"}
+                        if existing_cancel.requested
+                        else {"running"}
+                    )
+                )
+            ):
+                return _managed_cancel_proof(
+                    task_id=handle.task_id,
+                    cancel_id=cancel_id,
+                    reason=reason,
+                    state="deferred",
+                    code="CANCEL_WORKER_NOT_RUNNING",
+                    attempt_id=binding.attempt_id,
+                    evidence=existing_cancel,
+                    terminal_status=None,
+                    replayed=existing_cancel is not None
+                    and existing_cancel.requested,
+                    receipt_record_hash=record["record_hash"],
+                )
+            capability = read_worker_cancel_capability(
+                self._run_root, binding
+            )
+            if (
+                capability is None
+                or capability["worker_pid"] != attempt.ticket_worker_pid
+                or capability["worker_pid"] != attempt.ready_worker_pid
+                or capability["capacity_slot"] != attempt.capacity_slot
+                or capability["capacity_generation"]
+                != attempt.capacity_generation
+            ):
+                raise AdapterHandleError(
+                    "ADAPTER_CANCEL_INVALID: capability Worker identity changed"
+                )
+
+            try:
+                cancel_evidence, replayed = request_worker_cancel(
+                    self._run_root,
+                    binding,
+                    cancel_id=cancel_id,
+                    reason=reason,
+                    requested_at=self._clock(),
+                )
+            except WorkerControlError as error:
+                if error.code == "WORKER_CANCEL_CONFLICT":
+                    raise AdapterIdempotencyConflict(
+                        "CANCEL_IDEMPOTENCY_CONFLICT: attempt has another cancellation"
+                    ) from error
+                raise AdapterHandleError(
+                    "ADAPTER_CANCEL_INVALID: cancellation control is invalid"
+                ) from error
+
+            try:
+                with hold_idle_execution_fence(self._run_root, binding):
+                    # The Worker can finish naturally after request publication.
+                    # Re-read terminal status inside the idle fence so success or
+                    # failure can never be overwritten by cancellation.
+                    terminal = self._status_for_record(
+                        record, cancellation_fence_held=True
+                    )
+                    if terminal.terminal and terminal.status != "Cancelled":
+                        return _managed_cancel_proof(
+                            task_id=handle.task_id,
+                            cancel_id=cancel_id,
+                            reason=reason,
+                            state="terminal_won",
+                            code="CANCEL_TERMINAL_WON",
+                            attempt_id=binding.attempt_id,
+                            evidence=cancel_evidence,
+                            terminal_status=terminal.status,
+                            replayed=replayed,
+                            receipt_record_hash=record["record_hash"],
+                        )
+                    cancel_evidence = read_worker_cancel_evidence(
+                        self._run_root, binding
+                    )
+                    attempt = read_worker_attempt_evidence(
+                        self._run_root, job_dir, binding
+                    )
+                    capability = read_worker_cancel_capability(
+                        self._run_root, binding
+                    )
+                    if (
+                        not cancel_evidence.acknowledged
+                        or cancel_evidence.cancel_id != cancel_id
+                        or attempt is None
+                        or attempt.heartbeat_state != "stopped"
+                        or capability is None
+                        or capability["worker_pid"]
+                        != attempt.ticket_worker_pid
+                        or capability["worker_pid"]
+                        != attempt.ready_worker_pid
+                        or capability["capacity_slot"]
+                        != attempt.capacity_slot
+                        or capability["capacity_generation"]
+                        != attempt.capacity_generation
+                    ):
+                        return _managed_cancel_proof(
+                            task_id=handle.task_id,
+                            cancel_id=cancel_id,
+                            reason=reason,
+                            state="deferred",
+                            code="CANCEL_EXIT_UNPROVEN",
+                            attempt_id=binding.attempt_id,
+                            evidence=cancel_evidence,
+                            terminal_status=None,
+                            replayed=replayed,
+                            receipt_record_hash=record["record_hash"],
+                        )
+                    value = _read_json_file(
+                        job_dir / "status.json", code="WORKER_STATUS_INVALID"
+                    )
+                    if value.get("status") not in {"queued", "running", "cancelled"}:
+                        return _managed_cancel_proof(
+                            task_id=handle.task_id,
+                            cancel_id=cancel_id,
+                            reason=reason,
+                            state="terminal_won",
+                            code="CANCEL_TERMINAL_WON",
+                            attempt_id=binding.attempt_id,
+                            evidence=cancel_evidence,
+                            terminal_status=self._status_for_record(
+                                record, cancellation_fence_held=True
+                            ).status,
+                            replayed=replayed,
+                            receipt_record_hash=record["record_hash"],
+                        )
+                    if value.get("status") != "cancelled":
+                        value.update(
+                            {
+                                "status": "cancelled",
+                                "stage": "cancelled",
+                                "message": "FWI Worker cancellation completed",
+                                "updated_at": self._clock(),
+                            }
+                        )
+                        _atomic_write_json(job_dir / "status.json", value)
+                    return _managed_cancel_proof(
+                        task_id=handle.task_id,
+                        cancel_id=cancel_id,
+                        reason=reason,
+                        state="cancelled",
+                        code="CANCEL_COMPLETED",
+                        attempt_id=binding.attempt_id,
+                        evidence=cancel_evidence,
+                        terminal_status="Cancelled",
+                        replayed=replayed,
+                        receipt_record_hash=record["record_hash"],
+                    )
+            except WorkerControlError as error:
+                if error.code != "WORKER_ATTEMPT_BUSY":
+                    raise AdapterHandleError(
+                        "ADAPTER_CANCEL_INVALID: execution fence is invalid"
+                    ) from error
+                return _managed_cancel_proof(
+                    task_id=handle.task_id,
+                    cancel_id=cancel_id,
+                    reason=reason,
+                    state="pending" if replayed else "requested",
+                    code=("CANCEL_PENDING" if replayed else "CANCEL_REQUESTED"),
+                    attempt_id=binding.attempt_id,
+                    evidence=cancel_evidence,
+                    terminal_status=None,
+                    replayed=replayed,
+                    receipt_record_hash=record["record_hash"],
+                )
 
     @staticmethod
     def _read_artifact_bytes(
@@ -3705,6 +4386,7 @@ __all__ = [
     "AdapterHandle",
     "AdapterHandleError",
     "AdapterIdempotencyConflict",
+    "AdapterManagedCancelProof",
     "AdapterPurgeError",
     "AdapterPurgeResult",
     "AdapterStatus",

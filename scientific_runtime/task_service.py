@@ -57,6 +57,8 @@ RUN_EVENT_STATUS = {
     # lifecycle semantics are deferred to the P3 scheduler.
     "node_succeeded": frozenset({"Succeeded"}),
     "node_failed": frozenset({"Failed"}),
+    "cancel_requested": frozenset({"Queued", "Running"}),
+    "task_cancelled": frozenset({"Cancelled"}),
 }
 
 RUN_EVENT_EXPECTED_STATUS = {
@@ -64,6 +66,8 @@ RUN_EVENT_EXPECTED_STATUS = {
     "node_progress": frozenset({"Running"}),
     "node_succeeded": frozenset({"Running"}),
     "node_failed": frozenset({"Queued", "Running"}),
+    "cancel_requested": frozenset({"Queued", "Running"}),
+    "task_cancelled": frozenset({"Queued", "Running"}),
 }
 
 P2_EVENT_TYPES = frozenset(
@@ -71,8 +75,6 @@ P2_EVENT_TYPES = frozenset(
         "checkpoint_created",
         "node_waiting",
         "node_retrying",
-        "cancel_requested",
-        "task_cancelled",
     }
 )
 
@@ -187,6 +189,25 @@ class TaskScheduleResult:
     dispatch_attempted: bool
     projected: bool
     adopted: bool
+    deferred_code: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskCancellationResult:
+    """Public admission result for one durable exact-attempt cancellation."""
+
+    snapshot: TaskSnapshot
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class TaskCancellationProcessResult:
+    """One Supervisor-owned cancellation delivery/finalization pass."""
+
+    snapshot: TaskSnapshot
+    state: str
+    adapter_result: dict[str, Any] | None
+    replayed: bool
     deferred_code: str | None = None
 
 
@@ -1220,6 +1241,169 @@ class TaskService:
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
         return AbandonTaskResult(snapshot=snapshot, replayed=replayed)
+
+    def cancel_task(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> TaskCancellationResult:
+        """Durably request cancellation of one exact managed Worker attempt.
+
+        This admission path performs only a read-only exact-capability probe;
+        it never publishes an Adapter request or signals a PID.  Delivery and
+        terminal resolution belong exclusively to an active, fenced
+        :class:`RuntimeSupervisor` term.
+        """
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        _validate_idempotency_key(idempotency_key)
+        if reason != "user_requested":
+            raise TaskValidationError(
+                "INVALID_CANCEL_REASON",
+                ["reason must be user_requested"],
+            )
+        identity = "\x1f".join((project_id, principal_id, task_id))
+        request_id = "cancel-" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()[:32]
+        _, request_hash = encode_document(
+            {
+                "task_id": task_id,
+                "project_id": project_id,
+                "principal_id": principal_id,
+                "action": "cancel_task",
+                "reason": reason,
+            }
+        )
+        try:
+            replay = self._store.lookup_task_cancellation(
+                project_id=project_id,
+                principal_id=principal_id,
+                idempotency_key=idempotency_key,
+                request_id=request_id,
+                task_id=task_id,
+                reason=reason,
+                request_hash=request_hash,
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        if replay is not None:
+            return TaskCancellationResult(
+                snapshot=replay.snapshot,
+                replayed=True,
+            )
+        current = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if current.status in {"Draft", "NeedsInput", "AwaitingApproval"}:
+            raise TaskConflict(
+                "pre-runtime tasks must use the abandon operation"
+            )
+        if current.status not in {"Queued", "Running"}:
+            raise TaskConflict("only a queued or running task can be cancelled")
+        intent = self._store.get_dispatch_intent(task_id)
+        candidate = self._store.get_task_cancel_candidate(task_id)
+        if (
+            intent is None
+            or candidate is None
+            or self._dispatcher is None
+        ):
+            raise TaskConflict(
+                "task cancellation requires an exact managed Worker capability"
+            )
+        try:
+            supports_cancel = self._dispatcher.supports_exact_cancel(
+                intent, attempt_id=candidate["attempt_id"]
+            )
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("ADAPTER_CANCEL_CAPABILITY_UNAVAILABLE") from error
+        if supports_cancel is not True:
+            raise TaskConflict(
+                "task cancellation is unavailable for this exact Worker attempt"
+            )
+        def build_documents(
+            snapshot: TaskSnapshot,
+            intent: DispatchIntentSnapshot,
+            evidence: Mapping[str, Any],
+            sequence: int,
+            requested_at: str,
+        ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+            if intent.handle is None:
+                raise TaskConflict(
+                    "task cancellation requires a dispatched receipt"
+                )
+            request = {
+                "schema_version": "1.0.0",
+                "request_id": request_id,
+                "task_id": task_id,
+                "intent_id": intent.intent_id,
+                "attempt_id": evidence["attempt_id"],
+                "reason": reason,
+                "actor": {"type": "user", "id": principal_id},
+                "requested_at": requested_at,
+                "extensions": {},
+            }
+            _, event_identity = encode_document(
+                {
+                    "request_id": request_id,
+                    "event_type": "cancel_requested",
+                    "sequence": sequence,
+                }
+            )
+            event = {
+                "schema_version": "1.0.0",
+                "event_id": "event-"
+                + event_identity.removeprefix("sha256:")[:32],
+                "sequence": sequence,
+                "task_id": task_id,
+                "node_id": intent.node_id,
+                "event_type": "cancel_requested",
+                "task_status": snapshot.status,
+                "occurred_at": requested_at,
+                "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+                "extensions": {
+                    "org.agent_rpc.cancellation": {
+                        "request_id": request_id,
+                        "attempt_id": evidence["attempt_id"],
+                        "reason": reason,
+                    }
+                },
+            }
+            self._validate_schema("run-event.schema.json", event)
+            _validate_run_event_semantics(event)
+            _validate_run_event_binding(snapshot, event)
+            return request, event
+
+        try:
+            record = self._store.request_task_cancellation(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                request_id=request_id,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                build_documents=build_documents,
+                clock=self._clock,
+            )
+        except IdempotencyConflict as error:
+            raise TaskIdempotencyConflict(str(error)) from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        return TaskCancellationResult(
+            snapshot=record.snapshot,
+            replayed=record.replayed,
+        )
 
     def _change_task_visibility(
         self,
@@ -2592,6 +2776,29 @@ class TaskService:
         self.get_task(task_id, project_id=project_id, principal_id=principal_id)
         return self._store.get_dispatch_intent(task_id)
 
+    def can_cancel_task(
+        self, task_id: str, *, project_id: str, principal_id: str
+    ) -> bool:
+        """Return the server-proven current exact-attempt cancel capability."""
+
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if snapshot.cancellation is not None:
+            return False
+        candidate = self._store.get_task_cancel_candidate(task_id)
+        if candidate is None or self._dispatcher is None:
+            return False
+        intent = self._store.get_dispatch_intent(task_id)
+        if intent is None:
+            return False
+        try:
+            return self._dispatcher.supports_exact_cancel(
+                intent, attempt_id=candidate["attempt_id"]
+            ) is True
+        except Exception:
+            return False
+
     def list_run_events(
         self,
         task_id: str,
@@ -2644,6 +2851,10 @@ class TaskService:
         self._validate_schema("run-event.schema.json", event)
         if event["event_type"] == "task_queued":
             raise TaskConflict("task_queued is reserved for the atomic submit path")
+        if event["event_type"] in {"cancel_requested", "task_cancelled"}:
+            raise TaskConflict(
+                "cancellation events are reserved for the supervised cancel path"
+            )
         _validate_run_event_semantics(event)
         if expected_status in {"Waiting", "Retrying"} or event["task_status"] in {
             "Waiting",
@@ -2739,7 +2950,8 @@ class TaskService:
             or result.get("job_id") != intent.handle.get("job_id")
             or result.get("task_id") != intent.task_id
             or result.get("node_id") != intent.node_id
-            or status not in {"Queued", "Running", "Succeeded", "Failed"}
+            or status
+            not in {"Queued", "Running", "Succeeded", "Failed", "Cancelled"}
             or type(result.get("completed")) is not int
             or type(result.get("total")) is not int
             or result["completed"] < 0
@@ -2751,7 +2963,8 @@ class TaskService:
             or not isinstance(result.get("message"), str)
             or len(result["message"]) > 1000
             or type(result.get("terminal")) is not bool
-            or result["terminal"] != (status in {"Succeeded", "Failed"})
+            or result["terminal"]
+            != (status in {"Succeeded", "Failed", "Cancelled"})
         ):
             raise TaskDispatchError("ADAPTER_STATUS_INVALID")
         try:
@@ -2822,6 +3035,262 @@ class TaskService:
             }
         return event
 
+    def process_runtime_cancellation(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskCancellationProcessResult:
+        """Deliver/finalize one durable exact-attempt cancellation request."""
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        cancellation = snapshot.cancellation
+        if cancellation is None:
+            return TaskCancellationProcessResult(
+                snapshot=snapshot,
+                state="none",
+                adapter_result=None,
+                replayed=True,
+            )
+        if cancellation.state != "requested":
+            return TaskCancellationProcessResult(
+                snapshot=snapshot,
+                state=cancellation.state,
+                adapter_result=(
+                    None
+                    if cancellation.adapter_proof is None
+                    else copy.deepcopy(cancellation.adapter_proof)
+                ),
+                replayed=True,
+            )
+        intent = self._store.get_dispatch_intent(task_id)
+        if (
+            intent is None
+            or intent.intent_id != cancellation.intent_id
+            or intent.state != "dispatched"
+            or intent.handle is None
+        ):
+            raise TaskConflict(
+                "pending cancellation lost its dispatched intent binding"
+            )
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        try:
+            authorization = self._store.authorize_supervised_cancel(
+                request_id=cancellation.request_id,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        if authorization.cancellation.state != "requested":
+            current = self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            return TaskCancellationProcessResult(
+                snapshot=current,
+                state=authorization.cancellation.state,
+                adapter_result=(
+                    None
+                    if authorization.cancellation.adapter_proof is None
+                    else copy.deepcopy(
+                        authorization.cancellation.adapter_proof
+                    )
+                ),
+                replayed=True,
+            )
+        try:
+            proof = self._dispatcher.cancel(
+                intent,
+                request_id=cancellation.request_id,
+                attempt_id=cancellation.attempt_id,
+                reason=cancellation.reason,
+            )
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("ADAPTER_CANCEL_UNAVAILABLE") from error
+        if not isinstance(proof, Mapping):
+            raise TaskDispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+        adapter_result = copy.deepcopy(dict(proof))
+        state = adapter_result.get("state")
+        if (
+            adapter_result.get("task_id") != task_id
+            or adapter_result.get("request_id") != cancellation.request_id
+            or adapter_result.get("attempt_id") != cancellation.attempt_id
+            or adapter_result.get("reason") != cancellation.reason
+            or state
+            not in {
+                "requested",
+                "pending",
+                "cancelled",
+                "terminal_won",
+                "deferred",
+            }
+        ):
+            raise TaskDispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+        if state in {"requested", "pending", "deferred"}:
+            code = adapter_result.get("code")
+            return TaskCancellationProcessResult(
+                snapshot=snapshot,
+                state="requested",
+                adapter_result=adapter_result,
+                replayed=authorization.replayed,
+                deferred_code=(code if state == "deferred" else None),
+            )
+
+        if state == "terminal_won":
+            terminal = adapter_result.get("terminal_status")
+            if terminal not in {"Succeeded", "Failed"}:
+                raise TaskDispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+            try:
+                observed = self._dispatcher.status(intent)
+            except DispatchError as error:
+                raise TaskDispatchError(error.code) from error
+            except Exception as error:
+                raise TaskDispatchError("ADAPTER_STATUS_UNAVAILABLE") from error
+            adapter_status = self._validated_adapter_status(intent, observed)
+            if adapter_status["status"] != terminal:
+                raise TaskDispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+            current = self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            if current.status == "Queued" and terminal == "Succeeded":
+                # Preserve the existing one-node event history contract.  The
+                # intermediate Running projection is safe; the actual natural
+                # terminal and cancellation outcome are committed atomically
+                # below under the same active term.
+                started = self._adapter_event(
+                    snapshot=current,
+                    intent=intent,
+                    adapter_status=adapter_status,
+                    event_type="node_started",
+                    sequence=self._store.latest_run_event_sequence(task_id) + 1,
+                )
+                self.record_run_event(
+                    task_id=task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    expected_status="Queued",
+                    event=started,
+                    supervisor_lease=supervisor_lease,
+                )
+                current = self.get_task(
+                    task_id, project_id=project_id, principal_id=principal_id
+                )
+            terminal_event: Mapping[str, Any] | None
+            if current.status in {"Succeeded", "Failed"}:
+                if current.status != terminal:
+                    raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
+                terminal_event = None
+            else:
+                event_type = (
+                    "node_succeeded"
+                    if terminal == "Succeeded"
+                    else "node_failed"
+                )
+                terminal_event = self._adapter_event(
+                    snapshot=current,
+                    intent=intent,
+                    adapter_status=adapter_status,
+                    event_type=event_type,
+                    sequence=self._store.latest_run_event_sequence(task_id) + 1,
+                )
+                self._validate_schema(
+                    "run-event.schema.json", terminal_event
+                )
+                _validate_run_event_semantics(terminal_event)
+                _validate_run_event_binding(current, terminal_event)
+            try:
+                completed = self._store.complete_supervised_cancel(
+                    request_id=cancellation.request_id,
+                    result="terminal_preempted",
+                    terminal_event=terminal_event,
+                    adapter_proof=adapter_result,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+            except RuntimeSupervisorLeaseLost as error:
+                raise TaskSupervisorLeaseLost() from error
+            except TaskStoreConflict as error:
+                raise TaskConflict(str(error)) from error
+            return TaskCancellationProcessResult(
+                snapshot=completed.snapshot,
+                state=completed.cancellation.state,
+                adapter_result=adapter_result,
+                replayed=completed.replayed,
+            )
+
+        if adapter_result.get("terminal_status") != "Cancelled":
+            raise TaskDispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+        sequence = self._store.latest_run_event_sequence(task_id) + 1
+        occurred_at = self._runtime_supervisor_clock()
+        _, event_identity = encode_document(
+            {
+                "request_id": cancellation.request_id,
+                "event_type": "task_cancelled",
+                "proof_hash": adapter_result.get("proof_hash"),
+                "sequence": sequence,
+            }
+        )
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-"
+            + event_identity.removeprefix("sha256:")[:32],
+            "sequence": sequence,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "task_cancelled",
+            "task_status": "Cancelled",
+            "occurred_at": occurred_at,
+            "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+            "extensions": {
+                "org.agent_rpc.cancellation": {
+                    "request_id": cancellation.request_id,
+                    "attempt_id": cancellation.attempt_id,
+                    "reason": cancellation.reason,
+                    "proof_hash": adapter_result.get("proof_hash"),
+                }
+            },
+        }
+        self._validate_schema("run-event.schema.json", event)
+        _validate_run_event_semantics(event)
+        _validate_run_event_binding(snapshot, event)
+        try:
+            completed = self._store.complete_supervised_cancel(
+                request_id=cancellation.request_id,
+                result="cancel_confirmed",
+                terminal_event=event,
+                adapter_proof=adapter_result,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        return TaskCancellationProcessResult(
+            snapshot=completed.snapshot,
+            state=completed.cancellation.state,
+            adapter_result=adapter_result,
+            replayed=completed.replayed,
+        )
+
     def refresh_runtime_status(
         self,
         task_id: str,
@@ -2852,6 +3321,14 @@ class TaskService:
                 return TaskRuntimeResult(snapshot, None, None)
             raise TaskConflict("runtime task has no dispatch intent")
         if intent.state != "dispatched":
+            return TaskRuntimeResult(snapshot, intent, None)
+        if (
+            snapshot.cancellation is not None
+            and snapshot.cancellation.state == "requested"
+            and supervisor_lease is None
+        ):
+            # A browser GET may observe the durable request, but only the
+            # active fenced Supervisor may resolve its terminal race.
             return TaskRuntimeResult(snapshot, intent, None)
         if self._dispatcher is None:
             raise TaskDispatchError("DISPATCHER_UNAVAILABLE")

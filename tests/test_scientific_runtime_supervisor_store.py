@@ -18,6 +18,7 @@ from scientific_runtime.task_store import (
     RuntimeSupervisorLeaseLost,
     SQLiteTaskStore,
     TaskStoreConflict,
+    encode_document,
 )
 from scientific_runtime_contracts import compute_plan_hash
 from tests.test_scientific_runtime_contracts import (
@@ -45,6 +46,36 @@ T_PLUS_19 = "2026-07-15T03:00:19Z"
 T_PLUS_20 = "2026-07-15T03:00:20Z"
 T_PLUS_21 = "2026-07-15T03:00:21Z"
 T_PLUS_30 = "2026-07-15T03:00:30Z"
+
+
+def cancel_adapter_proof(
+    *,
+    task_id: str,
+    request_id: str,
+    attempt_id: str,
+    state: str,
+    terminal_status: str,
+) -> dict:
+    cancelled = state == "cancelled"
+    payload = {
+        "schema_version": "1.0.0",
+        "task_id": task_id,
+        "request_id": request_id,
+        "reason": "user_requested",
+        "state": state,
+        "code": "CANCEL_COMPLETED" if cancelled else "CANCEL_TERMINAL_WON",
+        "attempt_id": attempt_id,
+        "capability_record_hash": "sha256:" + "a" * 64 if cancelled else None,
+        "request_record_hash": "sha256:" + "b" * 64 if cancelled else None,
+        "acknowledgement_record_hash": (
+            "sha256:" + "c" * 64 if cancelled else None
+        ),
+        "terminal_status": terminal_status,
+        "local_run_state": "retained",
+        "replayed": False,
+        "receipt_record_hash": "sha256:" + "d" * 64,
+    }
+    return {**payload, "proof_hash": encode_document(payload)[1]}
 
 
 class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
@@ -167,8 +198,177 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         )
         return task_id, dispatcher, runtime
 
-    def test_fresh_v10_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 10)
+    def _cancellable_runtime(self, *, key: str):
+        task_id, dispatcher, runtime, _ = self._pending_runtime(key=key)
+        acquisition = runtime.acquire_runtime_supervisor_lease(
+            **self.scope,
+            owner_id=f"cancel-owner-{key}",
+            lease_seconds=10,
+        )
+        self.assertTrue(acquisition.acquired)
+        scheduled = runtime.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertTrue(runtime.can_cancel_task(task_id, **self.scope))
+        admitted = runtime.cancel_task(
+            task_id=task_id,
+            reason="user_requested",
+            idempotency_key=f"cancel-{key}",
+            **self.scope,
+        )
+        self.assertFalse(admitted.replayed)
+        self.assertIsNotNone(admitted.snapshot.cancellation)
+        return task_id, dispatcher, runtime, acquisition.lease, admitted
+
+    def _insert_direct_cancel_request(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        intent,
+        attempt_id: str,
+        request_id: str,
+        event_id: str,
+    ) -> None:
+        task = connection.execute(
+            "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        self.assertIsNotNone(task)
+        assert task is not None and intent.handle is not None
+        next_sequence = connection.execute(
+            "SELECT MAX(sequence) + 1 FROM run_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": event_id,
+            "sequence": next_sequence,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "cancel_requested",
+            "task_status": task["status"],
+            "occurred_at": NOW,
+            "fingerprint": intent.handle["fingerprint"],
+            "extensions": {
+                "org.agent_rpc.cancellation": {
+                    "request_id": request_id,
+                    "attempt_id": attempt_id,
+                    "reason": "user_requested",
+                }
+            },
+        }
+        event_json, event_hash = encode_document(event)
+        _, fingerprint_hash = encode_document(event["fingerprint"])
+        connection.execute(
+            """
+            INSERT INTO run_events(
+                task_id, sequence, event_id, event_type, task_status,
+                node_id, fingerprint_hash, document_json, document_hash,
+                occurred_at, recorded_at
+            ) VALUES (?, ?, ?, 'cancel_requested', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                next_sequence,
+                event_id,
+                task["status"],
+                intent.node_id,
+                fingerprint_hash,
+                event_json,
+                event_hash,
+                NOW,
+                NOW,
+            ),
+        )
+
+        request = {
+            "schema_version": "1.0.0",
+            "request_id": request_id,
+            "task_id": task_id,
+            "intent_id": intent.intent_id,
+            "attempt_id": attempt_id,
+            "reason": "user_requested",
+            "actor": {"type": "user", "id": PRINCIPAL_ID},
+            "requested_at": NOW,
+            "extensions": {},
+        }
+        request_json, request_document_hash = encode_document(request)
+        _, request_hash = encode_document(
+            {
+                "task_id": task_id,
+                "project_id": PROJECT_ID,
+                "principal_id": PRINCIPAL_ID,
+                "action": "cancel_task",
+                "reason": "user_requested",
+            }
+        )
+        connection.execute(
+            """
+            INSERT INTO task_cancel_requests(
+                request_id, task_id, project_id, principal_id,
+                intent_id, attempt_id, reason, idempotency_key,
+                request_hash, request_event_sequence,
+                document_json, document_hash, requested_at, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'user_requested', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                task_id,
+                PROJECT_ID,
+                PRINCIPAL_ID,
+                intent.intent_id,
+                attempt_id,
+                f"direct-sql-{request_id}",
+                request_hash,
+                next_sequence,
+                request_json,
+                request_document_hash,
+                NOW,
+                NOW,
+            ),
+        )
+
+    def _terminal_event(
+        self,
+        *,
+        task_id: str,
+        intent,
+        request_id: str,
+        attempt_id: str,
+        terminal_status: str,
+        proof_hash: str,
+        event_id: str,
+    ) -> dict:
+        event_type = {
+            "Cancelled": "task_cancelled",
+            "Succeeded": "node_succeeded",
+            "Failed": "node_failed",
+        }[terminal_status]
+        return {
+            "schema_version": "1.0.0",
+            "event_id": event_id,
+            "sequence": self.store.latest_run_event_sequence(task_id) + 1,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": event_type,
+            "task_status": terminal_status,
+            "occurred_at": NOW,
+            "fingerprint": intent.handle["fingerprint"],
+            "extensions": {
+                "org.agent_rpc.cancellation": {
+                    "request_id": request_id,
+                    "attempt_id": attempt_id,
+                    "reason": "user_requested",
+                    "proof_hash": proof_hash,
+                }
+            },
+        }
+
+    def test_fresh_v11_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 11)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -179,6 +379,9 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "supervised_dispatch_adoptions",
             "supervised_dispatch_attempts",
             "supervised_private_receipt_adoptions",
+            "task_cancel_requests",
+            "supervised_cancel_attempts",
+            "task_cancel_outcomes",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -218,6 +421,18 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "supervised_private_receipt_requires_active_term",
             "supervised_private_receipt_adoptions_are_immutable",
             "supervised_private_receipt_adoptions_cannot_be_deleted",
+            "task_cancel_request_requires_exact_running_attempt",
+            "task_cancel_request_blocks_supervised_dispatch",
+            "supervised_cancel_attempt_requires_pending_request",
+            "supervised_cancel_attempt_requires_active_term",
+            "task_cancel_outcome_requires_terminal_event",
+            "task_cancel_outcome_requires_active_term",
+            "task_cancel_requests_are_immutable",
+            "task_cancel_requests_cannot_be_deleted",
+            "supervised_cancel_attempts_are_immutable",
+            "supervised_cancel_attempts_cannot_be_deleted",
+            "task_cancel_outcomes_are_immutable",
+            "task_cancel_outcomes_cannot_be_deleted",
         }
         connection = self._connection()
         try:
@@ -248,6 +463,12 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(
                 dispatch_migration["name"], "0010_supervised_dispatch.sql"
+            )
+            cancel_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 11"
+            ).fetchone()
+            self.assertEqual(
+                cancel_migration["name"], "0011_task_cancellation.sql"
             )
         finally:
             connection.close()
@@ -293,12 +514,18 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v10(self) -> None:
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v11(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            connection.execute(
+                "DROP TRIGGER task_cancel_request_blocks_supervised_dispatch"
+            )
+            connection.execute("DROP TABLE task_cancel_outcomes")
+            connection.execute("DROP TABLE supervised_cancel_attempts")
+            connection.execute("DROP TABLE task_cancel_requests")
             connection.execute("DROP TABLE supervised_private_receipt_adoptions")
             connection.execute("DROP TABLE supervised_dispatch_attempts")
             connection.execute("DROP TABLE supervised_dispatch_adoptions")
@@ -311,7 +538,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 10)
+        self.assertEqual(reopened.migration_version(), 11)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -339,7 +566,635 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 0,
             )
             self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_cancel_requests"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+        finally:
+            connection.close()
+
+    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v11(self) -> None:
+        task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v11")
+        acquired = self._acquire("upgrade-v11-owner", lease_seconds=30)
+        self.assertTrue(acquired.acquired)
+        connection = self._connection()
+        try:
+            connection.execute(
+                "DROP TRIGGER task_cancel_request_blocks_supervised_dispatch"
+            )
+            connection.execute("DROP TABLE task_cancel_outcomes")
+            connection.execute("DROP TABLE supervised_cancel_attempts")
+            connection.execute("DROP TABLE task_cancel_requests")
+            connection.execute("DELETE FROM schema_migrations WHERE version = 11")
+            connection.execute("PRAGMA user_version = 10")
+            connection.commit()
+        finally:
+            connection.close()
+
+        reopened = SQLiteTaskStore(self.database_path)
+        self.assertEqual(reopened.migration_version(), 11)
+        self.assertEqual(reopened.get_task(task_id).status, "Queued")
+        lease = reopened.get_runtime_supervisor_lease(**self.scope)
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        self.assertEqual(lease.fencing_token, acquired.lease.fencing_token)
+        self.assertEqual(lease.state, "active")
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_cancel_requests"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+        finally:
+            connection.close()
+
+    def test_cancel_request_attempt_and_outcome_are_append_only(self) -> None:
+        task_id, _, runtime, lease, admitted = self._cancellable_runtime(
+            key="cancel-immutable"
+        )
+        cancellation = admitted.snapshot.cancellation
+        assert cancellation is not None
+        self.assertEqual(cancellation.state, "requested")
+
+        authorization = self.store.authorize_supervised_cancel(
+            request_id=cancellation.request_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: NOW,
+        )
+        self.assertFalse(authorization.replayed)
+        completed = runtime.process_runtime_cancellation(
+            task_id,
+            **self.scope,
+            supervisor_lease=lease,
+        )
+        self.assertEqual(completed.state, "cancelled")
+
+        connection = self._connection()
+        try:
+            for table, predicate, value in (
+                ("task_cancel_requests", "request_id", cancellation.request_id),
+                ("supervised_cancel_attempts", "request_id", cancellation.request_id),
+                ("task_cancel_outcomes", "request_id", cancellation.request_id),
+            ):
+                with self.subTest(table=table, operation="update"):
+                    with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                        connection.execute(
+                            f"UPDATE {table} SET request_id = request_id "
+                            f"WHERE {predicate} = ?",
+                            (value,),
+                        )
+                    connection.rollback()
+                with self.subTest(table=table, operation="delete"):
+                    with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                        connection.execute(
+                            f"DELETE FROM {table} WHERE {predicate} = ?",
+                            (value,),
+                        )
+                    connection.rollback()
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_cancel_requests"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM supervised_cancel_attempts"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_cancel_outcomes"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_cancel_completion_rejects_an_unbound_adapter_proof(self) -> None:
+        task_id, _, _, lease, admitted = self._cancellable_runtime(
+            key="cancel-reject-empty-proof"
+        )
+        cancellation = admitted.snapshot.cancellation
+        assert cancellation is not None
+        self.store.authorize_supervised_cancel(
+            request_id=cancellation.request_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: NOW,
+        )
+        before_sequence = self.store.latest_run_event_sequence(task_id)
+
+        with self.assertRaisesRegex(TaskStoreConflict, "Adapter proof is invalid"):
+            self.store.complete_supervised_cancel(
+                request_id=cancellation.request_id,
+                result="cancel_confirmed",
+                terminal_event=None,
+                adapter_proof={},
+                supervisor_lease=lease,
+                supervisor_clock=lambda: NOW,
+            )
+
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+        self.assertEqual(self.store.latest_run_event_sequence(task_id), before_sequence)
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_cancel_outcomes"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_cancel_completion_rejects_a_cross_terminal_adapter_proof(self) -> None:
+        task_id, _, _, lease, admitted = self._cancellable_runtime(
+            key="cancel-reject-cross-terminal-proof"
+        )
+        cancellation = admitted.snapshot.cancellation
+        assert cancellation is not None
+        self.store.authorize_supervised_cancel(
+            request_id=cancellation.request_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: NOW,
+        )
+        intent = self.store.get_dispatch_intent(task_id)
+        assert intent is not None and intent.handle is not None
+        proof = cancel_adapter_proof(
+            task_id=task_id,
+            request_id=cancellation.request_id,
+            attempt_id=cancellation.attempt_id,
+            state="terminal_won",
+            terminal_status="Succeeded",
+        )
+        event = self._terminal_event(
+            task_id=task_id,
+            intent=intent,
+            request_id=cancellation.request_id,
+            attempt_id=cancellation.attempt_id,
+            terminal_status="Failed",
+            proof_hash=proof["proof_hash"],
+            event_id="event-cancel-reject-cross-terminal-proof",
+        )
+        before_sequence = self.store.latest_run_event_sequence(task_id)
+
+        with self.assertRaisesRegex(TaskStoreConflict, "contradicts"):
+            self.store.complete_supervised_cancel(
+                request_id=cancellation.request_id,
+                result="terminal_preempted",
+                terminal_event=event,
+                adapter_proof=proof,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: NOW,
+            )
+
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+        self.assertEqual(self.store.latest_run_event_sequence(task_id), before_sequence)
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_cancel_outcomes"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_direct_sql_cancel_outcome_rejects_a_cross_request_proof(self) -> None:
+        task_id, _, _, lease, admitted = self._cancellable_runtime(
+            key="cancel-reject-direct-cross-proof"
+        )
+        cancellation = admitted.snapshot.cancellation
+        assert cancellation is not None
+        self.store.authorize_supervised_cancel(
+            request_id=cancellation.request_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: NOW,
+        )
+        intent = self.store.get_dispatch_intent(task_id)
+        assert intent is not None and intent.handle is not None
+        proof = cancel_adapter_proof(
+            task_id=task_id,
+            request_id="cancel-" + "f" * 32,
+            attempt_id=cancellation.attempt_id,
+            state="cancelled",
+            terminal_status="Cancelled",
+        )
+        event = self._terminal_event(
+            task_id=task_id,
+            intent=intent,
+            request_id=cancellation.request_id,
+            attempt_id=cancellation.attempt_id,
+            terminal_status="Cancelled",
+            proof_hash=proof["proof_hash"],
+            event_id="event-cancel-reject-direct-cross-proof",
+        )
+        event_json, event_hash = encode_document(event)
+        _, fingerprint_hash = encode_document(event["fingerprint"])
+        proof_json, proof_hash = encode_document(proof)
+        outcome = {
+            "schema_version": "1.0.0",
+            "request_id": cancellation.request_id,
+            "task_id": task_id,
+            "result": "cancel_confirmed",
+            "terminal_status": "Cancelled",
+            "adapter_proof": proof,
+            "resolved_at": NOW,
+            "extensions": {},
+        }
+        outcome_json, outcome_hash = encode_document(outcome)
+
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO run_events(
+                    task_id, sequence, event_id, event_type, task_status,
+                    node_id, fingerprint_hash, document_json, document_hash,
+                    occurred_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    event["sequence"],
+                    event["event_id"],
+                    event["event_type"],
+                    event["task_status"],
+                    event["node_id"],
+                    fingerprint_hash,
+                    event_json,
+                    event_hash,
+                    NOW,
+                    NOW,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Cancelled', updated_at = ? "
+                "WHERE task_id = ?",
+                (NOW, task_id),
+            )
+            authorization = connection.execute(
+                """
+                SELECT authorized_at_us FROM supervised_cancel_attempts
+                WHERE request_id = ? AND fencing_token = ?
+                """,
+                (cancellation.request_id, lease.fencing_token),
+            ).fetchone()
+            assert authorization is not None
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "cancel outcome requires its exact terminal event",
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO task_cancel_outcomes(
+                        request_id, task_id, project_id, principal_id,
+                        intent_id, attempt_id, result, terminal_status,
+                        terminal_event_sequence, adapter_proof_json,
+                        adapter_proof_hash, document_json, document_hash,
+                        fencing_token, resolved_at, resolved_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'cancel_confirmed',
+                              'Cancelled', ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cancellation.request_id,
+                        task_id,
+                        PROJECT_ID,
+                        PRINCIPAL_ID,
+                        cancellation.intent_id,
+                        cancellation.attempt_id,
+                        event["sequence"],
+                        proof_json,
+                        proof_hash,
+                        outcome_json,
+                        outcome_hash,
+                        lease.fencing_token,
+                        NOW,
+                        authorization["authorized_at_us"],
+                    ),
+                )
+            connection.rollback()
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
+                ).fetchone()[0],
+                "Queued",
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM run_events WHERE event_id = ?",
+                    (event["event_id"],),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_cancel_outcomes"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_direct_sql_cancel_request_rejects_an_older_running_attempt(
+        self,
+    ) -> None:
+        task_id, _, runtime, _ = self._pending_runtime(
+            key="cancel-reject-older-attempt"
+        )
+        acquisition = runtime.acquire_runtime_supervisor_lease(
+            **self.scope,
+            owner_id="cancel-reject-older-attempt-owner",
+            lease_seconds=10,
+        )
+        self.assertTrue(acquisition.acquired)
+        scheduled = runtime.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertIsNotNone(scheduled.intent.handle)
+
+        new_attempt_id = "attempt-" + "b" * 32
+        request_id = "cancel-" + "c" * 32
+        event_id = "event-direct-sql-older-attempt-cancel"
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            old_attempt = connection.execute(
+                """
+                SELECT * FROM worker_launch_attempts
+                WHERE intent_id = ? ORDER BY attempt_number ASC LIMIT 1
+                """,
+                (scheduled.intent.intent_id,),
+            ).fetchone()
+            self.assertIsNotNone(old_attempt)
+            assert old_attempt is not None
+            old_attempt_id = old_attempt["attempt_id"]
+            connection.execute(
+                """
+                INSERT INTO worker_launch_attempts(
+                    attempt_id, intent_id, task_id, project_id, principal_id,
+                    attempt_number, submission_id, job_id,
+                    adapter_request_hash, binding_hash, created_at,
+                    first_fencing_token, first_observed_at,
+                    first_observed_at_us
+                )
+                SELECT ?, intent_id, task_id, project_id, principal_id,
+                       attempt_number + 1, submission_id, job_id,
+                       adapter_request_hash, ?, created_at,
+                       first_fencing_token, first_observed_at,
+                       first_observed_at_us
+                FROM worker_launch_attempts WHERE attempt_id = ?
+                """,
+                (
+                    new_attempt_id,
+                    "sha256:" + "d" * 64,
+                    old_attempt_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO worker_attempt_observations(
+                    attempt_id, observation_sequence, ticket_state,
+                    capacity_slot, capacity_generation, ticket_worker_pid,
+                    ticket_updated_at, ticket_record_hash,
+                    ready_worker_pid, ready_started_at, ready_record_hash,
+                    heartbeat_sequence, heartbeat_state,
+                    heartbeat_updated_at, heartbeat_record_hash,
+                    document_json, document_hash, project_id, principal_id,
+                    fencing_token, observed_at, observed_at_us
+                )
+                SELECT ?, 1, ticket_state,
+                       capacity_slot, capacity_generation, ticket_worker_pid,
+                       ticket_updated_at, ticket_record_hash,
+                       ready_worker_pid, ready_started_at, ready_record_hash,
+                       heartbeat_sequence, heartbeat_state,
+                       heartbeat_updated_at, heartbeat_record_hash,
+                       document_json, document_hash, project_id, principal_id,
+                       fencing_token, observed_at, observed_at_us
+                FROM worker_attempt_observations
+                WHERE attempt_id = ?
+                ORDER BY observation_sequence DESC LIMIT 1
+                """,
+                (new_attempt_id, old_attempt_id),
+            )
+
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "cancel request requires an exact running attempt",
+            ):
+                self._insert_direct_cancel_request(
+                    connection,
+                    task_id=task_id,
+                    intent=scheduled.intent,
+                    attempt_id=old_attempt_id,
+                    request_id=request_id,
+                    event_id=event_id,
+                )
+            connection.rollback()
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_cancel_requests WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM run_events WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_direct_sql_cancel_request_rejects_historical_algorithm_binding(
+        self,
+    ) -> None:
+        task_id, _, runtime, _ = self._pending_runtime(
+            key="cancel-reject-historical-algorithm"
+        )
+        acquisition = runtime.acquire_runtime_supervisor_lease(
+            **self.scope,
+            owner_id="cancel-reject-historical-algorithm-owner",
+            lease_seconds=10,
+        )
+        self.assertTrue(acquisition.acquired)
+        scheduled = runtime.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        request_id = "cancel-" + "e" * 32
+        event_id = "event-direct-sql-historical-algorithm-cancel"
+
+        connection = self._connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt_id = connection.execute(
+                """
+                SELECT attempt_id FROM worker_launch_attempts
+                WHERE intent_id = ? ORDER BY attempt_number DESC LIMIT 1
+                """,
+                (scheduled.intent.intent_id,),
+            ).fetchone()[0]
+            # Build the impossible cross-version fixture without weakening the
+            # production schema: the DROP and tamper are rolled back below.
+            connection.execute("DROP TRIGGER dispatch_intents_are_immutable")
+            connection.execute(
+                """
+                UPDATE dispatch_intents
+                SET request_json = json_set(
+                    request_json, '$.request.algorithm.version', '1.3.0'
+                )
+                WHERE intent_id = ?
+                """,
+                (scheduled.intent.intent_id,),
+            )
+            binding = connection.execute(
+                """
+                SELECT adapter_version,
+                       json_extract(
+                           request_json, '$.request.algorithm.version'
+                       ) AS algorithm_version
+                FROM dispatch_intents WHERE intent_id = ?
+                """,
+                (scheduled.intent.intent_id,),
+            ).fetchone()
+            self.assertEqual(
+                (binding["algorithm_version"], binding["adapter_version"]),
+                ("1.3.0", "1.4.0"),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "cancel request requires an exact running attempt",
+            ):
+                self._insert_direct_cancel_request(
+                    connection,
+                    task_id=task_id,
+                    intent=scheduled.intent,
+                    attempt_id=attempt_id,
+                    request_id=request_id,
+                    event_id=event_id,
+                )
+            connection.rollback()
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_cancel_requests WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM run_events WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'trigger'
+                      AND name = 'dispatch_intents_are_immutable'
+                    """
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_cancel_authorization_replays_only_inside_the_active_term(self) -> None:
+        _, _, _, old_lease, admitted = self._cancellable_runtime(
+            key="cancel-active-term"
+        )
+        cancellation = admitted.snapshot.cancellation
+        assert cancellation is not None
+
+        first = self.store.authorize_supervised_cancel(
+            request_id=cancellation.request_id,
+            supervisor_lease=old_lease,
+            supervisor_clock=lambda: NOW,
+        )
+        self.assertFalse(first.replayed)
+        replay = self.store.authorize_supervised_cancel(
+            request_id=cancellation.request_id,
+            supervisor_lease=old_lease,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.authorized_at, first.authorized_at)
+
+        self.store.release_runtime_supervisor_lease(
+            lease=old_lease,
+            clock=lambda: T_PLUS_1,
+        )
+        with self.assertRaises(RuntimeSupervisorLeaseLost):
+            self.store.authorize_supervised_cancel(
+                request_id=cancellation.request_id,
+                supervisor_lease=old_lease,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+
+        next_term = self._acquire(
+            "cancel-active-term-takeover",
+            now=T_PLUS_5,
+            lease_seconds=10,
+        )
+        self.assertTrue(next_term.acquired)
+        self.assertGreater(
+            next_term.lease.fencing_token,
+            old_lease.fencing_token,
+        )
+        takeover = self.store.authorize_supervised_cancel(
+            request_id=cancellation.request_id,
+            supervisor_lease=next_term.lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertFalse(takeover.replayed)
+
+        connection = self._connection()
+        try:
+            attempts = connection.execute(
+                """
+                SELECT fencing_token, action
+                FROM supervised_cancel_attempts
+                WHERE request_id = ?
+                ORDER BY fencing_token
+                """,
+                (cancellation.request_id,),
+            ).fetchall()
+            self.assertEqual(
+                [row["fencing_token"] for row in attempts],
+                [old_lease.fencing_token, next_term.lease.fencing_token],
+            )
+            self.assertEqual(
+                {row["action"] for row in attempts},
+                {"deliver_exact_attempt_cancel"},
             )
         finally:
             connection.close()

@@ -7,14 +7,18 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scientific_runtime.registry_service import RegistryService
 from scientific_runtime.fwi_registry import load_deepwave_manifest
 from scientific_runtime.task_dispatcher import DispatchPreparation
-from scientific_runtime.task_service import TaskService
-from scientific_runtime.task_store import SQLiteTaskStore
+from scientific_runtime.task_service import TaskCancellationResult, TaskService
+from scientific_runtime.task_store import (
+    SQLiteTaskStore,
+    TaskCancellationSnapshot,
+)
 from scientific_runtime.workbench_service import (
     GuidedWorkbench,
     WorkbenchConflict,
@@ -253,7 +257,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             capabilities["scope"],
             {"project_id": PROJECT_ID, "principal_id": PRINCIPAL_ID},
         )
-        self.assertFalse(capabilities["features"]["running_cancel"])
+        self.assertTrue(capabilities["features"]["running_cancel"])
         self.assertFalse(capabilities["features"]["automatic_reconciliation"])
         self.assertFalse(capabilities["features"]["startup_dispatch_recovery"])
         self.assertFalse(capabilities["features"]["startup_receipt_recovery"])
@@ -299,7 +303,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(
             capabilities["capabilities"],
             {
-                "cancel": False,
+                "cancel": True,
                 "retry": False,
                 "sse": False,
                 "startup_dispatch_recovery": False,
@@ -782,6 +786,32 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                     self.workbench.list_tasks(limit=limit)
                 self.assertEqual(caught.exception.code, "INVALID_TASK_LIST_LIMIT")
 
+    def test_task_discovery_never_probes_runtime_cancel_capability(self) -> None:
+        created = self.workbench.create_task(
+            guided_form(goal="list cancellation projection"),
+            "list-cancel-projection",
+        )
+        original = self.tasks.can_cancel_task
+
+        def unexpected_probe(*args, **kwargs):
+            self.fail(
+                "list_tasks must remain SQLite-only and never probe cancel capability"
+            )
+
+        self.tasks.can_cancel_task = unexpected_probe
+        try:
+            listed = self.workbench.list_tasks()
+        finally:
+            self.tasks.can_cancel_task = original
+
+        item = next(
+            task
+            for task in listed["tasks"]
+            if task["task_id"] == created["task_id"]
+        )
+        self.assertFalse(item["can_cancel"])
+        self.assertIsNone(item["cancellation"])
+
     def test_task_trash_restore_projection_views_replay_and_cursor_binding(self) -> None:
         created = [
             self.workbench.create_task(
@@ -1138,6 +1168,164 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         with self.assertRaises(WorkbenchConflict):
             self.workbench.abandon_task(submitted["task_id"], "not-a-cancel")
+
+    def test_detail_projects_exact_cancel_capability_and_cancellation(self) -> None:
+        created = self.workbench.create_task(
+            guided_form(goal="detail cancellation projection"),
+            "detail-cancel-projection",
+        )
+        task_id = created["task_id"]
+        capability_calls = []
+        original_can_cancel = self.tasks.can_cancel_task
+
+        def can_cancel(current_task_id, **scope):
+            capability_calls.append((current_task_id, scope))
+            return True
+
+        self.tasks.can_cancel_task = can_cancel
+        try:
+            available = self.workbench.get_task(task_id, refresh=False)
+        finally:
+            self.tasks.can_cancel_task = original_can_cancel
+
+        self.assertTrue(available["can_cancel"])
+        self.assertIsNone(available["cancellation"])
+        self.assertEqual(
+            capability_calls,
+            [
+                (
+                    task_id,
+                    {
+                        "project_id": PROJECT_ID,
+                        "principal_id": PRINCIPAL_ID,
+                    },
+                )
+            ],
+        )
+
+        snapshot = self.store.get_task(task_id)
+        cancellation = TaskCancellationSnapshot(
+            request_id="cancel-" + "a" * 32,
+            task_id=task_id,
+            intent_id="intent-" + "b" * 32,
+            attempt_id="attempt-" + "c" * 32,
+            reason="user_requested",
+            requested_at="2026-07-15T03:00:20Z",
+            state="requested",
+        )
+        requested = replace(snapshot, cancellation=cancellation)
+        original_get_task = self.tasks.get_task
+
+        def get_requested_task(current_task_id, **scope):
+            self.assertEqual(current_task_id, task_id)
+            self.assertEqual(
+                scope,
+                {"project_id": PROJECT_ID, "principal_id": PRINCIPAL_ID},
+            )
+            return requested
+
+        def unexpected_probe(*args, **kwargs):
+            self.fail("a durable cancellation must suppress capability probing")
+
+        self.tasks.get_task = get_requested_task
+        self.tasks.can_cancel_task = unexpected_probe
+        try:
+            detail = self.workbench.get_task(task_id, refresh=False)
+        finally:
+            self.tasks.get_task = original_get_task
+            self.tasks.can_cancel_task = original_can_cancel
+
+        self.assertFalse(detail["can_cancel"])
+        self.assertEqual(
+            detail["cancellation"],
+            {
+                "state": "requested",
+                "reason": "user_requested",
+                "requested_at": "2026-07-15T03:00:20Z",
+                "resolved_at": None,
+                "failure_code": None,
+            },
+        )
+
+    def test_cancel_maps_three_arguments_and_replays_exactly(self) -> None:
+        created = self.workbench.create_task(
+            guided_form(goal="cancel facade mapping"),
+            "cancel-facade-create",
+        )
+        task_id = created["task_id"]
+        snapshot = self.store.get_task(task_id)
+        cancellation = TaskCancellationSnapshot(
+            request_id="cancel-" + "d" * 32,
+            task_id=task_id,
+            intent_id="intent-" + "e" * 32,
+            attempt_id="attempt-" + "f" * 32,
+            reason="user_requested",
+            requested_at="2026-07-15T03:00:30Z",
+            state="requested",
+        )
+        requested = replace(snapshot, cancellation=cancellation)
+        cancel_calls = []
+        original_cancel = self.tasks.cancel_task
+        original_can_cancel = self.tasks.can_cancel_task
+
+        def cancel_task(**kwargs):
+            cancel_calls.append(kwargs)
+            return TaskCancellationResult(
+                snapshot=requested,
+                replayed=len(cancel_calls) > 1,
+            )
+
+        def unexpected_probe(*args, **kwargs):
+            self.fail("cancel response must use its durable cancellation projection")
+
+        self.tasks.cancel_task = cancel_task
+        self.tasks.can_cancel_task = unexpected_probe
+        try:
+            first = self.workbench.cancel_task(
+                task_id,
+                "cancel-facade-key",
+                "user_requested",
+            )
+            replay = self.workbench.cancel_task(
+                task_id,
+                "cancel-facade-key",
+                "user_requested",
+            )
+            with self.assertRaises(WorkbenchValidationError) as caught:
+                self.workbench.cancel_task(
+                    task_id,
+                    "cancel-invalid-reason",
+                    "timeout",
+                )
+        finally:
+            self.tasks.cancel_task = original_cancel
+            self.tasks.can_cancel_task = original_can_cancel
+
+        expected_call = {
+            "task_id": task_id,
+            "reason": "user_requested",
+            "idempotency_key": self.workbench._mutation_key(
+                "cancel", "cancel-facade-key"
+            ),
+            "project_id": PROJECT_ID,
+            "principal_id": PRINCIPAL_ID,
+        }
+        self.assertEqual(cancel_calls, [expected_call, expected_call])
+        self.assertFalse(first["replayed"])
+        self.assertTrue(replay["replayed"])
+        self.assertFalse(first["can_cancel"])
+        self.assertEqual(first["cancellation"], replay["cancellation"])
+        self.assertEqual(
+            first["cancellation"],
+            {
+                "state": "requested",
+                "reason": "user_requested",
+                "requested_at": "2026-07-15T03:00:30Z",
+                "resolved_at": None,
+                "failure_code": None,
+            },
+        )
+        self.assertEqual(caught.exception.code, "INVALID_CANCEL_REASON")
 
     def test_get_refresh_events_and_artifact_projection_do_not_leak_runtime_ids(self) -> None:
         created = self.workbench.create_task(guided_form(), "create-read")

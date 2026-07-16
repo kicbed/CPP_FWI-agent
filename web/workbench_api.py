@@ -34,6 +34,7 @@ _MUTATION_ENDPOINTS = frozenset(
         "revise_task",
         "approve",
         "abandon",
+        "cancel",
         "trash",
         "restore",
         "purge",
@@ -346,6 +347,7 @@ def _route(path: str) -> _Route:
             "draft": ("revise_task", ("PUT",)),
             "approve": ("approve", ("POST",)),
             "abandon": ("abandon", ("POST",)),
+            "cancel": ("cancel", ("POST",)),
             "trash": ("trash", ("POST",)),
             "restore": ("restore", ("POST",)),
             "purge": ("purge", ("POST",)),
@@ -784,6 +786,19 @@ class WorkbenchAPI:
                 if payload:
                     raise _RequestError(422, "INVALID_ABANDON", "request validation failed")
                 return _success_response(self._application.abandon_task(route.task_id, key))
+            if route.endpoint == "cancel":
+                if (
+                    set(payload) != {"reason"}
+                    or payload["reason"] != "user_requested"
+                ):
+                    raise _RequestError(422, "INVALID_CANCEL", "request validation failed")
+                return _success_response(
+                    self._application.cancel_task(
+                        route.task_id,
+                        key,
+                        "user_requested",
+                    )
+                )
             if route.endpoint in {"trash", "restore"}:
                 if set(payload) != {"expected_visibility_revision"}:
                     raise _RequestError(

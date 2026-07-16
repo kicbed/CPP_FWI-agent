@@ -19,11 +19,13 @@
   attempt/capacity fence、ready/heartbeat 证据，以及 P2-005C SQLite v9 fenced Worker
   evidence projection/late adoption；P2-006 又增加 SQLite v10 受监督派发授权、enqueue-only
   submit、可恢复 fenced scheduler、exact staged attempt 恢复与 current 1.4 legacy-private
-  receipt 的受 fence 收养。
+  receipt 的受 fence 收养；P2-007 增加 SQLite v11 durable user-cancel admission、active-term
+  delivery、exact Worker self-cancel 证明和 Guided Web 取消状态。
 - 当前阶段：完整 P2 仍在进行；上述 P2 子项不得表述为完整 P2 已完成。
-- 下一安全方向：基于 exact attempt/fence 实现 cancel 与 timeout；随后处理有限 retry、
-  `reconciliation_required` resolution，SSE 继续后置。
-- 当前阻塞：无。工作树中的未提交内容可能属于另一个活跃窗口，必须现场检查并保护。
+- 下一安全方向：先由用户确认 timeout 的终态语义、计时起点和 force policy，再实现 timeout；
+  随后处理有限 retry、`reconciliation_required` resolution，SSE 继续后置。
+- 当前阻塞：P2-007 无阻塞；timeout 产品语义尚未形成 Accepted 决定。工作树中的未提交内容
+  可能属于另一个活跃窗口，必须现场检查并保护。
 - 已接受 D-011：继续保留逐切片开发，但采用弹性中等粒度；约十余个剩余切片只是估算，允许
   按真实风险小幅增加，不为 migration/字段/单项测试制造路线切片，也不得无说明膨胀成几十个。
   多算法首先是独立可选工具，自动全流程不是当前验收要求；测试分级执行但阶段质量门不降低。
@@ -66,6 +68,13 @@
   current 1.4 legacy private schema 1.0 的 exact launched receipt 可凭只读 proof 受 fence 收养；
   历史 Algorithm/Adapter identity 1.0–1.3、legacy CLI/MCP 仍不在首次派发/容量投影边界，升级前
   已终态任务不保证 evidence backfill。不完整 staging 保持 fail-closed，等待 reconciliation。
+- P2-007 只允许 current Algorithm/Adapter 1.4、private schema 1.1、durable `dispatched`、最新
+  v9 observation 为 spawned+ready+running 且 exact Worker 已发布 capability 的任务接受取消。
+  HTTP 只持久化请求，Task 仍为 Queued/Running；active Supervisor term 只在 exact request +
+  Worker ack + stopped heartbeat + idle execution `flock` 全部成立后提交 Cancelled。自然
+  Succeeded/Failed 先到则 cancellation 为 superseded 且不改写终态。控制面不根据持久 PID
+  发 signal；pending/staged、legacy private schema 1.0、公共历史 1.0–1.3 均不支持该入口。
+- `resources.wall_time_seconds` 仍只是持久资源策略字段，不是 runtime timeout；timeout 尚未实现。
 - 不读取、打印或提交 `.env`、API Key、凭证、私有 prompt、模型、运行 artifact、数据库、
   日志、构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开报告；科学结论只限实际实验边界。

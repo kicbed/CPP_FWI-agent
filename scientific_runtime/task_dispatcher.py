@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
@@ -12,10 +13,15 @@ from .fwi_adapter import (
     SUPPORTED_ADAPTER_VERSIONS,
     AdapterError,
     AdapterHandle,
+    AdapterManagedCancelProof,
     DeepwaveAdapter,
     is_supported_receipt_binding,
 )
-from .task_store import DispatchIntentSnapshot, TaskSnapshot
+from .task_store import DispatchIntentSnapshot, TaskSnapshot, encode_document
+
+
+_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MANAGED_ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
 
 
 class DispatchError(RuntimeError):
@@ -82,6 +88,21 @@ class TaskDispatcher(Protocol):
         ...
 
     def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
+        ...
+
+    def supports_exact_cancel(
+        self, intent: DispatchIntentSnapshot, *, attempt_id: str
+    ) -> bool:
+        ...
+
+    def cancel(
+        self,
+        intent: DispatchIntentSnapshot,
+        *,
+        request_id: str,
+        attempt_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
         ...
 
     def collect(self, intent: DispatchIntentSnapshot) -> list[dict[str, Any]]:
@@ -430,6 +451,178 @@ class DeepwaveTaskDispatcher:
             raise DispatchError(error.code) from error
         except Exception as error:
             raise DispatchError("ADAPTER_STATUS_UNAVAILABLE") from error
+
+    def supports_exact_cancel(
+        self, intent: DispatchIntentSnapshot, *, attempt_id: str
+    ) -> bool:
+        """Read-only exact-Worker cancellation capability probe."""
+
+        handle = self._handle_from_intent(intent)
+        try:
+            result = self._adapter.supports_exact_cancel(
+                handle, attempt_id=attempt_id
+            )
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("ADAPTER_CANCEL_CAPABILITY_UNAVAILABLE") from error
+        if type(result) is not bool:
+            raise DispatchError("ADAPTER_CANCEL_CAPABILITY_INVALID")
+        return result
+
+    def cancel(
+        self,
+        intent: DispatchIntentSnapshot,
+        *,
+        request_id: str,
+        attempt_id: str,
+        reason: str = "user_requested",
+    ) -> dict[str, Any]:
+        """Request/finalize cancellation for one dispatched exact receipt."""
+
+        handle = self._handle_from_intent(intent)
+        try:
+            result = self._adapter.cancel(
+                handle,
+                cancel_id=request_id,
+                attempt_id=attempt_id,
+                reason=reason,
+            )
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("ADAPTER_CANCEL_UNAVAILABLE") from error
+        if not isinstance(result, AdapterManagedCancelProof):
+            raise DispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+        proof = result.as_dict()
+        expected = {
+            "schema_version",
+            "task_id",
+            "request_id",
+            "reason",
+            "state",
+            "code",
+            "attempt_id",
+            "capability_record_hash",
+            "request_record_hash",
+            "acknowledgement_record_hash",
+            "terminal_status",
+            "local_run_state",
+            "replayed",
+            "receipt_record_hash",
+            "proof_hash",
+        }
+        supplied_hash = proof.get("proof_hash")
+        payload = {
+            key: copy.deepcopy(value)
+            for key, value in proof.items()
+            if key != "proof_hash"
+        }
+        _, actual_hash = encode_document(payload)
+        state = proof.get("state")
+        code = proof.get("code")
+        capability_hash = proof.get("capability_record_hash")
+        request_hash = proof.get("request_record_hash")
+        acknowledgement_hash = proof.get("acknowledgement_record_hash")
+        terminal_status = proof.get("terminal_status")
+        replayed = proof.get("replayed")
+        nullable_hashes = (
+            capability_hash,
+            request_hash,
+            acknowledgement_hash,
+        )
+        hash_chain_valid = (
+            all(
+                value is None
+                or (isinstance(value, str) and _SHA256.fullmatch(value))
+                for value in nullable_hashes
+            )
+            and not (capability_hash is None and request_hash is not None)
+            and not (request_hash is None and acknowledgement_hash is not None)
+        )
+        state_valid = False
+        if state == "requested":
+            state_valid = (
+                code == "CANCEL_REQUESTED"
+                and capability_hash is not None
+                and request_hash is not None
+                and terminal_status is None
+                and replayed is False
+            )
+        elif state == "pending":
+            state_valid = (
+                code == "CANCEL_PENDING"
+                and capability_hash is not None
+                and request_hash is not None
+                and terminal_status is None
+                and replayed is True
+            )
+        elif state == "cancelled":
+            state_valid = (
+                code == "CANCEL_COMPLETED"
+                and all(value is not None for value in nullable_hashes)
+                and terminal_status == "Cancelled"
+            )
+        elif state == "terminal_won":
+            state_valid = (
+                code == "CANCEL_TERMINAL_WON"
+                and terminal_status in {"Succeeded", "Failed"}
+            )
+        elif state == "deferred":
+            no_capability_codes = {
+                "CANCEL_MANAGED_ATTEMPT_UNAVAILABLE",
+                "CANCEL_ATTEMPT_MISMATCH",
+                "CANCEL_WORKER_CAPABILITY_UNAVAILABLE",
+            }
+            other_deferred_codes = {
+                "CANCEL_WORKER_NOT_RUNNING",
+                "CANCEL_EXIT_UNPROVEN",
+                "CANCEL_TERMINAL_PROOF_UNAVAILABLE",
+            }
+            state_valid = (
+                code in no_capability_codes | other_deferred_codes
+                and terminal_status in {None, "Cancelled"}
+                and (
+                    code not in no_capability_codes
+                    or (
+                        all(value is None for value in nullable_hashes)
+                        and replayed is False
+                    )
+                )
+                and (
+                    code
+                    not in {
+                        "CANCEL_EXIT_UNPROVEN",
+                        "CANCEL_TERMINAL_PROOF_UNAVAILABLE",
+                    }
+                    or (
+                        capability_hash is not None
+                        and request_hash is not None
+                    )
+                )
+            )
+        if (
+            set(proof) != expected
+            or proof.get("schema_version") != "1.0.0"
+            or proof.get("task_id") != intent.task_id
+            or proof.get("request_id") != request_id
+            or proof.get("attempt_id") != attempt_id
+            or not isinstance(attempt_id, str)
+            or _MANAGED_ATTEMPT_ID.fullmatch(attempt_id) is None
+            or proof.get("reason") != reason
+            or reason != "user_requested"
+            or not hash_chain_valid
+            or not state_valid
+            or proof.get("local_run_state") != "retained"
+            or type(replayed) is not bool
+            or not isinstance(proof.get("receipt_record_hash"), str)
+            or _SHA256.fullmatch(proof["receipt_record_hash"]) is None
+            or not isinstance(supplied_hash, str)
+            or _SHA256.fullmatch(supplied_hash) is None
+            or supplied_hash != actual_hash
+        ):
+            raise DispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+        return proof
 
     def collect(self, intent: DispatchIntentSnapshot) -> list[dict[str, Any]]:
         handle = self._handle_from_intent(intent)
