@@ -11,11 +11,12 @@ from typing import Any
 
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
-VALID_STATUSES = {"queued", "running", *TERMINAL_STATUSES}
+VALID_STATUSES = {"queued", "running", "waiting", *TERMINAL_STATUSES}
 VALID_TRANSITIONS = {
     None: {"queued", "running", "cancelled"},
     "queued": {"queued", "running", "failed", "cancelled"},
-    "running": {"running", "succeeded", "failed", "cancelled"},
+    "running": {"running", "waiting", "succeeded", "failed", "cancelled"},
+    "waiting": {"waiting", "running", "failed", "cancelled"},
     "succeeded": {"succeeded"},
     "failed": {"failed"},
     "cancelled": {"cancelled"},

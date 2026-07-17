@@ -128,6 +128,18 @@ class RuntimeSupervisorTaskService(Protocol):
     ) -> Any:
         ...
 
+    def process_runtime_checkpoint(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: Any,
+    ) -> Any:
+        """Optionally reconcile one durable checkpoint/wait/resume state."""
+
+        ...
+
     def process_runtime_retry(
         self,
         task_id: str,
@@ -156,6 +168,9 @@ class RuntimeSupervisorCycleResult:
     timeout_armed_task_ids: tuple[str, ...] = ()
     timeout_processed_task_ids: tuple[str, ...] = ()
     timeout_resolved_task_ids: tuple[str, ...] = ()
+    checkpoint_processed_task_ids: tuple[str, ...] = ()
+    checkpoint_waiting_task_ids: tuple[str, ...] = ()
+    checkpoint_resumed_task_ids: tuple[str, ...] = ()
     reconciled_task_ids: tuple[str, ...] = ()
     retry_processed_task_ids: tuple[str, ...] = ()
     retry_dispatched_task_ids: tuple[str, ...] = ()
@@ -669,6 +684,51 @@ class RuntimeSupervisor:
             raise _SupervisorFailure(FATAL)
         return result
 
+    def _process_task_checkpoint(self, task_id: str, lease: Any) -> Any:
+        """Run and strictly validate an optional checkpoint/resume pass."""
+
+        processor = getattr(self._task_service, "process_runtime_checkpoint", None)
+        if not callable(processor):
+            return None
+        result = processor(
+            task_id,
+            project_id=self._project_id,
+            principal_id=self._principal_id,
+            supervisor_lease=lease,
+        )
+        state = getattr(result, "state", None)
+        snapshot = getattr(result, "snapshot", None)
+        snapshot_status = getattr(snapshot, "status", None)
+        replayed = getattr(result, "replayed", None)
+        deferred_code = getattr(result, "deferred_code", None)
+        if (
+            getattr(snapshot, "task_id", None) != task_id
+            or state
+            not in {
+                "none",
+                "waiting",
+                "resume_requested",
+                "resumed",
+                "action_required",
+            }
+            or snapshot_status not in {"Running", "Waiting"}
+            or (
+                state in {"waiting", "resume_requested"}
+                and snapshot_status != "Waiting"
+            )
+            or (state == "resumed" and snapshot_status != "Running")
+            or type(replayed) is not bool
+            or (
+                deferred_code is not None
+                and (
+                    not isinstance(deferred_code, str)
+                    or _STABLE_CODE.fullmatch(deferred_code) is None
+                )
+            )
+        ):
+            raise _SupervisorFailure(FATAL)
+        return result
+
     def _observe_tasks(
         self, snapshots: list[Any], lease: Any, next_heartbeat: float
     ) -> tuple[RuntimeSupervisorCycleResult, Any, float]:
@@ -683,6 +743,9 @@ class RuntimeSupervisor:
         timeout_armed: list[str] = []
         timeout_processed: list[str] = []
         timeout_resolved: list[str] = []
+        checkpoint_processed: list[str] = []
+        checkpoint_waiting: list[str] = []
+        checkpoint_resumed: list[str] = []
         reconciled: list[str] = []
         retry_processed: list[str] = []
         retry_dispatched: list[str] = []
@@ -694,7 +757,7 @@ class RuntimeSupervisor:
             if self._stop_event.is_set():
                 break
             status = getattr(snapshot, "status", None)
-            if status not in {"Queued", "Running", "Retrying"}:
+            if status not in {"Queued", "Running", "Waiting", "Retrying"}:
                 continue
             task_id = snapshot.task_id
             scanned.append(task_id)
@@ -786,6 +849,113 @@ class RuntimeSupervisor:
                 # ordinary status bridge must not publish generic failure in
                 # the same cycle.
                 continue
+            timeout_checked_before_checkpoint = False
+            checkpoint_supported = callable(
+                getattr(
+                    self._task_service,
+                    "process_runtime_checkpoint",
+                    None,
+                )
+            )
+            if status in {"Running", "Waiting"} and (
+                checkpoint_supported or status == "Waiting"
+            ):
+                try:
+                    timeout_result = self._process_task_timeout(task_id, lease)
+                except _SupervisorFailure:
+                    raise
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "TIMEOUT_PROCESS_FAILED"
+                            ),
+                        )
+                    )
+                    continue
+                timeout_checked_before_checkpoint = True
+                timeout_state = getattr(timeout_result, "state", "none")
+                timeout_code = getattr(timeout_result, "deferred_code", None)
+                if timeout_state != "none":
+                    timeout_processed.append(task_id)
+                if timeout_state == "requested":
+                    deferred.append(
+                        (task_id, timeout_code or "TIMEOUT_IN_PROGRESS")
+                    )
+                    continue
+                if timeout_state in {
+                    "timed_out",
+                    "superseded",
+                    "not_triggered",
+                    "suppressed",
+                }:
+                    timeout_resolved.append(task_id)
+                    continue
+            if status in {"Running", "Waiting"}:
+                try:
+                    checkpoint_result = self._process_task_checkpoint(
+                        task_id, lease
+                    )
+                except _SupervisorFailure:
+                    raise
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "CHECKPOINT_PROCESS_FAILED"
+                            ),
+                        )
+                    )
+                    continue
+                if checkpoint_result is None:
+                    if status == "Waiting":
+                        deferred.append(
+                            (task_id, "CHECKPOINT_RESUME_UNSUPPORTED")
+                        )
+                        continue
+                else:
+                    checkpoint_state = getattr(checkpoint_result, "state", None)
+                    checkpoint_code = getattr(
+                        checkpoint_result, "deferred_code", None
+                    )
+                    if checkpoint_state != "none":
+                        checkpoint_processed.append(task_id)
+                    if checkpoint_state in {"waiting", "resume_requested"}:
+                        checkpoint_waiting.append(task_id)
+                    elif checkpoint_state == "resumed":
+                        checkpoint_resumed.append(task_id)
+                    if checkpoint_state == "none" and status == "Running":
+                        if checkpoint_code is None:
+                            pass
+                        else:
+                            deferred.append((task_id, checkpoint_code))
+                            continue
+                    else:
+                        if checkpoint_state in {
+                            "none",
+                            "waiting",
+                            "resume_requested",
+                            "action_required",
+                        }:
+                            default_code = {
+                                "none": "CHECKPOINT_WAITING",
+                                "waiting": "CHECKPOINT_WAITING",
+                                "resume_requested": "CHECKPOINT_RESUME_IN_PROGRESS",
+                                "action_required": "CHECKPOINT_ACTION_REQUIRED",
+                            }[checkpoint_state]
+                            deferred.append(
+                                (task_id, checkpoint_code or default_code)
+                            )
+                        elif checkpoint_code is not None:
+                            deferred.append((task_id, checkpoint_code))
+                        # A Waiting input never reaches retry/status in this
+                        # cycle, and any state-changing checkpoint result gets
+                        # one clean cycle boundary before further observation.
+                        continue
             try:
                 intent = self._task_service.get_dispatch_intent(
                     task_id,
@@ -1173,36 +1343,37 @@ class RuntimeSupervisor:
             lease, next_heartbeat = self._heartbeat_if_due(
                 lease, next_heartbeat
             )
-            try:
-                timeout_result = self._process_task_timeout(task_id, lease)
-            except Exception as error:
-                self._raise_if_fatal_task_error(error)
-                failures.append(
-                    (
-                        task_id,
-                        self._stable_error_code(
-                            error, "TIMEOUT_PROCESS_FAILED"
-                        ),
+            if not timeout_checked_before_checkpoint:
+                try:
+                    timeout_result = self._process_task_timeout(task_id, lease)
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "TIMEOUT_PROCESS_FAILED"
+                            ),
+                        )
                     )
-                )
-                continue
-            timeout_state = getattr(timeout_result, "state", "none")
-            timeout_code = getattr(timeout_result, "deferred_code", None)
-            if timeout_state != "none":
-                timeout_processed.append(task_id)
-            if timeout_state == "requested":
-                deferred.append(
-                    (task_id, timeout_code or "TIMEOUT_IN_PROGRESS")
-                )
-                continue
-            if timeout_state in {
-                "timed_out",
-                "superseded",
-                "not_triggered",
-                "suppressed",
-            }:
-                timeout_resolved.append(task_id)
-                continue
+                    continue
+                timeout_state = getattr(timeout_result, "state", "none")
+                timeout_code = getattr(timeout_result, "deferred_code", None)
+                if timeout_state != "none":
+                    timeout_processed.append(task_id)
+                if timeout_state == "requested":
+                    deferred.append(
+                        (task_id, timeout_code or "TIMEOUT_IN_PROGRESS")
+                    )
+                    continue
+                if timeout_state in {
+                    "timed_out",
+                    "superseded",
+                    "not_triggered",
+                    "suppressed",
+                }:
+                    timeout_resolved.append(task_id)
+                    continue
             try:
                 retry_result = self._process_task_retry(task_id, lease)
             except Exception as error:
@@ -1275,6 +1446,9 @@ class RuntimeSupervisor:
                 timeout_armed_task_ids=tuple(dict.fromkeys(timeout_armed)),
                 timeout_processed_task_ids=tuple(timeout_processed),
                 timeout_resolved_task_ids=tuple(timeout_resolved),
+                checkpoint_processed_task_ids=tuple(checkpoint_processed),
+                checkpoint_waiting_task_ids=tuple(checkpoint_waiting),
+                checkpoint_resumed_task_ids=tuple(checkpoint_resumed),
                 reconciled_task_ids=tuple(reconciled),
                 retry_processed_task_ids=tuple(retry_processed),
                 retry_dispatched_task_ids=tuple(retry_dispatched),

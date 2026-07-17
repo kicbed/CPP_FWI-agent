@@ -23,8 +23,21 @@ class InversionResult:
     model_update_relative_l2: float
 
 
+@dataclass(frozen=True)
+class InversionCheckpointState:
+    """Live optimizer state at the sole post-update checkpoint barrier."""
+
+    completed_updates: int
+    next_state_index: int
+    velocity: torch.nn.Parameter
+    optimizer: torch.optim.Optimizer
+    losses: tuple[float, ...]
+    gradient_clip_values: tuple[float, ...]
+
+
 ProgressCallback = Callable[[int, float, float | None], None]
 CancellationCheck = Callable[[], None]
+CheckpointCallback = Callable[[InversionCheckpointState], None]
 
 
 def run_inversion(
@@ -34,6 +47,7 @@ def run_inversion(
     geometry: AcquisitionGeometry,
     progress: ProgressCallback | None = None,
     cancel_check: CancellationCheck | None = None,
+    checkpoint: CheckpointCallback | None = None,
 ) -> InversionResult:
     if config.iterations < 1:
         raise ValueError("inversion requires iterations >= 1")
@@ -144,6 +158,17 @@ def run_inversion(
             clip_values.append(clip_value)
         if progress is not None:
             progress(state_index, total_loss_value, clip_value)
+        if checkpoint is not None and state_index == 0:
+            checkpoint(
+                InversionCheckpointState(
+                    completed_updates=1,
+                    next_state_index=1,
+                    velocity=velocity,
+                    optimizer=optimizer,
+                    losses=tuple(losses),
+                    gradient_clip_values=tuple(clip_values),
+                )
+            )
         if cancel_check is not None:
             cancel_check()
 

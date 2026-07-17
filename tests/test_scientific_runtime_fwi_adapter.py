@@ -39,16 +39,21 @@ from scientific_runtime import (
 )
 from scientific_runtime.fwi_adapter import (
     AdapterDispatchNotStartedProof,
+    AdapterCheckpointProof,
     AdapterExistingDispatchReceiptProof,
+    AdapterHandle,
     AdapterIdempotencyConflict,
     AdapterManagedCancelProof,
     AdapterManagedTimeoutProof,
     AdapterPurgeError,
     AdapterUnavailable,
+    AdapterValidationError,
     DeepwaveAdapter,
     SafeSubprocessWorkerLauncher,
 )
 from scientific_runtime.task_dispatcher import (
+    DispatchCheckpointProof,
+    DispatchCheckpointResumeResult,
     DispatchNotStartedProof,
     DispatchReconciliationDeferred,
     DispatchReceiptProbe,
@@ -58,12 +63,16 @@ from worker_launch_control import (
     LaunchAttemptBinding,
     ParentLaunchLease,
     WorkerCancellationRequested,
+    WorkerControlError,
     WorkerHeartbeat,
     WorkerWallTimeExceeded,
     binding_from_submission_record,
+    execution_fence_is_held,
     record_worker_exit,
     read_worker_cancel_evidence,
+    read_worker_checkpoint_evidence,
     read_worker_attempt_evidence,
+    read_pre_running_attempt_evidence,
     read_worker_stop_evidence,
     stage_launch_attempt,
 )
@@ -82,7 +91,7 @@ PLAN_HASH = "sha256:" + "d" * 64
 
 
 def algorithm_identity() -> dict[str, Any]:
-    return {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
+    return {"id": "deepwave.acoustic_fwi", "version": "1.6.0"}
 
 
 def dataset_ref(*, content_hash: str = HASH_DATASET) -> dict[str, Any]:
@@ -138,7 +147,7 @@ def development_fingerprint() -> dict[str, Any]:
     return {
         "provenance_mode": "development",
         "algorithm": algorithm_identity(),
-        "adapter_version": "1.5.0",
+        "adapter_version": "1.6.0",
         "source": {"identity_complete": False, "dirty": None},
         "environment": {"environment_lock_hash": HASH_ENVIRONMENT},
         "runtime": {
@@ -225,6 +234,7 @@ class FakeLauncher:
         run_dir: Path,
         run_root: Path,
         wall_time_seconds: int,
+        checkpoint_capable: bool = False,
     ) -> int:
         call = {
             "command": command,
@@ -232,6 +242,7 @@ class FakeLauncher:
             "run_dir": Path(run_dir),
             "run_root": Path(run_root),
             "wall_time_seconds": wall_time_seconds,
+            "checkpoint_capable": checkpoint_capable,
         }
         with self._lock:
             self.calls.append(call)
@@ -581,14 +592,14 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         return handle, self.launcher.calls[-1]["run_dir"]
 
     def start_exact_worker(
-        self, handle: Any, run_dir: Path
+        self, handle: Any, run_dir: Path, *, max_active: int = 2
     ) -> tuple[LaunchAttemptBinding, WorkerHeartbeat]:
         record = json.loads(
             self.submission_record_path(handle).read_text(encoding="utf-8")
         )
         binding = binding_from_submission_record(record)
         lease = ParentLaunchLease.acquire(
-            self.run_root, run_dir, max_active=2
+            self.run_root, run_dir, max_active=max_active
         )
         lease.mark_spawned(os.getpid())
         heartbeat = WorkerHeartbeat(
@@ -605,6 +616,602 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         lease.close_parent()
         heartbeat.start()
         return binding, heartbeat
+
+    def start_checkpoint_waiting_fault_window(
+        self, handle: Any, run_dir: Path
+    ) -> tuple[
+        LaunchAttemptBinding,
+        WorkerHeartbeat,
+        threading.Thread,
+        threading.Event,
+        list[BaseException],
+        AdapterCheckpointProof,
+    ]:
+        """Leave raw Waiting durable when an exact stop closes the Worker."""
+
+        import torch
+
+        from fwi_worker.checkpoint import save_checkpoint_payload
+        from fwi_worker.config import resolve_config
+        from fwi_worker.inversion import InversionCheckpointState
+        from fwi_worker.job_state import JobState
+
+        binding, heartbeat = self.start_exact_worker(handle, run_dir)
+        state = JobState(run_dir, binding.job_id)
+        state.update("running", "invert", 0, 2, "running")
+        config = resolve_config(
+            {"preset": "fwi_smoke", "device": "cpu", "iterations": 2}
+        )
+        velocity = torch.nn.Parameter(
+            torch.full((2, 3), 2000.0, dtype=torch.float32)
+        )
+        optimizer = torch.optim.Adam([velocity], lr=config.learning_rate)
+        optimizer.zero_grad(set_to_none=True)
+        velocity.square().sum().backward()
+        optimizer.step()
+        manifest = save_checkpoint_payload(
+            run_dir=run_dir,
+            binding=binding,
+            config=config,
+            checkpoint=InversionCheckpointState(
+                completed_updates=1,
+                next_state_index=1,
+                velocity=velocity,
+                optimizer=optimizer,
+                losses=(1.0,),
+                gradient_clip_values=(0.5,),
+            ),
+            clock=lambda: NOW,
+        )
+        barrier_errors: list[BaseException] = []
+        cooperative_stop = threading.Event()
+
+        def on_waiting(receipt) -> None:
+            state.update(
+                "waiting",
+                "checkpoint_wait",
+                1,
+                2,
+                "waiting",
+                checkpoint_id=receipt["checkpoint_id"],
+                checkpoint_record_hash=receipt["record_hash"],
+            )
+
+        def wait_at_barrier() -> None:
+            try:
+                heartbeat.wait_for_checkpoint_resume(
+                    manifest.as_dict(),
+                    on_waiting=on_waiting,
+                    on_resumed=lambda _receipt, _request: self.fail(
+                        "stopped Waiting barrier must not resume"
+                    ),
+                )
+            except (WorkerCancellationRequested, WorkerWallTimeExceeded):
+                # Model the fault window after exact acknowledgement and
+                # Worker stop, but before the Worker can project terminal
+                # status over its durable checkpoint Waiting status.
+                heartbeat.stop("stopped")
+                cooperative_stop.set()
+            except BaseException as error:
+                barrier_errors.append(error)
+
+        waiter = threading.Thread(target=wait_at_barrier)
+        waiter.start()
+        waiting: AdapterCheckpointProof | None = None
+        deadline = time.monotonic() + 3.0
+        while waiting is None and time.monotonic() < deadline:
+            try:
+                waiting = self.adapter.probe_runtime_checkpoint(handle)
+            except AdapterUnavailable as error:
+                if error.code != "CHECKPOINT_EVIDENCE_PENDING":
+                    raise
+            time.sleep(0.01)
+        self.assertIsNotNone(waiting)
+        assert waiting is not None
+        self.assertEqual(waiting.state, "waiting")
+        return (
+            binding,
+            heartbeat,
+            waiter,
+            cooperative_stop,
+            barrier_errors,
+            waiting,
+        )
+
+    def test_checkpoint_probe_wait_and_resume_are_same_live_attempt(self) -> None:
+        import torch
+
+        from fwi_worker.checkpoint import save_checkpoint_payload
+        from fwi_worker.config import resolve_config
+        from fwi_worker.inversion import InversionCheckpointState
+        from fwi_worker.job_state import JobState
+
+        request = self.submit_kwargs(
+            task_id="task-checkpoint-resume",
+            idempotency_key="task-checkpoint-resume:invert:0001",
+        )
+        handle = self.adapter.submit(**copy.deepcopy(request))
+        run_dir = self.launcher.calls[-1]["run_dir"]
+        self.assertTrue(self.launcher.calls[-1]["checkpoint_capable"])
+        binding, heartbeat = self.start_exact_worker(
+            handle, run_dir, max_active=1
+        )
+        state = JobState(run_dir, binding.job_id)
+        state.update("running", "invert", 0, 2, "running")
+        config = resolve_config(
+            {"preset": "fwi_smoke", "device": "cpu", "iterations": 2}
+        )
+        velocity = torch.nn.Parameter(
+            torch.full((2, 3), 2000.0, dtype=torch.float32)
+        )
+        optimizer = torch.optim.Adam([velocity], lr=config.learning_rate)
+        optimizer.zero_grad(set_to_none=True)
+        velocity.square().sum().backward()
+        optimizer.step()
+        checkpoint = InversionCheckpointState(
+            completed_updates=1,
+            next_state_index=1,
+            velocity=velocity,
+            optimizer=optimizer,
+            losses=(1.0,),
+            gradient_clip_values=(0.5,),
+        )
+        manifest = save_checkpoint_payload(
+            run_dir=run_dir,
+            binding=binding,
+            config=config,
+            checkpoint=checkpoint,
+            clock=lambda: NOW,
+        )
+        barrier_errors: list[BaseException] = []
+
+        def on_waiting(receipt) -> None:
+            state.update(
+                "waiting",
+                "checkpoint_wait",
+                1,
+                2,
+                "waiting",
+                checkpoint_id=receipt["checkpoint_id"],
+                checkpoint_record_hash=receipt["record_hash"],
+            )
+
+        def on_resumed(receipt, request) -> None:
+            state.update(
+                "running",
+                "invert",
+                1,
+                2,
+                "resumed",
+                checkpoint_id=receipt["checkpoint_id"],
+                checkpoint_record_hash=receipt["record_hash"],
+                resume_id=request["resume_id"],
+                resume_request_record_hash=request["record_hash"],
+            )
+
+        def wait_at_barrier() -> None:
+            try:
+                heartbeat.wait_for_checkpoint_resume(
+                    manifest.as_dict(),
+                    on_waiting=on_waiting,
+                    on_resumed=on_resumed,
+                )
+            except BaseException as error:
+                barrier_errors.append(error)
+
+        waiter = threading.Thread(target=wait_at_barrier)
+        waiter.start()
+        dispatcher = DeepwaveTaskDispatcher(self.adapter)
+        intent = self.dispatched_intent(handle)
+        waiting: AdapterCheckpointProof | None = None
+        deadline = time.monotonic() + 3.0
+        try:
+            while waiting is None and time.monotonic() < deadline:
+                try:
+                    waiting = self.adapter.probe_runtime_checkpoint(handle)
+                except AdapterUnavailable as error:
+                    if error.code != "CHECKPOINT_EVIDENCE_PENDING":
+                        raise
+                time.sleep(0.01)
+            self.assertIsNotNone(waiting)
+            assert waiting is not None
+            self.assertEqual(waiting.state, "waiting")
+            self.assertIsNone(waiting.checkpoint_proof_hash)
+            self.assertNotIn(str(self.run_root), json.dumps(waiting.as_dict()))
+            observed = self.adapter.observe_existing_worker_attempt(
+                **copy.deepcopy(request)
+            )
+            self.assertEqual(
+                observed["evidence"]["heartbeat"]["state"], "waiting"
+            )
+            reconciliation = dispatcher.probe_dispatch_reconciliation(
+                self.reconciliation_intent(handle, request)
+            )
+            self.assertIsInstance(reconciliation, DispatchReceiptProbe)
+            self.assertEqual(
+                reconciliation.evidence["heartbeat"]["state"], "waiting"
+            )
+            dispatch_waiting = dispatcher.probe_runtime_checkpoint(intent)
+            self.assertIsInstance(dispatch_waiting, DispatchCheckpointProof)
+            assert dispatch_waiting is not None
+            self.assertEqual(dispatch_waiting.proof_hash, waiting.proof_hash)
+            self.assertTrue(
+                dispatcher.supports_exact_cancel(
+                    intent, attempt_id=binding.attempt_id
+                )
+            )
+            self.assertIsNotNone(
+                dispatcher.supports_exact_timeout(
+                    intent, attempt_id=binding.attempt_id
+                )
+            )
+            resume_id = "resume-" + "f" * 32
+            request_payload = {
+                "schema_version": "1.0.0",
+                "resume_id": resume_id,
+                "submission_id": handle.submission_id,
+                "attempt_id": binding.attempt_id,
+                "attempt_number": binding.attempt_number,
+                "checkpoint_id": waiting.checkpoint_id,
+                "checkpoint_manifest_hash": waiting.checkpoint_manifest_hash,
+                "checkpoint_receipt_record_hash": (
+                    waiting.checkpoint_receipt_record_hash
+                ),
+                "checkpoint_proof_hash": waiting.proof_hash,
+                "authorized_at": NOW,
+            }
+            authorization = {
+                "schema_version": "1.0.0",
+                "intent_id": intent.intent_id,
+                "task_id": handle.task_id,
+                "node_id": handle.node_id,
+                "submission_id": handle.submission_id,
+                "attempt_id": binding.attempt_id,
+                "attempt_number": binding.attempt_number,
+                "checkpoint_id": waiting.checkpoint_id,
+                "checkpoint_manifest_hash": waiting.checkpoint_manifest_hash,
+                "checkpoint_receipt_record_hash": (
+                    waiting.checkpoint_receipt_record_hash
+                ),
+                "checkpoint_proof_hash": waiting.proof_hash,
+                "resume_id": resume_id,
+                "authorized_at": NOW,
+                "resume_request_record_hash": (
+                    fwi_adapter_module._sha256_document(request_payload)
+                ),
+            }
+            tampered = copy.deepcopy(authorization)
+            tampered["resume_request_record_hash"] = "sha256:" + "0" * 64
+            with self.assertRaisesRegex(
+                DispatchError, "CHECKPOINT_RESUME_AUTHORIZATION_INVALID"
+            ):
+                dispatcher.resume_runtime_checkpoint(
+                    intent, authorization=tampered
+                )
+            result = dispatcher.resume_runtime_checkpoint(
+                intent, authorization=authorization
+            )
+            self.assertIsInstance(result, DispatchCheckpointResumeResult)
+            self.assertIn(result.state, {"requested", "resumed"})
+            waiter.join(3.0)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(barrier_errors, [])
+            resumed = dispatcher.probe_runtime_checkpoint(intent)
+            assert resumed is not None
+            self.assertEqual(resumed.state, "resumed")
+            self.assertEqual(resumed.attempt_id, binding.attempt_id)
+            self.assertEqual(resumed.checkpoint_proof_hash, waiting.proof_hash)
+            self.assertEqual(
+                resumed.resume_request_record_hash,
+                authorization["resume_request_record_hash"],
+            )
+            self.assertEqual(len(self.launcher.calls), 1)
+        finally:
+            if waiter.is_alive():
+                heartbeat._stop.set()
+                waiter.join(2.0)
+            if not heartbeat._closed:
+                heartbeat.stop("succeeded")
+
+    def test_checkpoint_wait_cancel_releases_fences_without_resume_ack(self) -> None:
+        import torch
+
+        from fwi_worker.checkpoint import save_checkpoint_payload
+        from fwi_worker.config import resolve_config
+        from fwi_worker.inversion import InversionCheckpointState
+        from fwi_worker.job_state import JobState
+
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-checkpoint-wait-cancel",
+            idempotency_key="task-checkpoint-wait-cancel:invert:0001",
+        )
+        binding, heartbeat = self.start_exact_worker(
+            handle, run_dir, max_active=1
+        )
+        state = JobState(run_dir, binding.job_id)
+        state.update("running", "invert", 0, 2, "running")
+        config = resolve_config(
+            {"preset": "fwi_smoke", "device": "cpu", "iterations": 2}
+        )
+        velocity = torch.nn.Parameter(
+            torch.full((2, 3), 2000.0, dtype=torch.float32)
+        )
+        optimizer = torch.optim.Adam([velocity], lr=config.learning_rate)
+        optimizer.zero_grad(set_to_none=True)
+        velocity.square().sum().backward()
+        optimizer.step()
+        manifest = save_checkpoint_payload(
+            run_dir=run_dir,
+            binding=binding,
+            config=config,
+            checkpoint=InversionCheckpointState(
+                completed_updates=1,
+                next_state_index=1,
+                velocity=velocity,
+                optimizer=optimizer,
+                losses=(1.0,),
+                gradient_clip_values=(0.5,),
+            ),
+            clock=lambda: NOW,
+        )
+        barrier_errors: list[BaseException] = []
+        cooperative_stop = threading.Event()
+
+        def on_waiting(receipt) -> None:
+            state.update(
+                "waiting",
+                "checkpoint_wait",
+                1,
+                2,
+                "waiting",
+                checkpoint_id=receipt["checkpoint_id"],
+                checkpoint_record_hash=receipt["record_hash"],
+            )
+
+        def wait_at_barrier() -> None:
+            try:
+                heartbeat.wait_for_checkpoint_resume(
+                    manifest.as_dict(),
+                    on_waiting=on_waiting,
+                    on_resumed=lambda _receipt, _request: self.fail(
+                        "cancelled Waiting barrier must not resume"
+                    ),
+                )
+            except WorkerCancellationRequested:
+                state.update("cancelled", "cancelled", 1, 2, "cancelled")
+                heartbeat.stop("stopped")
+                cooperative_stop.set()
+            except BaseException as error:
+                barrier_errors.append(error)
+
+        waiter = threading.Thread(target=wait_at_barrier)
+        waiter.start()
+        waiting: AdapterCheckpointProof | None = None
+        deadline = time.monotonic() + 3.0
+        while waiting is None and time.monotonic() < deadline:
+            try:
+                waiting = self.adapter.probe_runtime_checkpoint(handle)
+            except AdapterUnavailable as error:
+                if error.code != "CHECKPOINT_EVIDENCE_PENDING":
+                    raise
+            time.sleep(0.01)
+        self.assertIsNotNone(waiting)
+        assert waiting is not None
+        self.assertEqual(waiting.state, "waiting")
+
+        replacement_binding = LaunchAttemptBinding(
+            submission_id="submission-" + "7" * 64,
+            attempt_id="attempt-" + "8" * 32,
+            attempt_number=1,
+            job_id="fwi-20260715T060000Z-777777777777",
+            request_hash="sha256:" + "9" * 64,
+            created_at=NOW,
+        )
+        replacement_dir = self.run_root / replacement_binding.job_id
+        replacement_dir.mkdir(mode=0o700)
+        stage_launch_attempt(
+            self.run_root, replacement_dir, replacement_binding
+        )
+        with self.assertRaises(WorkerControlError) as capacity_full:
+            ParentLaunchLease.acquire(
+                self.run_root, replacement_dir, max_active=1
+            )
+        self.assertEqual(capacity_full.exception.code, "ADAPTER_CONCURRENCY_LIMIT")
+
+        cancellation = self.adapter.cancel(
+            handle,
+            cancel_id="cancel-checkpoint-wait-1",
+            attempt_id=binding.attempt_id,
+            reason="user_requested",
+        )
+        self.assertIn(cancellation.state, {"requested", "pending"})
+        waiter.join(3.0)
+        self.assertFalse(waiter.is_alive())
+        self.assertTrue(cooperative_stop.is_set())
+        self.assertEqual(barrier_errors, [])
+        self.assertTrue(
+            read_worker_cancel_evidence(self.run_root, binding).acknowledged
+        )
+        self.assertFalse(execution_fence_is_held(self.run_root, binding))
+        self.assertFalse((run_dir / ".worker-resume-ack.json").exists())
+        self.assertEqual(len(self.launcher.calls), 1)
+        replacement = ParentLaunchLease.acquire(
+            self.run_root, replacement_dir, max_active=1
+        )
+        replacement.abort()
+        with self.assertRaises(AdapterUnavailable) as orphaned:
+            self.adapter.probe_runtime_checkpoint(handle)
+        self.assertEqual(orphaned.exception.code, "CHECKPOINT_ACTION_REQUIRED")
+        self.assertEqual(self.adapter.status(handle).status, "Cancelled")
+
+    def test_cancel_recovers_stopped_checkpoint_waiting_fault_window(self) -> None:
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-checkpoint-cancel-fault-window",
+            idempotency_key="task-checkpoint-cancel-fault-window:invert:0001",
+        )
+        (
+            binding,
+            heartbeat,
+            waiter,
+            cooperative_stop,
+            barrier_errors,
+            _waiting,
+        ) = self.start_checkpoint_waiting_fault_window(handle, run_dir)
+        cancel_id = "cancel-checkpoint-fault-window-1"
+        try:
+            requested = self.adapter.cancel(
+                handle,
+                cancel_id=cancel_id,
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertIn(requested.state, {"requested", "pending"})
+            waiter.join(3.0)
+            self.assertFalse(waiter.is_alive())
+            self.assertTrue(cooperative_stop.is_set())
+            self.assertEqual(barrier_errors, [])
+            self.assertTrue(
+                read_worker_cancel_evidence(self.run_root, binding).acknowledged
+            )
+            self.assertFalse(execution_fence_is_held(self.run_root, binding))
+            raw_waiting = json.loads(
+                (run_dir / "status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(raw_waiting["status"], "waiting")
+
+            completed = self.adapter.cancel(
+                handle,
+                cancel_id=cancel_id,
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(completed.state, "cancelled")
+            self.assertEqual(completed.code, "CANCEL_COMPLETED")
+            self.assertEqual(completed.terminal_status, "Cancelled")
+            self.assertEqual(self.adapter.status(handle).status, "Cancelled")
+            raw_cancelled = json.loads(
+                (run_dir / "status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(raw_cancelled["status"], "cancelled")
+        finally:
+            if waiter.is_alive():
+                heartbeat._stop.set()
+                waiter.join(2.0)
+            if not heartbeat._closed:
+                heartbeat.stop("stopped")
+
+    def test_timeout_recovers_stopped_checkpoint_waiting_fault_window(self) -> None:
+        handle, run_dir = self.submit_and_run_dir(
+            task_id="task-checkpoint-timeout-fault-window",
+            idempotency_key="task-checkpoint-timeout-fault-window:invert:0001",
+        )
+        (
+            binding,
+            heartbeat,
+            waiter,
+            cooperative_stop,
+            barrier_errors,
+            _waiting,
+        ) = self.start_checkpoint_waiting_fault_window(handle, run_dir)
+        wall_time_seconds = resources()["wall_time_seconds"]
+        deadline_at = NOW
+        started_at = (
+            datetime.fromisoformat(NOW.replace("Z", "+00:00"))
+            - timedelta(seconds=wall_time_seconds)
+        ).isoformat().replace("+00:00", "Z")
+        timeout_id = "timeout-checkpoint-fault-window-1"
+        try:
+            assert heartbeat._started_monotonic is not None
+            heartbeat._started_monotonic -= wall_time_seconds
+            requested = self.adapter.timeout(
+                handle,
+                timeout_id,
+                binding.attempt_id,
+                wall_time_seconds,
+                started_at,
+                deadline_at,
+            )
+            self.assertIn(requested.state, {"requested", "pending"})
+            waiter.join(3.0)
+            self.assertFalse(waiter.is_alive())
+            self.assertTrue(cooperative_stop.is_set())
+            self.assertEqual(barrier_errors, [])
+            self.assertTrue(
+                read_worker_stop_evidence(self.run_root, binding).acknowledged
+            )
+            self.assertFalse(execution_fence_is_held(self.run_root, binding))
+            raw_waiting = json.loads(
+                (run_dir / "status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(raw_waiting["status"], "waiting")
+
+            completed = self.adapter.timeout(
+                handle,
+                timeout_id,
+                binding.attempt_id,
+                wall_time_seconds,
+                started_at,
+                deadline_at,
+            )
+            self.assertEqual(completed.state, "timed_out")
+            self.assertEqual(completed.code, "TIMEOUT_COMPLETED")
+            self.assertEqual(completed.terminal_status, "Failed")
+            self.assertEqual(
+                completed.terminal_failure_code, "WALL_TIME_EXCEEDED"
+            )
+            self.assertEqual(self.adapter.status(handle).status, "Failed")
+            raw_failed = json.loads(
+                (run_dir / "status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(raw_failed["status"], "failed")
+            self.assertEqual(
+                raw_failed["failure_code"], "WALL_TIME_EXCEEDED"
+            )
+        finally:
+            if waiter.is_alive():
+                heartbeat._stop.set()
+                waiter.join(2.0)
+            if not heartbeat._closed:
+                heartbeat.stop("stopped")
+
+    def test_historical_v1_5_launch_identity_never_enables_checkpoint(self) -> None:
+        request = self.submit_kwargs(
+            task_id="task-historical-no-checkpoint",
+            idempotency_key="task-historical-no-checkpoint:invert:0001",
+        )
+        handle = self.adapter.submit(**copy.deepcopy(request))
+        self.assertTrue(self.launcher.calls[-1]["checkpoint_capable"])
+        record_path = self.submission_record_path(handle)
+        record = self.adapter._read_submission(record_path)
+        binding = binding_from_submission_record(record)
+        record["algorithm"]["version"] = "1.5.0"
+        record["adapter_version"] = "1.5.0"
+        record["fingerprint"]["algorithm"]["version"] = "1.5.0"
+        record["fingerprint"]["adapter_version"] = "1.5.0"
+        record["launch_state"] = "preparing"
+        validated = self.adapter.validate(
+            **{
+                key: copy.deepcopy(request[key])
+                for key in (
+                    "project_id",
+                    "principal_id",
+                    "algorithm",
+                    "dataset",
+                    "task_type",
+                    "parameters",
+                    "resources",
+                )
+            }
+        )
+        historical = self.adapter._launch_prepared_submission(
+            index_path=record_path,
+            record=record,
+            validated=validated,
+            job_dir=self.launcher.calls[-1]["run_dir"],
+            launch_binding=binding,
+        )
+        self.assertEqual(historical.adapter_version, "1.5.0")
+        self.assertFalse(self.launcher.calls[-1]["checkpoint_capable"])
 
     def dispatched_intent(self, handle: Any) -> DispatchIntentSnapshot:
         return DispatchIntentSnapshot(
@@ -1419,7 +2026,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 self.assertEqual(
                     proof.evidence_kind, "managed_pre_running_failure"
                 )
-                self.assertEqual(proof.adapter_version, "1.5.0")
+                self.assertEqual(proof.adapter_version, "1.6.0")
                 self.assertEqual(proof.private_schema_version, "1.2.0")
                 self.assertEqual(
                     proof.private_record_hash, record["record_hash"]
@@ -1436,7 +2043,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                         "schema_version": "1.0.0",
                         "result": "not_dispatched",
                         "evidence_kind": "managed_pre_running_failure",
-                        "adapter_version": "1.5.0",
+                        "adapter_version": "1.6.0",
                         "private_schema_version": "1.2.0",
                         "private_record_hash": record["record_hash"],
                         "attempt_id": proof.attempt_id,
@@ -2415,6 +3022,193 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             adapter.probe_pre_running_retry(**copy.deepcopy(request))
         self.assertEqual(exhausted.exception.code, "WORKER_RETRY_UNSUPPORTED")
 
+    def test_historical_v1_5_retry_status_and_cancel_remain_operable(self) -> None:
+        launcher = StoppedThenSuccessfulSafeLauncher()
+        adapter = self.make_adapter(launcher=launcher)
+        request = self.submit_kwargs(
+            task_id="task-historical-v1-5-retry",
+            idempotency_key="task-historical-v1-5-retry:invert:0001",
+        )
+
+        with self.assertRaises(AdapterUnavailable) as stopped:
+            adapter.submit(**copy.deepcopy(request))
+        self.assertEqual(stopped.exception.code, "WORKER_LAUNCH_FAILED")
+
+        historical_request = copy.deepcopy(request)
+        historical_request["algorithm"]["version"] = "1.5.0"
+        runtime_fields = {
+            key: copy.deepcopy(historical_request[key])
+            for key in (
+                "project_id",
+                "principal_id",
+                "algorithm",
+                "dataset",
+                "task_type",
+                "parameters",
+                "resources",
+            )
+        }
+        with self.assertRaises(AdapterValidationError) as historical_submit:
+            adapter.validate(**copy.deepcopy(runtime_fields))
+        self.assertEqual(
+            historical_submit.exception.code, "ALGORITHM_VERSION_UNAVAILABLE"
+        )
+        validated = adapter._validate_request(
+            **copy.deepcopy(runtime_fields),
+            verify_runtime=False,
+            allow_historical_managed=True,
+        )
+
+        record_path = next(
+            (
+                self.run_root
+                / fwi_adapter_module.CONTROL_DIRECTORY
+                / "submissions"
+            ).glob("*.json")
+        )
+        record = adapter._read_submission(record_path)
+        old_binding = binding_from_submission_record(record)
+        run_dir = self.run_root / old_binding.job_id
+        request_payload = adapter._request_payload(
+            submission_id=record["submission_id"],
+            task_id=record["task_id"],
+            node_id=record["node_id"],
+            plan_hash=record["plan_hash"],
+            idempotency_key=record["idempotency_key"],
+            validated=validated,
+        )
+        request_hash = fwi_adapter_module._sha256_document(request_payload)
+        record.update(request_payload)
+        record["request_hash"] = request_hash
+        record["adapter_version"] = "1.5.0"
+        record["fingerprint"]["algorithm"] = copy.deepcopy(
+            validated.algorithm
+        )
+        record["fingerprint"]["adapter_version"] = "1.5.0"
+        record["fingerprint"][
+            "normalized_config_hash"
+        ] = validated.normalized_config_hash
+        historical_binding = LaunchAttemptBinding(
+            submission_id=old_binding.submission_id,
+            attempt_id=old_binding.attempt_id,
+            attempt_number=old_binding.attempt_number,
+            job_id=old_binding.job_id,
+            request_hash=request_hash,
+            created_at=old_binding.created_at,
+        )
+        record["launch_attempt"] = historical_binding.record()
+
+        ticket_path = run_dir / ".worker-launch.json"
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+        ticket["request_hash"] = request_hash
+        ticket["binding_hash"] = historical_binding.binding_hash
+        ticket.pop("record_hash")
+        ticket["record_hash"] = fwi_adapter_module._sha256_document(ticket)
+        ticket_path.write_text(json.dumps(ticket), encoding="utf-8")
+        ticket_path.chmod(0o600)
+        evidence = read_pre_running_attempt_evidence(
+            self.run_root, run_dir, historical_binding
+        )
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        record["launch_failure"] = adapter._failure_proof(record, evidence)
+        adapter._write_submission(record_path, record)
+
+        intent = DispatchIntentSnapshot(
+            intent_id="intent-historical-v1-5-retry",
+            task_id=record["task_id"],
+            plan_id="plan-historical-v1-5-retry",
+            plan_hash=record["plan_hash"],
+            approval_id="approval-historical-v1-5-retry",
+            node_id=record["node_id"],
+            node_idempotency_key=record["idempotency_key"],
+            adapter_id="fwi.deepwave_adapter",
+            adapter_version="1.5.0",
+            request={
+                **copy.deepcopy(historical_request),
+                "normalized_config_hash": validated.normalized_config_hash,
+            },
+            request_hash="sha256:" + "e" * 64,
+            queue_fingerprint=copy.deepcopy(record["fingerprint"]),
+            state="dispatching",
+            handle=None,
+            failure_code=None,
+            created_at=NOW,
+            dispatch_claimed_at=NOW,
+            outcome_recorded_at=None,
+        )
+        dispatcher = DeepwaveTaskDispatcher(adapter)
+        proof = dispatcher.probe_pre_running_retry(intent)
+        authorization = {
+            "schema_version": "1.0.0",
+            "intent_id": intent.intent_id,
+            "previous_attempt_id": proof.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "failure_kind": "pre_running_launch_failure",
+            "private_proof_hash": proof.private_proof_hash,
+            "next_attempt_number": 2,
+            "authorized_at": "2026-07-15T06:00:01Z",
+        }
+        handle = AdapterHandle(
+            **dispatcher.retry_pre_running(
+                intent,
+                authorization=authorization,
+            )
+        )
+        self.assertEqual(handle.adapter_version, "1.5.0")
+        self.assertEqual(handle.algorithm["version"], "1.5.0")
+        self.assertEqual(launcher.calls, 2)
+
+        retry_dir = self.run_root / handle.job_id
+        binding, heartbeat = self.start_exact_worker(handle, retry_dir)
+        dispatched = dataclasses.replace(
+            intent,
+            state="dispatched",
+            handle=handle.as_dict(),
+            outcome_recorded_at=NOW,
+        )
+        try:
+            self.write_status(retry_dir, "running")
+            observed = dispatcher.observe_existing_worker_attempt(dispatched)
+            self.assertEqual(observed["handle"], handle.as_dict())
+            self.assertEqual(observed["evidence"]["attempt_number"], 2)
+            self.assertEqual(dispatcher.status(dispatched)["status"], "Running")
+            self.assertTrue(
+                dispatcher.supports_exact_cancel(
+                    dispatched, attempt_id=binding.attempt_id
+                )
+            )
+            self.assertIsNotNone(
+                dispatcher.supports_exact_timeout(
+                    dispatched, attempt_id=binding.attempt_id
+                )
+            )
+            cancellation = dispatcher.cancel(
+                dispatched,
+                request_id="cancel-historical-v1-5-retry-1",
+                attempt_id=binding.attempt_id,
+                reason="user_requested",
+            )
+            self.assertEqual(cancellation["state"], "requested")
+            for _ in range(200):
+                cancel_evidence = read_worker_cancel_evidence(
+                    self.run_root, binding
+                )
+                if cancel_evidence.acknowledged:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(cancel_evidence.acknowledged)
+            self.write_status(retry_dir, "cancelled")
+            with self.assertRaises(WorkerCancellationRequested):
+                heartbeat.raise_if_cancel_requested()
+            heartbeat.stop("stopped")
+            heartbeat = None
+            self.assertEqual(dispatcher.status(dispatched)["status"], "Cancelled")
+            self.assertEqual(launcher.calls, 2)
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop("succeeded")
+
     def test_attempt_two_exhaustion_probe_is_exact_and_read_only(self) -> None:
         launcher = StoppedTwiceSafeLauncher()
         adapter = self.make_adapter(launcher=launcher)
@@ -2573,6 +3367,76 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(exhausted.private_schema_version, "1.2.0")
         self.assertEqual(exhausted.private_proof_hash, exit_evidence.record_hash)
         self.assertEqual(exhausted.exit_evidence, exit_evidence.as_dict())
+
+    def test_worker_exit_attempt_two_timeout_capability_keeps_schema_1_3(
+        self,
+    ) -> None:
+        request = self.submit_kwargs(
+            task_id="task-worker-exit-timeout-schema",
+            idempotency_key="task-worker-exit-timeout-schema:invert:0001",
+        )
+        first_handle = self.adapter.submit(**copy.deepcopy(request))
+        first_dir = self.launcher.calls[-1]["run_dir"]
+        first_binding, first_heartbeat = self.start_exact_worker(
+            first_handle, first_dir
+        )
+        first_heartbeat._stop.set()
+        assert first_heartbeat._thread is not None
+        first_heartbeat._thread.join(2.0)
+        self.assertFalse(first_heartbeat._thread.is_alive())
+        first_heartbeat._close_descriptors()
+        pre_status = json.loads(
+            (first_dir / "status.json").read_text(encoding="utf-8")
+        )
+        post_status = {
+            **pre_status,
+            "status": "failed",
+            "stage": "worker_exit",
+            "message": "FWI worker exited with code -9",
+            "updated_at": "2026-07-15T06:00:01Z",
+        }
+        record_worker_exit(
+            self.run_root,
+            first_dir,
+            first_binding,
+            return_code=-9,
+            pre_status=pre_status,
+            post_status=post_status,
+        )
+        retry = self.adapter.probe_worker_exit_retry(
+            **copy.deepcopy(request)
+        )
+        authorization = {
+            "schema_version": "1.0.0",
+            "intent_id": "intent-worker-exit-timeout-schema",
+            "previous_attempt_id": retry.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "failure_kind": "worker_exit",
+            "private_proof_hash": retry.private_proof_hash,
+            "next_attempt_number": 2,
+            "authorized_at": "2026-07-15T06:00:02Z",
+        }
+        second_handle = self.adapter.retry_worker_exit(
+            **copy.deepcopy(request), authorization=authorization
+        )
+        second_dir = self.run_root / second_handle.job_id
+        second_binding, second_heartbeat = self.start_exact_worker(
+            second_handle, second_dir
+        )
+        try:
+            dispatcher = DeepwaveTaskDispatcher(self.adapter)
+            capability = dispatcher.supports_exact_timeout(
+                self.dispatched_intent(second_handle),
+                attempt_id=second_binding.attempt_id,
+            )
+            self.assertIsNotNone(capability)
+            assert capability is not None
+            self.assertEqual(capability["private_schema_version"], "1.3.0")
+            self.assertEqual(
+                capability["attempt_id"], second_binding.attempt_id
+            )
+        finally:
+            second_heartbeat.stop("succeeded")
 
     def test_retry_exhaustion_purge_deletes_both_attempts_and_replays(self) -> None:
         adapter, request, token, record_path = (
@@ -2761,7 +3625,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             node_id=request["node_id"],
             node_idempotency_key=request["idempotency_key"],
             adapter_id="fwi.deepwave_adapter",
-            adapter_version="1.5.0",
+            adapter_version="1.6.0",
             request=durable_request,
             request_hash="sha256:" + "e" * 64,
             queue_fingerprint=copy.deepcopy(record["fingerprint"]),
@@ -3278,6 +4142,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                     ("1.3.0", "1.3.0"),
                     ("1.4.0", "1.4.0"),
                     ("1.5.0", "1.5.0"),
+                    ("1.6.0", "1.6.0"),
                 }
             ),
         )
@@ -3564,7 +4429,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ADAPTER_HANDLE_INVALID"):
             self.adapter.status(mixed_handle)
 
-    def test_current_v1_5_receipt_reopens_private_schema_v1_0(self) -> None:
+    def test_current_v1_6_receipt_reopens_private_schema_v1_0(self) -> None:
         request = self.submit_kwargs(
             task_id="task-current-private-v1",
             idempotency_key="task-current-private-v1:invert:0001",
@@ -3574,7 +4439,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.write_success_artifacts(run_dir)
         record_path = self.submission_record_path(handle)
         record = json.loads(record_path.read_text(encoding="utf-8"))
-        self.assertEqual(record["adapter_version"], "1.5.0")
+        self.assertEqual(record["adapter_version"], "1.6.0")
         current_binding = binding_from_submission_record(record)
         record["schema_version"] = "1.0.0"
         record.pop("launch_attempt")

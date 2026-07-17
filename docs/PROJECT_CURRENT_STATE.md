@@ -13,9 +13,10 @@
 - Accepted：D-003 固定 P0→P1→P2→P3→P4→P5→P6；只有 P6 出口通过才算全项目完成。
 - Verified：P0、P1，以及 P2-001～P2-009A、P2-009B1、P2-009B2 和负向/不确定
   reconciliation 矩阵的账本所列有界范围。P2-009A 已验证正向 receipt resolution；P2-009B1 已验证
-  pre-running retry；P2-009B2 已验证 post-ready `worker_exit` retry。完整 P2 仍在进行。
-- Pending：P2 剩余一个路线切片、两个工作轮次：先实现 checkpoint / Waiting / resume，再完成
-  SSE 与完整 P2 故障、代表性 CPU/CUDA 阶段出口；P3–P6 仍按顺序 Pending。
+  pre-running retry；P2-009B2 已验证 post-ready `worker_exit` retry；P2 收尾第 2 轮已验证 checkpoint /
+  Waiting / same-live-attempt resume。该工作轮次不等于路线切片出口，完整 P2 仍在进行。
+- Pending：P2 仍余一个 In progress 路线切片；第 3 轮完成 SSE 与完整 P2 故障、代表性 CPU/CUDA
+  阶段出口。P3–P6 仍按顺序 Pending。
 - 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 7 个，当前约 5 个，其中 P2 为 1、
   P3–P6 暂估约 4；这是弹性估算，不是配额。
 - 当前阻塞：无；开始前仍须检查分支、工作树、最近提交和相关 diff。
@@ -48,6 +49,11 @@
   timeout、retry 或终态推断。不完整、损坏、分歧或模糊证据一律 fail closed。
 - D-012 只允许新 Approval 最多两个 append-only attempt，并只重试 exact stopped 的 pre-running
   launch failure 或 post-ready `worker_exit`；普通数值失败、timeout、cancel、成功和不确定状态不重试。
+- current Deepwave Algorithm/Adapter 为 immutable 1.6，历史 1.0–1.5 保持精确兼容。checkpoint 只在
+  首个 optimizer update 后创建无 pickle 的有界 JSON+NPY，并仅在同一 live Worker/attempt 内恢复；
+  未实现跨进程 restart-from-checkpoint。
+- Waiting 保留 Worker 及 execution/capacity `flock`，wall clock 继续且不消耗 retry；cancel/timeout
+  优先，lost fence/Worker fail closed。Workbench 仅只读有界投影，无 resume POST，SSE 仍为 false。
 - reconciliation 的精确负向证明只终结为 Failed，不退款、不重试；transient/uncertain 保持
   action_required。该负向证明可进入 Trash，但无授权清理协议时 purge 必须 fail closed。
 - P3 DAG 只在用户明确选择工作流或任务确需拆解时运行；多算法默认是独立可发现、可选择的工具，

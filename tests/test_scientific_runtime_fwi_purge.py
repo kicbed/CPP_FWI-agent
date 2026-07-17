@@ -34,7 +34,7 @@ ENVIRONMENT_HASH = "sha256:" + "b" * 64
 
 
 def algorithm() -> dict[str, str]:
-    return {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
+    return {"id": "deepwave.acoustic_fwi", "version": "1.6.0"}
 
 
 def dataset() -> dict[str, Any]:
@@ -87,7 +87,7 @@ class FingerprintFactory:
         return {
             "provenance_mode": "development",
             "algorithm": algorithm(),
-            "adapter_version": "1.5.0",
+            "adapter_version": "1.6.0",
             "source": {"identity_complete": False, "dirty": None},
             "environment": {"environment_lock_hash": ENVIRONMENT_HASH},
             "runtime": {
@@ -303,13 +303,13 @@ class ScientificRuntimeFWIPurgeTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "PURGE_IDEMPOTENCY_CONFLICT"):
             self.adapter.purge(handle, purge_id="purge-operation-2")
 
-    def test_current_v1_4_private_schema_v1_0_remains_purgeable(self) -> None:
+    def test_current_v1_6_private_schema_v1_0_remains_purgeable(self) -> None:
         handle, run_dir = self.make_terminal_tree(
             task_id="task-purge-current-private-v1"
         )
         record_path = self.record_path(handle)
         record = json.loads(record_path.read_text(encoding="utf-8"))
-        self.assertEqual(record["adapter_version"], "1.5.0")
+        self.assertEqual(record["adapter_version"], "1.6.0")
         record["schema_version"] = "1.0.0"
         record.pop("launch_attempt")
         self.adapter._write_submission(record_path, record)

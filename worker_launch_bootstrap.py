@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--launch-attempt-fd", required=True, type=int)
     parser.add_argument("--capacity-lease-fd", required=True, type=int)
     parser.add_argument("--wall-time-seconds", type=int, default=86_400)
+    parser.add_argument(
+        "--checkpoint-after-first-update",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -59,12 +64,66 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat.start()
         heartbeat.raise_if_cancel_requested()
         run_worker = _load_run_worker()
+
+        def checkpoint_barrier(run_dir, config, state, checkpoint) -> None:
+            assert heartbeat is not None
+            from fwi_worker.checkpoint import save_checkpoint_payload
+
+            manifest = save_checkpoint_payload(
+                run_dir=run_dir,
+                binding=heartbeat.checkpoint_binding,
+                config=config,
+                checkpoint=checkpoint,
+            )
+
+            def on_waiting(receipt) -> None:
+                state.update(
+                    "waiting",
+                    "checkpoint_wait",
+                    checkpoint.completed_updates,
+                    config.iterations,
+                    "Checkpoint is durable; waiting for exact resume authorization",
+                    checkpoint_id=receipt["checkpoint_id"],
+                    checkpoint_record_hash=receipt["record_hash"],
+                    checkpoint_manifest_relative_path=(
+                        receipt["manifest_relative_path"]
+                    ),
+                    checkpoint_manifest_size_bytes=receipt["manifest_size_bytes"],
+                    checkpoint_manifest_hash=receipt["manifest_hash"],
+                    completed_updates=checkpoint.completed_updates,
+                )
+
+            def on_resumed(receipt, request) -> None:
+                state.update(
+                    "running",
+                    "invert",
+                    checkpoint.completed_updates,
+                    config.iterations,
+                    "Exact live Worker resumed after checkpoint authorization",
+                    checkpoint_id=receipt["checkpoint_id"],
+                    checkpoint_record_hash=receipt["record_hash"],
+                    resume_id=request["resume_id"],
+                    resume_request_record_hash=request["record_hash"],
+                    completed_updates=checkpoint.completed_updates,
+                )
+
+            heartbeat.wait_for_checkpoint_resume(
+                manifest.as_dict(),
+                on_waiting=on_waiting,
+                on_resumed=on_resumed,
+            )
+
+        run_arguments = {
+            "managed_launch": True,
+            "cancel_check": heartbeat.raise_if_cancel_requested,
+        }
+        if args.checkpoint_after_first_update:
+            run_arguments["checkpoint_barrier"] = checkpoint_barrier
         result = run_worker(
             args.command,
             args.config,
             args.run_dir,
-            managed_launch=True,
-            cancel_check=heartbeat.raise_if_cancel_requested,
+            **run_arguments,
         )
         heartbeat.stop("succeeded")
         heartbeat = None

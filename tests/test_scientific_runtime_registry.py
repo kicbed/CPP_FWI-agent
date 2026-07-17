@@ -96,8 +96,8 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_fresh_v16_has_all_migration_checksums_and_task_discovery_index(self) -> None:
-        self.assertEqual(self.store.migration_version(), 16)
+    def test_fresh_v17_has_all_migration_checksums_and_task_discovery_index(self) -> None:
+        self.assertEqual(self.store.migration_version(), 17)
         connection = sqlite3.connect(self.database_path)
         try:
             rows = connection.execute(
@@ -140,6 +140,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
                 (14, "0014_task_retry.sql"),
                 (15, "0015_worker_exit_retry.sql"),
                 (16, "0016_dispatch_negative_reconciliation.sql"),
+                (17, "0017_checkpoint_wait_resume.sql"),
             ],
         )
         for version, name, checksum in rows:
@@ -273,6 +274,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         optimizer_version = load_deepwave_manifest("1.2.0")
         previous_current = load_deepwave_manifest("1.3.0")
         previous_outputs = load_deepwave_manifest("1.4.0")
+        previous_reconciliation = load_deepwave_manifest("1.5.0")
         current = load_deepwave_manifest()
         legacy_json, legacy_hash = encode_document(legacy)
         _, optimizer_version_hash = encode_document(optimizer_version)
@@ -317,10 +319,12 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         self.assertEqual(len(previous_current["outputs"]), 2)
         self.assertEqual(previous_outputs["version"], "1.4.0")
         self.assertEqual(previous_outputs["adapter"]["version"], "1.4.0")
-        self.assertEqual(current["version"], "1.5.0")
+        self.assertEqual(previous_reconciliation["version"], "1.5.0")
+        self.assertEqual(previous_reconciliation["adapter"]["version"], "1.5.0")
+        self.assertEqual(current["version"], "1.6.0")
         self.assertEqual(
             current_hash,
-            "sha256:09168e087073e3f39a8829e457a9197d50331eea140cb1dbe989224d6ec6b658",
+            "sha256:0e4bf7e1eca41b4ef8590c61ce469652e74b711906360bbd3c0e50e34d0689e7",
         )
         self.assertEqual(current["schema_version"], "1.1.0")
         self.assertEqual(
@@ -335,7 +339,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
             current["parameter_schema"]["properties"]["seed"]["maximum"],
             2147483647,
         )
-        self.assertEqual(current["adapter"]["version"], "1.5.0")
+        self.assertEqual(current["adapter"]["version"], "1.6.0")
         self.assertEqual(
             current["outputs"],
             [
@@ -378,6 +382,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         reopened.register_algorithm(manifest=optimizer_version)
         reopened.register_algorithm(manifest=previous_current)
         reopened.register_algorithm(manifest=previous_outputs)
+        reopened.register_algorithm(manifest=previous_reconciliation)
         reopened.register_algorithm(manifest=current)
         self.assertEqual(
             reopened.get_algorithm(
@@ -400,7 +405,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         self.assertEqual(legacy_row_after, legacy_row_before)
         self.assertEqual(
             [value["version"] for value in reopened.list_algorithms()],
-            ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"],
+            ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0"],
         )
 
     def test_iteration_policy_is_bound_to_algorithm_version(self) -> None:
@@ -428,7 +433,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
         current_draft = task_draft()
         current_draft["draft_id"] = "draft-current-limit"
         current_draft["schema_version"] = "1.1.0"
-        current_draft["algorithm"]["version"] = "1.5.0"
+        current_draft["algorithm"]["version"] = "1.6.0"
         current_draft["parameters"].update(
             {"optimizer": "adam", "learning_rate_milli": 10000}
         )
@@ -890,8 +895,8 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
     def test_packaged_fwi_snapshot_is_schema_valid_and_path_free(self) -> None:
         manifest = load_deepwave_manifest()
         self.assertEqual(schema_errors("algorithm-manifest.schema.json", manifest), [])
-        self.assertEqual(manifest["version"], "1.5.0")
-        self.assertEqual(manifest["adapter"]["version"], "1.5.0")
+        self.assertEqual(manifest["version"], "1.6.0")
+        self.assertEqual(manifest["adapter"]["version"], "1.6.0")
         self.assertEqual(manifest["task_types"], ["acoustic_fwi_2d"])
         self.assertEqual(
             manifest["parameter_schema"]["properties"]["preset"]["enum"],
@@ -1203,7 +1208,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
     def test_v1_database_upgrades_in_place_and_backfills_approval_budget(self) -> None:
         task_id, approval = self.seed_v1_database()
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 16)
+        self.assertEqual(store.migration_version(), 17)
         snapshot = store.get_task(task_id)
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.approval, approval)
@@ -1217,7 +1222,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
         task_id, _ = self.seed_v1_database()
         self.upgrade_fixture_to_v2()
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 16)
+        self.assertEqual(store.migration_version(), 17)
         self.assertEqual(store.get_task(task_id).status, "AwaitingApproval")
         connection = sqlite3.connect(self.database_path)
         try:
@@ -1258,7 +1263,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
             connection.close()
 
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 16)
+        self.assertEqual(store.migration_version(), 17)
         snapshot = store.get_task(task_id)
         self.assertEqual(snapshot.approval, approval)
         service = TaskService(
@@ -1343,7 +1348,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
             connection.close()
 
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 16)
+        self.assertEqual(store.migration_version(), 17)
         snapshot = store.get_task(task_id)
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.approval, approval)
@@ -1438,7 +1443,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(reopen, range(8)))
-        self.assertEqual(results, [(16, approval["approval_id"])] * 8)
+        self.assertEqual(results, [(17, approval["approval_id"])] * 8)
         connection = sqlite3.connect(self.database_path)
         try:
             self.assertEqual(

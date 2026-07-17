@@ -323,6 +323,58 @@ def _public_dispatch_reconciliation(value: Any) -> dict[str, Any]:
     }
 
 
+def _public_checkpoint(value: Any, *, task_status: str) -> dict[str, Any] | None:
+    """Project checkpoint progress without Worker, path, or proof identity."""
+
+    if value is None:
+        if task_status == "Waiting":
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID",
+                ["Waiting task is missing its durable checkpoint"],
+            )
+        return None
+    state = _value(value, "state")
+    checkpoint_index = _value(value, "checkpoint_index")
+    completed_updates = _value(value, "completed_updates")
+    created_at = _value(value, "checkpoint_created_at")
+    resume_requested_at = _value(value, "resume_requested_at")
+    resumed_at = _value(value, "resume_acknowledged_at")
+    if (
+        state not in {"waiting", "resume_requested", "resumed", "superseded"}
+        or type(checkpoint_index) is not int
+        or checkpoint_index < 1
+        or type(completed_updates) is not int
+        or completed_updates < 1
+        or not isinstance(created_at, str)
+        or (resume_requested_at is not None and not isinstance(resume_requested_at, str))
+        or (resumed_at is not None and not isinstance(resumed_at, str))
+        or (state == "waiting" and (resume_requested_at is not None or resumed_at is not None))
+        or (state == "resume_requested" and (resume_requested_at is None or resumed_at is not None))
+        or (state == "resumed" and (resume_requested_at is None or resumed_at is None))
+        or (state == "superseded" and resumed_at is not None)
+        or (task_status == "Waiting" and state not in {"waiting", "resume_requested"})
+        or (state == "superseded" and task_status not in {"Failed", "Cancelled"})
+    ):
+        raise WorkbenchRuntimeError(
+            "SERVICE_RESPONSE_INVALID", ["checkpoint projection is invalid"]
+        )
+    _timestamp(created_at, field="checkpoint created_at")
+    if resume_requested_at is not None:
+        _timestamp(resume_requested_at, field="checkpoint resume_requested_at")
+    if resumed_at is not None:
+        _timestamp(resumed_at, field="checkpoint resumed_at")
+    return {
+        "state": state,
+        "checkpoint_index": checkpoint_index,
+        "completed_updates": completed_updates,
+        "created_at": created_at,
+        "resume_requested_at": resume_requested_at,
+        "resumed_at": resumed_at,
+        "same_attempt": True,
+        "capacity_released_while_waiting": False,
+    }
+
+
 def _public_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "id": manifest["id"],
@@ -499,6 +551,7 @@ class GuidedWorkbench:
                 "supervisor_leases": True,
                 "running_cancel": True,
                 "runtime_timeout": True,
+                "checkpoint_wait_resume": True,
                 "positive_receipt_reconciliation": True,
                 "exact_negative_reconciliation": True,
                 "automatic_reconciliation": False,
@@ -516,6 +569,12 @@ class GuidedWorkbench:
                     "max_concurrent_attempts": 1,
                     "pre_running_launch_failure": True,
                     "worker_exit": True,
+                },
+                "checkpoint_resume": {
+                    "automatic": True,
+                    "browser_mutation": False,
+                    "same_attempt": True,
+                    "capacity_released_while_waiting": False,
                 },
                 "sse": False,
                 "startup_dispatch_recovery": False,
@@ -1473,7 +1532,21 @@ class GuidedWorkbench:
             }
         status = _as_mapping(adapter_status)
         if status is not None:
-            for internal in ("job_id", "handle", "submission_id", "relative_path"):
+            for internal in (
+                "job_id",
+                "handle",
+                "submission_id",
+                "attempt_id",
+                "checkpoint_id",
+                "relative_path",
+                "checkpoint_manifest_relative_path",
+                "checkpoint_manifest_hash",
+                "checkpoint_receipt_record_hash",
+                "checkpoint_proof_hash",
+                "resume_request_record_hash",
+                "resume_acknowledgement_record_hash",
+                "proof_hash",
+            ):
                 status.pop(internal, None)
         cancellation = snapshot.cancellation
         cancellation_projection = (
@@ -1500,6 +1573,9 @@ class GuidedWorkbench:
                 "failure_code": timeout.failure_code,
                 "terminal_status": timeout.terminal_status,
             }
+        )
+        checkpoint_projection = _public_checkpoint(
+            getattr(snapshot, "checkpoint", None), task_status=snapshot.status
         )
         can_cancel = False
         can_cancel_task = getattr(self._tasks, "can_cancel_task", None)
@@ -1561,6 +1637,7 @@ class GuidedWorkbench:
             "can_cancel": can_cancel,
             "cancellation": cancellation_projection,
             "timeout": timeout_projection,
+            "checkpoint": checkpoint_projection,
             "created_at": snapshot.created_at,
             "updated_at": snapshot.updated_at,
             "visibility_revision": snapshot.visibility_revision,
@@ -1679,6 +1756,10 @@ class GuidedWorkbench:
                             "failure_code": snapshot.timeout.failure_code,
                             "terminal_status": snapshot.timeout.terminal_status,
                         }
+                    ),
+                    "checkpoint": _public_checkpoint(
+                        getattr(snapshot, "checkpoint", None),
+                        task_status=snapshot.status,
                     ),
                 }
             )
@@ -1801,17 +1882,23 @@ class GuidedWorkbench:
         projected: list[dict[str, Any]] = []
         for event in events:
             value = copy.deepcopy(event)
+            # Checkpoint manifests and their exact attempt/resume bindings are
+            # internal Worker evidence.  The browser only needs the durable
+            # lifecycle event, never its path or private checkpoint identity.
+            value.pop("checkpoint", None)
             extensions = value.get("extensions")
             if isinstance(extensions, dict):
                 # Retry audits bind internal intent, attempt, observation, and
                 # private Adapter proof identities.  Browser/API consumers need
                 # only the public event/state; never project either proof.
-                for internal_retry_extension in (
+                for internal_extension in (
                     "org.agent_rpc.retry_exhaustion",
                     "org.agent_rpc.worker_exit_retry",
                     "org.agent_rpc.dispatch_reconciliation",
+                    "org.agent_rpc.checkpoint_wait",
+                    "org.agent_rpc.checkpoint_resume",
                 ):
-                    extensions.pop(internal_retry_extension, None)
+                    extensions.pop(internal_extension, None)
                 adapter_detail = extensions.get("org.agent_rpc.adapter_status")
                 if isinstance(adapter_detail, dict):
                     adapter_detail.pop("job_id", None)

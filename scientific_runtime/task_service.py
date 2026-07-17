@@ -60,26 +60,30 @@ RETRYABLE_FAILURE_CLASSES = frozenset(
 RUN_EVENT_STATUS = {
     "node_started": frozenset({"Running"}),
     "node_progress": frozenset({"Running"}),
+    "checkpoint_created": frozenset({"Running"}),
+    "node_waiting": frozenset({"Waiting"}),
     # P1's only executable capability will be one FWI node. Multi-node
     # lifecycle semantics are deferred to the P3 scheduler.
     "node_succeeded": frozenset({"Succeeded"}),
     "node_failed": frozenset({"Failed"}),
     "node_retrying": frozenset({"Retrying"}),
-    "cancel_requested": frozenset({"Queued", "Running"}),
+    "cancel_requested": frozenset({"Queued", "Running", "Waiting"}),
     "task_cancelled": frozenset({"Cancelled"}),
 }
 
 RUN_EVENT_EXPECTED_STATUS = {
-    "node_started": frozenset({"Queued", "Retrying"}),
+    "node_started": frozenset({"Queued", "Waiting", "Retrying"}),
     "node_progress": frozenset({"Running"}),
+    "checkpoint_created": frozenset({"Running"}),
+    "node_waiting": frozenset({"Running"}),
     "node_succeeded": frozenset({"Running"}),
     "node_failed": frozenset({"Queued", "Running"}),
     "node_retrying": frozenset({"Queued", "Running"}),
-    "cancel_requested": frozenset({"Queued", "Running"}),
-    "task_cancelled": frozenset({"Queued", "Running"}),
+    "cancel_requested": frozenset({"Queued", "Running", "Waiting"}),
+    "task_cancelled": frozenset({"Queued", "Running", "Waiting"}),
 }
 
-P2_EVENT_TYPES = frozenset(
+SUPERVISED_CHECKPOINT_EVENT_TYPES = frozenset(
     {
         "checkpoint_created",
         "node_waiting",
@@ -267,6 +271,17 @@ class TaskTimeoutProcessResult:
 
 
 @dataclass(frozen=True)
+class TaskCheckpointProcessResult:
+    """One Supervisor-owned checkpoint wait or same-attempt resume pass."""
+
+    snapshot: TaskSnapshot
+    state: str
+    adapter_result: dict[str, Any] | None
+    replayed: bool
+    deferred_code: str | None = None
+
+
+@dataclass(frozen=True)
 class RuntimeRecoveryResult:
     """Bounded outcome of one scope-wide startup recovery pass."""
 
@@ -355,7 +370,8 @@ def _validate_approval_retry_policy(
         raise TaskValidationError(
             "APPROVAL_RETRY_POLICY_INVALID",
             [
-                "retry policy requires one current deepwave.acoustic_fwi@1.5.0 "
+                "retry policy requires one current "
+                f"deepwave.acoustic_fwi@{DEEPWAVE_ALGORITHM_VERSION} "
                 "resource-bound plan node"
             ],
         )
@@ -393,11 +409,6 @@ def _validate_approval_retry_policy(
 
 def _validate_run_event_semantics(event: Mapping[str, Any]) -> None:
     event_type = event["event_type"]
-    if event_type in P2_EVENT_TYPES:
-        raise TaskValidationError(
-            "RUN_EVENT_UNSUPPORTED_IN_P1",
-            [f"{event_type} semantics are deferred to P2"],
-        )
     allowed_statuses = RUN_EVENT_STATUS.get(event_type)
     if allowed_statuses is None or event["task_status"] not in allowed_statuses:
         raise TaskValidationError(
@@ -428,10 +439,10 @@ def _validate_run_event_semantics(event: Mapping[str, Any]) -> None:
             "RUN_EVENT_DETAIL_FORBIDDEN",
             [f"{event_type} cannot carry progress"],
         )
-    if "checkpoint" in event:
+    if event_type != "checkpoint_created" and "checkpoint" in event:
         raise TaskValidationError(
-            "RUN_EVENT_UNSUPPORTED_IN_P1",
-            ["checkpoint semantics are deferred to P2"],
+            "RUN_EVENT_DETAIL_FORBIDDEN",
+            [f"{event_type} cannot carry a checkpoint"],
         )
     progress = event.get("progress")
     if progress is not None and progress["completed"] > progress["total"]:
@@ -1437,8 +1448,10 @@ class TaskService:
             raise TaskConflict(
                 "pre-runtime tasks must use the abandon operation"
             )
-        if current.status not in {"Queued", "Running"}:
-            raise TaskConflict("only a queued or running task can be cancelled")
+        if current.status not in {"Queued", "Running", "Waiting"}:
+            raise TaskConflict(
+                "only a queued, running, or waiting task can be cancelled"
+            )
         current_timeout = getattr(current, "timeout", None)
         if (
             current_timeout is not None
@@ -2477,7 +2490,11 @@ class TaskService:
                 proof.adapter_version,
                 proof.private_schema_version,
             )
-            not in {("1.4.0", "1.1.0"), ("1.5.0", "1.2.0")}
+            not in {
+                ("1.4.0", "1.1.0"),
+                ("1.5.0", "1.2.0"),
+                ("1.6.0", "1.2.0"),
+            }
             or re.fullmatch(r"sha256:[0-9a-f]{64}", proof.private_record_hash)
             is None
             or re.fullmatch(r"sha256:[0-9a-f]{64}", proof.private_proof_hash)
@@ -3027,9 +3044,18 @@ class TaskService:
         timeout_armed = False
         if positive.evidence_kind == "managed_worker_receipt":
             assert isinstance(positive.evidence, Mapping)
+            projected_snapshot = self._project_early_checkpoint_running(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                snapshot=snapshot,
+                intent=resolved,
+                evidence=positive.evidence,
+                supervisor_lease=supervisor_lease,
+            )
             timeout_armed = self._arm_projected_worker_timeout(
                 task_id=task_id,
-                snapshot=snapshot,
+                snapshot=projected_snapshot,
                 intent=resolved,
                 evidence=positive.evidence,
                 attempt_id=completion.attempt_id,
@@ -3896,6 +3922,15 @@ class TaskService:
         ticket = evidence.get("ticket")
         ready = evidence.get("ready")
         heartbeat = evidence.get("heartbeat")
+        heartbeat_state = (
+            heartbeat.get("state")
+            if isinstance(heartbeat, Mapping)
+            else None
+        )
+        live_heartbeat = heartbeat_state == "running" or (
+            heartbeat_state == "waiting"
+            and self._checkpoint_capable_intent(intent)
+        )
         timeout_capable = (
             getattr(snapshot, "timeout", None) is None
             and intent.state == "dispatched"
@@ -3903,7 +3938,7 @@ class TaskService:
             and ticket.get("state") == "spawned"
             and isinstance(ready, Mapping)
             and isinstance(heartbeat, Mapping)
-            and heartbeat.get("state") == "running"
+            and live_heartbeat
         )
         if not timeout_capable:
             return False
@@ -3956,6 +3991,116 @@ class TaskService:
         ):
             raise TaskDispatchError("TIMEOUT_WINDOW_INVALID")
         return not replayed
+
+    @staticmethod
+    def _checkpoint_capable_intent(intent: DispatchIntentSnapshot) -> bool:
+        """Return the exact immutable 1.6 checkpoint capability binding."""
+
+        return (
+            intent.adapter_id == "fwi.deepwave_adapter"
+            and intent.adapter_version == "1.6.0"
+            and intent.request.get("algorithm")
+            == {"id": DEEPWAVE_ALGORITHM_ID, "version": "1.6.0"}
+        )
+
+    def _project_early_checkpoint_running(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        evidence: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskSnapshot:
+        """Publish the ready boundary before processing an early checkpoint.
+
+        A checkpoint-capable Worker can reach its first durable Waiting sample
+        before the control plane has appended ``node_started``.  The Worker is
+        already exact and live at that point; project its immutable ready time
+        as Running without launching or allocating another attempt.  The next
+        checkpoint pass then owns Running-to-Waiting.
+        """
+
+        heartbeat = evidence.get("heartbeat")
+        if not isinstance(heartbeat, Mapping) or heartbeat.get("state") != "waiting":
+            return snapshot
+        if not self._checkpoint_capable_intent(intent):
+            raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
+        ticket = evidence.get("ticket")
+        ready = evidence.get("ready")
+        started_at = ready.get("started_at") if isinstance(ready, Mapping) else None
+        if (
+            intent.state != "dispatched"
+            or intent.handle is None
+            or not isinstance(ticket, Mapping)
+            or ticket.get("state") != "spawned"
+            or not isinstance(ready, Mapping)
+            or not isinstance(started_at, str)
+            or evidence.get("attempt_id") is None
+        ):
+            raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
+        try:
+            self._parse_gate_time(started_at)
+        except TaskDispatchError as error:
+            raise TaskDispatchError("WORKER_EVIDENCE_INVALID") from error
+
+        for _ in range(8):
+            current = self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            if current.status in {"Running", "Waiting"}:
+                return current
+            if current.status != "Queued":
+                raise TaskConflict(
+                    "early checkpoint cannot cross the Worker ready boundary"
+                )
+            sequence = self._store.latest_run_event_sequence(task_id) + 1
+            extension = {
+                "job_id": intent.handle["job_id"],
+                "stage": "running",
+                "worker_updated_at": started_at,
+            }
+            _, identity_hash = encode_document(
+                {
+                    "intent_id": intent.intent_id,
+                    "attempt_id": evidence["attempt_id"],
+                    "ready_record_hash": ready.get("record_hash"),
+                    "event_type": "node_started",
+                    "sequence": sequence,
+                }
+            )
+            event = {
+                "schema_version": "1.0.0",
+                "event_id": "event-"
+                + identity_hash.removeprefix("sha256:")[:32],
+                "sequence": sequence,
+                "task_id": task_id,
+                "node_id": intent.node_id,
+                "event_type": "node_started",
+                "task_status": "Running",
+                "occurred_at": started_at,
+                "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+                "extensions": {
+                    "org.agent_rpc.adapter_status": extension,
+                },
+            }
+            self._validate_schema("run-event.schema.json", event)
+            _validate_run_event_semantics(event)
+            _validate_run_event_binding(current, event)
+            try:
+                return self.record_run_event(
+                    task_id=task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    expected_status="Queued",
+                    event=event,
+                    supervisor_lease=supervisor_lease,
+                )
+            except TaskConflict:
+                continue
+        raise TaskConflict("concurrent early checkpoint projection did not converge")
 
     def project_worker_attempt(
         self,
@@ -4039,12 +4184,24 @@ class TaskService:
         if intent.state == "retrying" and validated_handle is not None:
             ready = evidence.get("ready")
             heartbeat = evidence.get("heartbeat")
+            heartbeat_state = (
+                heartbeat.get("state")
+                if isinstance(heartbeat, Mapping)
+                else None
+            )
+            replacement_started = heartbeat_state in {
+                "running",
+                "succeeded",
+                "failed",
+            } or (
+                heartbeat_state == "waiting"
+                and self._checkpoint_capable_intent(intent)
+            )
             if (
                 evidence.get("attempt_number") != 2
                 or not isinstance(ready, Mapping)
                 or not isinstance(heartbeat, Mapping)
-                or heartbeat.get("state")
-                not in {"running", "succeeded", "failed"}
+                or not replacement_started
             ):
                 raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
             sequence = self._store.latest_run_event_sequence(task_id) + 1
@@ -4098,9 +4255,18 @@ class TaskService:
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
         projected_intent = projection.intent
+        projected_snapshot = self._project_early_checkpoint_running(
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            snapshot=snapshot,
+            intent=projected_intent,
+            evidence=evidence,
+            supervisor_lease=supervisor_lease,
+        )
         timeout_armed = self._arm_projected_worker_timeout(
             task_id=task_id,
-            snapshot=snapshot,
+            snapshot=projected_snapshot,
             intent=projected_intent,
             evidence=evidence,
             attempt_id=projection.attempt_id,
@@ -4168,7 +4334,7 @@ class TaskService:
         status_refresh_failures: list[tuple[str, str]] = []
         reconciliation_required: list[str] = []
         for listed in snapshots:
-            if listed.status not in {"Queued", "Running"}:
+            if listed.status not in {"Queued", "Running", "Waiting"}:
                 continue
             intent = self._store.get_dispatch_intent(listed.task_id)
             if intent is None:
@@ -4295,6 +4461,10 @@ class TaskService:
             raise TaskConflict(
                 "cancellation events are reserved for the supervised cancel path"
             )
+        if event["event_type"] in SUPERVISED_CHECKPOINT_EVENT_TYPES:
+            raise TaskConflict(
+                "checkpoint events are reserved for the supervised checkpoint path"
+            )
         _validate_run_event_semantics(event)
         if expected_status in {"Waiting", "Retrying"} or event["task_status"] in {
             "Waiting",
@@ -4391,7 +4561,14 @@ class TaskService:
             or result.get("task_id") != intent.task_id
             or result.get("node_id") != intent.node_id
             or status
-            not in {"Queued", "Running", "Succeeded", "Failed", "Cancelled"}
+            not in {
+                "Queued",
+                "Running",
+                "Waiting",
+                "Succeeded",
+                "Failed",
+                "Cancelled",
+            }
             or type(result.get("completed")) is not int
             or type(result.get("total")) is not int
             or result["completed"] < 0
@@ -4474,6 +4651,679 @@ class TaskService:
                 "retryable": False,
             }
         return event
+
+    def _validate_control_owned_terminal_event(
+        self,
+        *,
+        snapshot: TaskSnapshot,
+        event: Mapping[str, Any],
+        owner: str,
+    ) -> None:
+        """Validate a terminal transition owned by cancel or timeout only.
+
+        Generic runtime event admission intentionally does not allow
+        ``Waiting`` to publish natural terminal node events.  A durable cancel
+        or timeout request, however, owns that exact Worker race and may prove
+        that the Worker stopped or naturally won while the control plane still
+        projected Waiting.  Keep that exception private to these fenced
+        completion paths instead of widening ``record_run_event``.
+        """
+
+        if owner == "cancellation":
+            control = getattr(snapshot, "cancellation", None)
+        elif owner == "timeout":
+            control = getattr(snapshot, "timeout", None)
+        else:
+            raise TaskDispatchError("CONTROL_TERMINAL_EVENT_INVALID")
+        target = event.get("task_status")
+        expected_type = {
+            "Succeeded": "node_succeeded",
+            "Failed": "node_failed",
+        }.get(target)
+        allowed_targets = {
+            "Queued": {"Failed"},
+            "Running": {"Succeeded", "Failed"},
+            "Waiting": {"Succeeded", "Failed"},
+        }
+        if (
+            getattr(control, "state", None) != "requested"
+            or snapshot.status not in allowed_targets
+            or target not in allowed_targets[snapshot.status]
+            or event.get("event_type") != expected_type
+        ):
+            raise TaskDispatchError("CONTROL_TERMINAL_EVENT_INVALID")
+        self._validate_schema("run-event.schema.json", event)
+        _validate_run_event_semantics(event)
+        _validate_run_event_binding(snapshot, event)
+
+    @staticmethod
+    def _checkpoint_adapter_result(value: Any) -> dict[str, Any] | None:
+        """Normalize one trusted Dispatcher checkpoint result without paths."""
+
+        if value is None:
+            return None
+        if isinstance(value, Mapping):
+            result = copy.deepcopy(dict(value))
+        else:
+            converter = getattr(value, "as_dict", None)
+            converted = converter() if callable(converter) else None
+            if not isinstance(converted, Mapping):
+                raise TaskDispatchError("ADAPTER_CHECKPOINT_RESPONSE_INVALID")
+            result = copy.deepcopy(dict(converted))
+        return result
+
+    @staticmethod
+    def _checkpoint_events(
+        *,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        proof: Mapping[str, Any],
+        first_sequence: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build the bounded atomic Running checkpoint and Waiting events."""
+
+        if intent.handle is None:
+            raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+        checkpoint_id = proof.get("checkpoint_id")
+        checkpoint_index = proof.get("checkpoint_index")
+        completed_updates = proof.get("completed_updates")
+        relative_path = proof.get("checkpoint_manifest_relative_path")
+        occurred_at = proof.get("checkpoint_created_at")
+        if (
+            not isinstance(checkpoint_id, str)
+            or re.fullmatch(r"checkpoint-[0-9a-f]{32}", checkpoint_id) is None
+            or type(checkpoint_index) is not int
+            or checkpoint_index < 1
+            or type(completed_updates) is not int
+            or completed_updates < 1
+            or not isinstance(relative_path, str)
+            or re.fullmatch(
+                r"(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9._/-]+",
+                relative_path,
+            )
+            is None
+            or not isinstance(occurred_at, str)
+        ):
+            raise TaskDispatchError("ADAPTER_CHECKPOINT_RESPONSE_INVALID")
+        try:
+            TaskService._parse_gate_time(occurred_at)
+        except TaskDispatchError as error:
+            raise TaskDispatchError("ADAPTER_CHECKPOINT_RESPONSE_INVALID") from error
+        bounded = {
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_index": checkpoint_index,
+            "completed_updates": completed_updates,
+            "same_attempt": True,
+        }
+
+        def event_identity(event_type: str, sequence: int) -> str:
+            _, identity_hash = encode_document(
+                {
+                    "task_id": snapshot.task_id,
+                    "node_id": intent.node_id,
+                    "event_type": event_type,
+                    "sequence": sequence,
+                    "checkpoint": bounded,
+                    "occurred_at": occurred_at,
+                }
+            )
+            return "event-" + identity_hash.removeprefix("sha256:")[:32]
+
+        checkpoint_event = {
+            "schema_version": "1.0.0",
+            "event_id": event_identity("checkpoint_created", first_sequence),
+            "sequence": first_sequence,
+            "task_id": snapshot.task_id,
+            "node_id": intent.node_id,
+            "event_type": "checkpoint_created",
+            "task_status": "Running",
+            "checkpoint": {"relative_path": relative_path},
+            "occurred_at": occurred_at,
+            "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+            "extensions": {
+                "org.agent_rpc.checkpoint_wait": copy.deepcopy(bounded)
+            },
+        }
+        waiting_event = {
+            "schema_version": "1.0.0",
+            "event_id": event_identity("node_waiting", first_sequence + 1),
+            "sequence": first_sequence + 1,
+            "task_id": snapshot.task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_waiting",
+            "task_status": "Waiting",
+            "occurred_at": occurred_at,
+            "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+            "extensions": {
+                "org.agent_rpc.checkpoint_wait": copy.deepcopy(bounded)
+            },
+        }
+        return checkpoint_event, waiting_event
+
+    @staticmethod
+    def _checkpoint_resume_event(
+        *,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        proof: Mapping[str, Any],
+        resume_id: str,
+        sequence: int,
+    ) -> dict[str, Any]:
+        """Build the bounded Waiting-to-Running acknowledgement event."""
+
+        checkpoint = getattr(snapshot, "checkpoint", None)
+        occurred_at = proof.get("resume_acknowledged_at")
+        if (
+            intent.handle is None
+            or checkpoint is None
+            or not isinstance(occurred_at, str)
+            or proof.get("checkpoint_id") != checkpoint.checkpoint_id
+            or proof.get("resume_id") != resume_id
+        ):
+            raise TaskDispatchError("ADAPTER_CHECKPOINT_RESPONSE_INVALID")
+        try:
+            TaskService._parse_gate_time(occurred_at)
+        except TaskDispatchError as error:
+            raise TaskDispatchError("ADAPTER_CHECKPOINT_RESPONSE_INVALID") from error
+        bounded = {
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "resume_id": resume_id,
+            "same_attempt": True,
+        }
+        _, identity_hash = encode_document(
+            {
+                "task_id": snapshot.task_id,
+                "node_id": intent.node_id,
+                "event_type": "node_started",
+                "sequence": sequence,
+                "resume": bounded,
+                "occurred_at": occurred_at,
+            }
+        )
+        return {
+            "schema_version": "1.0.0",
+            "event_id": "event-" + identity_hash.removeprefix("sha256:")[:32],
+            "sequence": sequence,
+            "task_id": snapshot.task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_started",
+            "task_status": "Running",
+            "occurred_at": occurred_at,
+            "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+            "extensions": {
+                "org.agent_rpc.checkpoint_resume": bounded,
+            },
+        }
+
+    def process_runtime_checkpoint(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskCheckpointProcessResult:
+        """Persist one checkpoint wait or resume its exact live attempt.
+
+        This state machine never invokes a launcher.  A checkpoint-capable
+        Worker keeps both inherited kernel fences while Waiting, and only an
+        active Supervisor term may bind the append-only proof and publish the
+        deterministic resume request.
+        """
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if snapshot.status not in {"Running", "Waiting"}:
+            return TaskCheckpointProcessResult(
+                snapshot=snapshot,
+                state="none",
+                adapter_result=None,
+                replayed=True,
+            )
+
+        checkpoint = getattr(snapshot, "checkpoint", None)
+        checkpoint_state = getattr(checkpoint, "state", None)
+        if snapshot.status == "Running" and checkpoint is not None:
+            if checkpoint_state != "resumed":
+                raise TaskConflict(
+                    "Running task has an unresolved checkpoint lifecycle"
+                )
+        if snapshot.status == "Waiting" and checkpoint_state not in {
+            "waiting",
+            "resume_requested",
+        }:
+            raise TaskConflict(
+                "Waiting task lacks its current resumable checkpoint"
+            )
+
+        intent = self._store.get_dispatch_intent(task_id)
+        if (
+            intent is None
+            or intent.state != "dispatched"
+            or intent.handle is None
+        ):
+            raise TaskConflict(
+                "checkpoint lifecycle lost its dispatched intent binding"
+            )
+        checkpoint_capable = (
+            intent.adapter_id == "fwi.deepwave_adapter"
+            and intent.adapter_version == "1.6.0"
+            and intent.request.get("algorithm")
+            == {"id": DEEPWAVE_ALGORITHM_ID, "version": "1.6.0"}
+        )
+        if not checkpoint_capable:
+            if snapshot.status == "Waiting":
+                return TaskCheckpointProcessResult(
+                    snapshot=snapshot,
+                    state="action_required",
+                    adapter_result=None,
+                    replayed=True,
+                    deferred_code="CHECKPOINT_CAPABILITY_UNAVAILABLE",
+                )
+            return TaskCheckpointProcessResult(
+                snapshot=snapshot,
+                state="none",
+                adapter_result=None,
+                replayed=True,
+            )
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        probe = getattr(self._dispatcher, "probe_runtime_checkpoint", None)
+        resume = getattr(self._dispatcher, "resume_runtime_checkpoint", None)
+        if not callable(probe) or not callable(resume):
+            return TaskCheckpointProcessResult(
+                snapshot=snapshot,
+                state=(
+                    "action_required"
+                    if snapshot.status == "Waiting"
+                    else "none"
+                ),
+                adapter_result=None,
+                replayed=True,
+                deferred_code="CHECKPOINT_RESUME_UNSUPPORTED",
+            )
+
+        def transient_result(code: str) -> TaskCheckpointProcessResult:
+            state = "none"
+            if snapshot.status == "Waiting":
+                state = (
+                    "resume_requested"
+                    if checkpoint_state == "resume_requested"
+                    else "waiting"
+                )
+            return TaskCheckpointProcessResult(
+                snapshot=snapshot,
+                state=state,
+                adapter_result=None,
+                replayed=True,
+                deferred_code=code,
+            )
+
+        def action_required_result(code: str) -> TaskCheckpointProcessResult:
+            return TaskCheckpointProcessResult(
+                snapshot=snapshot,
+                state="action_required",
+                adapter_result=None,
+                replayed=True,
+                deferred_code=code,
+            )
+
+        try:
+            observed = probe(intent)
+        except DispatchDeferred as error:
+            if error.code == "CHECKPOINT_ACTION_REQUIRED":
+                return action_required_result(error.code)
+            return transient_result(error.code)
+        except DispatchError as error:
+            if error.code == "CHECKPOINT_CAPABILITY_UNAVAILABLE" and (
+                snapshot.status == "Running"
+            ):
+                return TaskCheckpointProcessResult(
+                    snapshot=snapshot,
+                    state="none",
+                    adapter_result=None,
+                    replayed=True,
+                )
+            if snapshot.status == "Waiting" or error.code in {
+                "CHECKPOINT_ACTION_REQUIRED",
+                "CHECKPOINT_NOT_WAITING",
+                "CHECKPOINT_RESUME_CONFLICT",
+                "CHECKPOINT_RESUME_AUTHORIZATION_INVALID",
+                "ADAPTER_CHECKPOINT_RESPONSE_INVALID",
+            }:
+                return action_required_result(error.code)
+            return transient_result(error.code)
+        except Exception:
+            if snapshot.status == "Waiting":
+                return action_required_result("CHECKPOINT_PROBE_UNAVAILABLE")
+            return transient_result("CHECKPOINT_PROBE_UNAVAILABLE")
+
+        proof = self._checkpoint_adapter_result(observed)
+        if proof is None:
+            if snapshot.status == "Waiting":
+                return action_required_result("CHECKPOINT_PROOF_UNAVAILABLE")
+            return TaskCheckpointProcessResult(
+                snapshot=snapshot,
+                state="none",
+                adapter_result=None,
+                replayed=True,
+            )
+        if (
+            proof.get("schema_version") != "1.0.0"
+            or proof.get("task_id") != task_id
+            or proof.get("node_id") != intent.node_id
+            or proof.get("submission_id")
+            != intent.handle.get("submission_id")
+            or proof.get("state")
+            not in {"waiting", "requested", "resumed"}
+        ):
+            return action_required_result(
+                "ADAPTER_CHECKPOINT_RESPONSE_INVALID"
+            )
+
+        stable_checkpoint_fields = {
+            "checkpoint_id": "checkpoint_id",
+            "node_id": "node_id",
+            "submission_id": "submission_id",
+            "attempt_id": "attempt_id",
+            "attempt_number": "attempt_number",
+            "checkpoint_index": "checkpoint_index",
+            "completed_updates": "completed_updates",
+            "checkpoint_manifest_relative_path": (
+                "checkpoint_manifest_relative_path"
+            ),
+            "checkpoint_manifest_size_bytes": (
+                "checkpoint_manifest_size_bytes"
+            ),
+            "checkpoint_manifest_hash": "checkpoint_manifest_hash",
+            "checkpoint_receipt_record_hash": (
+                "checkpoint_receipt_record_hash"
+            ),
+            "checkpoint_created_at": "checkpoint_created_at",
+        }
+
+        if snapshot.status == "Running":
+            if checkpoint is not None:
+                same_checkpoint = (
+                    proof.get("checkpoint_id") == checkpoint.checkpoint_id
+                )
+                stable_replay = same_checkpoint and not any(
+                    proof.get(proof_field)
+                    != getattr(checkpoint, snapshot_field)
+                    for proof_field, snapshot_field in (
+                        stable_checkpoint_fields.items()
+                    )
+                )
+                if stable_replay and proof.get("state") == "resumed":
+                    # The current live attempt is still exposing the exact
+                    # checkpoint whose completion is already durable.  Return
+                    # to retry/status processing.  A later finite retry has a
+                    # different attempt-bound checkpoint identity and must be
+                    # allowed to enter Waiting independently.
+                    return TaskCheckpointProcessResult(
+                        snapshot=snapshot,
+                        state="none",
+                        adapter_result=proof,
+                        replayed=True,
+                    )
+                if same_checkpoint or (
+                    proof.get("attempt_id") == checkpoint.attempt_id
+                ):
+                    return action_required_result(
+                        "CHECKPOINT_STATE_CONFLICT"
+                    )
+            if proof.get("state") != "waiting":
+                return action_required_result("CHECKPOINT_STATE_CONFLICT")
+            sequence = self._store.latest_run_event_sequence(task_id) + 1
+            try:
+                checkpoint_event, waiting_event = self._checkpoint_events(
+                    snapshot=snapshot,
+                    intent=intent,
+                    proof=proof,
+                    first_sequence=sequence,
+                )
+                for event in (checkpoint_event, waiting_event):
+                    self._validate_schema("run-event.schema.json", event)
+                    _validate_run_event_semantics(event)
+                    _validate_run_event_binding(snapshot, event)
+                recorded = self._store.record_supervised_checkpoint_wait(
+                    intent_id=intent.intent_id,
+                    checkpoint_proof=proof,
+                    checkpoint_event=checkpoint_event,
+                    waiting_event=waiting_event,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+            except RuntimeSupervisorLeaseLost as error:
+                raise TaskSupervisorLeaseLost() from error
+            except TaskStoreConflict as error:
+                raise TaskConflict(str(error)) from error
+            recorded_snapshot = getattr(recorded, "snapshot", None)
+            recorded_checkpoint = getattr(recorded, "checkpoint", None)
+            replayed = getattr(recorded, "replayed", None)
+            if (
+                getattr(recorded_snapshot, "task_id", None) != task_id
+                or getattr(recorded_snapshot, "status", None) != "Waiting"
+                or getattr(recorded_checkpoint, "checkpoint_id", None)
+                != proof.get("checkpoint_id")
+                or getattr(recorded_checkpoint, "state", None)
+                not in {"waiting", "resume_requested"}
+                or type(replayed) is not bool
+            ):
+                raise TaskDispatchError("CHECKPOINT_STORE_RESPONSE_INVALID")
+            return TaskCheckpointProcessResult(
+                snapshot=recorded_snapshot,
+                state="waiting",
+                adapter_result=proof,
+                replayed=replayed,
+                deferred_code="CHECKPOINT_WAITING",
+            )
+
+        assert checkpoint is not None
+        if any(
+            proof.get(proof_field) != getattr(checkpoint, snapshot_field)
+            for proof_field, snapshot_field in stable_checkpoint_fields.items()
+        ):
+            return action_required_result("CHECKPOINT_STATE_CONFLICT")
+        if checkpoint_state == "waiting" and proof.get("state") != "waiting":
+            return action_required_result("CHECKPOINT_STATE_CONFLICT")
+
+        admission = {
+            "schema_version": "1.0.0",
+            "task_id": task_id,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "action": "resume_exact_checkpoint",
+            "extensions": {},
+        }
+        _, request_hash = encode_document(admission)
+        try:
+            request = self._store.request_checkpoint_resume(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                idempotency_key=(
+                    f"checkpoint-resume:{checkpoint.checkpoint_id}"
+                ),
+                request_hash=request_hash,
+                clock=self._runtime_supervisor_clock,
+            )
+            resume_id = getattr(request, "resume_id", None)
+            request_snapshot = getattr(request, "snapshot", None)
+            request_checkpoint = getattr(request, "checkpoint", None)
+            request_replayed = getattr(request, "replayed", None)
+            if (
+                not isinstance(resume_id, str)
+                or re.fullmatch(r"resume-[0-9a-f]{32}", resume_id) is None
+                or getattr(request_snapshot, "task_id", None) != task_id
+                or getattr(request_snapshot, "status", None) != "Waiting"
+                or getattr(request_checkpoint, "checkpoint_id", None)
+                != checkpoint.checkpoint_id
+                or getattr(request_checkpoint, "state", None)
+                != "resume_requested"
+                or type(request_replayed) is not bool
+            ):
+                raise TaskDispatchError("CHECKPOINT_STORE_RESPONSE_INVALID")
+            authorization = (
+                self._store.authorize_supervised_checkpoint_resume(
+                    resume_id=resume_id,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except (IdempotencyConflict, TaskStoreConflict) as error:
+            raise TaskConflict(str(error)) from error
+        adapter_token = getattr(authorization, "adapter_token", None)
+        authorization_replayed = getattr(authorization, "replayed", None)
+        if (
+            getattr(authorization, "task_id", None) != task_id
+            or getattr(authorization, "resume_id", None) != resume_id
+            or getattr(
+                getattr(authorization, "checkpoint", None),
+                "checkpoint_id",
+                None,
+            )
+            != checkpoint.checkpoint_id
+            or not callable(adapter_token)
+            or type(authorization_replayed) is not bool
+        ):
+            raise TaskDispatchError("CHECKPOINT_AUTHORIZATION_INVALID")
+        token = adapter_token()
+        if not isinstance(token, Mapping):
+            raise TaskDispatchError("CHECKPOINT_AUTHORIZATION_INVALID")
+
+        try:
+            resumed = resume(intent, authorization=token)
+        except DispatchDeferred as error:
+            if error.code == "CHECKPOINT_ACTION_REQUIRED":
+                return TaskCheckpointProcessResult(
+                    snapshot=request_snapshot,
+                    state="action_required",
+                    adapter_result=None,
+                    replayed=(request_replayed and authorization_replayed),
+                    deferred_code=error.code,
+                )
+            return TaskCheckpointProcessResult(
+                snapshot=request_snapshot,
+                state="resume_requested",
+                adapter_result=None,
+                replayed=(request_replayed and authorization_replayed),
+                deferred_code=error.code,
+            )
+        except DispatchError as error:
+            action_required_codes = {
+                "CHECKPOINT_ACTION_REQUIRED",
+                "CHECKPOINT_NOT_WAITING",
+                "CHECKPOINT_RESUME_AUTHORIZATION_INVALID",
+                "CHECKPOINT_RESUME_CONFLICT",
+                "ADAPTER_CHECKPOINT_RESPONSE_INVALID",
+            }
+            return TaskCheckpointProcessResult(
+                snapshot=request_snapshot,
+                state=(
+                    "action_required"
+                    if error.code in action_required_codes
+                    else "resume_requested"
+                ),
+                adapter_result=None,
+                replayed=(request_replayed and authorization_replayed),
+                deferred_code=error.code,
+            )
+        except Exception:
+            return TaskCheckpointProcessResult(
+                snapshot=request_snapshot,
+                state="resume_requested",
+                adapter_result=None,
+                replayed=(request_replayed and authorization_replayed),
+                deferred_code="CHECKPOINT_RESUME_UNAVAILABLE",
+            )
+        resume_proof = self._checkpoint_adapter_result(resumed)
+        if (
+            resume_proof is None
+            or resume_proof.get("state") not in {"requested", "resumed"}
+            or resume_proof.get("resume_id") != resume_id
+            or resume_proof.get("checkpoint_id") != checkpoint.checkpoint_id
+            or resume_proof.get("checkpoint_proof_hash")
+            != token.get("checkpoint_proof_hash")
+            or resume_proof.get("resume_request_record_hash")
+            != token.get("resume_request_record_hash")
+            or any(
+                resume_proof.get(proof_field)
+                != getattr(checkpoint, snapshot_field)
+                for proof_field, snapshot_field in stable_checkpoint_fields.items()
+            )
+        ):
+            return TaskCheckpointProcessResult(
+                snapshot=request_snapshot,
+                state="action_required",
+                adapter_result=resume_proof,
+                replayed=False,
+                deferred_code="ADAPTER_CHECKPOINT_RESPONSE_INVALID",
+            )
+        if resume_proof["state"] == "requested":
+            return TaskCheckpointProcessResult(
+                snapshot=request_snapshot,
+                state="resume_requested",
+                adapter_result=resume_proof,
+                replayed=(
+                    request_replayed
+                    and authorization_replayed
+                    and proof.get("state") == "requested"
+                ),
+                deferred_code="CHECKPOINT_RESUME_IN_PROGRESS",
+            )
+
+        running_event = self._checkpoint_resume_event(
+            snapshot=request_snapshot,
+            intent=intent,
+            proof=resume_proof,
+            resume_id=resume_id,
+            sequence=self._store.latest_run_event_sequence(task_id) + 1,
+        )
+        self._validate_schema("run-event.schema.json", running_event)
+        _validate_run_event_semantics(running_event)
+        _validate_run_event_binding(request_snapshot, running_event)
+        try:
+            completed = self._store.complete_supervised_checkpoint_resume(
+                resume_id=resume_id,
+                adapter_proof=resume_proof,
+                running_event=running_event,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        completed_snapshot = getattr(completed, "snapshot", None)
+        completed_checkpoint = getattr(completed, "checkpoint", None)
+        completed_replayed = getattr(completed, "replayed", None)
+        if (
+            getattr(completed_snapshot, "task_id", None) != task_id
+            or getattr(completed_snapshot, "status", None) != "Running"
+            or getattr(completed_checkpoint, "checkpoint_id", None)
+            != checkpoint.checkpoint_id
+            or getattr(completed_checkpoint, "state", None) != "resumed"
+            or type(completed_replayed) is not bool
+        ):
+            raise TaskDispatchError("CHECKPOINT_STORE_RESPONSE_INVALID")
+        return TaskCheckpointProcessResult(
+            snapshot=completed_snapshot,
+            state="resumed",
+            adapter_result=resume_proof,
+            replayed=completed_replayed,
+        )
 
     def process_runtime_cancellation(
         self,
@@ -4651,11 +5501,11 @@ class TaskService:
                     event_type=event_type,
                     sequence=self._store.latest_run_event_sequence(task_id) + 1,
                 )
-                self._validate_schema(
-                    "run-event.schema.json", terminal_event
+                self._validate_control_owned_terminal_event(
+                    snapshot=current,
+                    event=terminal_event,
+                    owner="cancellation",
                 )
-                _validate_run_event_semantics(terminal_event)
-                _validate_run_event_binding(current, terminal_event)
             try:
                 completed = self._store.complete_supervised_cancel(
                     request_id=cancellation.request_id,
@@ -4974,9 +5824,11 @@ class TaskService:
                     event_type=event_type,
                     sequence=self._store.latest_run_event_sequence(task_id) + 1,
                 )
-                self._validate_schema("run-event.schema.json", terminal_event)
-                _validate_run_event_semantics(terminal_event)
-                _validate_run_event_binding(current, terminal_event)
+                self._validate_control_owned_terminal_event(
+                    snapshot=current,
+                    event=terminal_event,
+                    owner="timeout",
+                )
             try:
                 completed = self._store.complete_supervised_timeout(
                     timeout_id=authorized_timeout.timeout_id,
@@ -5044,9 +5896,11 @@ class TaskService:
                 }
             },
         }
-        self._validate_schema("run-event.schema.json", event)
-        _validate_run_event_semantics(event)
-        _validate_run_event_binding(current, event)
+        self._validate_control_owned_terminal_event(
+            snapshot=current,
+            event=event,
+            owner="timeout",
+        )
         try:
             completed = self._store.complete_supervised_timeout(
                 timeout_id=authorized_timeout.timeout_id,
@@ -5803,6 +6657,11 @@ class TaskService:
             raise TaskConflict("runtime task has no dispatch intent")
         if intent.state != "dispatched":
             return TaskRuntimeResult(snapshot, intent, None)
+        if snapshot.status == "Waiting":
+            # Waiting belongs exclusively to the fenced checkpoint/cancel/
+            # timeout state machines.  Browser reads and the ordinary status
+            # bridge must not synthesize a resume or a terminal transition.
+            return TaskRuntimeResult(snapshot, intent, None)
         timeout = getattr(snapshot, "timeout", None)
         supervised_control_pending = (
             snapshot.cancellation is not None
@@ -5826,6 +6685,14 @@ class TaskService:
             raise TaskDispatchError("ADAPTER_STATUS_UNAVAILABLE") from error
         adapter_status = self._validated_adapter_status(intent, observed)
         target = adapter_status["status"]
+        if target == "Waiting":
+            # A checkpoint may become visible between the Supervisor's
+            # checkpoint probe and this ordinary observation.  Preserve the
+            # read-only evidence and let the next fenced checkpoint pass
+            # commit the atomic checkpoint_created/node_waiting pair.
+            if snapshot.status != "Running":
+                raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
+            return TaskRuntimeResult(snapshot, intent, adapter_status)
         if target == "Failed" and adapter_status["stage"] == "worker_exit":
             # Neither browser reads nor the ordinary active-term status pass
             # own this decision.  The fenced retry processor must first prove

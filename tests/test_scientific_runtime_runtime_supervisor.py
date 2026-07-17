@@ -85,6 +85,14 @@ class FakeTimeoutProcess:
 
 
 @dataclass(frozen=True)
+class FakeCheckpointProcess:
+    snapshot: FakeSnapshot
+    state: str
+    replayed: bool
+    deferred_code: str | None = None
+
+
+@dataclass(frozen=True)
 class FakeRetryProcess:
     snapshot: FakeSnapshot
     intent: "FakeIntent"
@@ -191,6 +199,7 @@ class FakeTaskService:
         self.refresh_calls: list[str] = []
         self.cancel_calls: list[str] = []
         self.timeout_calls: list[str] = []
+        self.checkpoint_calls: list[str] = []
         self.retry_calls: list[str] = []
         self.dispatch_calls = 0
         self.lease_held = False
@@ -207,6 +216,8 @@ class FakeTaskService:
         self.cancel_results: dict[str, FakeCancelProcess] = {}
         self.timeout_failures: dict[str, Exception] = {}
         self.timeout_results: dict[str, FakeTimeoutProcess] = {}
+        self.checkpoint_failures: dict[str, Exception] = {}
+        self.checkpoint_results: dict[str, FakeCheckpointProcess] = {}
         self.retry_failures: dict[str, Exception] = {}
         self.retry_results: dict[str, FakeRetryProcess] = {}
         self.refresh_hook: Callable[[str], None] | None = None
@@ -568,6 +579,36 @@ class FakeTaskService:
             adopted=False,
         )
 
+    def process_runtime_checkpoint(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: FakeLease,
+    ) -> FakeCheckpointProcess:
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        with self.lock:
+            if supervisor_lease != self.active_lease:
+                raise RuntimeSupervisorLeaseLost(
+                    "simulated stale checkpoint write"
+                )
+            self.calls.append("checkpoint")
+            self.checkpoint_calls.append(task_id)
+        failure = self.checkpoint_failures.get(task_id)
+        if failure is not None:
+            raise failure
+        configured = self.checkpoint_results.get(task_id)
+        if configured is not None:
+            return configured
+        current = next(value for value in self.snapshots if value.task_id == task_id)
+        return FakeCheckpointProcess(
+            snapshot=current,
+            state="none",
+            replayed=True,
+        )
+
     def dispatch(self) -> None:
         self.dispatch_calls += 1
         raise AssertionError("the observation-only supervisor must not dispatch")
@@ -714,6 +755,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertEqual(cycle.task_failures, ())
             self.assertEqual(service.cancel_calls, [task_id])
             self.assertEqual(service.timeout_calls, [])
+            self.assertEqual(service.checkpoint_calls, [])
             self.assertEqual(service.retry_calls, [])
             self.assertEqual(service.intent_calls, [])
             self.assertEqual(service.projection_calls, [])
@@ -756,6 +798,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertEqual(cycle.refreshed_task_ids, ())
             self.assertEqual(service.timeout_calls, [task_id])
             self.assertEqual(service.cancel_calls, [])
+            self.assertEqual(service.checkpoint_calls, [])
             self.assertEqual(service.retry_calls, [])
             self.assertEqual(service.intent_calls, [])
             self.assertEqual(service.projection_calls, [])
@@ -763,6 +806,204 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertEqual(service.refresh_calls, [])
         finally:
             runtime.stop()
+
+    def test_running_checkpoint_enters_waiting_before_retry_or_status(self) -> None:
+        task_id = "checkpoint-running-to-waiting"
+        current = snapshot(task_id, "Running", timeout_state="armed")
+        service = FakeTaskService(
+            [current],
+            {task_id: FakeIntent(task_id, "dispatched")},
+        )
+        service.timeout_results[task_id] = FakeTimeoutProcess(
+            snapshot=current,
+            state="armed",
+            adapter_result=None,
+            replayed=True,
+            deferred_code="TIMEOUT_NOT_DUE",
+        )
+        service.checkpoint_results[task_id] = FakeCheckpointProcess(
+            snapshot=snapshot(task_id, "Waiting", timeout_state="armed"),
+            state="waiting",
+            replayed=False,
+        )
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks([current], lease, float("inf"))
+
+        self.assertEqual(cycle.scanned_task_ids, (task_id,))
+        self.assertEqual(cycle.timeout_processed_task_ids, (task_id,))
+        self.assertEqual(cycle.checkpoint_processed_task_ids, (task_id,))
+        self.assertEqual(cycle.checkpoint_waiting_task_ids, (task_id,))
+        self.assertEqual(cycle.checkpoint_resumed_task_ids, ())
+        self.assertEqual(cycle.deferred, ((task_id, "CHECKPOINT_WAITING"),))
+        self.assertEqual(cycle.refreshed_task_ids, ())
+        self.assertEqual(service.timeout_calls, [task_id])
+        self.assertEqual(service.checkpoint_calls, [task_id])
+        self.assertEqual(service.intent_calls, [])
+        self.assertEqual(service.retry_calls, [])
+        self.assertEqual(service.refresh_calls, [])
+        self.assertLess(
+            service.calls.index("timeout"), service.calls.index("checkpoint")
+        )
+
+    def test_waiting_resume_skips_retry_and_status_for_one_cycle(self) -> None:
+        task_id = "checkpoint-waiting-resumed"
+        current = snapshot(task_id, "Waiting")
+        service = FakeTaskService(
+            [current],
+            {task_id: FakeIntent(task_id, "retrying")},
+        )
+        service.checkpoint_results[task_id] = FakeCheckpointProcess(
+            snapshot=snapshot(task_id, "Running"),
+            state="resumed",
+            replayed=True,
+        )
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks([current], lease, float("inf"))
+
+        self.assertEqual(cycle.scanned_task_ids, (task_id,))
+        self.assertEqual(cycle.checkpoint_processed_task_ids, (task_id,))
+        self.assertEqual(cycle.checkpoint_waiting_task_ids, ())
+        self.assertEqual(cycle.checkpoint_resumed_task_ids, (task_id,))
+        self.assertEqual(cycle.deferred, ())
+        self.assertEqual(service.timeout_calls, [task_id])
+        self.assertEqual(service.checkpoint_calls, [task_id])
+        self.assertEqual(service.intent_calls, [])
+        self.assertEqual(service.retry_calls, [])
+        self.assertEqual(service.refresh_calls, [])
+        self.assertLess(
+            service.calls.index("timeout"), service.calls.index("checkpoint")
+        )
+
+    def test_waiting_cancel_and_timeout_preempt_checkpoint_resume(self) -> None:
+        cases = (
+            ("cancel", snapshot("waiting-cancel", "Waiting", "requested")),
+            (
+                "timeout",
+                snapshot("waiting-timeout", "Waiting", timeout_state="requested"),
+            ),
+        )
+        for control, current in cases:
+            with self.subTest(control=control):
+                service = FakeTaskService(
+                    [current],
+                    {current.task_id: FakeIntent(current.task_id, "dispatched")},
+                )
+                if control == "timeout":
+                    service.timeout_results[current.task_id] = FakeTimeoutProcess(
+                        snapshot=current,
+                        state="requested",
+                        adapter_result={"state": "pending"},
+                        replayed=True,
+                        deferred_code="TIMEOUT_EXIT_UNPROVEN",
+                    )
+                runtime = supervisor(service)
+                lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+                service.active_lease = lease
+
+                cycle, _, _ = runtime._observe_tasks(
+                    [current], lease, float("inf")
+                )
+
+                self.assertEqual(cycle.scanned_task_ids, (current.task_id,))
+                self.assertEqual(service.checkpoint_calls, [])
+                self.assertEqual(service.intent_calls, [])
+                self.assertEqual(service.retry_calls, [])
+                self.assertEqual(service.refresh_calls, [])
+                if control == "cancel":
+                    self.assertEqual(
+                        cycle.cancel_processed_task_ids, (current.task_id,)
+                    )
+                    self.assertEqual(service.cancel_calls, [current.task_id])
+                    self.assertEqual(service.timeout_calls, [])
+                else:
+                    self.assertEqual(
+                        cycle.timeout_processed_task_ids, (current.task_id,)
+                    )
+                    self.assertEqual(service.cancel_calls, [])
+                    self.assertEqual(service.timeout_calls, [current.task_id])
+
+    def test_absent_checkpoint_hook_preserves_running_and_fences_waiting(self) -> None:
+        for status in ("Running", "Waiting"):
+            with self.subTest(status=status):
+                task_id = f"checkpoint-legacy-{status.lower()}"
+                current = snapshot(task_id, status)
+                service = FakeTaskService(
+                    [current],
+                    {task_id: FakeIntent(task_id, "dispatched")},
+                )
+                service.process_runtime_checkpoint = None  # type: ignore[assignment]
+                runtime = supervisor(service)
+                lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+                service.active_lease = lease
+
+                cycle, _, _ = runtime._observe_tasks(
+                    [current], lease, float("inf")
+                )
+
+                self.assertEqual(service.checkpoint_calls, [])
+                if status == "Running":
+                    self.assertEqual(cycle.refreshed_task_ids, (task_id,))
+                    self.assertEqual(cycle.deferred, ())
+                else:
+                    self.assertEqual(cycle.refreshed_task_ids, ())
+                    self.assertEqual(
+                        cycle.deferred,
+                        ((task_id, "CHECKPOINT_RESUME_UNSUPPORTED"),),
+                    )
+                    self.assertEqual(service.intent_calls, [])
+                    self.assertEqual(service.retry_calls, [])
+
+    def test_malformed_checkpoint_result_stops_the_supervisor(self) -> None:
+        cases = (
+            FakeCheckpointProcess(
+                snapshot("checkpoint-malformed", "Waiting"),
+                state="unknown",
+                replayed=False,
+            ),
+            FakeCheckpointProcess(
+                snapshot("checkpoint-malformed", "Waiting"),
+                state="waiting",
+                replayed=False,
+                deferred_code="not_stable",
+            ),
+            FakeCheckpointProcess(
+                snapshot("checkpoint-malformed", "Running"),
+                state="waiting",
+                replayed=False,
+            ),
+            FakeCheckpointProcess(
+                snapshot("another-task", "Waiting"),
+                state="waiting",
+                replayed=False,
+            ),
+        )
+        for malformed in cases:
+            with self.subTest(result=malformed):
+                task_id = "checkpoint-malformed"
+                current = snapshot(task_id, "Running")
+                service = FakeTaskService(
+                    [current],
+                    {task_id: FakeIntent(task_id, "dispatched")},
+                )
+                service.checkpoint_results[task_id] = malformed
+                runtime = supervisor(service)
+                try:
+                    runtime.start()
+                    self.assertTrue(runtime.wait_until_stopped(timeout=1))
+                    self.assertEqual(runtime.failure_code, FATAL)
+                    self.assertFalse(runtime.healthy)
+                    self.assertEqual(service.checkpoint_calls, [task_id])
+                    self.assertEqual(service.intent_calls, [])
+                    self.assertEqual(service.retry_calls, [])
+                    self.assertEqual(service.refresh_calls, [])
+                finally:
+                    runtime.stop()
 
     def test_worker_exit_retry_runs_after_timeout_and_preempts_generic_status(
         self,

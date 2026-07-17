@@ -30,6 +30,7 @@ from worker_launch_control import (
     LaunchAttemptBinding,
     ParentLaunchLease,
     WorkerCancellationRequested,
+    WorkerCheckpointEvidence,
     WorkerControlError,
     WorkerExitEvidence,
     WorkerHeartbeat,
@@ -39,9 +40,11 @@ from worker_launch_control import (
     read_worker_exit_evidence,
     read_pre_running_attempt_evidence,
     read_worker_cancel_evidence,
+    read_worker_checkpoint_evidence,
     read_worker_stop_evidence,
     read_worker_attempt_evidence,
     request_worker_cancel,
+    request_worker_checkpoint_resume,
     request_worker_stop,
     record_worker_exit,
     stage_launch_attempt,
@@ -193,6 +196,88 @@ class WorkerLaunchControlTest(unittest.TestCase):
         heartbeat._close_descriptors()
         self.assertFalse(execution_fence_is_held(self.root, binding))
         return binding, run_dir
+
+    def checkpoint_worker(self, index: int):
+        import torch
+
+        from fwi_worker.checkpoint import save_checkpoint_payload
+        from fwi_worker.config import resolve_config
+        from fwi_worker.inversion import InversionCheckpointState
+
+        binding, run_dir = self.binding(index)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        config = resolve_config(
+            {"preset": "fwi_smoke", "device": "cpu", "iterations": 2}
+        )
+        velocity = torch.nn.Parameter(
+            torch.full((2, 3), 2000.0, dtype=torch.float32)
+        )
+        optimizer = torch.optim.Adam([velocity], lr=config.learning_rate)
+        optimizer.zero_grad(set_to_none=True)
+        velocity.square().sum().backward()
+        optimizer.step()
+        checkpoint = InversionCheckpointState(
+            completed_updates=1,
+            next_state_index=1,
+            velocity=velocity,
+            optimizer=optimizer,
+            losses=(1.0,),
+            gradient_clip_values=(0.5,),
+        )
+        manifest = save_checkpoint_payload(
+            run_dir=run_dir,
+            binding=binding,
+            config=config,
+            checkpoint=checkpoint,
+            clock=lambda: "2026-07-16T08:00:01Z",
+        )
+        return binding, run_dir, heartbeat, manifest
+
+    @staticmethod
+    def rewrite_checkpoint_manifest(run_dir: Path, evidence, mutate):
+        manifest_path = run_dir / evidence.manifest_relative_path
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mutate(document)
+        data = worker_control._stable_json_bytes(document) + b"\n"
+        manifest_path.write_bytes(data)
+        return {
+            **evidence.as_dict(),
+            "manifest_size_bytes": len(data),
+            "manifest_hash": "sha256:" + hashlib.sha256(data).hexdigest(),
+        }
+
+    @staticmethod
+    def checkpoint_resume_request(
+        binding: LaunchAttemptBinding,
+        waiting: WorkerCheckpointEvidence,
+        *,
+        resume_digit: str,
+    ) -> dict[str, object]:
+        return worker_control._record_with_hash(
+            {
+                "schema_version": "1.0.0",
+                "resume_id": "resume-" + resume_digit * 32,
+                "submission_id": binding.submission_id,
+                "attempt_id": binding.attempt_id,
+                "attempt_number": binding.attempt_number,
+                "checkpoint_id": waiting.checkpoint_id,
+                "checkpoint_manifest_hash": waiting.manifest_hash,
+                "checkpoint_receipt_record_hash": waiting.checkpoint_record_hash,
+                "checkpoint_proof_hash": "sha256:" + "e" * 64,
+                "authorized_at": "2026-07-16T08:00:01Z",
+            }
+        )
 
     def worker_exit_statuses(
         self, binding: LaunchAttemptBinding
@@ -2015,6 +2100,468 @@ class WorkerLaunchControlTest(unittest.TestCase):
             self.root, replacement_dir, max_active=1
         )
         replacement_lease.abort()
+
+    def test_checkpoint_payload_tamper_fails_closed_before_waiting(self) -> None:
+        binding, run_dir, heartbeat, manifest = self.checkpoint_worker(1)
+        model_path = (
+            run_dir
+            / "checkpoints"
+            / manifest.checkpoint_id
+            / "model.npy"
+        )
+        data = bytearray(model_path.read_bytes())
+        data[-1] ^= 0x01
+        model_path.write_bytes(data)
+        try:
+            with self.assertRaises(WorkerControlError) as tampered:
+                heartbeat.wait_for_checkpoint_resume(
+                    manifest.as_dict(),
+                    on_waiting=lambda _receipt: None,
+                    on_resumed=lambda _receipt, _request: None,
+                )
+            self.assertEqual(tampered.exception.code, "WORKER_CHECKPOINT_INVALID")
+            self.assertTrue(execution_fence_is_held(self.root, binding))
+            self.assertFalse(
+                (run_dir / worker_control.WORKER_CHECKPOINT_NAME).exists()
+            )
+            self.assertFalse(
+                (run_dir / worker_control.WORKER_RESUME_ACK_NAME).exists()
+            )
+        finally:
+            heartbeat.stop("failed")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_checkpoint_consumer_rejects_file_over_producer_bound(self) -> None:
+        binding, run_dir, heartbeat, evidence = self.checkpoint_worker(1)
+        try:
+            receipt = self.rewrite_checkpoint_manifest(
+                run_dir,
+                evidence,
+                lambda document: document["model"].__setitem__(
+                    "size_bytes", worker_control.MAX_CHECKPOINT_FILE_BYTES + 1
+                ),
+            )
+            with self.assertRaisesRegex(
+                WorkerControlError,
+                "checkpoint file descriptor is invalid",
+            ):
+                worker_control._validate_checkpoint_manifest(
+                    run_dir, binding, receipt
+                )
+        finally:
+            heartbeat.stop("failed")
+
+    def test_checkpoint_consumer_rejects_declared_aggregate_before_reads(
+        self,
+    ) -> None:
+        binding, run_dir, heartbeat, evidence = self.checkpoint_worker(2)
+
+        def inflate_descriptors(document) -> None:
+            descriptors = [
+                document["model"],
+                document["history"]["losses"],
+                document["history"]["gradient_clip_values"],
+                *document["optimizer"]["state"].values(),
+            ]
+            for descriptor in descriptors:
+                descriptor["size_bytes"] = 1_900_000
+
+        try:
+            receipt = self.rewrite_checkpoint_manifest(
+                run_dir, evidence, inflate_descriptors
+            )
+            with self.assertRaisesRegex(
+                WorkerControlError,
+                "checkpoint payload exceeds the aggregate bound",
+            ):
+                worker_control._validate_checkpoint_manifest(
+                    run_dir, binding, receipt
+                )
+        finally:
+            heartbeat.stop("failed")
+
+    def test_checkpoint_stop_wins_terminal_arbitration_without_resume_ack(
+        self,
+    ) -> None:
+        binding, run_dir, heartbeat, manifest = self.checkpoint_worker(2)
+        gate_entered = threading.Event()
+        gate_release = threading.Event()
+        stopped = threading.Event()
+        resumed_callbacks: list[bool] = []
+        errors: list[BaseException] = []
+        original_arbitration = worker_control._hold_worker_terminal_arbitration
+
+        @contextlib.contextmanager
+        def gated_arbitration(run_root, selected_binding):
+            if threading.current_thread().name == "checkpoint-stop-first":
+                gate_entered.set()
+                if not gate_release.wait(3.0):
+                    raise RuntimeError("checkpoint arbitration gate timed out")
+            with original_arbitration(run_root, selected_binding) as root:
+                yield root
+
+        def on_waiting(receipt) -> None:
+            self.write_status(
+                run_dir,
+                {
+                    "job_id": binding.job_id,
+                    "status": "waiting",
+                    "stage": "checkpoint_wait",
+                    "iteration": 1,
+                    "total_iterations": 2,
+                    "message": "waiting",
+                    "updated_at": "2026-07-16T08:00:01Z",
+                    "checkpoint_id": receipt["checkpoint_id"],
+                    "checkpoint_record_hash": receipt["record_hash"],
+                },
+            )
+
+        def wait_at_barrier() -> None:
+            try:
+                heartbeat.wait_for_checkpoint_resume(
+                    manifest.as_dict(),
+                    on_waiting=on_waiting,
+                    on_resumed=lambda _receipt, _request: resumed_callbacks.append(
+                        True
+                    ),
+                )
+            except WorkerCancellationRequested:
+                heartbeat.stop("stopped")
+                stopped.set()
+            except BaseException as error:
+                errors.append(error)
+
+        waiter = threading.Thread(
+            target=wait_at_barrier, name="checkpoint-stop-first"
+        )
+        try:
+            with patch.object(
+                worker_control,
+                "_hold_worker_terminal_arbitration",
+                gated_arbitration,
+            ):
+                waiter.start()
+                waiting: WorkerCheckpointEvidence | None = None
+                deadline = time.monotonic() + 3.0
+                while waiting is None and time.monotonic() < deadline:
+                    try:
+                        waiting = read_worker_checkpoint_evidence(
+                            self.root, run_dir, binding
+                        )
+                    except WorkerControlError as error:
+                        if error.code != "WORKER_CHECKPOINT_PENDING":
+                            raise
+                    time.sleep(0.01)
+                self.assertIsNotNone(waiting)
+                assert waiting is not None
+                request_worker_checkpoint_resume(
+                    self.root,
+                    run_dir,
+                    binding,
+                    request_document=self.checkpoint_resume_request(
+                        binding, waiting, resume_digit="a"
+                    ),
+                )
+                self.assertTrue(gate_entered.wait(3.0))
+                stop_evidence, replayed = request_worker_cancel(
+                    self.root,
+                    binding,
+                    cancel_id="cancel-checkpoint-stop-first",
+                    reason="user_requested",
+                    requested_at=NOW,
+                )
+                self.assertFalse(replayed)
+                self.assertTrue(stop_evidence.requested)
+                gate_release.set()
+                waiter.join(3.0)
+        finally:
+            gate_release.set()
+            if waiter.is_alive():
+                waiter.join(2.0)
+            if not heartbeat._closed:
+                heartbeat.stop("failed")
+        self.assertFalse(waiter.is_alive())
+        self.assertTrue(stopped.is_set())
+        self.assertEqual(errors, [])
+        self.assertEqual(resumed_callbacks, [])
+        self.assertTrue(read_worker_cancel_evidence(self.root, binding).acknowledged)
+        self.assertFalse(
+            (run_dir / worker_control.WORKER_RESUME_ACK_NAME).exists()
+        )
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_checkpoint_ack_commits_before_running_then_cancel_is_normal(
+        self,
+    ) -> None:
+        binding, run_dir, heartbeat, manifest = self.checkpoint_worker(3)
+        errors: list[BaseException] = []
+        ack_visible_to_running_projection: list[bool] = []
+
+        def on_waiting(receipt) -> None:
+            self.write_status(
+                run_dir,
+                {
+                    "job_id": binding.job_id,
+                    "status": "waiting",
+                    "stage": "checkpoint_wait",
+                    "iteration": 1,
+                    "total_iterations": 2,
+                    "message": "waiting",
+                    "updated_at": "2026-07-16T08:00:01Z",
+                    "checkpoint_id": receipt["checkpoint_id"],
+                    "checkpoint_record_hash": receipt["record_hash"],
+                },
+            )
+
+        def on_resumed(receipt, request) -> None:
+            ack_visible_to_running_projection.append(
+                (run_dir / worker_control.WORKER_RESUME_ACK_NAME).is_file()
+            )
+            self.write_status(
+                run_dir,
+                {
+                    "job_id": binding.job_id,
+                    "status": "running",
+                    "stage": "invert",
+                    "iteration": 1,
+                    "total_iterations": 2,
+                    "message": "resumed",
+                    "updated_at": "2026-07-16T08:00:02Z",
+                    "checkpoint_id": receipt["checkpoint_id"],
+                    "checkpoint_record_hash": receipt["record_hash"],
+                    "resume_id": request["resume_id"],
+                    "resume_request_record_hash": request["record_hash"],
+                },
+            )
+
+        def wait_at_barrier() -> None:
+            try:
+                heartbeat.wait_for_checkpoint_resume(
+                    manifest.as_dict(),
+                    on_waiting=on_waiting,
+                    on_resumed=on_resumed,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        waiter = threading.Thread(target=wait_at_barrier)
+        waiter.start()
+        try:
+            waiting: WorkerCheckpointEvidence | None = None
+            deadline = time.monotonic() + 3.0
+            while waiting is None and time.monotonic() < deadline:
+                try:
+                    waiting = read_worker_checkpoint_evidence(
+                        self.root, run_dir, binding
+                    )
+                except WorkerControlError as error:
+                    if error.code != "WORKER_CHECKPOINT_PENDING":
+                        raise
+                time.sleep(0.01)
+            self.assertIsNotNone(waiting)
+            assert waiting is not None
+            request_worker_checkpoint_resume(
+                self.root,
+                run_dir,
+                binding,
+                request_document=self.checkpoint_resume_request(
+                    binding, waiting, resume_digit="b"
+                ),
+            )
+            waiter.join(3.0)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(ack_visible_to_running_projection, [True])
+            resumed = read_worker_checkpoint_evidence(
+                self.root, run_dir, binding
+            )
+            assert resumed is not None
+            self.assertEqual(resumed.state, "resumed")
+
+            cancellation, replayed = request_worker_cancel(
+                self.root,
+                binding,
+                cancel_id="cancel-checkpoint-ack-first",
+                reason="user_requested",
+                requested_at="2026-07-16T08:00:03Z",
+            )
+            self.assertFalse(replayed)
+            self.assertTrue(cancellation.requested)
+            deadline = time.monotonic() + 3.0
+            while not cancellation.acknowledged and time.monotonic() < deadline:
+                cancellation = read_worker_cancel_evidence(self.root, binding)
+                time.sleep(0.01)
+            self.assertTrue(cancellation.acknowledged)
+            with self.assertRaises(WorkerCancellationRequested):
+                heartbeat.raise_if_cancel_requested()
+        finally:
+            heartbeat.stop("stopped")
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+
+    def test_checkpoint_wait_resume_keeps_same_fenced_attempt(self) -> None:
+        import torch
+
+        from fwi_worker.checkpoint import save_checkpoint_payload
+        from fwi_worker.config import resolve_config
+        from fwi_worker.inversion import InversionCheckpointState
+
+        binding, run_dir = self.binding(1)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=0.02,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        config = resolve_config(
+            {"preset": "fwi_smoke", "device": "cpu", "iterations": 2}
+        )
+        velocity = torch.nn.Parameter(
+            torch.full((2, 3), 2000.0, dtype=torch.float32)
+        )
+        optimizer = torch.optim.Adam([velocity], lr=config.learning_rate)
+        optimizer.zero_grad(set_to_none=True)
+        velocity.square().sum().backward()
+        optimizer.step()
+        checkpoint = InversionCheckpointState(
+            completed_updates=1,
+            next_state_index=1,
+            velocity=velocity,
+            optimizer=optimizer,
+            losses=(1.0,),
+            gradient_clip_values=(0.5,),
+        )
+        manifest = save_checkpoint_payload(
+            run_dir=run_dir,
+            binding=binding,
+            config=config,
+            checkpoint=checkpoint,
+            clock=lambda: "2026-07-16T08:00:01Z",
+        )
+        errors: list[BaseException] = []
+
+        def on_waiting(receipt) -> None:
+            self.write_status(
+                run_dir,
+                {
+                    "job_id": binding.job_id,
+                    "status": "waiting",
+                    "stage": "checkpoint_wait",
+                    "iteration": 1,
+                    "total_iterations": 2,
+                    "message": "waiting",
+                    "updated_at": "2026-07-16T08:00:01Z",
+                    "checkpoint_id": receipt["checkpoint_id"],
+                    "checkpoint_record_hash": receipt["record_hash"],
+                },
+            )
+
+        def on_resumed(receipt, request) -> None:
+            self.write_status(
+                run_dir,
+                {
+                    "job_id": binding.job_id,
+                    "status": "running",
+                    "stage": "invert",
+                    "iteration": 1,
+                    "total_iterations": 2,
+                    "message": "resumed",
+                    "updated_at": "2026-07-16T08:00:02Z",
+                    "checkpoint_id": receipt["checkpoint_id"],
+                    "checkpoint_record_hash": receipt["record_hash"],
+                    "resume_id": request["resume_id"],
+                    "resume_request_record_hash": request["record_hash"],
+                },
+            )
+
+        def wait_at_barrier() -> None:
+            try:
+                heartbeat.wait_for_checkpoint_resume(
+                    manifest.as_dict(),
+                    on_waiting=on_waiting,
+                    on_resumed=on_resumed,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        waiter = threading.Thread(target=wait_at_barrier)
+        waiter.start()
+        waiting: WorkerCheckpointEvidence | None = None
+        deadline = time.monotonic() + 3.0
+        while waiting is None and time.monotonic() < deadline:
+            try:
+                waiting = read_worker_checkpoint_evidence(
+                    self.root, run_dir, binding
+                )
+            except WorkerControlError as error:
+                if error.code != "WORKER_CHECKPOINT_PENDING":
+                    raise
+            time.sleep(0.01)
+        self.assertIsNotNone(waiting)
+        assert waiting is not None
+        self.assertEqual(waiting.state, "waiting")
+        self.assertTrue(execution_fence_is_held(self.root, binding))
+        request = worker_control._record_with_hash(
+            {
+                "schema_version": "1.0.0",
+                "resume_id": "resume-" + "d" * 32,
+                "submission_id": binding.submission_id,
+                "attempt_id": binding.attempt_id,
+                "attempt_number": binding.attempt_number,
+                "checkpoint_id": waiting.checkpoint_id,
+                "checkpoint_manifest_hash": waiting.manifest_hash,
+                "checkpoint_receipt_record_hash": waiting.checkpoint_record_hash,
+                "checkpoint_proof_hash": "sha256:" + "e" * 64,
+                "authorized_at": "2026-07-16T08:00:01Z",
+            }
+        )
+        requested = request_worker_checkpoint_resume(
+            self.root,
+            run_dir,
+            binding,
+            request_document=request,
+        )
+        self.assertIn(requested.state, {"requested", "resumed"})
+        waiter.join(3.0)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(errors, [])
+        resumed = read_worker_checkpoint_evidence(self.root, run_dir, binding)
+        assert resumed is not None
+        self.assertEqual(resumed.state, "resumed")
+        self.assertEqual(resumed.attempt_id, binding.attempt_id)
+        self.assertEqual(resumed.resume_request_record_hash, request["record_hash"])
+        self.assertTrue(execution_fence_is_held(self.root, binding))
+
+        # Model a later abrupt running exit.  The completed resume preserves
+        # the existing D-012 exact worker-exit proof; no checkpoint restore is
+        # inferred and no second process is launched by the resume path.
+        heartbeat._stop.set()
+        assert heartbeat._thread is not None
+        heartbeat._thread.join(2.0)
+        heartbeat._close_descriptors()
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+        pre = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+        post = {
+            **pre,
+            "status": "failed",
+            "stage": "worker_exit",
+            "message": "FWI worker exited with code -9",
+            "updated_at": "2026-07-16T08:00:03Z",
+        }
+        exit_evidence = record_worker_exit(
+            self.root,
+            run_dir,
+            binding,
+            return_code=-9,
+            pre_status=pre,
+            post_status=post,
+        )
+        self.assertEqual(exit_evidence.attempt_id, binding.attempt_id)
 
     def test_missing_run_directory_is_never_recreated_by_evidence_reads(self) -> None:
         binding, run_dir = self.binding(11)

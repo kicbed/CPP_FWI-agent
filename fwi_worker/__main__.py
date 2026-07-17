@@ -32,7 +32,7 @@ from .deepwave_2d import (
     small_model_gradient_check,
     validate_device,
 )
-from .inversion import run_inversion
+from .inversion import InversionCheckpointState, run_inversion
 from .job_state import JobState
 from .metrics import calculate_metrics, environment_info
 from .model_io import load_model, make_initial_model
@@ -155,6 +155,9 @@ def run_worker(
     *,
     managed_launch: bool = False,
     cancel_check: Callable[[], None] | None = None,
+    checkpoint_barrier: (
+        Callable[[Path, Any, JobState, InversionCheckpointState], None] | None
+    ) = None,
 ) -> dict[str, Any]:
     raw, config = load_config(config_path)
     if command == "forward":
@@ -312,6 +315,13 @@ def run_worker(
                 geometry,
                 progress=progress,
                 cancel_check=cancel_check,
+                checkpoint=(
+                    None
+                    if checkpoint_barrier is None
+                    else lambda checkpoint: checkpoint_barrier(
+                        run_dir, config, state, checkpoint
+                    )
+                ),
             )
             inverted = inversion.inverted_velocity
             predicted = inversion.predicted_data

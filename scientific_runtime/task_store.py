@@ -59,8 +59,14 @@ TASK_PURGE_LOCAL_RUN_STATES = frozenset({"deleted", "not_created"})
 WORKER_SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
 WORKER_ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
 WORKER_JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+WORKER_EVIDENCE_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{3}|\.[0-9]{6})?Z$"
+)
 DOCUMENT_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 RUNTIME_TIMEOUT_ID = re.compile(r"^timeout-[0-9a-f]{32}$")
+RUNTIME_CHECKPOINT_ID = re.compile(r"^checkpoint-[0-9a-f]{32}$")
+RUNTIME_RESUME_ID = re.compile(r"^resume-[0-9a-f]{32}$")
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "Draft": frozenset({"Draft", "NeedsInput", "AwaitingApproval", "Cancelled"}),
@@ -142,6 +148,29 @@ class TaskTimeoutSnapshot:
 
 
 @dataclass(frozen=True)
+class TaskCheckpointSnapshot:
+    """Bounded public projection of one exact same-attempt checkpoint."""
+
+    checkpoint_id: str
+    intent_id: str
+    node_id: str
+    submission_id: str
+    attempt_id: str
+    attempt_number: int
+    checkpoint_index: int
+    completed_updates: int
+    checkpoint_manifest_relative_path: str
+    checkpoint_manifest_size_bytes: int
+    checkpoint_manifest_hash: str
+    checkpoint_receipt_record_hash: str
+    checkpoint_created_at: str
+    state: str
+    resume_id: str | None = None
+    resume_requested_at: str | None = None
+    resume_acknowledged_at: str | None = None
+
+
+@dataclass(frozen=True)
 class TaskSnapshot:
     """Current durable view of one task aggregate."""
 
@@ -163,6 +192,7 @@ class TaskSnapshot:
     purge_local_run_state: str | None = None
     cancellation: TaskCancellationSnapshot | None = None
     timeout: TaskTimeoutSnapshot | None = None
+    checkpoint: TaskCheckpointSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -548,6 +578,71 @@ class WorkerAttemptProjection:
     adopted: bool
     replayed: bool
 
+
+@dataclass(frozen=True)
+class SupervisedCheckpointWait:
+    """Atomic checkpoint evidence plus Running-to-Waiting projection."""
+
+    snapshot: TaskSnapshot
+    checkpoint: TaskCheckpointSnapshot
+    checkpoint_proof: dict[str, Any]
+    fencing_token: int
+    recorded_at: str
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class TaskCheckpointResumeRecord:
+    """One internal resume request or its exact acknowledged outcome."""
+
+    snapshot: TaskSnapshot
+    checkpoint: TaskCheckpointSnapshot
+    resume_id: str
+    request_record_hash: str
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class SupervisedCheckpointResumeAuthorization:
+    """Active-term token for one exact same-attempt resume delivery."""
+
+    checkpoint: TaskCheckpointSnapshot
+    task_id: str
+    resume_id: str
+    resume_request_record_hash: str
+    checkpoint_proof_hash: str
+    requested_at: str
+    authorized_at: str
+    fencing_token: int
+    replayed: bool
+
+    def adapter_token(self) -> dict[str, Any]:
+        """Return the strict path-free token consumed by Dispatcher/Adapter."""
+
+        return {
+            "schema_version": "1.0.0",
+            "intent_id": self.checkpoint.intent_id,
+            "task_id": self.task_id,
+            "node_id": self.checkpoint.node_id,
+            "submission_id": self.checkpoint.submission_id,
+            "attempt_id": self.checkpoint.attempt_id,
+            "attempt_number": self.checkpoint.attempt_number,
+            "checkpoint_id": self.checkpoint.checkpoint_id,
+            "checkpoint_manifest_hash": (
+                self.checkpoint.checkpoint_manifest_hash
+            ),
+            "checkpoint_receipt_record_hash": (
+                self.checkpoint.checkpoint_receipt_record_hash
+            ),
+            "checkpoint_proof_hash": self.checkpoint_proof_hash,
+            "resume_id": self.resume_id,
+            # The Worker request is one immutable, append-only action.  Bind
+            # it to the durable resume admission time so successor terms can
+            # safely re-deliver the exact same bytes.  ``authorized_at`` on
+            # this dataclass remains the per-term SQLite audit time.
+            "authorized_at": self.requested_at,
+            "resume_request_record_hash": self.resume_request_record_hash,
+        }
 
 @dataclass(frozen=True)
 class TaskCancellationRecord:
@@ -1050,6 +1145,50 @@ class TaskStore(Protocol):
     ) -> WorkerAttemptProjection:
         ...
 
+    def record_supervised_checkpoint_wait(
+        self,
+        *,
+        intent_id: str,
+        checkpoint_proof: Mapping[str, Any],
+        checkpoint_event: Mapping[str, Any],
+        waiting_event: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedCheckpointWait:
+        ...
+
+    def request_checkpoint_resume(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        clock: Callable[[], str],
+    ) -> TaskCheckpointResumeRecord:
+        ...
+
+    def authorize_supervised_checkpoint_resume(
+        self,
+        *,
+        resume_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedCheckpointResumeAuthorization:
+        ...
+
+    def complete_supervised_checkpoint_resume(
+        self,
+        *,
+        resume_id: str,
+        adapter_proof: Mapping[str, Any],
+        running_event: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> TaskCheckpointResumeRecord:
+        ...
+
     def arm_worker_attempt_timeout(
         self,
         *,
@@ -1305,7 +1444,7 @@ def _validate_timeout_capability_proof(
     if (
         set(proof) != required
         or proof.get("schema_version") != "2.0.0"
-        or private_schema_version not in {"1.1.0", "1.2.0"}
+        or private_schema_version not in {"1.1.0", "1.2.0", "1.3.0"}
         or proof.get("private_schema_version") != private_schema_version
         or proof.get("attempt_id") != attempt_id
         or WORKER_ATTEMPT_ID.fullmatch(attempt_id) is None
@@ -1347,16 +1486,23 @@ def _validate_store_approval_retry_policy(
     nodes = plan.get("nodes")
     resources = scope.get("resource_limits") if isinstance(scope, Mapping) else None
     algorithms = scope.get("algorithms") if isinstance(scope, Mapping) else None
-    current_algorithm = {
-        "id": "deepwave.acoustic_fwi",
-        "version": "1.5.0",
-    }
+    managed_algorithm = (
+        nodes[0].get("algorithm")
+        if isinstance(nodes, list)
+        and nodes
+        and isinstance(nodes[0], Mapping)
+        else None
+    )
+    supported_algorithms = (
+        {"id": "deepwave.acoustic_fwi", "version": "1.5.0"},
+        {"id": "deepwave.acoustic_fwi", "version": "1.6.0"},
+    )
     if (
         not isinstance(nodes, list)
         or len(nodes) != 1
         or not isinstance(nodes[0], Mapping)
-        or nodes[0].get("algorithm") != current_algorithm
-        or algorithms != [current_algorithm]
+        or managed_algorithm not in supported_algorithms
+        or algorithms != [managed_algorithm]
         or not isinstance(nodes[0].get("resources"), Mapping)
         or not isinstance(resources, Mapping)
         or resources != nodes[0]["resources"]
@@ -1551,20 +1697,189 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
+def _is_safe_checkpoint_relative_path(value: Any) -> bool:
+    """Reject absolute, platform-dependent, and traversal artifact paths."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 512
+        or value.startswith("/")
+        or "\\" in value
+        or "\x00" in value
+    ):
+        return False
+    parts = value.split("/")
+    return all(part not in {"", ".", ".."} for part in parts)
+
+
+def _validate_checkpoint_adapter_proof(
+    value: Mapping[str, Any],
+    *,
+    state: str,
+    task_id: str | None = None,
+    intent_id: str | None = None,
+    node_id: str | None = None,
+    submission_id: str | None = None,
+    attempt_id: str | None = None,
+    attempt_number: int | None = None,
+    checkpoint_id: str | None = None,
+    checkpoint_proof_hash: str | None = None,
+    resume_id: str | None = None,
+    resume_request_record_hash: str | None = None,
+) -> dict[str, Any]:
+    """Validate the path-safe 1.0 checkpoint/resume Adapter proof."""
+
+    if not isinstance(value, Mapping) or state not in {"waiting", "resumed"}:
+        raise TaskStoreConflict("checkpoint Adapter proof is invalid")
+    proof = dict(value)
+    required = {
+        "schema_version",
+        "task_id",
+        "node_id",
+        "submission_id",
+        "attempt_id",
+        "attempt_number",
+        "checkpoint_id",
+        "checkpoint_index",
+        "completed_updates",
+        "binding_hash",
+        "submission_receipt_record_hash",
+        "ready_record_hash",
+        "checkpoint_manifest_relative_path",
+        "checkpoint_manifest_size_bytes",
+        "checkpoint_manifest_hash",
+        "checkpoint_receipt_record_hash",
+        "checkpoint_created_at",
+        "state",
+        "checkpoint_proof_hash",
+        "resume_id",
+        "resume_request_record_hash",
+        "resume_acknowledgement_record_hash",
+        "resume_acknowledged_at",
+        "proof_hash",
+    }
+    try:
+        created_at, _ = _runtime_timestamp(proof.get("checkpoint_created_at"))
+        _, calculated_hash = encode_document(
+            {key: item for key, item in proof.items() if key != "proof_hash"}
+        )
+    except (TaskStoreConflict, TypeError) as error:
+        raise TaskStoreConflict("checkpoint Adapter proof is invalid") from error
+    hashes = (
+        proof.get("binding_hash"),
+        proof.get("submission_receipt_record_hash"),
+        proof.get("ready_record_hash"),
+        proof.get("checkpoint_manifest_hash"),
+        proof.get("checkpoint_receipt_record_hash"),
+        proof.get("proof_hash"),
+    )
+    common_valid = (
+        set(proof) == required
+        and proof.get("schema_version") == "1.0.0"
+        and isinstance(proof.get("task_id"), str)
+        and bool(proof.get("task_id"))
+        and isinstance(proof.get("node_id"), str)
+        and bool(proof.get("node_id"))
+        and isinstance(proof.get("submission_id"), str)
+        and WORKER_SUBMISSION_ID.fullmatch(proof["submission_id"]) is not None
+        and isinstance(proof.get("attempt_id"), str)
+        and WORKER_ATTEMPT_ID.fullmatch(proof["attempt_id"]) is not None
+        and type(proof.get("attempt_number")) is int
+        and proof["attempt_number"] >= 1
+        and isinstance(proof.get("checkpoint_id"), str)
+        and RUNTIME_CHECKPOINT_ID.fullmatch(proof["checkpoint_id"]) is not None
+        and type(proof.get("checkpoint_index")) is int
+        and proof["checkpoint_index"] >= 1
+        and type(proof.get("completed_updates")) is int
+        and proof["completed_updates"] >= 1
+        and all(_is_sha256(item) for item in hashes)
+        and _is_safe_checkpoint_relative_path(
+            proof.get("checkpoint_manifest_relative_path")
+        )
+        and type(proof.get("checkpoint_manifest_size_bytes")) is int
+        and 1 <= proof["checkpoint_manifest_size_bytes"] <= 16 * 1024 * 1024
+        and proof.get("checkpoint_created_at") == created_at
+        and proof.get("proof_hash") == calculated_hash
+    )
+    indexed = {
+        "task_id": task_id,
+        "node_id": node_id,
+        "submission_id": submission_id,
+        "attempt_id": attempt_id,
+        "attempt_number": attempt_number,
+        "checkpoint_id": checkpoint_id,
+    }
+    exact_valid = all(
+        expected is None or proof.get(key) == expected
+        for key, expected in indexed.items()
+    )
+    if intent_id is not None and not isinstance(intent_id, str):
+        exact_valid = False
+    if state == "waiting":
+        state_valid = (
+            proof.get("state") == "waiting"
+            and proof.get("checkpoint_proof_hash") is None
+            and proof.get("resume_id") is None
+            and proof.get("resume_request_record_hash") is None
+            and proof.get("resume_acknowledgement_record_hash") is None
+            and proof.get("resume_acknowledged_at") is None
+        )
+    else:
+        try:
+            acknowledged_at, _ = _runtime_timestamp(
+                proof.get("resume_acknowledged_at")
+            )
+        except (TaskStoreConflict, TypeError):
+            acknowledged_at = None
+        state_valid = (
+            proof.get("state") == "resumed"
+            and proof.get("checkpoint_proof_hash") == checkpoint_proof_hash
+            and _is_sha256(checkpoint_proof_hash)
+            and proof.get("resume_id") == resume_id
+            and isinstance(resume_id, str)
+            and RUNTIME_RESUME_ID.fullmatch(resume_id) is not None
+            and proof.get("resume_request_record_hash")
+            == resume_request_record_hash
+            and _is_sha256(resume_request_record_hash)
+            and _is_sha256(proof.get("resume_acknowledgement_record_hash"))
+            and proof.get("resume_acknowledged_at") == acknowledged_at
+        )
+    if not (common_valid and exact_valid and state_valid):
+        raise TaskStoreConflict("checkpoint Adapter proof is invalid")
+    return proof
+
+
 def _is_supported_managed_dispatch(intent: DispatchIntentSnapshot) -> bool:
     """Accept only immutable, same-version Adapter/Algorithm managed pairs."""
 
     version = intent.adapter_version
     return (
         intent.adapter_id == "fwi.deepwave_adapter"
-        and version in {"1.4.0", "1.5.0"}
+        and version in {"1.4.0", "1.5.0", "1.6.0"}
         and intent.request.get("algorithm")
         == {"id": "deepwave.acoustic_fwi", "version": version}
     )
 
 
+def _is_checkpoint_capable_managed_dispatch(
+    intent: DispatchIntentSnapshot,
+) -> bool:
+    """Return whether the immutable dispatch pair owns Waiting semantics."""
+
+    return (
+        intent.adapter_id == "fwi.deepwave_adapter"
+        and intent.adapter_version == "1.6.0"
+        and intent.request.get("algorithm")
+        == {"id": "deepwave.acoustic_fwi", "version": "1.6.0"}
+    )
+
+
 def _worker_evidence_timestamp(value: Any) -> None:
-    if not isinstance(value, str) or not value.endswith("Z"):
+    if (
+        not isinstance(value, str)
+        or WORKER_EVIDENCE_TIMESTAMP.fullmatch(value) is None
+    ):
         raise TaskStoreConflict("Worker evidence timestamp is invalid")
     try:
         _runtime_timestamp(value)
@@ -1732,7 +2047,7 @@ def _validated_worker_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
             type(heartbeat.get("sequence")) is not int
             or heartbeat["sequence"] < 1
             or heartbeat.get("state")
-            not in {"running", "succeeded", "failed", "stopped"}
+            not in {"running", "waiting", "succeeded", "failed", "stopped"}
             or not _is_sha256(heartbeat.get("record_hash"))
         ):
             raise TaskStoreConflict("Worker heartbeat state is invalid")
@@ -1820,6 +2135,7 @@ def _first_durable_running_observation(
     attempt_id: str,
     project_id: str,
     principal_id: str,
+    allow_checkpoint_waiting: bool = False,
 ) -> tuple[sqlite3.Row, dict[str, Any]] | None:
     """Decode observations in sequence order before selecting the start tick.
 
@@ -1850,11 +2166,19 @@ def _first_durable_running_observation(
                 "Worker attempt observation audit chain is invalid"
             )
         expected_sequence += 1
+        heartbeat_state = (
+            None
+            if evidence["heartbeat"] is None
+            else evidence["heartbeat"]["state"]
+        )
         if first_running is None and (
             evidence["ticket"]["state"] == "spawned"
             and evidence["ready"] is not None
             and evidence["heartbeat"] is not None
-            and evidence["heartbeat"]["state"] == "running"
+            and (
+                heartbeat_state == "running"
+                or (allow_checkpoint_waiting and heartbeat_state == "waiting")
+            )
         ):
             first_running = observation, evidence
     return first_running
@@ -2169,6 +2493,11 @@ def _expected_schema_manifest(
         for migration in migrations:
             for statement in _migration_statements(migration.text):
                 connection.execute(statement)
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise TaskStoreCorruption(
+                "expected task-store schema has invalid foreign keys"
+            )
+        connection.execute("PRAGMA foreign_keys = ON")
         return _schema_manifest(connection)
     finally:
         connection.close()
@@ -2365,10 +2694,13 @@ class SQLiteTaskStore:
                 attempt_id=attempt_id,
                 project_id=task["project_id"],
                 principal_id=task["principal_id"],
+                allow_checkpoint_waiting=(
+                    _is_checkpoint_capable_managed_dispatch(intent)
+                ),
             )
             if first_running is None:
                 raise TaskStoreConflict(
-                    "timeout window requires durable ready/running evidence"
+                    "timeout window requires durable ready/live evidence"
                 )
             observation, observation_evidence = first_running
             _require_worker_attempt_observation_binding(
@@ -2379,17 +2711,23 @@ class SQLiteTaskStore:
                 project_id=task["project_id"],
                 principal_id=task["principal_id"],
             )
+            heartbeat_state = observation_evidence["heartbeat"]["state"]
+            start_source = (
+                observation_evidence["ready"]["started_at"]
+                if heartbeat_state == "waiting"
+                else observation["observed_at"]
+            )
             try:
-                started_at, started_at_us = _runtime_timestamp(
-                    observation["observed_at"]
-                )
+                started_at, started_at_us = _runtime_timestamp(start_source)
             except TaskStoreConflict as error:
                 raise TaskStoreCorruption(
                     "timeout start observation time is invalid"
                 ) from error
             if (
-                started_at != observation["observed_at"]
-                or started_at_us != observation["observed_at_us"]
+                (
+                    heartbeat_state != "waiting"
+                    and started_at != start_source
+                )
                 or recorded_at_us < started_at_us
             ):
                 raise TaskStoreConflict("timeout window clock is inconsistent")
@@ -3082,9 +3420,12 @@ class SQLiteTaskStore:
                 or intent.handle is None
                 or task["status"] not in {"Queued", "Running"}
                 or intent.adapter_id != "fwi.deepwave_adapter"
-                or intent.adapter_version != "1.5.0"
+                or intent.adapter_version not in {"1.5.0", "1.6.0"}
                 or intent.request.get("algorithm")
-                != {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
+                != {
+                    "id": "deepwave.acoustic_fwi",
+                    "version": intent.adapter_version,
+                }
             ):
                 raise TaskStoreConflict(
                     "retry requires a current post-ready managed dispatch"
@@ -3945,7 +4286,11 @@ class SQLiteTaskStore:
             or WORKER_ATTEMPT_ID.fullmatch(attempt_id) is None
             or attempt_number != 1
             or (adapter_version, private_schema_version)
-            not in {("1.4.0", "1.1.0"), ("1.5.0", "1.2.0")}
+            not in {
+                ("1.4.0", "1.1.0"),
+                ("1.5.0", "1.2.0"),
+                ("1.6.0", "1.2.0"),
+            }
             or not _is_sha256(private_record_hash)
             or not _is_sha256(private_proof_hash)
             or not isinstance(terminal_event, Mapping)
@@ -4759,7 +5104,7 @@ class SQLiteTaskStore:
 
             event: dict[str, Any]
             if result == "timeout_confirmed":
-                if task["status"] not in {"Queued", "Running"}:
+                if task["status"] not in {"Queued", "Running", "Waiting"}:
                     raise TaskStoreConflict(
                         "timeout confirmation lost the terminal race"
                     )
@@ -4927,7 +5272,7 @@ class SQLiteTaskStore:
                         ) from error
                     terminal_sequence = terminal["sequence"]
                 else:
-                    if task["status"] not in {"Queued", "Running"}:
+                    if task["status"] not in {"Queued", "Running", "Waiting"}:
                         raise TaskStoreConflict(
                             "terminal-preempted timeout lost the terminal race"
                         )
@@ -4955,9 +5300,15 @@ class SQLiteTaskStore:
                         or event.get("node_id") != intent.node_id
                         or event.get("fingerprint")
                         != intent.handle["fingerprint"]
-                        or terminal_status
-                        not in ALLOWED_TRANSITIONS.get(
-                            task["status"], frozenset()
+                        or (
+                            terminal_status
+                            not in ALLOWED_TRANSITIONS.get(
+                                task["status"], frozenset()
+                            )
+                            and not (
+                                task["status"] == "Waiting"
+                                and terminal_status == "Succeeded"
+                            )
                         )
                         or not isinstance(event.get("occurred_at"), str)
                         or not event["occurred_at"]
@@ -5196,9 +5547,9 @@ class SQLiteTaskStore:
                 JOIN worker_attempt_observations AS observation
                   ON observation.attempt_id = attempt.attempt_id
                 WHERE task.task_id = ?
-                  AND task.status IN ('Queued', 'Running')
+                  AND task.status IN ('Queued', 'Running', 'Waiting')
                   AND intent.adapter_id = 'fwi.deepwave_adapter'
-                  AND intent.adapter_version IN ('1.4.0', '1.5.0')
+                  AND intent.adapter_version IN ('1.4.0', '1.5.0', '1.6.0')
                   AND json_extract(
                       intent.request_json, '$.request.algorithm.id'
                   ) = 'deepwave.acoustic_fwi'
@@ -5217,7 +5568,13 @@ class SQLiteTaskStore:
                   )
                   AND observation.ticket_state = 'spawned'
                   AND observation.ready_record_hash IS NOT NULL
-                  AND observation.heartbeat_state = 'running'
+                  AND (
+                      observation.heartbeat_state = 'running'
+                      OR (
+                          intent.adapter_version = '1.6.0'
+                          AND observation.heartbeat_state = 'waiting'
+                      )
+                  )
                   AND observation.heartbeat_record_hash IS NOT NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM task_cancel_requests AS cancel
@@ -5325,9 +5682,9 @@ class SQLiteTaskStore:
                 or task["principal_id"] != principal_id
             ):
                 raise TaskStoreConflict("task cancel crosses task scope")
-            if task["status"] not in {"Queued", "Running"}:
+            if task["status"] not in {"Queued", "Running", "Waiting"}:
                 raise TaskStoreConflict(
-                    "only a queued or running task can be cancelled"
+                    "only a queued, running, or waiting task can be cancelled"
                 )
             if connection.execute(
                 "SELECT 1 FROM task_cancel_requests WHERE task_id = ?",
@@ -5385,7 +5742,13 @@ class SQLiteTaskStore:
                 evidence["ticket"]["state"] != "spawned"
                 or evidence["ready"] is None
                 or evidence["heartbeat"] is None
-                or evidence["heartbeat"]["state"] != "running"
+                or (
+                    evidence["heartbeat"]["state"] != "running"
+                    and not (
+                        evidence["heartbeat"]["state"] == "waiting"
+                        and _is_checkpoint_capable_managed_dispatch(intent)
+                    )
+                )
             ):
                 raise TaskStoreConflict(
                     "task cancellation requires an exact running attempt"
@@ -5726,7 +6089,7 @@ class SQLiteTaskStore:
             if task is None:
                 raise TaskStoreCorruption("task cancel target cannot be read")
             if result == "cancel_confirmed":
-                if task["status"] not in {"Queued", "Running"}:
+                if task["status"] not in {"Queued", "Running", "Waiting"}:
                     raise TaskStoreConflict(
                         "cancel confirmation lost the terminal race"
                     )
@@ -5835,7 +6198,7 @@ class SQLiteTaskStore:
                         )
                     terminal_sequence = terminal["sequence"]
                 else:
-                    if task["status"] not in {"Queued", "Running"}:
+                    if task["status"] not in {"Queued", "Running", "Waiting"}:
                         raise TaskStoreConflict(
                             "terminal-preempted cancel lost the terminal race"
                         )
@@ -5866,9 +6229,15 @@ class SQLiteTaskStore:
                         or event.get("node_id") != intent.node_id
                         or event.get("fingerprint")
                         != intent.handle["fingerprint"]
-                        or terminal_status
-                        not in ALLOWED_TRANSITIONS.get(
-                            task["status"], frozenset()
+                        or (
+                            terminal_status
+                            not in ALLOWED_TRANSITIONS.get(
+                                task["status"], frozenset()
+                            )
+                            and not (
+                                task["status"] == "Waiting"
+                                and terminal_status == "Succeeded"
+                            )
                         )
                     ):
                         raise TaskStoreConflict(
@@ -8114,11 +8483,17 @@ class SQLiteTaskStore:
                 "timeout window differs from its immutable index"
             )
 
+        intent = self._load_dispatch_intent(connection, task_id=task_id)
+        allow_checkpoint_waiting = (
+            intent is not None
+            and _is_checkpoint_capable_managed_dispatch(intent)
+        )
         first_running = _first_durable_running_observation(
             connection,
             attempt_id=row["attempt_id"],
             project_id=row["project_id"],
             principal_id=row["principal_id"],
+            allow_checkpoint_waiting=allow_checkpoint_waiting,
         )
         observation, observation_evidence = (
             (None, None) if first_running is None else first_running
@@ -8136,17 +8511,36 @@ class SQLiteTaskStore:
                 project_id=row["project_id"],
                 principal_id=row["principal_id"],
             )
+        heartbeat_state = (
+            None
+            if observation_evidence is None
+            or observation_evidence["heartbeat"] is None
+            else observation_evidence["heartbeat"]["state"]
+        )
+        start_source = (
+            None
+            if observation is None or observation_evidence is None
+            else (
+                observation_evidence["ready"]["started_at"]
+                if heartbeat_state == "waiting"
+                else observation["observed_at"]
+            )
+        )
         try:
             observation_at, observation_at_us = (
                 (None, None)
                 if observation is None
                 else _runtime_timestamp(observation["observed_at"])
             )
+            source_at, source_at_us = (
+                (None, None)
+                if start_source is None
+                else _runtime_timestamp(start_source)
+            )
         except TaskStoreConflict as error:
             raise TaskStoreCorruption(
                 "timeout source observation time is invalid"
             ) from error
-        intent = self._load_dispatch_intent(connection, task_id=task_id)
         if (
             observation is None
             or observation_evidence is None
@@ -8154,18 +8548,24 @@ class SQLiteTaskStore:
             or observation_evidence["ticket"]["state"] != "spawned"
             or observation_evidence["ready"] is None
             or observation_evidence["heartbeat"] is None
-            or observation_evidence["heartbeat"]["state"] != "running"
+            or heartbeat_state not in {"running", "waiting"}
+            or (heartbeat_state == "waiting" and not allow_checkpoint_waiting)
             or type(observation["observation_sequence"]) is not int
             or observation["observation_sequence"]
             != row["start_observation_sequence"]
             or observation["ready_record_hash"] != row["ready_record_hash"]
-            or observation["heartbeat_state"] != "running"
+            or observation["heartbeat_state"] != heartbeat_state
             or observation["heartbeat_record_hash"]
             != row["running_heartbeat_record_hash"]
             or observation_at != observation["observed_at"]
             or observation_at_us != observation["observed_at_us"]
-            or observation["observed_at"] != row["started_at"]
-            or observation["observed_at_us"] != row["started_at_us"]
+            or (
+                heartbeat_state != "waiting"
+                and source_at != start_source
+            )
+            or source_at != row["started_at"]
+            or source_at_us != row["started_at_us"]
+            or observation_at_us < source_at_us
             or intent is None
             or intent.intent_id != row["intent_id"]
             or not _is_supported_managed_dispatch(intent)
@@ -8216,14 +8616,14 @@ class SQLiteTaskStore:
                     "timeout and cancellation both own the exact stop slot"
                 )
             if authorization_count > 0:
-                if task_status not in {"Queued", "Running"}:
+                if task_status not in {"Queued", "Running", "Waiting"}:
                     raise TaskStoreCorruption(
                         "pending timeout has an unresolved terminal task"
                     )
                 state = "requested"
             elif has_cancel_request:
                 state = "suppressed"
-            elif task_status in {"Queued", "Running"}:
+            elif task_status in {"Queued", "Running", "Waiting"}:
                 state = "armed"
             elif task_status in {"Succeeded", "Failed"}:
                 state = "not_triggered"
@@ -8427,6 +8827,232 @@ class SQLiteTaskStore:
             adapter_proof=adapter_proof,
         )
 
+    def _load_task_checkpoint(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        *,
+        task_status: str,
+        checkpoint_id: str | None = None,
+    ) -> TaskCheckpointSnapshot | None:
+        """Decode the latest or one exact checkpoint without private paths."""
+
+        query = """
+            SELECT checkpoint.*,
+                   request.resume_id, request.document_json AS request_json,
+                   request.document_hash AS request_document_hash,
+                   request.requested_at,
+                   outcome.adapter_proof_json AS resumed_proof_json,
+                   outcome.adapter_proof_hash AS resumed_proof_hash,
+                   outcome.resume_acknowledged_at,
+                   outcome.running_event_sequence
+            FROM worker_checkpoint_waits AS checkpoint
+            LEFT JOIN task_checkpoint_resume_requests AS request
+              ON request.checkpoint_id = checkpoint.checkpoint_id
+            LEFT JOIN task_checkpoint_resume_outcomes AS outcome
+              ON outcome.resume_id = request.resume_id
+            WHERE checkpoint.task_id = ?
+        """
+        parameters: tuple[Any, ...] = (task_id,)
+        if checkpoint_id is None:
+            query += " ORDER BY checkpoint.waiting_event_sequence DESC LIMIT 1"
+        else:
+            query += " AND checkpoint.checkpoint_id = ? LIMIT 1"
+            parameters = (task_id, checkpoint_id)
+        row = connection.execute(query, parameters).fetchone()
+        if row is None:
+            if checkpoint_id is None and task_status == "Waiting":
+                raise TaskStoreCorruption(
+                    "Waiting task lacks an exact checkpoint"
+                )
+            return None
+        try:
+            waiting_proof = _decode_document(
+                row["proof_json"], label="checkpoint Adapter proof"
+            )
+            waiting_proof = _validate_checkpoint_adapter_proof(
+                waiting_proof,
+                state="waiting",
+                task_id=task_id,
+                node_id=row["node_id"],
+                submission_id=row["submission_id"],
+                attempt_id=row["attempt_id"],
+                attempt_number=row["attempt_number"],
+                checkpoint_id=row["checkpoint_id"],
+            )
+            created_at, created_at_us = _runtime_timestamp(
+                row["checkpoint_created_at"]
+            )
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "checkpoint Adapter proof is invalid"
+            ) from error
+        indexed = {
+            "node_id": row["node_id"],
+            "submission_id": row["submission_id"],
+            "attempt_id": row["attempt_id"],
+            "attempt_number": row["attempt_number"],
+            "checkpoint_index": row["checkpoint_index"],
+            "completed_updates": row["completed_updates"],
+            "checkpoint_manifest_relative_path": row[
+                "checkpoint_manifest_relative_path"
+            ],
+            "checkpoint_manifest_size_bytes": row[
+                "checkpoint_manifest_size_bytes"
+            ],
+            "binding_hash": row["binding_hash"],
+            "submission_receipt_record_hash": row[
+                "submission_receipt_record_hash"
+            ],
+            "ready_record_hash": row["ready_record_hash"],
+            "checkpoint_manifest_hash": row["checkpoint_manifest_hash"],
+            "checkpoint_receipt_record_hash": row[
+                "checkpoint_receipt_record_hash"
+            ],
+            "checkpoint_created_at": row["checkpoint_created_at"],
+        }
+        if (
+            waiting_proof["proof_hash"] != row["proof_hash"]
+            or created_at != row["checkpoint_created_at"]
+            or created_at_us != row["checkpoint_created_at_us"]
+            or any(waiting_proof.get(key) != value for key, value in indexed.items())
+        ):
+            raise TaskStoreCorruption(
+                "checkpoint proof differs from its immutable index"
+            )
+
+        resume_id = row["resume_id"]
+        state = "waiting"
+        requested_at = None
+        acknowledged_at = None
+        if resume_id is not None:
+            try:
+                request = _decode_document(
+                    row["request_json"], label="checkpoint resume request"
+                )
+                _, request_document_hash = encode_document(request)
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "checkpoint resume request is invalid"
+                ) from error
+            if (
+                RUNTIME_RESUME_ID.fullmatch(resume_id) is None
+                or request_document_hash != row["request_document_hash"]
+                or request
+                != {
+                    "schema_version": "1.0.0",
+                    "resume_id": resume_id,
+                    "task_id": task_id,
+                    "checkpoint_id": row["checkpoint_id"],
+                    "action": "resume_exact_checkpoint",
+                    "requested_at": row["requested_at"],
+                    "extensions": {},
+                }
+            ):
+                raise TaskStoreCorruption(
+                    "checkpoint resume request differs from its index"
+                )
+            requested_at = row["requested_at"]
+            state = "resume_requested"
+        if row["resumed_proof_json"] is not None:
+            try:
+                resumed_proof = _decode_document(
+                    row["resumed_proof_json"],
+                    label="checkpoint resume Adapter proof",
+                )
+                authorization = connection.execute(
+                    """
+                    SELECT authorization_json
+                    FROM supervised_checkpoint_resume_authorizations AS auth
+                    JOIN task_checkpoint_resume_outcomes AS outcome
+                      ON outcome.resume_id = auth.resume_id
+                     AND outcome.fencing_token = auth.fencing_token
+                    WHERE outcome.resume_id = ?
+                    """,
+                    (resume_id,),
+                ).fetchone()
+                if authorization is None:
+                    raise TaskStoreCorruption(
+                        "checkpoint resume outcome lacks authorization"
+                    )
+                token = _decode_document(
+                    authorization["authorization_json"],
+                    label="checkpoint resume authorization",
+                )
+                resumed_proof = _validate_checkpoint_adapter_proof(
+                    resumed_proof,
+                    state="resumed",
+                    task_id=task_id,
+                    node_id=row["node_id"],
+                    submission_id=row["submission_id"],
+                    attempt_id=row["attempt_id"],
+                    attempt_number=row["attempt_number"],
+                    checkpoint_id=row["checkpoint_id"],
+                    checkpoint_proof_hash=row["proof_hash"],
+                    resume_id=resume_id,
+                    resume_request_record_hash=token.get(
+                        "resume_request_record_hash"
+                    ),
+                )
+                _, resumed_hash = encode_document(resumed_proof)
+                acknowledged_at, _ = _runtime_timestamp(
+                    row["resume_acknowledged_at"]
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "checkpoint resume Adapter proof is invalid"
+                ) from error
+            if (
+                resumed_hash != row["resumed_proof_hash"]
+                or acknowledged_at != resumed_proof["resume_acknowledged_at"]
+            ):
+                raise TaskStoreCorruption(
+                    "checkpoint resume proof differs from its index"
+                )
+            state = "resumed"
+        elif task_status not in {"Waiting"}:
+            state = "superseded"
+        if checkpoint_id is None and task_status == "Waiting" and state not in {
+            "waiting",
+            "resume_requested",
+        }:
+            raise TaskStoreCorruption(
+                "Waiting task checkpoint lifecycle is inconsistent"
+            )
+        if (
+            checkpoint_id is None
+            and task_status == "Running"
+            and state not in {"resumed"}
+        ):
+            raise TaskStoreCorruption(
+                "Running task has an unresolved latest checkpoint"
+            )
+        return TaskCheckpointSnapshot(
+            checkpoint_id=row["checkpoint_id"],
+            intent_id=row["intent_id"],
+            node_id=row["node_id"],
+            submission_id=row["submission_id"],
+            attempt_id=row["attempt_id"],
+            attempt_number=row["attempt_number"],
+            checkpoint_index=row["checkpoint_index"],
+            completed_updates=row["completed_updates"],
+            checkpoint_manifest_relative_path=row[
+                "checkpoint_manifest_relative_path"
+            ],
+            checkpoint_manifest_size_bytes=row[
+                "checkpoint_manifest_size_bytes"
+            ],
+            checkpoint_manifest_hash=row["checkpoint_manifest_hash"],
+            checkpoint_receipt_record_hash=row[
+                "checkpoint_receipt_record_hash"
+            ],
+            checkpoint_created_at=row["checkpoint_created_at"],
+            state=state,
+            resume_id=resume_id,
+            resume_requested_at=requested_at,
+            resume_acknowledged_at=acknowledged_at,
+        )
+
     def _load_snapshot(
         self, connection: sqlite3.Connection, task_id: str
     ) -> TaskSnapshot | None:
@@ -8439,10 +9065,14 @@ class SQLiteTaskStore:
         timeout = self._load_task_timeout(
             connection, task_id, task_status=row["status"]
         )
+        checkpoint = self._load_task_checkpoint(
+            connection, task_id, task_status=row["status"]
+        )
         if cancellation is not None:
             if cancellation.state == "requested" and row["status"] not in {
                 "Queued",
                 "Running",
+                "Waiting",
             }:
                 raise TaskStoreCorruption(
                     "pending cancellation has an unresolved terminal task"
@@ -8769,6 +9399,7 @@ class SQLiteTaskStore:
             purge_local_run_state=purge_local_run_state,
             cancellation=cancellation,
             timeout=timeout,
+            checkpoint=checkpoint,
         )
 
     def _load_task_purge_record(
@@ -9307,7 +9938,11 @@ class SQLiteTaskStore:
                     observation["adapter_version"],
                     observation["private_schema_version"],
                 )
-                not in {("1.4.0", "1.1.0"), ("1.5.0", "1.2.0")}
+                not in {
+                    ("1.4.0", "1.1.0"),
+                    ("1.5.0", "1.2.0"),
+                    ("1.6.0", "1.2.0"),
+                }
                 or observation["adapter_version"] != row["adapter_version"]
                 or not _is_sha256(observation["private_record_hash"])
                 or calculated_proof_hash != observation["private_proof_hash"]
@@ -9482,6 +10117,22 @@ class SQLiteTaskStore:
                     project_id=task_identity["project_id"],
                     principal_id=task_identity["principal_id"],
                 )
+                checkpoint_waiting_evidence = (
+                    evidence["heartbeat"] is not None
+                    and evidence["heartbeat"]["state"] == "waiting"
+                    and row["adapter_version"] == "1.6.0"
+                    and request.get("algorithm")
+                    == {
+                        "id": "deepwave.acoustic_fwi",
+                        "version": "1.6.0",
+                    }
+                    and resolution_handle.get("adapter_version") == "1.6.0"
+                    and resolution_handle.get("algorithm")
+                    == {
+                        "id": "deepwave.acoustic_fwi",
+                        "version": "1.6.0",
+                    }
+                )
                 if (
                     type(observation_sequence) is not int
                     or observation_sequence < 1
@@ -9490,8 +10141,11 @@ class SQLiteTaskStore:
                     or evidence["ticket"]["state"] != "spawned"
                     or evidence["ready"] is None
                     or evidence["heartbeat"] is None
-                    or evidence["heartbeat"]["state"]
-                    not in {"running", "succeeded", "failed"}
+                    or (
+                        evidence["heartbeat"]["state"]
+                        not in {"running", "succeeded", "failed"}
+                        and not checkpoint_waiting_evidence
+                    )
                     or resolution_handle.get("submission_id")
                     != evidence["submission_id"]
                     or resolution_handle.get("job_id") != evidence["job_id"]
@@ -12093,9 +12747,12 @@ class SQLiteTaskStore:
                 or intent.handle is not None
                 or intent.failure_code != "WORKER_RETRY_EXHAUSTED"
                 or intent.adapter_id != "fwi.deepwave_adapter"
-                or intent.adapter_version != "1.5.0"
+                or intent.adapter_version not in {"1.5.0", "1.6.0"}
                 or intent.request.get("algorithm")
-                != {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
+                != {
+                    "id": "deepwave.acoustic_fwi",
+                    "version": intent.adapter_version,
+                }
             ):
                 raise TaskStoreCorruption(
                     "retry exhaustion cleanup intent is inconsistent"
@@ -12979,13 +13636,13 @@ class SQLiteTaskStore:
             )
             expected_algorithm = {
                 "id": "deepwave.acoustic_fwi",
-                "version": "1.5.0",
+                "version": intent.adapter_version,
             }
             if (
                 task["status"] != "Queued"
                 or intent.state != "dispatching"
                 or intent.adapter_id != "fwi.deepwave_adapter"
-                or intent.adapter_version != "1.5.0"
+                or intent.adapter_version not in {"1.5.0", "1.6.0"}
                 or intent.request.get("algorithm") != expected_algorithm
             ):
                 raise TaskStoreConflict(
@@ -13264,9 +13921,12 @@ class SQLiteTaskStore:
                 task["status"] != "Queued"
                 or intent.state != "dispatching"
                 or intent.adapter_id != "fwi.deepwave_adapter"
-                or intent.adapter_version != "1.5.0"
+                or intent.adapter_version not in {"1.5.0", "1.6.0"}
                 or intent.request.get("algorithm")
-                != {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
+                != {
+                    "id": "deepwave.acoustic_fwi",
+                    "version": intent.adapter_version,
+                }
                 or connection.execute(
                     "SELECT 1 FROM dispatch_outcomes WHERE intent_id = ?",
                     (intent_id,),
@@ -13672,9 +14332,12 @@ class SQLiteTaskStore:
                 task["status"] != "Queued"
                 or intent.state != "dispatching"
                 or intent.adapter_id != "fwi.deepwave_adapter"
-                or intent.adapter_version != "1.5.0"
+                or intent.adapter_version not in {"1.5.0", "1.6.0"}
                 or intent.request.get("algorithm")
-                != {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
+                != {
+                    "id": "deepwave.acoustic_fwi",
+                    "version": intent.adapter_version,
+                }
                 or event.get("sequence") != expected_sequence
             ):
                 raise TaskStoreConflict(
@@ -14700,6 +15363,14 @@ class SQLiteTaskStore:
             intent = self._load_dispatch_intent(connection, task_id=task_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
+            if (
+                heartbeat is not None
+                and heartbeat["state"] == "waiting"
+                and not _is_checkpoint_capable_managed_dispatch(intent)
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint Waiting requires the exact 1.6 managed dispatch"
+                )
             task = connection.execute(
                 """
                 SELECT project_id, principal_id, status
@@ -14756,8 +15427,14 @@ class SQLiteTaskStore:
                 or ticket["state"] != "spawned"
                 or ready is None
                 or heartbeat is None
-                or heartbeat["state"]
-                not in {"running", "succeeded", "failed"}
+                or (
+                    heartbeat["state"]
+                    not in {"running", "succeeded", "failed"}
+                    and not (
+                        heartbeat["state"] == "waiting"
+                        and _is_checkpoint_capable_managed_dispatch(intent)
+                    )
+                )
             ):
                 raise TaskStoreConflict(
                     "dispatch reconciliation requires exact positive Worker proof"
@@ -15353,6 +16030,1182 @@ class SQLiteTaskStore:
             if connection.in_transaction:
                 connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _insert_checkpoint_run_event(
+        connection: sqlite3.Connection,
+        *,
+        event: Mapping[str, Any],
+        project_id: str,
+        principal_id: str,
+        fingerprint_hash: str,
+        fencing_token: int,
+        recorded_at: str,
+        recorded_at_us: int,
+    ) -> None:
+        event_json, event_hash = encode_document(event)
+        connection.execute(
+            """
+            INSERT INTO run_events(
+                task_id, sequence, event_id, event_type, task_status,
+                node_id, fingerprint_hash, document_json, document_hash,
+                occurred_at, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["task_id"], event["sequence"], event["event_id"],
+                event["event_type"], event["task_status"], event["node_id"],
+                fingerprint_hash, event_json, event_hash,
+                event["occurred_at"], recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO supervised_run_event_commits(
+                task_id, sequence, project_id, principal_id,
+                fencing_token, recorded_at, recorded_at_us
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["task_id"], event["sequence"], project_id, principal_id,
+                fencing_token, recorded_at, recorded_at_us,
+            ),
+        )
+
+    def record_supervised_checkpoint_wait(
+        self,
+        *,
+        intent_id: str,
+        checkpoint_proof: Mapping[str, Any],
+        checkpoint_event: Mapping[str, Any],
+        waiting_event: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedCheckpointWait:
+        """Atomically persist a safe checkpoint and enter Waiting."""
+
+        if (
+            not isinstance(intent_id, str)
+            or not intent_id
+            or not isinstance(checkpoint_event, Mapping)
+            or not isinstance(waiting_event, Mapping)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("supervised checkpoint wait is invalid")
+        proof = _validate_checkpoint_adapter_proof(
+            checkpoint_proof, state="waiting", intent_id=intent_id
+        )
+        checkpoint_event = dict(checkpoint_event)
+        waiting_event = dict(waiting_event)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            recorded_at, recorded_at_us = _runtime_timestamp(supervisor_clock())
+            task = connection.execute(
+                """
+                SELECT task.task_id, task.project_id, task.principal_id,
+                       task.status
+                FROM dispatch_intents AS intent
+                JOIN tasks AS task ON task.task_id = intent.task_id
+                WHERE intent.intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreConflict("checkpoint intent does not exist")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=recorded_at_us,
+                action="supervised checkpoint wait",
+            )
+            existing = connection.execute(
+                "SELECT proof_json FROM worker_checkpoint_waits "
+                "WHERE checkpoint_id = ?",
+                (proof["checkpoint_id"],),
+            ).fetchone()
+            if existing is not None:
+                stored = _decode_document(
+                    existing["proof_json"], label="checkpoint Adapter proof"
+                )
+                if stored != proof:
+                    raise TaskStoreConflict(
+                        "checkpoint identity was already used by another proof"
+                    )
+                snapshot = self._load_snapshot(connection, task["task_id"])
+                exact_checkpoint = self._load_task_checkpoint(
+                    connection,
+                    task["task_id"],
+                    task_status=task["status"],
+                    checkpoint_id=proof["checkpoint_id"],
+                )
+                if snapshot is None or exact_checkpoint is None:
+                    raise TaskStoreCorruption("checkpoint replay cannot be read")
+                connection.commit()
+                return SupervisedCheckpointWait(
+                    snapshot=snapshot,
+                    checkpoint=exact_checkpoint,
+                    checkpoint_proof=proof,
+                    fencing_token=supervisor_lease.fencing_token,
+                    recorded_at=recorded_at,
+                    replayed=True,
+                )
+            intent = self._load_dispatch_intent(
+                connection, task_id=task["task_id"]
+            )
+            if (
+                intent is None
+                or intent.intent_id != intent_id
+                or intent.state != "dispatched"
+                or intent.handle is None
+                or task["status"] != "Running"
+                or intent.adapter_version != "1.6.0"
+                or not _is_supported_managed_dispatch(intent)
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint requires a current 1.6 managed dispatch"
+                )
+            if connection.execute(
+                "SELECT 1 FROM task_cancel_requests WHERE task_id = ?",
+                (task["task_id"],),
+            ).fetchone() is not None:
+                raise TaskStoreConflict(
+                    "task cancellation has priority over checkpoint Waiting"
+                )
+            timeout_owner = connection.execute(
+                """
+                SELECT 1
+                FROM worker_attempt_timeout_windows AS timeout
+                WHERE timeout.task_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM worker_exit_retry_timeout_retirements AS retirement
+                      WHERE retirement.timeout_id = timeout.timeout_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_timeout_outcomes AS outcome
+                      WHERE outcome.timeout_id = timeout.timeout_id
+                  )
+                  AND (
+                      timeout.deadline_at_us <= ?
+                      OR EXISTS (
+                          SELECT 1 FROM supervised_timeout_attempts AS delivery
+                          WHERE delivery.timeout_id = timeout.timeout_id
+                      )
+                  )
+                LIMIT 1
+                """,
+                (task["task_id"], recorded_at_us),
+            ).fetchone()
+            if timeout_owner is not None:
+                raise TaskStoreConflict(
+                    "due timeout has priority over checkpoint Waiting"
+                )
+            attempt = connection.execute(
+                """
+                SELECT attempt.*, observation.ready_record_hash,
+                       observation.ticket_state,
+                       observation.heartbeat_state,
+                       observation.heartbeat_record_hash
+                FROM worker_launch_attempts AS attempt
+                JOIN worker_attempt_observations AS observation
+                  ON observation.attempt_id = attempt.attempt_id
+                WHERE attempt.intent_id = ?
+                  AND attempt.attempt_number = (
+                      SELECT MAX(latest.attempt_number)
+                      FROM worker_launch_attempts AS latest
+                      WHERE latest.intent_id = attempt.intent_id
+                  )
+                  AND observation.observation_sequence = (
+                      SELECT MAX(latest.observation_sequence)
+                      FROM worker_attempt_observations AS latest
+                      WHERE latest.attempt_id = attempt.attempt_id
+                  )
+                """,
+                (intent_id,),
+            ).fetchone()
+            effective = connection.execute(
+                """
+                SELECT outcome_document_json, outcome_document_hash
+                FROM effective_dispatched_intents WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if attempt is None or effective is None:
+                raise TaskStoreConflict(
+                    "checkpoint requires an observed live Worker attempt"
+                )
+            outcome = _decode_document(
+                effective["outcome_document_json"],
+                label="effective dispatch outcome",
+            )
+            source_handle = outcome.get("handle")
+            if not isinstance(source_handle, Mapping):
+                raise TaskStoreCorruption("effective dispatch handle is invalid")
+            _, source_handle_hash = encode_document(source_handle)
+            parameters = intent.request.get("parameters")
+            iterations = (
+                parameters.get("iterations")
+                if isinstance(parameters, Mapping)
+                else None
+            )
+            if (
+                proof["task_id"] != task["task_id"]
+                or proof["node_id"] != intent.node_id
+                or proof["submission_id"] != attempt["submission_id"]
+                or proof["submission_id"] != source_handle.get("submission_id")
+                or proof["attempt_id"] != attempt["attempt_id"]
+                or proof["attempt_number"] != attempt["attempt_number"]
+                or proof["binding_hash"] != attempt["binding_hash"]
+                or proof["ready_record_hash"] != attempt["ready_record_hash"]
+                or attempt["ticket_state"] != "spawned"
+                or attempt["heartbeat_state"] not in {"running", "waiting"}
+                or attempt["heartbeat_record_hash"] is None
+                or type(iterations) is not int
+                or proof["completed_updates"] > iterations
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint proof differs from the exact live attempt"
+                )
+            checkpoint_index = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(checkpoint_index), 0) + 1 "
+                    "FROM worker_checkpoint_waits "
+                    "WHERE task_id = ? AND attempt_id = ?",
+                    (task["task_id"], proof["attempt_id"]),
+                ).fetchone()[0]
+            )
+            next_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 "
+                    "FROM run_events WHERE task_id = ?",
+                    (task["task_id"],),
+                ).fetchone()[0]
+            )
+            extension = {
+                "org.agent_rpc.checkpoint_wait": {
+                    "checkpoint_id": proof["checkpoint_id"],
+                    "checkpoint_index": proof["checkpoint_index"],
+                    "completed_updates": proof["completed_updates"],
+                    "same_attempt": True,
+                }
+            }
+            handle_fingerprint = intent.handle.get("fingerprint")
+            if (
+                not isinstance(handle_fingerprint, Mapping)
+                or proof["checkpoint_index"] != checkpoint_index
+                or checkpoint_event.get("task_id") != task["task_id"]
+                or checkpoint_event.get("sequence") != next_sequence
+                or checkpoint_event.get("event_type") != "checkpoint_created"
+                or checkpoint_event.get("task_status") != "Running"
+                or checkpoint_event.get("node_id") != intent.node_id
+                or checkpoint_event.get("fingerprint") != handle_fingerprint
+                or checkpoint_event.get("checkpoint")
+                != {"relative_path": proof["checkpoint_manifest_relative_path"]}
+                or checkpoint_event.get("extensions") != extension
+                or checkpoint_event.get("occurred_at")
+                != proof["checkpoint_created_at"]
+                or waiting_event.get("task_id") != task["task_id"]
+                or waiting_event.get("sequence") != next_sequence + 1
+                or waiting_event.get("event_type") != "node_waiting"
+                or waiting_event.get("task_status") != "Waiting"
+                or waiting_event.get("node_id") != intent.node_id
+                or waiting_event.get("fingerprint") != handle_fingerprint
+                or waiting_event.get("extensions") != extension
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint Waiting events do not bind the exact proof"
+                )
+            created_at, created_at_us = _runtime_timestamp(
+                proof["checkpoint_created_at"]
+            )
+            _, waiting_at_us = _runtime_timestamp(waiting_event.get("occurred_at"))
+            if created_at_us > waiting_at_us or waiting_at_us > recorded_at_us:
+                raise TaskStoreConflict("checkpoint event time order is invalid")
+            _, fingerprint_hash = encode_document(handle_fingerprint)
+            self._insert_checkpoint_run_event(
+                connection,
+                event=checkpoint_event,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                fingerprint_hash=fingerprint_hash,
+                fencing_token=supervisor_lease.fencing_token,
+                recorded_at=recorded_at,
+                recorded_at_us=recorded_at_us,
+            )
+            self._insert_checkpoint_run_event(
+                connection,
+                event=waiting_event,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                fingerprint_hash=fingerprint_hash,
+                fencing_token=supervisor_lease.fencing_token,
+                recorded_at=recorded_at,
+                recorded_at_us=recorded_at_us,
+            )
+            proof_json, _ = encode_document(proof)
+            connection.execute(
+                """
+                INSERT INTO worker_checkpoint_waits(
+                    checkpoint_id, task_id, project_id, principal_id,
+                    intent_id, node_id, submission_id, attempt_id,
+                    attempt_number, checkpoint_index, completed_updates,
+                    checkpoint_manifest_relative_path,
+                    checkpoint_manifest_size_bytes, binding_hash,
+                    submission_receipt_record_hash, ready_record_hash,
+                    checkpoint_manifest_hash, checkpoint_receipt_record_hash,
+                    checkpoint_created_at, checkpoint_created_at_us,
+                    source_outcome_document_hash, source_handle_hash,
+                    proof_json, proof_hash, checkpoint_event_sequence,
+                    waiting_event_sequence, fencing_token,
+                    recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proof["checkpoint_id"], task["task_id"],
+                    task["project_id"], task["principal_id"], intent_id,
+                    intent.node_id, proof["submission_id"], proof["attempt_id"],
+                    proof["attempt_number"], proof["checkpoint_index"],
+                    proof["completed_updates"],
+                    proof["checkpoint_manifest_relative_path"],
+                    proof["checkpoint_manifest_size_bytes"],
+                    proof["binding_hash"],
+                    proof["submission_receipt_record_hash"],
+                    proof["ready_record_hash"],
+                    proof["checkpoint_manifest_hash"],
+                    proof["checkpoint_receipt_record_hash"],
+                    created_at, created_at_us,
+                    effective["outcome_document_hash"], source_handle_hash,
+                    proof_json, proof["proof_hash"], next_sequence,
+                    next_sequence + 1, supervisor_lease.fencing_token,
+                    recorded_at, recorded_at_us,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Waiting', updated_at = ? "
+                "WHERE task_id = ?",
+                (recorded_at, task["task_id"]),
+            )
+            snapshot = self._load_snapshot(connection, task["task_id"])
+            if snapshot is None or snapshot.checkpoint is None:
+                raise TaskStoreCorruption("checkpoint wait cannot be read")
+            connection.commit()
+            return SupervisedCheckpointWait(
+                snapshot=snapshot,
+                checkpoint=snapshot.checkpoint,
+                checkpoint_proof=proof,
+                fencing_token=supervisor_lease.fencing_token,
+                recorded_at=recorded_at,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "checkpoint wait lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "checkpoint wait conflicts with durable state"
+            ) from error
+        finally:
+            connection.close()
+
+    def request_checkpoint_resume(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        clock: Callable[[], str],
+    ) -> TaskCheckpointResumeRecord:
+        """Persist one deterministic, server-owned resume admission."""
+
+        if (
+            any(
+                not isinstance(value, str) or not value
+                for value in (
+                    task_id, project_id, principal_id,
+                    idempotency_key, request_hash,
+                )
+            )
+            or not _is_sha256(request_hash)
+            or not callable(clock)
+        ):
+            raise TaskStoreConflict("checkpoint resume request is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            requested_at, requested_at_us = _runtime_timestamp(clock())
+            task = connection.execute(
+                "SELECT project_id, principal_id, status FROM tasks "
+                "WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreConflict("task does not exist")
+            if (
+                task["project_id"] != project_id
+                or task["principal_id"] != principal_id
+            ):
+                raise TaskStoreConflict("checkpoint resume crosses task scope")
+            snapshot = self._load_snapshot(connection, task_id)
+            if (
+                snapshot is None
+                or snapshot.status != "Waiting"
+                or snapshot.checkpoint is None
+                or snapshot.checkpoint.state
+                not in {"waiting", "resume_requested"}
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint resume requires the current Waiting checkpoint"
+                )
+            checkpoint = snapshot.checkpoint
+            expected_idempotency_key = (
+                f"checkpoint-resume:{checkpoint.checkpoint_id}"
+            )
+            admission = {
+                "schema_version": "1.0.0",
+                "task_id": task_id,
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "action": "resume_exact_checkpoint",
+                "extensions": {},
+            }
+            _, expected_request_hash = encode_document(admission)
+            identity = "\x1f".join(
+                (task_id, checkpoint.checkpoint_id, "resume_exact_checkpoint")
+            )
+            resume_id = "resume-" + hashlib.sha256(
+                identity.encode("utf-8")
+            ).hexdigest()[:32]
+            if (
+                idempotency_key != expected_idempotency_key
+                or request_hash != expected_request_hash
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint resume request differs from its server identity"
+                )
+            existing = connection.execute(
+                """
+                SELECT resume_id, checkpoint_id, task_id, request_hash
+                FROM task_checkpoint_resume_requests
+                WHERE project_id = ? AND principal_id = ?
+                  AND idempotency_key = ?
+                """,
+                (project_id, principal_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["resume_id"] != resume_id
+                    or existing["checkpoint_id"] != checkpoint.checkpoint_id
+                    or existing["task_id"] != task_id
+                    or existing["request_hash"] != request_hash
+                ):
+                    raise IdempotencyConflict(
+                        "checkpoint resume idempotency key was already used"
+                    )
+                connection.commit()
+                return TaskCheckpointResumeRecord(
+                    snapshot=snapshot,
+                    checkpoint=checkpoint,
+                    resume_id=resume_id,
+                    request_record_hash=request_hash,
+                    replayed=True,
+                )
+            if snapshot.cancellation is not None:
+                raise TaskStoreConflict(
+                    "task cancellation already owns the Waiting attempt"
+                )
+            if snapshot.timeout is not None and snapshot.timeout.state in {
+                "requested", "timed_out"
+            }:
+                raise TaskStoreConflict(
+                    "authorized timeout already owns the Waiting attempt"
+                )
+            request_document = {
+                **admission,
+                "resume_id": resume_id,
+                "requested_at": requested_at,
+            }
+            # Keep the immutable field order irrelevant while matching the
+            # exact loader shape.
+            request_document = {
+                "schema_version": request_document["schema_version"],
+                "resume_id": request_document["resume_id"],
+                "task_id": request_document["task_id"],
+                "checkpoint_id": request_document["checkpoint_id"],
+                "action": request_document["action"],
+                "requested_at": request_document["requested_at"],
+                "extensions": request_document["extensions"],
+            }
+            document_json, document_hash = encode_document(request_document)
+            connection.execute(
+                """
+                INSERT INTO task_checkpoint_resume_requests(
+                    resume_id, checkpoint_id, task_id, project_id,
+                    principal_id, intent_id, attempt_id, idempotency_key,
+                    request_hash, document_json, document_hash,
+                    requested_at, requested_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    resume_id, checkpoint.checkpoint_id, task_id, project_id,
+                    principal_id, checkpoint.intent_id, checkpoint.attempt_id,
+                    idempotency_key, request_hash, document_json, document_hash,
+                    requested_at, requested_at_us,
+                ),
+            )
+            snapshot = self._load_snapshot(connection, task_id)
+            if snapshot is None or snapshot.checkpoint is None:
+                raise TaskStoreCorruption("checkpoint resume request cannot be read")
+            connection.commit()
+            return TaskCheckpointResumeRecord(
+                snapshot=snapshot,
+                checkpoint=snapshot.checkpoint,
+                resume_id=resume_id,
+                request_record_hash=request_hash,
+                replayed=False,
+            )
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise TaskStoreConflict(
+                "checkpoint resume request conflicts with durable state"
+            ) from error
+        finally:
+            connection.close()
+
+    def authorize_supervised_checkpoint_resume(
+        self,
+        *,
+        resume_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedCheckpointResumeAuthorization:
+        """Fence and authorize delivery to the same live Worker attempt."""
+
+        if (
+            not isinstance(resume_id, str)
+            or RUNTIME_RESUME_ID.fullmatch(resume_id) is None
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict(
+                "checkpoint resume authorization is invalid"
+            )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authorized_at, authorized_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            row = connection.execute(
+                """
+                SELECT request.task_id, request.project_id,
+                       request.principal_id, request.checkpoint_id,
+                       request.intent_id, request.attempt_id,
+                       request.requested_at, request.requested_at_us,
+                       checkpoint.node_id, checkpoint.submission_id,
+                       checkpoint.attempt_number,
+                       checkpoint.checkpoint_manifest_hash,
+                       checkpoint.checkpoint_receipt_record_hash,
+                       checkpoint.proof_hash AS checkpoint_proof_hash,
+                       task.status
+                FROM task_checkpoint_resume_requests AS request
+                JOIN worker_checkpoint_waits AS checkpoint
+                  ON checkpoint.checkpoint_id = request.checkpoint_id
+                JOIN tasks AS task ON task.task_id = request.task_id
+                WHERE request.resume_id = ?
+                """,
+                (resume_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskStoreConflict(
+                    "checkpoint resume request does not exist"
+                )
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=row["project_id"],
+                principal_id=row["principal_id"],
+                supplied=supervisor_lease,
+                now_us=authorized_at_us,
+                action="checkpoint resume authorization",
+            )
+            requested_at, requested_at_us = _runtime_timestamp(
+                row["requested_at"]
+            )
+            if requested_at_us != int(row["requested_at_us"]):
+                raise TaskStoreCorruption(
+                    "checkpoint resume request time is inconsistent"
+                )
+            if authorized_at_us < requested_at_us:
+                raise TaskStoreConflict(
+                    "checkpoint resume authorization clock regressed"
+                )
+            snapshot = self._load_snapshot(connection, row["task_id"])
+            if (
+                snapshot is None
+                or snapshot.status != "Waiting"
+                or snapshot.checkpoint is None
+                or snapshot.checkpoint.resume_id != resume_id
+                or snapshot.checkpoint.state != "resume_requested"
+                or snapshot.cancellation is not None
+                or (
+                    snapshot.timeout is not None
+                    and snapshot.timeout.state in {"requested", "timed_out"}
+                )
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint resume is no longer deliverable"
+                )
+            request_payload = {
+                "schema_version": "1.0.0",
+                "resume_id": resume_id,
+                "submission_id": row["submission_id"],
+                "attempt_id": row["attempt_id"],
+                "attempt_number": row["attempt_number"],
+                "checkpoint_id": row["checkpoint_id"],
+                "checkpoint_manifest_hash": row[
+                    "checkpoint_manifest_hash"
+                ],
+                "checkpoint_receipt_record_hash": row[
+                    "checkpoint_receipt_record_hash"
+                ],
+                "checkpoint_proof_hash": row["checkpoint_proof_hash"],
+                # This is the immutable Worker-request causal time.  The
+                # per-term authorization time stays in SQLite below.
+                "authorized_at": requested_at,
+            }
+            _, resume_request_record_hash = encode_document(request_payload)
+            resume_request_document = {
+                **request_payload,
+                "record_hash": resume_request_record_hash,
+            }
+            existing = connection.execute(
+                """
+                SELECT resume_request_json, resume_request_record_hash,
+                       authorization_json, authorization_hash,
+                       fencing_token, authorized_at, authorized_at_us
+                FROM supervised_checkpoint_resume_authorizations
+                WHERE resume_id = ? AND fencing_token = ?
+                """,
+                (resume_id, supervisor_lease.fencing_token),
+            ).fetchone()
+            if existing is not None:
+                stored_authorized_at, stored_authorized_at_us = (
+                    _runtime_timestamp(existing["authorized_at"])
+                )
+                authorization = SupervisedCheckpointResumeAuthorization(
+                    checkpoint=snapshot.checkpoint,
+                    task_id=row["task_id"],
+                    resume_id=resume_id,
+                    resume_request_record_hash=resume_request_record_hash,
+                    checkpoint_proof_hash=row["checkpoint_proof_hash"],
+                    requested_at=requested_at,
+                    authorized_at=stored_authorized_at,
+                    fencing_token=supervisor_lease.fencing_token,
+                    replayed=True,
+                )
+                expected_token = authorization.adapter_token()
+                token = _decode_document(
+                    existing["authorization_json"],
+                    label="checkpoint resume authorization",
+                )
+                stored_request = _decode_document(
+                    existing["resume_request_json"],
+                    label="checkpoint Worker resume request",
+                )
+                if (
+                    int(existing["fencing_token"])
+                    != supervisor_lease.fencing_token
+                    or stored_authorized_at_us
+                    != int(existing["authorized_at_us"])
+                    or stored_authorized_at_us < requested_at_us
+                    or existing["resume_request_record_hash"]
+                    != resume_request_record_hash
+                    or stored_request != resume_request_document
+                    or token != expected_token
+                    or encode_document(token)[1]
+                    != existing["authorization_hash"]
+                ):
+                    raise TaskStoreCorruption(
+                        "checkpoint resume authorization is inconsistent"
+                    )
+                connection.commit()
+                return authorization
+            attempt = connection.execute(
+                """
+                SELECT attempt.submission_id, attempt.attempt_number,
+                       observation.ticket_state,
+                       observation.ready_record_hash,
+                       observation.heartbeat_state,
+                       observation.heartbeat_record_hash
+                FROM worker_launch_attempts AS attempt
+                JOIN worker_attempt_observations AS observation
+                  ON observation.attempt_id = attempt.attempt_id
+                WHERE attempt.intent_id = ? AND attempt.attempt_id = ?
+                  AND attempt.attempt_number = (
+                      SELECT MAX(latest.attempt_number)
+                      FROM worker_launch_attempts AS latest
+                      WHERE latest.intent_id = attempt.intent_id
+                  )
+                  AND observation.observation_sequence = (
+                      SELECT MAX(latest.observation_sequence)
+                      FROM worker_attempt_observations AS latest
+                      WHERE latest.attempt_id = attempt.attempt_id
+                  )
+                """,
+                (row["intent_id"], row["attempt_id"]),
+            ).fetchone()
+            if (
+                attempt is None
+                or attempt["submission_id"] != row["submission_id"]
+                or attempt["attempt_number"] != row["attempt_number"]
+                or attempt["ticket_state"] != "spawned"
+                or attempt["ready_record_hash"] is None
+                or attempt["heartbeat_state"] not in {"running", "waiting"}
+                or attempt["heartbeat_record_hash"] is None
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint Worker attempt is no longer live"
+                )
+            resume_request_json, _ = encode_document(resume_request_document)
+            authorization = SupervisedCheckpointResumeAuthorization(
+                checkpoint=snapshot.checkpoint,
+                task_id=row["task_id"],
+                resume_id=resume_id,
+                resume_request_record_hash=resume_request_record_hash,
+                checkpoint_proof_hash=row["checkpoint_proof_hash"],
+                requested_at=requested_at,
+                authorized_at=authorized_at,
+                fencing_token=supervisor_lease.fencing_token,
+                replayed=False,
+            )
+            token = authorization.adapter_token()
+            token_json, token_hash = encode_document(token)
+            connection.execute(
+                """
+                INSERT INTO supervised_checkpoint_resume_authorizations(
+                    resume_id, checkpoint_id, task_id, project_id,
+                    principal_id, intent_id, attempt_id,
+                    resume_request_json, resume_request_record_hash,
+                    authorization_json, authorization_hash,
+                    fencing_token, authorized_at, authorized_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    resume_id, row["checkpoint_id"], row["task_id"],
+                    row["project_id"], row["principal_id"], row["intent_id"],
+                    row["attempt_id"], resume_request_json,
+                    resume_request_record_hash, token_json, token_hash,
+                    supervisor_lease.fencing_token, authorized_at,
+                    authorized_at_us,
+                ),
+            )
+            connection.commit()
+            return authorization
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "checkpoint resume authorization lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "checkpoint resume authorization conflicts with durable state"
+            ) from error
+        finally:
+            connection.close()
+
+    def complete_supervised_checkpoint_resume(
+        self,
+        *,
+        resume_id: str,
+        adapter_proof: Mapping[str, Any],
+        running_event: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> TaskCheckpointResumeRecord:
+        """Commit exact resume acknowledgement and Waiting -> Running."""
+
+        if (
+            not isinstance(resume_id, str)
+            or RUNTIME_RESUME_ID.fullmatch(resume_id) is None
+            or not isinstance(adapter_proof, Mapping)
+            or not isinstance(running_event, Mapping)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("checkpoint resume completion is invalid")
+        running_event = dict(running_event)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            resumed_at, resumed_at_us = _runtime_timestamp(supervisor_clock())
+            row = connection.execute(
+                """
+                SELECT request.task_id, request.project_id,
+                       request.principal_id, request.request_hash,
+                       request.checkpoint_id, request.intent_id,
+                       request.attempt_id, request.requested_at,
+                       request.requested_at_us, checkpoint.node_id,
+                       checkpoint.submission_id, checkpoint.attempt_number,
+                       checkpoint.proof_json AS waiting_proof_json,
+                       checkpoint.proof_hash AS checkpoint_proof_hash,
+                       task.status
+                FROM task_checkpoint_resume_requests AS request
+                JOIN worker_checkpoint_waits AS checkpoint
+                  ON checkpoint.checkpoint_id = request.checkpoint_id
+                JOIN tasks AS task ON task.task_id = request.task_id
+                WHERE request.resume_id = ?
+                """,
+                (resume_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskStoreConflict(
+                    "checkpoint resume request does not exist"
+                )
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=row["project_id"],
+                principal_id=row["principal_id"],
+                supplied=supervisor_lease,
+                now_us=resumed_at_us,
+                action="checkpoint resume completion",
+            )
+            waiting_proof = _decode_document(
+                row["waiting_proof_json"], label="checkpoint Adapter proof"
+            )
+            existing = connection.execute(
+                """
+                SELECT outcome.adapter_proof_json, outcome.adapter_proof_hash,
+                       authorization.resume_request_record_hash,
+                       authorization.authorization_hash,
+                       authorization.authorized_at,
+                       authorization.authorized_at_us
+                FROM task_checkpoint_resume_outcomes AS outcome
+                JOIN supervised_checkpoint_resume_authorizations AS authorization
+                  ON authorization.resume_id = outcome.resume_id
+                 AND authorization.fencing_token = outcome.fencing_token
+                 AND authorization.authorization_hash = outcome.authorization_hash
+                WHERE outcome.resume_id = ?
+                """,
+                (resume_id,),
+            ).fetchone()
+            if existing is None:
+                authorization = connection.execute(
+                    """
+                    SELECT resume_request_record_hash, authorization_hash,
+                           authorized_at, authorized_at_us
+                    FROM supervised_checkpoint_resume_authorizations
+                    WHERE resume_id = ? AND fencing_token = ?
+                    """,
+                    (resume_id, supervisor_lease.fencing_token),
+                ).fetchone()
+                if authorization is None:
+                    raise TaskStoreConflict(
+                        "checkpoint resume lacks this term's authorization"
+                    )
+            else:
+                authorization = existing
+            resume_request_record_hash = authorization[
+                "resume_request_record_hash"
+            ]
+            authorization_hash = authorization["authorization_hash"]
+            authorization_authorized_at = authorization["authorized_at"]
+            authorization_authorized_at_us = int(
+                authorization["authorized_at_us"]
+            )
+            proof = _validate_checkpoint_adapter_proof(
+                adapter_proof,
+                state="resumed",
+                task_id=row["task_id"],
+                node_id=row["node_id"],
+                submission_id=row["submission_id"],
+                attempt_id=row["attempt_id"],
+                attempt_number=row["attempt_number"],
+                checkpoint_id=row["checkpoint_id"],
+                checkpoint_proof_hash=row["checkpoint_proof_hash"],
+                resume_id=resume_id,
+                resume_request_record_hash=resume_request_record_hash,
+            )
+            stable_fields = {
+                "schema_version",
+                "task_id",
+                "node_id",
+                "submission_id",
+                "attempt_id",
+                "attempt_number",
+                "checkpoint_id",
+                "checkpoint_index",
+                "completed_updates",
+                "binding_hash",
+                "submission_receipt_record_hash",
+                "ready_record_hash",
+                "checkpoint_manifest_relative_path",
+                "checkpoint_manifest_size_bytes",
+                "checkpoint_manifest_hash",
+                "checkpoint_receipt_record_hash",
+                "checkpoint_created_at",
+            }
+            if any(
+                proof.get(field) != waiting_proof.get(field)
+                for field in stable_fields
+            ):
+                raise TaskStoreConflict(
+                    "resume acknowledgement differs from its checkpoint proof"
+                )
+            proof_json, proof_document_hash = encode_document(proof)
+            if existing is not None:
+                stored_proof = _decode_document(
+                    existing["adapter_proof_json"],
+                    label="checkpoint resume Adapter proof",
+                )
+                if (
+                    existing["adapter_proof_hash"]
+                    != encode_document(stored_proof)[1]
+                ):
+                    raise TaskStoreCorruption(
+                        "checkpoint resume outcome proof hash is inconsistent"
+                    )
+                if stored_proof != proof:
+                    raise TaskStoreConflict(
+                        "checkpoint resume was completed with another proof"
+                    )
+                snapshot = self._load_snapshot(connection, row["task_id"])
+                exact_checkpoint = self._load_task_checkpoint(
+                    connection,
+                    row["task_id"],
+                    task_status=row["status"],
+                    checkpoint_id=row["checkpoint_id"],
+                )
+                if snapshot is None or exact_checkpoint is None:
+                    raise TaskStoreCorruption(
+                        "checkpoint resume replay cannot be read"
+                    )
+                connection.commit()
+                return TaskCheckpointResumeRecord(
+                    snapshot=snapshot,
+                    checkpoint=exact_checkpoint,
+                    resume_id=resume_id,
+                    request_record_hash=resume_request_record_hash,
+                    replayed=True,
+                )
+            snapshot = self._load_snapshot(connection, row["task_id"])
+            if (
+                row["status"] != "Waiting"
+                or snapshot is None
+                or snapshot.checkpoint is None
+                or snapshot.checkpoint.state != "resume_requested"
+                or snapshot.checkpoint.resume_id != resume_id
+                or snapshot.cancellation is not None
+                or (
+                    snapshot.timeout is not None
+                    and snapshot.timeout.state in {"requested", "timed_out"}
+                )
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint resume is no longer completable"
+                )
+            attempt = connection.execute(
+                """
+                SELECT attempt.submission_id, attempt.attempt_number,
+                       observation.ticket_state,
+                       observation.heartbeat_state,
+                       observation.heartbeat_record_hash
+                FROM worker_launch_attempts AS attempt
+                JOIN worker_attempt_observations AS observation
+                  ON observation.attempt_id = attempt.attempt_id
+                WHERE attempt.intent_id = ? AND attempt.attempt_id = ?
+                  AND attempt.attempt_number = (
+                      SELECT MAX(latest.attempt_number)
+                      FROM worker_launch_attempts AS latest
+                      WHERE latest.intent_id = attempt.intent_id
+                  )
+                  AND observation.observation_sequence = (
+                      SELECT MAX(latest.observation_sequence)
+                      FROM worker_attempt_observations AS latest
+                      WHERE latest.attempt_id = attempt.attempt_id
+                  )
+                """,
+                (row["intent_id"], row["attempt_id"]),
+            ).fetchone()
+            intent = self._load_dispatch_intent(
+                connection, task_id=row["task_id"]
+            )
+            if (
+                attempt is None
+                or intent is None
+                or intent.handle is None
+                or intent.intent_id != row["intent_id"]
+                or intent.adapter_version != "1.6.0"
+                or attempt["submission_id"] != row["submission_id"]
+                or attempt["attempt_number"] != row["attempt_number"]
+                or attempt["ticket_state"] != "spawned"
+                or attempt["heartbeat_state"] not in {"running", "waiting"}
+                or attempt["heartbeat_record_hash"] is None
+            ):
+                raise TaskStoreConflict(
+                    "checkpoint Worker attempt is no longer live"
+                )
+            next_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 "
+                    "FROM run_events WHERE task_id = ?",
+                    (row["task_id"],),
+                ).fetchone()[0]
+            )
+            extension = {
+                "org.agent_rpc.checkpoint_resume": {
+                    "checkpoint_id": row["checkpoint_id"],
+                    "resume_id": resume_id,
+                    "same_attempt": True,
+                }
+            }
+            handle_fingerprint = intent.handle.get("fingerprint")
+            acknowledged_at, acknowledged_at_us = _runtime_timestamp(
+                proof["resume_acknowledged_at"]
+            )
+            requested_at, requested_at_us = _runtime_timestamp(
+                row["requested_at"]
+            )
+            stored_authorized_at, stored_authorized_at_us = _runtime_timestamp(
+                authorization_authorized_at
+            )
+            first_authorization = connection.execute(
+                """
+                SELECT MIN(authorized_at_us) AS first_authorized_at_us
+                FROM supervised_checkpoint_resume_authorizations
+                WHERE resume_id = ? AND resume_request_record_hash = ?
+                """,
+                (resume_id, resume_request_record_hash),
+            ).fetchone()
+            first_authorized_at_us = (
+                None
+                if first_authorization is None
+                else first_authorization["first_authorized_at_us"]
+            )
+            if (
+                not isinstance(handle_fingerprint, Mapping)
+                or requested_at != row["requested_at"]
+                or requested_at_us != int(row["requested_at_us"])
+                or stored_authorized_at != authorization_authorized_at
+                or stored_authorized_at_us != authorization_authorized_at_us
+                or first_authorized_at_us is None
+                or requested_at_us > int(first_authorized_at_us)
+                or int(first_authorized_at_us) > acknowledged_at_us
+                or authorization_authorized_at_us < requested_at_us
+                or authorization_authorized_at_us > resumed_at_us
+                or running_event.get("task_id") != row["task_id"]
+                or running_event.get("sequence") != next_sequence
+                or running_event.get("event_type") != "node_started"
+                or running_event.get("task_status") != "Running"
+                or running_event.get("node_id") != row["node_id"]
+                or running_event.get("fingerprint") != handle_fingerprint
+                or running_event.get("extensions") != extension
+                or running_event.get("occurred_at") != acknowledged_at
+                or acknowledged_at_us > resumed_at_us
+            ):
+                raise TaskStoreConflict(
+                    "resume Running event does not bind the exact acknowledgement"
+                )
+            _, fingerprint_hash = encode_document(handle_fingerprint)
+            self._insert_checkpoint_run_event(
+                connection,
+                event=running_event,
+                project_id=row["project_id"],
+                principal_id=row["principal_id"],
+                fingerprint_hash=fingerprint_hash,
+                fencing_token=supervisor_lease.fencing_token,
+                recorded_at=resumed_at,
+                recorded_at_us=resumed_at_us,
+            )
+            connection.execute(
+                """
+                INSERT INTO task_checkpoint_resume_outcomes(
+                    resume_id, checkpoint_id, task_id, project_id,
+                    principal_id, intent_id, attempt_id, authorization_hash,
+                    adapter_proof_json, adapter_proof_hash,
+                    resume_acknowledged_at, resume_acknowledged_at_us,
+                    running_event_sequence, fencing_token,
+                    resumed_at, resumed_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    resume_id, row["checkpoint_id"], row["task_id"],
+                    row["project_id"], row["principal_id"], row["intent_id"],
+                    row["attempt_id"], authorization_hash, proof_json,
+                    proof_document_hash, acknowledged_at, acknowledged_at_us,
+                    next_sequence, supervisor_lease.fencing_token,
+                    resumed_at, resumed_at_us,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Running', updated_at = ? "
+                "WHERE task_id = ?",
+                (resumed_at, row["task_id"]),
+            )
+            snapshot = self._load_snapshot(connection, row["task_id"])
+            if snapshot is None or snapshot.checkpoint is None:
+                raise TaskStoreCorruption("checkpoint resume cannot be read")
+            connection.commit()
+            return TaskCheckpointResumeRecord(
+                snapshot=snapshot,
+                checkpoint=snapshot.checkpoint,
+                resume_id=resume_id,
+                request_record_hash=resume_request_record_hash,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "checkpoint resume completion lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "checkpoint resume completion conflicts with durable state"
+            ) from error
         finally:
             connection.close()
 

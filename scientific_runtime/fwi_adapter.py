@@ -47,6 +47,7 @@ from worker_launch_control import (
     ParentLaunchLease,
     WorkerAttemptEvidence,
     WorkerCancelEvidence,
+    WorkerCheckpointEvidence,
     WorkerControlError,
     WorkerExitEvidence,
     WORKER_EXIT_NAME,
@@ -58,11 +59,13 @@ from worker_launch_control import (
     read_pre_running_attempt_evidence,
     read_worker_cancel_capability,
     read_worker_cancel_evidence,
+    read_worker_checkpoint_evidence,
     read_worker_stop_capability,
     read_worker_stop_evidence,
     read_worker_exit_evidence,
     read_worker_attempt_evidence,
     request_worker_cancel,
+    request_worker_checkpoint_resume,
     request_worker_stop,
     record_worker_exit,
     stage_launch_attempt,
@@ -78,7 +81,7 @@ from .fwi_registry import (
 
 ALGORITHM_ID = DEEPWAVE_ALGORITHM_ID
 ALGORITHM_VERSION = DEEPWAVE_ALGORITHM_VERSION
-ADAPTER_VERSION = "1.5.0"
+ADAPTER_VERSION = "1.6.0"
 SUPPORTED_RECEIPT_BINDINGS = frozenset(
     {
         ("1.0.0", "1.0.0"),
@@ -86,14 +89,22 @@ SUPPORTED_RECEIPT_BINDINGS = frozenset(
         ("1.2.0", "1.2.0"),
         ("1.3.0", "1.3.0"),
         ("1.4.0", "1.4.0"),
+        ("1.5.0", "1.5.0"),
         (ALGORITHM_VERSION, ADAPTER_VERSION),
     }
 )
 SUPPORTED_ADAPTER_VERSIONS = frozenset(
     adapter_version for _, adapter_version in SUPPORTED_RECEIPT_BINDINGS
 )
+SUPPORTED_MANAGED_REQUEST_VERSIONS = frozenset(
+    {"1.4.0", "1.5.0", ALGORITHM_VERSION}
+)
 _EXACT_NEGATIVE_RECONCILIATION_VERSIONS = frozenset(
-    {("1.4.0", "1.1.0"), ("1.5.0", "1.2.0")}
+    {
+        ("1.4.0", "1.1.0"),
+        ("1.5.0", "1.2.0"),
+        ("1.6.0", "1.2.0"),
+    }
 )
 _TRANSIENT_RECONCILIATION_CODES = frozenset(
     {"ADAPTER_SUBMISSION_BUSY", "WORKER_ATTEMPT_BUSY"}
@@ -101,7 +112,7 @@ _TRANSIENT_RECONCILIATION_CODES = frozenset(
 LOGICAL_ENTRYPOINT = "fwi.deepwave_adapter"
 MODEL_ID = "marmousi_94_288"
 BOUND_MANIFEST_HASH = (
-    "sha256:09168e087073e3f39a8829e457a9197d50331eea140cb1dbe989224d6ec6b658"
+    "sha256:0e4bf7e1eca41b4ef8590c61ce469652e74b711906360bbd3c0e50e34d0689e7"
 )
 GRADIENT_CLIP_QUANTILE = 0.98
 ADAM_LEARNING_RATE_MILLI_RANGE = (100, 100_000)
@@ -126,6 +137,9 @@ NODE_IDEMPOTENCY_KEY = re.compile(
 )
 JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 MANAGED_ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
+MANAGED_SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
+MANAGED_CHECKPOINT_ID = re.compile(r"^checkpoint-[0-9a-f]{32}$")
+MANAGED_RESUME_ID = re.compile(r"^resume-[0-9a-f]{32}$")
 
 # These plots are fixed Algorithm 1.4 outputs, not paths copied from the
 # legacy Worker manifest.  Dimensions follow the version-bound Matplotlib
@@ -213,13 +227,13 @@ def is_supported_receipt_binding(
 
 
 def _is_supported_managed_record(record: Mapping[str, Any]) -> bool:
-    """Recognize exact managed-control receipts retained across 1.5 rollout."""
+    """Recognize exact managed-control receipts retained across 1.6 rollout."""
 
     version = record.get("adapter_version")
     return (
         (version == "1.4.0" and record.get("schema_version") == "1.1.0")
         or (
-            version == "1.5.0"
+            version in {"1.5.0", "1.6.0"}
             and record.get("schema_version") in {"1.1.0", "1.2.0", "1.3.0"}
         )
     )
@@ -289,6 +303,24 @@ class _AdapterLaunchAmbiguous(AdapterUnavailable):
 
 class _AdapterLaunchStopped(AdapterUnavailable):
     """The production launcher proved that no pre-ready child remains."""
+
+
+def _is_orphaned_checkpoint_waiting(
+    error: AdapterStatusError, *, idle_fence_held: bool = False
+) -> bool:
+    """Recognize only the stopped-Worker checkpoint crash window."""
+
+    cause = error.__cause__
+    return (
+        isinstance(cause, WorkerControlError)
+        and (
+            cause.code == "WORKER_CHECKPOINT_ORPHANED"
+            or (
+                idle_fence_held
+                and cause.code == "WORKER_CHECKPOINT_PENDING"
+            )
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -502,6 +534,73 @@ class AdapterWorkerExitRetryProof:
             "private_proof_hash": self.private_proof_hash,
             "evidence": copy.deepcopy(self.evidence),
             "exit_evidence": copy.deepcopy(self.exit_evidence),
+        }
+
+
+@dataclass(frozen=True)
+class AdapterCheckpointProof:
+    """Path-bounded proof for the sole same-live-attempt checkpoint."""
+
+    task_id: str
+    node_id: str
+    submission_id: str
+    attempt_id: str
+    attempt_number: int
+    checkpoint_id: str
+    checkpoint_index: int
+    completed_updates: int
+    binding_hash: str
+    submission_receipt_record_hash: str
+    ready_record_hash: str
+    checkpoint_manifest_relative_path: str
+    checkpoint_manifest_size_bytes: int
+    checkpoint_manifest_hash: str
+    checkpoint_receipt_record_hash: str
+    checkpoint_proof_hash: str | None
+    checkpoint_created_at: str
+    state: Literal["waiting", "requested", "resumed", "action_required"]
+    resume_id: str | None
+    resume_request_record_hash: str | None
+    resume_acknowledgement_record_hash: str | None
+    resume_acknowledged_at: str | None
+    proof_hash: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0.0",
+            "task_id": self.task_id,
+            "node_id": self.node_id,
+            "submission_id": self.submission_id,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "checkpoint_id": self.checkpoint_id,
+            "checkpoint_index": self.checkpoint_index,
+            "completed_updates": self.completed_updates,
+            "binding_hash": self.binding_hash,
+            "submission_receipt_record_hash": (
+                self.submission_receipt_record_hash
+            ),
+            "ready_record_hash": self.ready_record_hash,
+            "checkpoint_manifest_relative_path": (
+                self.checkpoint_manifest_relative_path
+            ),
+            "checkpoint_manifest_size_bytes": (
+                self.checkpoint_manifest_size_bytes
+            ),
+            "checkpoint_manifest_hash": self.checkpoint_manifest_hash,
+            "checkpoint_receipt_record_hash": (
+                self.checkpoint_receipt_record_hash
+            ),
+            "checkpoint_proof_hash": self.checkpoint_proof_hash,
+            "checkpoint_created_at": self.checkpoint_created_at,
+            "state": self.state,
+            "resume_id": self.resume_id,
+            "resume_request_record_hash": self.resume_request_record_hash,
+            "resume_acknowledgement_record_hash": (
+                self.resume_acknowledgement_record_hash
+            ),
+            "resume_acknowledged_at": self.resume_acknowledged_at,
+            "proof_hash": self.proof_hash,
         }
 
 
@@ -815,6 +914,7 @@ class WorkerLauncher(Protocol):
         run_dir: Path,
         run_root: Path,
         wall_time_seconds: int = 86_400,
+        checkpoint_capable: bool = False,
     ) -> Any: ...
 
 
@@ -1519,6 +1619,7 @@ class SafeSubprocessWorkerLauncher:
         run_dir: Path,
         run_root: Path,
         wall_time_seconds: int = 86_400,
+        checkpoint_capable: bool = False,
     ) -> int:
         """Expose only explicitly stopped failures as retry candidates."""
 
@@ -1529,6 +1630,7 @@ class SafeSubprocessWorkerLauncher:
                 run_dir=run_dir,
                 run_root=run_root,
                 wall_time_seconds=wall_time_seconds,
+                checkpoint_capable=checkpoint_capable,
             )
         except _AdapterLaunchAmbiguous:
             raise
@@ -1549,11 +1651,17 @@ class SafeSubprocessWorkerLauncher:
         run_dir: Path,
         run_root: Path,
         wall_time_seconds: int = 86_400,
+        checkpoint_capable: bool = False,
     ) -> int:
         if command != "invert":
             raise AdapterValidationError(
                 "TASK_TYPE_UNSUPPORTED_IN_P1",
                 ["the standard P1 Adapter launches only inversion"],
+            )
+        if type(checkpoint_capable) is not bool:
+            raise AdapterValidationError(
+                "CHECKPOINT_CAPABILITY_INVALID",
+                ["checkpoint capability must be an immutable boolean"],
             )
         self._reserve()
         lease: ParentLaunchLease | None = None
@@ -1594,6 +1702,11 @@ class SafeSubprocessWorkerLauncher:
                 str(run_root),
                 "--wall-time-seconds",
                 str(wall_time_seconds),
+                *(
+                    ["--checkpoint-after-first-update"]
+                    if checkpoint_capable
+                    else []
+                ),
                 *lease.child_arguments,
             ]
             process = subprocess.Popen(
@@ -1948,17 +2061,28 @@ class DeepwaveAdapter:
             )
 
     @staticmethod
-    def _validate_algorithm(algorithm: Mapping[str, Any]) -> dict[str, str]:
+    def _validate_algorithm(
+        algorithm: Mapping[str, Any], *, allow_historical_managed: bool = False
+    ) -> dict[str, str]:
         if not isinstance(algorithm, Mapping) or set(algorithm) != {"id", "version"}:
             raise AdapterValidationError(
                 "ALGORITHM_IDENTITY_INVALID",
                 ["algorithm must contain only id and version"],
             )
         value = {"id": algorithm.get("id"), "version": algorithm.get("version")}
-        if value != {"id": ALGORITHM_ID, "version": ALGORITHM_VERSION}:
+        expected_versions = (
+            SUPPORTED_MANAGED_REQUEST_VERSIONS
+            if allow_historical_managed
+            else frozenset({ALGORITHM_VERSION})
+        )
+        if value["id"] != ALGORITHM_ID or value["version"] not in expected_versions:
             raise AdapterValidationError(
                 "ALGORITHM_VERSION_UNAVAILABLE",
-                [f"Adapter is bound to {ALGORITHM_ID}@{ALGORITHM_VERSION}"],
+                [
+                    f"Adapter is bound to {ALGORITHM_ID}@{ALGORITHM_VERSION}"
+                    if not allow_historical_managed
+                    else "Adapter cannot reopen this managed Algorithm version"
+                ],
             )
         return value  # type: ignore[return-value]
 
@@ -2185,13 +2309,17 @@ class DeepwaveAdapter:
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
         verify_runtime: bool,
+        allow_historical_managed: bool = False,
     ) -> AdapterValidation:
         for name, value in (("project_id", project_id), ("principal_id", principal_id)):
             if not isinstance(value, str) or OPAQUE_ID.fullmatch(value) is None:
                 raise AdapterValidationError(
                     "AUTH_SCOPE_INVALID", [f"{name} must be a v1 opaque identifier"]
                 )
-        algorithm_value = self._validate_algorithm(algorithm)
+        algorithm_value = self._validate_algorithm(
+            algorithm,
+            allow_historical_managed=allow_historical_managed,
+        )
         if task_type != "acoustic_fwi_2d":
             raise AdapterValidationError(
                 "TASK_TYPE_UNSUPPORTED_IN_P1",
@@ -2224,7 +2352,10 @@ class DeepwaveAdapter:
         # to the finite float consumed by PyTorch.  Other numerical defaults
         # remain fixed by versioned adapter/Worker source.
         normalized_material = {
-            "adapter_version": ADAPTER_VERSION,
+            # Every retained managed version is an exact Algorithm/Adapter
+            # pair.  Reconstruct historical request hashes from that immutable
+            # pair; only new submissions pass the current-version-only path.
+            "adapter_version": algorithm_value["version"],
             "project_id": project_id,
             "principal_id": principal_id,
             "algorithm": algorithm_value,
@@ -2296,6 +2427,31 @@ class DeepwaveAdapter:
                 **validated.as_dict(),
                 "fingerprint": fingerprint,
             }
+        )
+
+    def _validate_managed_runtime_request(
+        self,
+        *,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterValidation:
+        """Revalidate a retained managed request without minting new identity."""
+
+        return self._validate_request(
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+            verify_runtime=True,
+            allow_historical_managed=True,
         )
 
     def estimate(self, **kwargs: Any) -> AdapterEstimate:
@@ -2509,6 +2665,7 @@ class DeepwaveAdapter:
             parameters=parameters,
             resources=resources,
             verify_runtime=False,
+            allow_historical_managed=True,
         )
         submission_id = self._submission_id(task_id, plan_hash, idempotency_key)
         request_payload = self._request_payload(
@@ -3171,6 +3328,7 @@ class DeepwaveAdapter:
             parameters=parameters,
             resources=resources,
             verify_runtime=False,
+            allow_historical_managed=True,
         )
         submission_id = self._submission_id(task_id, plan_hash, idempotency_key)
         request_payload = self._request_payload(
@@ -3196,7 +3354,7 @@ class DeepwaveAdapter:
                 )
             record = self._read_submission(index_path)
             if (
-                record["adapter_version"] != ADAPTER_VERSION
+                record["adapter_version"] != validated.algorithm["version"]
                 or record["algorithm"] != validated.algorithm
             ):
                 raise AdapterUnavailable(
@@ -3252,6 +3410,14 @@ class DeepwaveAdapter:
             if evidence is None:
                 raise AdapterUnavailable(
                     "WORKER_EVIDENCE_NOT_READY: managed launch ticket is unavailable"
+                )
+            if (
+                evidence.heartbeat_state == "waiting"
+                and validated.algorithm
+                != {"id": ALGORITHM_ID, "version": "1.6.0"}
+            ):
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: checkpoint Waiting is not supported by this receipt"
                 )
 
             handle: AdapterHandle | None = None
@@ -3451,7 +3617,7 @@ class DeepwaveAdapter:
             )
             if (
                 record["schema_version"] not in expected_schemas
-                or record["adapter_version"] != ADAPTER_VERSION
+                or record["adapter_version"] != validated.algorithm["version"]
                 or record["algorithm"] != validated.algorithm
                 or record["submission_id"] != submission_id
                 or record["request_hash"] != request_hash
@@ -3569,7 +3735,7 @@ class DeepwaveAdapter:
             )
             if (
                 record["schema_version"] not in expected_schema_versions
-                or record["adapter_version"] != ADAPTER_VERSION
+                or record["adapter_version"] != validated.algorithm["version"]
                 or record["algorithm"] != validated.algorithm
                 or record["submission_id"] != submission_id
                 or record["request_hash"] != request_hash
@@ -3683,7 +3849,7 @@ class DeepwaveAdapter:
             record = self._read_submission(index_path)
             if (
                 record["schema_version"] != "1.2.0"
-                or record["adapter_version"] != ADAPTER_VERSION
+                or record["adapter_version"] != validated.algorithm["version"]
                 or record["algorithm"] != validated.algorithm
                 or record["submission_id"] != submission_id
                 or record["request_hash"] != request_hash
@@ -3704,7 +3870,7 @@ class DeepwaveAdapter:
                 if record["launch_state"] == "launched":
                     return self._handle_from_record(record)
                 if record["launch_state"] in {"preparing", "launching"}:
-                    live = self.validate(
+                    live = self._validate_managed_runtime_request(
                         project_id=project_id,
                         principal_id=principal_id,
                         algorithm=algorithm,
@@ -3745,7 +3911,7 @@ class DeepwaveAdapter:
                 raise AdapterUnavailable(
                     "WORKER_RETRY_UNSAFE: stopped proof no longer matches"
                 )
-            live = self.validate(
+            live = self._validate_managed_runtime_request(
                 project_id=project_id,
                 principal_id=principal_id,
                 algorithm=algorithm,
@@ -3941,7 +4107,7 @@ class DeepwaveAdapter:
         with self._lock_submission(lock_path, create=False, timeout_seconds=5.0):
             record = self._read_submission(index_path)
             if (
-                record["adapter_version"] != ADAPTER_VERSION
+                record["adapter_version"] != validated.algorithm["version"]
                 or record["algorithm"] != validated.algorithm
                 or record["submission_id"] != submission_id
                 or record["request_hash"] != request_hash
@@ -3967,7 +4133,7 @@ class DeepwaveAdapter:
                 if record["launch_state"] == "launched":
                     return self._handle_from_record(record)
                 if record["launch_state"] in {"preparing", "launching"}:
-                    live = self.validate(
+                    live = self._validate_managed_runtime_request(
                         project_id=project_id,
                         principal_id=principal_id,
                         algorithm=algorithm,
@@ -4021,7 +4187,7 @@ class DeepwaveAdapter:
                 raise AdapterUnavailable(
                     "WORKER_RETRY_UNSAFE: stopped proof no longer matches"
                 )
-            live = self.validate(
+            live = self._validate_managed_runtime_request(
                 project_id=project_id,
                 principal_id=principal_id,
                 algorithm=algorithm,
@@ -4256,7 +4422,7 @@ class DeepwaveAdapter:
             or not isinstance(algorithm, Mapping)
             or set(algorithm) != {"id", "version"}
             or algorithm.get("id") != ALGORITHM_ID
-            or algorithm.get("version") not in {"1.4.0", "1.5.0"}
+            or algorithm.get("version") not in {"1.4.0", "1.5.0", "1.6.0"}
             or not isinstance(dataset, Mapping)
             or not isinstance(dataset.get("access_scope"), Mapping)
             or not isinstance(parameters, Mapping)
@@ -4368,10 +4534,17 @@ class DeepwaveAdapter:
                 raise
 
             if evidence is not None and evidence.started:
+                allowed_heartbeat_states = {
+                    "running",
+                    "succeeded",
+                    "failed",
+                }
+                if adapter_version == "1.6.0":
+                    allowed_heartbeat_states.add("waiting")
                 if (
                     launch_state not in {"launching", "launched"}
                     or evidence.heartbeat_state
-                    not in {"running", "succeeded", "failed"}
+                    not in allowed_heartbeat_states
                 ):
                     raise AdapterUnavailable(
                         "DISPATCH_RECONCILIATION_UNCERTAIN: started evidence conflicts with private state"
@@ -4556,6 +4729,7 @@ class DeepwaveAdapter:
             parameters=parameters,
             resources=resources,
             verify_runtime=False,
+            allow_historical_managed=True,
         )
         submission_id = self._submission_id(
             task_id, plan_hash, idempotency_key
@@ -4583,7 +4757,7 @@ class DeepwaveAdapter:
                 )
             record = self._read_submission(index_path)
             if (
-                record["adapter_version"] != ADAPTER_VERSION
+                record["adapter_version"] != validated.algorithm["version"]
                 or record["algorithm"] != validated.algorithm
             ):
                 raise AdapterUnavailable(
@@ -4710,7 +4884,15 @@ class DeepwaveAdapter:
             mismatches.append("P1.2a source identity must remain explicitly incomplete")
         if value["algorithm"] != validated.algorithm:
             mismatches.append("algorithm")
-        if value["adapter_version"] != ADAPTER_VERSION:
+        expected_adapter_version = validated.algorithm["version"]
+        if (
+            value["adapter_version"] != expected_adapter_version
+            or not is_supported_receipt_binding(
+                validated.algorithm,
+                expected_adapter_version,
+                value,
+            )
+        ):
             mismatches.append("adapter_version")
         if value["seed"] != validated.parameters["seed"]:
             mismatches.append("seed")
@@ -4831,6 +5013,11 @@ class DeepwaveAdapter:
                 run_dir=job_dir,
                 run_root=self._run_root,
                 wall_time_seconds=validated.resources["wall_time_seconds"],
+                checkpoint_capable=(
+                    record.get("adapter_version") == "1.6.0"
+                    and record.get("algorithm")
+                    == {"id": ALGORITHM_ID, "version": "1.6.0"}
+                ),
             )
         except _AdapterLaunchAmbiguous as error:
             # Popen may have succeeded and the child retains both kernel
@@ -4893,7 +5080,7 @@ class DeepwaveAdapter:
 
         if (
             record["schema_version"] not in {"1.1.0", "1.2.0", "1.3.0"}
-            or record["adapter_version"] != ADAPTER_VERSION
+            or record["adapter_version"] != validated.algorithm["version"]
             or record["algorithm"] != validated.algorithm
             or record["launch_state"] not in {"preparing", "launching"}
         ):
@@ -5156,6 +5343,10 @@ class DeepwaveAdapter:
             raise AdapterHandleError(
                 "ADAPTER_HANDLE_INVALID: expected an AdapterHandle"
             )
+        if MANAGED_SUBMISSION_ID.fullmatch(handle.submission_id) is None:
+            raise AdapterHandleError(
+                "ADAPTER_HANDLE_INVALID: submission identity is malformed"
+            )
         if (
             not handle.submission_id.startswith("submission-")
             or not JOB_ID.fullmatch(handle.job_id)
@@ -5193,6 +5384,345 @@ class DeepwaveAdapter:
                 "ADAPTER_HANDLE_INVALID: submission state does not permit this operation"
             )
         return record
+
+    def _checkpoint_submission_lock_path(self, handle: AdapterHandle) -> Path:
+        if not isinstance(handle, AdapterHandle):
+            raise AdapterHandleError(
+                "ADAPTER_HANDLE_INVALID: expected an AdapterHandle"
+            )
+        if MANAGED_SUBMISSION_ID.fullmatch(handle.submission_id) is None:
+            raise AdapterHandleError(
+                "ADAPTER_HANDLE_INVALID: submission identity is malformed"
+            )
+        root = _validate_run_root(self._run_root, create=False)
+        control = _require_private_directory(
+            root / CONTROL_DIRECTORY, parent=root
+        )
+        locks = _require_private_directory(control / "locks", parent=control)
+        index_name = handle.submission_id.removeprefix("submission-") + ".json"
+        return locks / (index_name + ".lock")
+
+    @staticmethod
+    def _checkpoint_proof_from_evidence(
+        handle: AdapterHandle,
+        record: Mapping[str, Any],
+        evidence: WorkerCheckpointEvidence,
+        *,
+        state: Literal["waiting", "requested", "resumed"] | None = None,
+    ) -> AdapterCheckpointProof:
+        selected_state = evidence.state if state is None else state
+        if selected_state == "waiting":
+            resume_id = None
+            resume_request_hash = None
+            resume_ack_hash = None
+            resume_acknowledged_at = None
+            checkpoint_proof_hash = None
+        else:
+            resume_id = evidence.resume_id
+            resume_request_hash = evidence.resume_request_record_hash
+            resume_ack_hash = evidence.resume_acknowledgement_record_hash
+            resume_acknowledged_at = evidence.resume_acknowledged_at
+            checkpoint_proof_hash = evidence.checkpoint_proof_hash
+        if (
+            selected_state == "waiting"
+            and any(
+                value is not None
+                for value in (
+                    resume_id,
+                    resume_request_hash,
+                    resume_ack_hash,
+                    resume_acknowledged_at,
+                )
+            )
+        ):
+            raise AdapterHandleError(
+                "CHECKPOINT_EVIDENCE_INVALID: waiting resume fields are invalid"
+            )
+        if (
+            selected_state == "requested"
+            and (
+                checkpoint_proof_hash is None
+                or PLAN_HASH.fullmatch(checkpoint_proof_hash) is None
+                or
+                resume_id is None
+                or resume_request_hash is None
+                or resume_ack_hash is not None
+                or resume_acknowledged_at is not None
+            )
+        ):
+            raise AdapterHandleError(
+                "CHECKPOINT_EVIDENCE_INVALID: requested resume fields are invalid"
+            )
+        if selected_state == "resumed" and (
+            checkpoint_proof_hash is None
+            or PLAN_HASH.fullmatch(checkpoint_proof_hash) is None
+            or any(
+                value is None
+                for value in (
+                    resume_id,
+                    resume_request_hash,
+                    resume_ack_hash,
+                    resume_acknowledged_at,
+                )
+            )
+        ):
+            raise AdapterHandleError(
+                "CHECKPOINT_EVIDENCE_INVALID: resumed fields are incomplete"
+            )
+        payload = {
+            "schema_version": "1.0.0",
+            "task_id": handle.task_id,
+            "node_id": handle.node_id,
+            "submission_id": handle.submission_id,
+            "attempt_id": evidence.attempt_id,
+            "attempt_number": evidence.attempt_number,
+            "checkpoint_id": evidence.checkpoint_id,
+            "checkpoint_index": evidence.checkpoint_index,
+            "completed_updates": evidence.completed_updates,
+            "binding_hash": evidence.binding_hash,
+            "submission_receipt_record_hash": record["record_hash"],
+            "ready_record_hash": evidence.ready_record_hash,
+            "checkpoint_manifest_relative_path": evidence.manifest_relative_path,
+            "checkpoint_manifest_size_bytes": evidence.manifest_size_bytes,
+            "checkpoint_manifest_hash": evidence.manifest_hash,
+            "checkpoint_receipt_record_hash": evidence.checkpoint_record_hash,
+            "checkpoint_proof_hash": checkpoint_proof_hash,
+            "checkpoint_created_at": evidence.checkpoint_created_at,
+            "state": selected_state,
+            "resume_id": resume_id,
+            "resume_request_record_hash": resume_request_hash,
+            "resume_acknowledgement_record_hash": resume_ack_hash,
+            "resume_acknowledged_at": resume_acknowledged_at,
+        }
+        return AdapterCheckpointProof(
+            task_id=payload["task_id"],
+            node_id=payload["node_id"],
+            submission_id=payload["submission_id"],
+            attempt_id=payload["attempt_id"],
+            attempt_number=payload["attempt_number"],
+            checkpoint_id=payload["checkpoint_id"],
+            checkpoint_index=payload["checkpoint_index"],
+            completed_updates=payload["completed_updates"],
+            binding_hash=payload["binding_hash"],
+            submission_receipt_record_hash=payload[
+                "submission_receipt_record_hash"
+            ],
+            ready_record_hash=payload["ready_record_hash"],
+            checkpoint_manifest_relative_path=payload[
+                "checkpoint_manifest_relative_path"
+            ],
+            checkpoint_manifest_size_bytes=payload[
+                "checkpoint_manifest_size_bytes"
+            ],
+            checkpoint_manifest_hash=payload["checkpoint_manifest_hash"],
+            checkpoint_receipt_record_hash=payload[
+                "checkpoint_receipt_record_hash"
+            ],
+            checkpoint_proof_hash=checkpoint_proof_hash,
+            checkpoint_created_at=payload["checkpoint_created_at"],
+            state=selected_state,
+            resume_id=resume_id,
+            resume_request_record_hash=resume_request_hash,
+            resume_acknowledgement_record_hash=resume_ack_hash,
+            resume_acknowledged_at=resume_acknowledged_at,
+            proof_hash=_sha256_document(payload),
+        )
+
+    @staticmethod
+    def _checkpoint_capability_is_current(
+        handle: AdapterHandle, record: Mapping[str, Any]
+    ) -> bool:
+        return (
+            handle.adapter_version == "1.6.0"
+            and handle.algorithm
+            == {"id": ALGORITHM_ID, "version": "1.6.0"}
+            and record.get("adapter_version") == "1.6.0"
+            and record.get("algorithm") == handle.algorithm
+            and _is_supported_managed_control_record(handle, record)
+        )
+
+    @staticmethod
+    def _checkpoint_control_error(error: WorkerControlError) -> AdapterError:
+        if error.code == "WORKER_CHECKPOINT_PENDING":
+            return AdapterUnavailable(
+                "CHECKPOINT_EVIDENCE_PENDING: checkpoint publication is incomplete"
+            )
+        if error.code in {
+            "WORKER_CHECKPOINT_ORPHANED",
+            "WORKER_CHECKPOINT_INVALID",
+            "WORKER_RESUME_INVALID",
+        }:
+            return AdapterUnavailable(
+                "CHECKPOINT_ACTION_REQUIRED: checkpoint evidence is ambiguous"
+            )
+        if error.code in {
+            "WORKER_RESUME_CONFLICT",
+            "WORKER_RESUME_REPLAY",
+        }:
+            return AdapterIdempotencyConflict(
+                "CHECKPOINT_RESUME_CONFLICT: resume identity changed"
+            )
+        return AdapterUnavailable(f"{error.code}: checkpoint control failed")
+
+    def _read_checkpoint_locked(
+        self, handle: AdapterHandle
+    ) -> tuple[dict[str, Any], WorkerCheckpointEvidence | None]:
+        record = self._record_for_handle(handle)
+        if not self._checkpoint_capability_is_current(handle, record):
+            raise AdapterUnavailable(
+                "CHECKPOINT_CAPABILITY_UNAVAILABLE: receipt is not immutable 1.6"
+            )
+        binding = binding_from_submission_record(record)
+        try:
+            evidence = read_worker_checkpoint_evidence(
+                self._run_root, self._job_directory(record), binding
+            )
+        except WorkerControlError as error:
+            raise self._checkpoint_control_error(error) from error
+        return record, evidence
+
+    def probe_runtime_checkpoint(
+        self, handle: AdapterHandle
+    ) -> AdapterCheckpointProof | None:
+        """Probe the sole checkpoint under the exact submission lock."""
+
+        lock_path = self._checkpoint_submission_lock_path(handle)
+        with self._lock_submission(
+            lock_path, create=False, timeout_seconds=5.0
+        ):
+            record, evidence = self._read_checkpoint_locked(handle)
+            if evidence is None:
+                return None
+            return self._checkpoint_proof_from_evidence(
+                handle, record, evidence
+            )
+
+    @staticmethod
+    def _validate_checkpoint_resume_authorization(
+        value: Mapping[str, Any],
+        handle: AdapterHandle,
+        waiting: AdapterCheckpointProof,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        required = {
+            "schema_version",
+            "intent_id",
+            "task_id",
+            "node_id",
+            "submission_id",
+            "attempt_id",
+            "attempt_number",
+            "checkpoint_id",
+            "checkpoint_manifest_hash",
+            "checkpoint_receipt_record_hash",
+            "checkpoint_proof_hash",
+            "resume_id",
+            "authorized_at",
+            "resume_request_record_hash",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise AdapterHandleError(
+                "CHECKPOINT_RESUME_AUTHORIZATION_INVALID: fields are invalid"
+            )
+        token = copy.deepcopy(dict(value))
+        if (
+            token.get("schema_version") != "1.0.0"
+            or not isinstance(token.get("intent_id"), str)
+            or OPAQUE_ID.fullmatch(token["intent_id"]) is None
+            or token.get("task_id") != handle.task_id
+            or token.get("node_id") != handle.node_id
+            or token.get("submission_id") != handle.submission_id
+            or token.get("attempt_id") != waiting.attempt_id
+            or token.get("attempt_number") != waiting.attempt_number
+            or token.get("checkpoint_id") != waiting.checkpoint_id
+            or token.get("checkpoint_manifest_hash")
+            != waiting.checkpoint_manifest_hash
+            or token.get("checkpoint_receipt_record_hash")
+            != waiting.checkpoint_receipt_record_hash
+            or token.get("checkpoint_proof_hash") != waiting.proof_hash
+            or MANAGED_RESUME_ID.fullmatch(token.get("resume_id", "")) is None
+            or PLAN_HASH.fullmatch(
+                token.get("resume_request_record_hash", "")
+            )
+            is None
+        ):
+            raise AdapterHandleError(
+                "CHECKPOINT_RESUME_AUTHORIZATION_INVALID: binding changed"
+            )
+        _parse_timestamp(
+            token.get("authorized_at"), code="CHECKPOINT_RESUME_AUTHORIZATION_INVALID"
+        )
+        request_payload = {
+            "schema_version": "1.0.0",
+            "resume_id": token["resume_id"],
+            "submission_id": token["submission_id"],
+            "attempt_id": token["attempt_id"],
+            "attempt_number": token["attempt_number"],
+            "checkpoint_id": token["checkpoint_id"],
+            "checkpoint_manifest_hash": token["checkpoint_manifest_hash"],
+            "checkpoint_receipt_record_hash": token[
+                "checkpoint_receipt_record_hash"
+            ],
+            "checkpoint_proof_hash": token["checkpoint_proof_hash"],
+            "authorized_at": token["authorized_at"],
+        }
+        request_document = {
+            **request_payload,
+            "record_hash": _sha256_document(request_payload),
+        }
+        if (
+            request_document["record_hash"]
+            != token["resume_request_record_hash"]
+        ):
+            raise AdapterHandleError(
+                "CHECKPOINT_RESUME_AUTHORIZATION_INVALID: request hash changed"
+            )
+        return token, request_document
+
+    def resume_runtime_checkpoint(
+        self,
+        handle: AdapterHandle,
+        *,
+        authorization: Mapping[str, Any],
+    ) -> AdapterCheckpointProof:
+        """Resume only the exact live Worker; this path has no launcher call."""
+
+        lock_path = self._checkpoint_submission_lock_path(handle)
+        with self._lock_submission(
+            lock_path, create=False, timeout_seconds=5.0
+        ):
+            record, evidence = self._read_checkpoint_locked(handle)
+            if evidence is None:
+                raise AdapterUnavailable(
+                    "CHECKPOINT_NOT_WAITING: checkpoint barrier was not reached"
+                )
+            waiting = self._checkpoint_proof_from_evidence(
+                handle, record, evidence, state="waiting"
+            )
+            token, request_document = self._validate_checkpoint_resume_authorization(
+                authorization, handle, waiting
+            )
+            if evidence.state in {"requested", "resumed"} and (
+                evidence.resume_id != token["resume_id"]
+                or evidence.checkpoint_proof_hash != token["checkpoint_proof_hash"]
+                or evidence.resume_request_record_hash
+                != token["resume_request_record_hash"]
+            ):
+                raise AdapterIdempotencyConflict(
+                    "CHECKPOINT_RESUME_CONFLICT: existing resume request changed"
+                )
+            binding = binding_from_submission_record(record)
+            try:
+                resumed = request_worker_checkpoint_resume(
+                    self._run_root,
+                    self._job_directory(record),
+                    binding,
+                    request_document=request_document,
+                )
+            except WorkerControlError as error:
+                raise self._checkpoint_control_error(error) from error
+            return self._checkpoint_proof_from_evidence(
+                handle, record, resumed
+            )
 
     def _job_directory(self, record: Mapping[str, Any]) -> Path:
         job_id = record["job_id"]
@@ -5235,7 +5765,7 @@ class DeepwaveAdapter:
         value = _read_json_file(job_dir / "status.json", code="ADAPTER_STATUS_INVALID")
         exit_receipt_path = job_dir / WORKER_EXIT_NAME
         if (
-            value.get("status") in {"queued", "running"}
+            value.get("status") in {"queued", "running", "waiting"}
             and _is_supported_managed_record(record)
             and not cancellation_fence_held
             and not timeout_fence_held
@@ -5259,6 +5789,7 @@ class DeepwaveAdapter:
         mapping = {
             "queued": "Queued",
             "running": "Running",
+            "waiting": "Waiting",
             "succeeded": "Succeeded",
             "failed": "Failed",
             "cancelled": "Cancelled",
@@ -5279,6 +5810,7 @@ class DeepwaveAdapter:
             "generate_observed",
             "gradient_check",
             "invert",
+            "checkpoint_wait",
             "plot",
             "complete",
             "failed",
@@ -5320,7 +5852,13 @@ class DeepwaveAdapter:
                     "failed",
                     "worker_exit",
                     "cancelled",
+                    "checkpoint_wait",
                 }
+            )
+            or (
+                worker_status == "waiting"
+                and value["stage"] == "checkpoint_wait"
+                and completed == 1
             )
             or (
                 worker_status == "succeeded"
@@ -5340,6 +5878,35 @@ class DeepwaveAdapter:
             raise AdapterStatusError(
                 "ADAPTER_STATUS_INVALID: status, stage, and progress contradict one another"
             )
+        if worker_status == "waiting":
+            if not (
+                record.get("adapter_version") == "1.6.0"
+                and record.get("algorithm")
+                == {"id": ALGORITHM_ID, "version": "1.6.0"}
+            ):
+                raise AdapterStatusError(
+                    "ADAPTER_STATUS_INVALID: Waiting is not supported by this receipt"
+                )
+            try:
+                checkpoint = read_worker_checkpoint_evidence(
+                    self._run_root,
+                    job_dir,
+                    binding_from_submission_record(record),
+                )
+            except WorkerControlError as error:
+                raise AdapterStatusError(
+                    "ADAPTER_STATUS_INVALID: checkpoint Waiting proof is invalid"
+                ) from error
+            if (
+                checkpoint is None
+                or checkpoint.state not in {"waiting", "requested"}
+                or value.get("checkpoint_id") != checkpoint.checkpoint_id
+                or value.get("checkpoint_record_hash")
+                != checkpoint.checkpoint_record_hash
+            ):
+                raise AdapterStatusError(
+                    "ADAPTER_STATUS_INVALID: checkpoint Waiting proof changed"
+                )
         failure_code = value.get("failure_code")
         if failure_code is not None and (
             worker_status != "failed" or failure_code != "WALL_TIME_EXCEEDED"
@@ -5470,6 +6037,7 @@ class DeepwaveAdapter:
         controlled_messages = {
             "Queued": "FWI job is queued",
             "Running": f"FWI job is running ({value['stage']})",
+            "Waiting": "FWI job is waiting at a durable checkpoint",
             "Succeeded": "FWI job succeeded",
             "Failed": "FWI Worker reported a failure",
             "Cancelled": "FWI job was cancelled",
@@ -5623,7 +6191,7 @@ class DeepwaveAdapter:
             if (
                 record["schema_version"]
                 != ("1.3.0" if worker_exit_lineage else "1.2.0")
-                or record["adapter_version"] != ADAPTER_VERSION
+                or record["adapter_version"] != validated.algorithm["version"]
                 or record["algorithm"] != validated.algorithm
                 or record["submission_id"] != submission_id
                 or record["task_id"] != task_id
@@ -5980,7 +6548,7 @@ class DeepwaveAdapter:
                     attempt is None
                     or attempt.ticket_state != "spawned"
                     or not attempt.ready
-                    or attempt.heartbeat_state != "running"
+                    or attempt.heartbeat_state not in {"running", "waiting"}
                     or capability is None
                     or capability.get("supported_reasons")
                     != ["user_requested", "wall_time_exceeded"]
@@ -6067,7 +6635,7 @@ class DeepwaveAdapter:
                     attempt is None
                     or attempt.ticket_state != "spawned"
                     or not attempt.ready
-                    or attempt.heartbeat_state != "running"
+                    or attempt.heartbeat_state not in {"running", "waiting"}
                 ):
                     return False
                 capability = read_worker_cancel_capability(
@@ -6167,10 +6735,22 @@ class DeepwaveAdapter:
             try:
                 binding = binding_from_submission_record(record)
                 job_dir = self._job_directory(record)
+            except WorkerControlError as error:
+                raise AdapterHandleError(
+                    "ADAPTER_CANCEL_INVALID: managed attempt evidence is invalid"
+                ) from error
+            try:
                 observed = self._status_for_record(
                     record, allow_pending_cancel=True
                 )
-            except (WorkerControlError, AdapterStatusError) as error:
+            except AdapterStatusError as error:
+                if _is_orphaned_checkpoint_waiting(error):
+                    observed = None
+                else:
+                    raise AdapterHandleError(
+                        "ADAPTER_CANCEL_INVALID: managed attempt evidence is invalid"
+                    ) from error
+            except WorkerControlError as error:
                 raise AdapterHandleError(
                     "ADAPTER_CANCEL_INVALID: managed attempt evidence is invalid"
                 ) from error
@@ -6192,7 +6772,11 @@ class DeepwaveAdapter:
             # wins, and needs no cancellation capability.  Raw Cancelled is
             # not included here: _status_for_record proves its exact
             # request/ack/stopped/idle chain before exposing it.
-            if observed.terminal and observed.status in {"Succeeded", "Failed"}:
+            if (
+                observed is not None
+                and observed.terminal
+                and observed.status in {"Succeeded", "Failed"}
+            ):
                 terminal_evidence: WorkerCancelEvidence | None = None
                 try:
                     terminal_evidence = read_worker_cancel_evidence(
@@ -6263,7 +6847,7 @@ class DeepwaveAdapter:
                     "CANCEL_IDEMPOTENCY_CONFLICT: attempt has another cancellation"
                 )
 
-            if observed.terminal:
+            if observed is not None and observed.terminal:
                 if observed.status == "Cancelled":
                     if (
                         existing_cancel is None
@@ -6313,9 +6897,9 @@ class DeepwaveAdapter:
                 or (
                     attempt.heartbeat_state
                     not in (
-                        {"running", "stopped"}
+                        {"running", "waiting", "stopped"}
                         if existing_cancel.requested
-                        else {"running"}
+                        else {"running", "waiting"}
                     )
                 )
             ):
@@ -6369,10 +6953,24 @@ class DeepwaveAdapter:
                     # The Worker can finish naturally after request publication.
                     # Re-read terminal status inside the idle fence so success or
                     # failure can never be overwritten by cancellation.
-                    terminal = self._status_for_record(
-                        record, cancellation_fence_held=True
-                    )
-                    if terminal.terminal and terminal.status != "Cancelled":
+                    try:
+                        terminal = self._status_for_record(
+                            record, cancellation_fence_held=True
+                        )
+                    except AdapterStatusError as error:
+                        if _is_orphaned_checkpoint_waiting(
+                            error, idle_fence_held=True
+                        ):
+                            terminal = None
+                        else:
+                            raise AdapterHandleError(
+                                "ADAPTER_CANCEL_INVALID: terminal status is invalid"
+                            ) from error
+                    if (
+                        terminal is not None
+                        and terminal.terminal
+                        and terminal.status != "Cancelled"
+                    ):
                         return _managed_cancel_proof(
                             task_id=handle.task_id,
                             cancel_id=cancel_id,
@@ -6424,7 +7022,12 @@ class DeepwaveAdapter:
                     value = _read_json_file(
                         job_dir / "status.json", code="WORKER_STATUS_INVALID"
                     )
-                    if value.get("status") not in {"queued", "running", "cancelled"}:
+                    if value.get("status") not in {
+                        "queued",
+                        "running",
+                        "waiting",
+                        "cancelled",
+                    }:
                         return _managed_cancel_proof(
                             task_id=handle.task_id,
                             cancel_id=cancel_id,
@@ -6563,10 +7166,22 @@ class DeepwaveAdapter:
             try:
                 binding = binding_from_submission_record(record)
                 job_dir = self._job_directory(record)
+            except WorkerControlError as error:
+                raise AdapterHandleError(
+                    "ADAPTER_TIMEOUT_INVALID: managed attempt evidence is invalid"
+                ) from error
+            try:
                 observed = self._status_for_record(
                     record, allow_pending_timeout=True
                 )
-            except (WorkerControlError, AdapterStatusError) as error:
+            except AdapterStatusError as error:
+                if _is_orphaned_checkpoint_waiting(error):
+                    observed = None
+                else:
+                    raise AdapterHandleError(
+                        "ADAPTER_TIMEOUT_INVALID: managed attempt evidence is invalid"
+                    ) from error
+            except WorkerControlError as error:
                 raise AdapterHandleError(
                     "ADAPTER_TIMEOUT_INVALID: managed attempt evidence is invalid"
                 ) from error
@@ -6663,7 +7278,7 @@ class DeepwaveAdapter:
                 job_dir / "status.json", code="WORKER_STATUS_INVALID"
             )
             raw_failure_code = raw_status.get("failure_code")
-            if observed.terminal and (
+            if observed is not None and observed.terminal and (
                 observed.status == "Succeeded"
                 or (
                     observed.status == "Failed"
@@ -6748,7 +7363,11 @@ class DeepwaveAdapter:
                 or attempt.ticket_state != "spawned"
                 or not attempt.ready
                 or attempt.heartbeat_state
-                not in ({"running", "stopped"} if existing and existing.requested else {"running"})
+                not in (
+                    {"running", "waiting", "stopped"}
+                    if existing and existing.requested
+                    else {"running", "waiting"}
+                )
             ):
                 return _managed_timeout_proof(
                     task_id=handle.task_id,
@@ -6823,6 +7442,18 @@ class DeepwaveAdapter:
                     raw_status = _read_json_file(
                         job_dir / "status.json", code="WORKER_STATUS_INVALID"
                     )
+                    if raw_status.get("status") == "waiting":
+                        try:
+                            self._status_for_record(
+                                record, timeout_fence_held=True
+                            )
+                        except AdapterStatusError as error:
+                            if not _is_orphaned_checkpoint_waiting(
+                                error, idle_fence_held=True
+                            ):
+                                raise AdapterHandleError(
+                                    "ADAPTER_TIMEOUT_INVALID: terminal status is invalid"
+                                ) from error
                     if raw_status.get("status") in {"succeeded", "failed"} and raw_status.get(
                         "failure_code"
                     ) != "WALL_TIME_EXCEEDED":
@@ -6898,6 +7529,7 @@ class DeepwaveAdapter:
                     if raw_status.get("status") not in {
                         "queued",
                         "running",
+                        "waiting",
                         "failed",
                     }:
                         raise AdapterHandleError(
@@ -7497,7 +8129,7 @@ class DeepwaveAdapter:
         # Algorithm/Adapter 1.0--1.3 promised only the two primary numerical
         # outputs.  Their immutable receipts remain readable as that exact
         # pair even though the legacy Worker happened to write PNG files too.
-        if record["algorithm"]["version"] not in {"1.4.0", "1.5.0"}:
+        if record["algorithm"]["version"] not in {"1.4.0", "1.5.0", "1.6.0"}:
             return artifacts
 
         # Algorithm 1.4/1.5 promote the six fixed Worker plots to declared,

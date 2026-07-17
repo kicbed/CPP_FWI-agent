@@ -15,6 +15,7 @@ from scientific_runtime import task_store as task_store_module
 from scientific_runtime.fwi_registry import load_deepwave_manifest
 from scientific_runtime.registry_service import RegistryService
 from scientific_runtime.task_service import (
+    TaskConflict,
     TaskService,
     TaskSupervisorLeaseLost,
 )
@@ -52,6 +53,56 @@ T_PLUS_19 = "2026-07-15T03:00:19Z"
 T_PLUS_20 = "2026-07-15T03:00:20Z"
 T_PLUS_21 = "2026-07-15T03:00:21Z"
 T_PLUS_30 = "2026-07-15T03:00:30Z"
+CHECKPOINT_AT = "2026-07-15T03:00:01.000000Z"
+RESUME_ACK_AT = "2026-07-15T03:00:10.000000Z"
+
+
+def checkpoint_adapter_proof(
+    *,
+    task_id: str,
+    node_id: str,
+    submission_id: str,
+    attempt_id: str,
+    attempt_number: int,
+    binding_hash: str,
+    ready_record_hash: str,
+    state: str = "waiting",
+    checkpoint_proof_hash: str | None = None,
+    resume_id: str | None = None,
+    resume_request_record_hash: str | None = None,
+) -> dict:
+    payload = {
+        "schema_version": "1.0.0",
+        "task_id": task_id,
+        "node_id": node_id,
+        "submission_id": submission_id,
+        "attempt_id": attempt_id,
+        "attempt_number": attempt_number,
+        "checkpoint_id": "checkpoint-" + "a" * 32,
+        "checkpoint_index": 1,
+        "completed_updates": 1,
+        "binding_hash": binding_hash,
+        "submission_receipt_record_hash": "sha256:" + "1" * 64,
+        "ready_record_hash": ready_record_hash,
+        "checkpoint_manifest_relative_path": (
+            "checkpoints/checkpoint-" + "a" * 32 + "/manifest.json"
+        ),
+        "checkpoint_manifest_size_bytes": 512,
+        "checkpoint_manifest_hash": "sha256:" + "2" * 64,
+        "checkpoint_receipt_record_hash": "sha256:" + "3" * 64,
+        "checkpoint_created_at": CHECKPOINT_AT,
+        "state": state,
+        "checkpoint_proof_hash": checkpoint_proof_hash,
+        "resume_id": resume_id,
+        "resume_request_record_hash": resume_request_record_hash,
+        "resume_acknowledgement_record_hash": (
+            "sha256:" + "4" * 64 if state == "resumed" else None
+        ),
+        "resume_acknowledged_at": (
+            RESUME_ACK_AT if state == "resumed" else None
+        ),
+    }
+    return {**payload, "proof_hash": encode_document(payload)[1]}
 
 
 def cancel_adapter_proof(
@@ -141,6 +192,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         self.registry.register_dataset(dataset=dataset_ref())
         self.registry.register_algorithm(manifest=algorithm_manifest())
         self.registry.register_algorithm(manifest=load_deepwave_manifest("1.4.0"))
+        self.registry.register_algorithm(manifest=load_deepwave_manifest("1.5.0"))
         self.registry.register_algorithm(manifest=load_deepwave_manifest())
         self.next_task_id = 0
 
@@ -161,6 +213,29 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_worker_evidence_timestamp_has_one_rfc3339_spelling_set(
+        self,
+    ) -> None:
+        for accepted in (
+            "2026-07-15T03:00:00Z",
+            "2026-07-15T03:00:00.123Z",
+            "2026-07-15T03:00:00.123456Z",
+        ):
+            task_store_module._worker_evidence_timestamp(accepted)
+        for rejected in (
+            "2026-07-15 03:00:00Z",
+            "2026-07-15t03:00:00Z",
+            "2026-07-15X03:00:00Z",
+            "2026-07-15T03:00Z",
+            "2026-07-15T03Z",
+            "2026-07-15T03:00:00.1Z",
+        ):
+            with self.subTest(timestamp=rejected):
+                with self.assertRaisesRegex(
+                    TaskStoreConflict, "Worker evidence timestamp is invalid"
+                ):
+                    task_store_module._worker_evidence_timestamp(rejected)
 
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
@@ -245,6 +320,35 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         )
         connection.execute("DROP TABLE dispatch_reconciliation_observations")
 
+    @staticmethod
+    def _drop_checkpoint_schema(connection: sqlite3.Connection) -> None:
+        for trigger in (
+            "worker_attempt_waiting_requires_checkpoint_capable_intent",
+            "worker_checkpoint_wait_requires_active_term",
+            "worker_checkpoint_wait_requires_exact_live_attempt",
+            "checkpoint_resume_request_requires_current_wait",
+            "checkpoint_resume_authorization_requires_active_term",
+            "checkpoint_resume_authorization_requires_current_wait",
+            "checkpoint_resume_authorization_reuses_worker_request",
+            "checkpoint_resume_outcome_requires_active_term",
+            "checkpoint_resume_outcome_requires_exact_ack",
+            "worker_checkpoint_waits_are_append_only",
+            "worker_checkpoint_waits_cannot_be_deleted",
+            "checkpoint_resume_requests_are_append_only",
+            "checkpoint_resume_requests_cannot_be_deleted",
+            "checkpoint_resume_authorizations_are_append_only",
+            "checkpoint_resume_authorizations_cannot_be_deleted",
+            "checkpoint_resume_outcomes_are_append_only",
+            "checkpoint_resume_outcomes_cannot_be_deleted",
+        ):
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        connection.execute("DROP TABLE task_checkpoint_resume_outcomes")
+        connection.execute(
+            "DROP TABLE supervised_checkpoint_resume_authorizations"
+        )
+        connection.execute("DROP TABLE task_checkpoint_resume_requests")
+        connection.execute("DROP TABLE worker_checkpoint_waits")
+
     def _acquire(
         self,
         owner_id: str,
@@ -265,7 +369,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         key: str,
         deferred: bool = False,
         wall_time_seconds: int | None = None,
-        algorithm_version: str = "1.5.0",
+        algorithm_version: str = "1.6.0",
         dispatcher: FakeDispatcher | None = None,
     ):
         token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
@@ -281,6 +385,9 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         task_id = created.snapshot.task_id
 
         plan = optimizer_plan_graph(algorithm_version=algorithm_version)
+        plan["nodes"][0]["outputs"] = copy.deepcopy(
+            load_deepwave_manifest(algorithm_version)["outputs"]
+        )
         plan["plan_id"] = f"plan-{token}"
         plan["draft"] = {
             "draft_id": draft["draft_id"],
@@ -294,7 +401,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         plan["plan_hash"] = compute_plan_hash(plan)
         self.service.persist_plan(task_id=task_id, plan=plan, **self.scope)
         approval = executable_approval_decision(plan)
-        if algorithm_version != "1.5.0":
+        if algorithm_version not in {"1.5.0", "1.6.0"}:
             # Historical bindings remain readable, but ApprovalDecision 1.1
             # grants the finite retry budget only to the current 1.5 pair.
             approval["schema_version"] = "1.0.0"
@@ -326,7 +433,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "idempotency_key": f"submit-{key}",
             **self.scope,
         }
-        if algorithm_version == "1.5.0":
+        if algorithm_version == "1.6.0":
             submitted = runtime.submit_task(**submit_arguments)
         else:
             # Reconstruct a receipt admitted while 1.4 was the fixed current
@@ -363,7 +470,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         return task_id, dispatcher, runtime
 
     def _reconciliation_runtime(
-        self, *, key: str, algorithm_version: str = "1.5.0"
+        self, *, key: str, algorithm_version: str = "1.6.0"
     ):
         task_id, dispatcher, runtime, intent = self._pending_runtime(
             key=key, algorithm_version=algorithm_version
@@ -381,6 +488,38 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         self.assertEqual(reconciled.state, "reconciliation_required")
         self.assertIsNotNone(reconciled.reconciliation)
         return task_id, dispatcher, runtime, reconciled
+
+    def test_historical_waiting_observation_is_rejected_before_persistence(
+        self,
+    ) -> None:
+        task_id, dispatcher, runtime, _ = self._pending_runtime(
+            key="historical-waiting-store-boundary",
+            algorithm_version="1.4.0",
+        )
+        dispatcher.first_dispatch_heartbeat_state = "waiting"
+        lease = self._acquire(
+            "historical-waiting-store-owner", lease_seconds=30
+        ).lease
+        try:
+            with self.assertRaisesRegex(TaskConflict, "exact 1.6"):
+                runtime.schedule_runtime_dispatch(
+                    task_id,
+                    supervisor_lease=lease,
+                    **self.scope,
+                )
+        finally:
+            runtime.release_runtime_supervisor_lease(lease)
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_attempt_observations"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+        self.assertIsNone(self.store.get_task_cancel_candidate(task_id))
 
     def _negative_reconciliation_inputs(
         self,
@@ -400,6 +539,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         private_schema_version = {
             "1.4.0": "1.1.0",
             "1.5.0": "1.2.0",
+            "1.6.0": "1.2.0",
         }[adapter_version]
         private_record_hash = "sha256:" + hashlib.sha256(
             (intent.intent_id + "\x1fprivate-negative-proof").encode("utf-8")
@@ -495,6 +635,771 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         self.assertFalse(admitted.replayed)
         self.assertIsNotNone(admitted.snapshot.cancellation)
         return task_id, dispatcher, runtime, acquisition.lease, admitted
+
+    def _checkpoint_runtime(
+        self,
+        *,
+        key: str,
+        project_waiting: bool = False,
+        wall_time_seconds: int | None = None,
+        checkpoint_clock: str = T_PLUS_5,
+        commit: bool = True,
+    ):
+        task_id, dispatcher, runtime, _ = self._pending_runtime(
+            key=key, wall_time_seconds=wall_time_seconds
+        )
+        acquisition = runtime.acquire_runtime_supervisor_lease(
+            **self.scope,
+            owner_id=f"checkpoint-owner-{key}",
+            lease_seconds=30,
+        )
+        self.assertTrue(acquisition.acquired)
+        if wall_time_seconds is not None:
+            def supports_exact_timeout(_intent, *, attempt_id):
+                connection = self._connection()
+                try:
+                    attempt = connection.execute(
+                        "SELECT binding_hash FROM worker_launch_attempts "
+                        "WHERE attempt_id = ?",
+                        (attempt_id,),
+                    ).fetchone()
+                    self.assertIsNotNone(attempt)
+                    assert attempt is not None
+                    return timeout_capability_proof(
+                        attempt_id=attempt_id,
+                        binding_hash=attempt["binding_hash"],
+                    )
+                finally:
+                    connection.close()
+
+            dispatcher.supports_exact_timeout = supports_exact_timeout
+        scheduled = runtime.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        dispatcher.adapter_status = {
+            "status": "Running",
+            "stage": "inversion",
+            "completed": 1,
+            "total": 2,
+            "message": "iteration 1 of 2",
+            "updated_at": NOW,
+            "terminal": False,
+        }
+        refreshed = runtime.refresh_runtime_status(
+            task_id,
+            **self.scope,
+            supervisor_lease=acquisition.lease,
+        )
+        self.assertEqual(refreshed.snapshot.status, "Running")
+        if project_waiting:
+            evidence = copy.deepcopy(dispatcher.worker_observation["evidence"])
+            heartbeat = evidence["heartbeat"]
+            heartbeat["sequence"] += 1
+            heartbeat["state"] = "waiting"
+            heartbeat["updated_at"] = CHECKPOINT_AT
+            heartbeat_payload = {
+                "schema_version": "1.0.0",
+                "submission_id": evidence["submission_id"],
+                "attempt_id": evidence["attempt_id"],
+                "attempt_number": evidence["attempt_number"],
+                "binding_hash": evidence["binding_hash"],
+                "job_id": evidence["job_id"],
+                "capacity_slot": evidence["ticket"]["capacity_slot"],
+                "capacity_generation": evidence["ticket"][
+                    "capacity_generation"
+                ],
+                "sequence": heartbeat["sequence"],
+                "state": "waiting",
+                "worker_pid": evidence["ready"]["worker_pid"],
+                "started_at": evidence["ready"]["started_at"],
+                "updated_at": CHECKPOINT_AT,
+            }
+            heartbeat["record_hash"] = encode_document(heartbeat_payload)[1]
+            projected = self.store.record_supervised_worker_observation(
+                intent_id=scheduled.intent.intent_id,
+                evidence=evidence,
+                handle=None,
+                supervisor_lease=acquisition.lease,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+            self.assertEqual(projected.observation_sequence, 2)
+        connection = self._connection()
+        try:
+            attempt = connection.execute(
+                """
+                SELECT attempt.*, observation.ready_record_hash,
+                       observation.heartbeat_state
+                FROM worker_launch_attempts AS attempt
+                JOIN worker_attempt_observations AS observation
+                  ON observation.attempt_id = attempt.attempt_id
+                WHERE attempt.intent_id = ?
+                ORDER BY observation.observation_sequence DESC LIMIT 1
+                """,
+                (scheduled.intent.intent_id,),
+            ).fetchone()
+            self.assertIsNotNone(attempt)
+            assert attempt is not None
+        finally:
+            connection.close()
+        proof = checkpoint_adapter_proof(
+            task_id=task_id,
+            node_id=scheduled.intent.node_id,
+            submission_id=attempt["submission_id"],
+            attempt_id=attempt["attempt_id"],
+            attempt_number=attempt["attempt_number"],
+            binding_hash=attempt["binding_hash"],
+            ready_record_hash=attempt["ready_record_hash"],
+        )
+        extension = {
+            "org.agent_rpc.checkpoint_wait": {
+                "checkpoint_id": proof["checkpoint_id"],
+                "checkpoint_index": 1,
+                "completed_updates": 1,
+                "same_attempt": True,
+            }
+        }
+        sequence = self.store.latest_run_event_sequence(task_id) + 1
+        base = {
+            "schema_version": "1.0.0",
+            "task_id": task_id,
+            "node_id": scheduled.intent.node_id,
+            "occurred_at": CHECKPOINT_AT,
+            "fingerprint": scheduled.intent.handle["fingerprint"],
+            "extensions": extension,
+        }
+        checkpoint_event = {
+            **base,
+            "event_id": f"event-checkpoint-{key}",
+            "sequence": sequence,
+            "event_type": "checkpoint_created",
+            "task_status": "Running",
+            "checkpoint": {
+                "relative_path": proof[
+                    "checkpoint_manifest_relative_path"
+                ]
+            },
+        }
+        waiting_event = {
+            **base,
+            "event_id": f"event-waiting-{key}",
+            "sequence": sequence + 1,
+            "event_type": "node_waiting",
+            "task_status": "Waiting",
+        }
+        waited = None
+        if commit:
+            waited = self.store.record_supervised_checkpoint_wait(
+                intent_id=scheduled.intent.intent_id,
+                checkpoint_proof=proof,
+                checkpoint_event=checkpoint_event,
+                waiting_event=waiting_event,
+                supervisor_lease=acquisition.lease,
+                supervisor_clock=lambda: checkpoint_clock,
+            )
+        return (
+            task_id,
+            scheduled.intent,
+            acquisition.lease,
+            waited,
+            proof,
+            runtime,
+            dispatcher,
+            checkpoint_event,
+            waiting_event,
+        )
+
+    def test_checkpoint_wait_and_exact_resume_are_one_attempt(self) -> None:
+        task_id, intent, lease, waited, waiting_proof, _, _, _, _ = (
+            self._checkpoint_runtime(key="store-resume")
+        )
+        assert waited is not None
+        self.assertEqual(waited.snapshot.status, "Waiting")
+        self.assertEqual(waited.checkpoint.state, "waiting")
+        self.assertEqual(
+            [event["event_type"] for event in self.store.list_run_events(task_id)[-2:]],
+            ["checkpoint_created", "node_waiting"],
+        )
+        admission = {
+            "schema_version": "1.0.0",
+            "task_id": task_id,
+            "checkpoint_id": waiting_proof["checkpoint_id"],
+            "action": "resume_exact_checkpoint",
+            "extensions": {},
+        }
+        request = self.store.request_checkpoint_resume(
+            task_id=task_id,
+            **self.scope,
+            idempotency_key=(
+                f"checkpoint-resume:{waiting_proof['checkpoint_id']}"
+            ),
+            request_hash=encode_document(admission)[1],
+            clock=lambda: T_PLUS_5,
+        )
+        self.assertEqual(request.checkpoint.state, "resume_requested")
+        authorization = self.store.authorize_supervised_checkpoint_resume(
+            resume_id=request.resume_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        token = authorization.adapter_token()
+        self.assertEqual(
+            token["checkpoint_proof_hash"], waiting_proof["proof_hash"]
+        )
+        self.assertRegex(
+            token["resume_request_record_hash"], r"^sha256:[0-9a-f]{64}$"
+        )
+        resumed_proof = checkpoint_adapter_proof(
+            task_id=task_id,
+            node_id=intent.node_id,
+            submission_id=waiting_proof["submission_id"],
+            attempt_id=waiting_proof["attempt_id"],
+            attempt_number=waiting_proof["attempt_number"],
+            binding_hash=waiting_proof["binding_hash"],
+            ready_record_hash=waiting_proof["ready_record_hash"],
+            state="resumed",
+            checkpoint_proof_hash=waiting_proof["proof_hash"],
+            resume_id=request.resume_id,
+            resume_request_record_hash=token[
+                "resume_request_record_hash"
+            ],
+        )
+        running_event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-resumed-store-resume",
+            "sequence": self.store.latest_run_event_sequence(task_id) + 1,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_started",
+            "task_status": "Running",
+            "occurred_at": RESUME_ACK_AT,
+            "fingerprint": intent.handle["fingerprint"],
+            "extensions": {
+                "org.agent_rpc.checkpoint_resume": {
+                    "checkpoint_id": waiting_proof["checkpoint_id"],
+                    "resume_id": request.resume_id,
+                    "same_attempt": True,
+                }
+            },
+        }
+        completed = self.store.complete_supervised_checkpoint_resume(
+            resume_id=request.resume_id,
+            adapter_proof=resumed_proof,
+            running_event=running_event,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_10,
+        )
+        self.assertEqual(completed.snapshot.status, "Running")
+        self.assertEqual(completed.checkpoint.state, "resumed")
+        self.assertEqual(
+            completed.checkpoint.attempt_id, waiting_proof["attempt_id"]
+        )
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_launch_attempts "
+                    "WHERE intent_id = ?",
+                    (intent.intent_id,),
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_checkpoint_resume_request_and_ack_survive_term_takeover(self) -> None:
+        task_id, intent, first, waited, waiting_proof, _, _, _, _ = (
+            self._checkpoint_runtime(key="store-resume-takeover")
+        )
+        assert waited is not None
+        admission = {
+            "schema_version": "1.0.0",
+            "task_id": task_id,
+            "checkpoint_id": waiting_proof["checkpoint_id"],
+            "action": "resume_exact_checkpoint",
+            "extensions": {},
+        }
+        request = self.store.request_checkpoint_resume(
+            task_id=task_id,
+            **self.scope,
+            idempotency_key=(
+                f"checkpoint-resume:{waiting_proof['checkpoint_id']}"
+            ),
+            request_hash=encode_document(admission)[1],
+            clock=lambda: T_PLUS_5,
+        )
+        first_authorization = (
+            self.store.authorize_supervised_checkpoint_resume(
+                resume_id=request.resume_id,
+                supervisor_lease=first,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+        )
+        stable_token = first_authorization.adapter_token()
+        resumed_proof = checkpoint_adapter_proof(
+            task_id=task_id,
+            node_id=intent.node_id,
+            submission_id=waiting_proof["submission_id"],
+            attempt_id=waiting_proof["attempt_id"],
+            attempt_number=waiting_proof["attempt_number"],
+            binding_hash=waiting_proof["binding_hash"],
+            ready_record_hash=waiting_proof["ready_record_hash"],
+            state="resumed",
+            checkpoint_proof_hash=waiting_proof["proof_hash"],
+            resume_id=request.resume_id,
+            resume_request_record_hash=stable_token[
+                "resume_request_record_hash"
+            ],
+        )
+        running_event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-resumed-store-resume-takeover",
+            "sequence": self.store.latest_run_event_sequence(task_id) + 1,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_started",
+            "task_status": "Running",
+            "occurred_at": RESUME_ACK_AT,
+            "fingerprint": intent.handle["fingerprint"],
+            "extensions": {
+                "org.agent_rpc.checkpoint_resume": {
+                    "checkpoint_id": waiting_proof["checkpoint_id"],
+                    "resume_id": request.resume_id,
+                    "same_attempt": True,
+                }
+            },
+        }
+
+        self.store.release_runtime_supervisor_lease(
+            lease=first, clock=lambda: T_PLUS_11
+        )
+        with self.assertRaises(RuntimeSupervisorLeaseLost):
+            self.store.complete_supervised_checkpoint_resume(
+                resume_id=request.resume_id,
+                adapter_proof=resumed_proof,
+                running_event=running_event,
+                supervisor_lease=first,
+                supervisor_clock=lambda: T_PLUS_11,
+            )
+
+        successor = self._acquire(
+            "store-resume-takeover-successor",
+            now=T_PLUS_11,
+            lease_seconds=30,
+        ).lease
+        successor_authorization = (
+            self.store.authorize_supervised_checkpoint_resume(
+                resume_id=request.resume_id,
+                supervisor_lease=successor,
+                supervisor_clock=lambda: T_PLUS_11,
+            )
+        )
+        self.assertNotEqual(
+            successor_authorization.fencing_token,
+            first_authorization.fencing_token,
+        )
+        self.assertEqual(
+            successor_authorization.authorized_at,
+            "2026-07-15T03:00:11.000000Z",
+        )
+        self.assertEqual(successor_authorization.adapter_token(), stable_token)
+        completed = self.store.complete_supervised_checkpoint_resume(
+            resume_id=request.resume_id,
+            adapter_proof=resumed_proof,
+            running_event=running_event,
+            supervisor_lease=successor,
+            supervisor_clock=lambda: T_PLUS_15,
+        )
+        self.assertEqual(completed.snapshot.status, "Running")
+        self.assertEqual(completed.checkpoint.checkpoint_id, waiting_proof["checkpoint_id"])
+
+        connection = self._connection()
+        try:
+            authorizations = connection.execute(
+                """
+                SELECT fencing_token, resume_request_record_hash,
+                       authorization_hash
+                FROM supervised_checkpoint_resume_authorizations
+                WHERE resume_id = ? ORDER BY fencing_token
+                """,
+                (request.resume_id,),
+            ).fetchall()
+            self.assertEqual(len(authorizations), 2)
+            self.assertEqual(
+                len({row["resume_request_record_hash"] for row in authorizations}),
+                1,
+            )
+            self.assertEqual(
+                len({row["authorization_hash"] for row in authorizations}),
+                1,
+            )
+            outcome = connection.execute(
+                "SELECT fencing_token FROM task_checkpoint_resume_outcomes "
+                "WHERE resume_id = ?",
+                (request.resume_id,),
+            ).fetchone()
+            self.assertEqual(outcome["fencing_token"], successor.fencing_token)
+        finally:
+            connection.close()
+
+    def test_waiting_worker_projection_can_commit_checkpoint(self) -> None:
+        task_id, intent, _, waited, proof, _, _, _, _ = self._checkpoint_runtime(
+            key="waiting-projection", project_waiting=True
+        )
+        assert waited is not None
+        self.assertEqual(waited.snapshot.status, "Waiting")
+        self.assertEqual(waited.checkpoint.attempt_id, proof["attempt_id"])
+        candidate = self.store.get_task_cancel_candidate(task_id)
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate["heartbeat"]["state"], "waiting")
+        self.assertEqual(candidate["attempt_id"], proof["attempt_id"])
+        self.assertEqual(intent.adapter_version, "1.6.0")
+
+    def test_waiting_task_can_cancel_the_exact_projected_attempt(self) -> None:
+        (
+            task_id,
+            _,
+            lease,
+            waited,
+            waiting_proof,
+            runtime,
+            dispatcher,
+            _,
+            _,
+        ) = self._checkpoint_runtime(
+            key="waiting-cancel", project_waiting=True
+        )
+        assert waited is not None
+        self.assertEqual(waited.snapshot.status, "Waiting")
+        self.now[0] = T_PLUS_5
+        admitted = runtime.cancel_task(
+            task_id=task_id,
+            reason="user_requested",
+            idempotency_key="cancel-waiting-cancel",
+            **self.scope,
+        )
+        cancellation = admitted.snapshot.cancellation
+        self.assertIsNotNone(cancellation)
+        assert cancellation is not None
+        self.assertEqual(cancellation.attempt_id, waiting_proof["attempt_id"])
+        authorized = self.store.authorize_supervised_cancel(
+            request_id=cancellation.request_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertFalse(authorized.replayed)
+        completed = runtime.process_runtime_cancellation(
+            task_id,
+            **self.scope,
+            supervisor_lease=lease,
+        )
+        self.assertEqual(completed.state, "cancelled")
+        self.assertEqual(self.store.get_task(task_id).status, "Cancelled")
+        self.assertEqual(dispatcher.cancel_requests[-1][1], waiting_proof["attempt_id"])
+
+    def test_due_timeout_can_complete_from_waiting(self) -> None:
+        (
+            task_id,
+            intent,
+            lease,
+            waited,
+            waiting_proof,
+            _,
+            _,
+            _,
+            _,
+        ) = self._checkpoint_runtime(
+            key="waiting-timeout",
+            project_waiting=True,
+            wall_time_seconds=5,
+            checkpoint_clock=T_PLUS_1,
+        )
+        assert waited is not None
+        timeout = waited.snapshot.timeout
+        self.assertIsNotNone(timeout)
+        assert timeout is not None
+        self.assertEqual(timeout.state, "armed")
+        self.assertEqual(timeout.attempt_id, waiting_proof["attempt_id"])
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        self.assertEqual(authorization.timeout.state, "requested")
+        proof = timeout_adapter_proof(
+            timeout=timeout,
+            state="timed_out",
+            terminal_status="Failed",
+            terminal_failure_code="WALL_TIME_EXCEEDED",
+            ready_record_hash=self._timeout_ready_record_hash(timeout.timeout_id),
+        )
+        event = self._confirmed_timeout_failure_event(
+            timeout=timeout,
+            intent=intent,
+            proof=proof,
+            event_id="event-waiting-timeout",
+            occurred_at=T_PLUS_5,
+        )
+        completed = self.store.complete_supervised_timeout(
+            timeout_id=timeout.timeout_id,
+            result="timeout_confirmed",
+            terminal_event=event,
+            adapter_proof=proof,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertEqual(completed.snapshot.status, "Failed")
+        self.assertEqual(completed.timeout.state, "timed_out")
+
+    def test_preexisting_cancel_blocks_checkpoint_wait_atomically(self) -> None:
+        (
+            task_id,
+            intent,
+            lease,
+            waited,
+            proof,
+            runtime,
+            _,
+            checkpoint_event,
+            waiting_event,
+        ) = self._checkpoint_runtime(key="cancel-before-wait", commit=False)
+        self.assertIsNone(waited)
+        self.now[0] = T_PLUS_1
+        admitted = runtime.cancel_task(
+            task_id=task_id,
+            reason="user_requested",
+            idempotency_key="cancel-before-checkpoint-wait",
+            **self.scope,
+        )
+        self.assertIsNotNone(admitted.snapshot.cancellation)
+        sequence = self.store.latest_run_event_sequence(task_id)
+        with self.assertRaisesRegex(
+            TaskStoreConflict, "cancellation has priority"
+        ):
+            self.store.record_supervised_checkpoint_wait(
+                intent_id=intent.intent_id,
+                checkpoint_proof=proof,
+                checkpoint_event=checkpoint_event,
+                waiting_event=waiting_event,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+        self.assertEqual(self.store.latest_run_event_sequence(task_id), sequence)
+        self.assertEqual(self.store.get_task(task_id).status, "Running")
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_checkpoint_waits "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_authorized_timeout_blocks_checkpoint_wait_atomically(self) -> None:
+        (
+            task_id,
+            intent,
+            lease,
+            waited,
+            proof,
+            _,
+            _,
+            checkpoint_event,
+            waiting_event,
+        ) = self._checkpoint_runtime(
+            key="timeout-before-wait",
+            wall_time_seconds=5,
+            commit=False,
+        )
+        self.assertIsNone(waited)
+        snapshot = self.store.get_task(task_id)
+        timeout = snapshot.timeout
+        self.assertIsNotNone(timeout)
+        assert timeout is not None
+        authorization = self.store.authorize_supervised_timeout(
+            timeout_id=timeout.timeout_id,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_5,
+        )
+        self.assertTrue(authorization.authorized)
+        sequence = self.store.latest_run_event_sequence(task_id)
+        with self.assertRaisesRegex(TaskStoreConflict, "timeout has priority"):
+            self.store.record_supervised_checkpoint_wait(
+                intent_id=intent.intent_id,
+                checkpoint_proof=proof,
+                checkpoint_event=checkpoint_event,
+                waiting_event=waiting_event,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+        self.assertEqual(self.store.latest_run_event_sequence(task_id), sequence)
+        self.assertEqual(self.store.get_task(task_id).status, "Running")
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_checkpoint_waits "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_checkpoint_wait_and_cancel_race_serializes_without_partial_state(
+        self,
+    ) -> None:
+        (
+            task_id,
+            intent,
+            lease,
+            _,
+            proof,
+            runtime,
+            _,
+            checkpoint_event,
+            waiting_event,
+        ) = self._checkpoint_runtime(key="cancel-wait-race", commit=False)
+        self.now[0] = T_PLUS_1
+        barrier = threading.Barrier(2)
+
+        def commit_checkpoint() -> str:
+            barrier.wait(timeout=5)
+            try:
+                self.store.record_supervised_checkpoint_wait(
+                    intent_id=intent.intent_id,
+                    checkpoint_proof=proof,
+                    checkpoint_event=checkpoint_event,
+                    waiting_event=waiting_event,
+                    supervisor_lease=lease,
+                    supervisor_clock=lambda: T_PLUS_1,
+                )
+            except TaskStoreConflict:
+                return "checkpoint_conflict"
+            return "checkpoint_committed"
+
+        def request_cancel() -> str:
+            barrier.wait(timeout=5)
+            runtime.cancel_task(
+                task_id=task_id,
+                reason="user_requested",
+                idempotency_key="cancel-concurrent-checkpoint-wait",
+                **self.scope,
+            )
+            return "cancel_requested"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = (
+                executor.submit(commit_checkpoint),
+                executor.submit(request_cancel),
+            )
+            results = {future.result() for future in futures}
+        self.assertIn("cancel_requested", results)
+        self.assertTrue(
+            {"checkpoint_conflict", "checkpoint_committed"} & results
+        )
+        snapshot = self.store.get_task(task_id)
+        self.assertIsNotNone(snapshot.cancellation)
+        assert snapshot.cancellation is not None
+        self.assertEqual(snapshot.cancellation.attempt_id, proof["attempt_id"])
+        connection = self._connection()
+        try:
+            checkpoint_count = connection.execute(
+                "SELECT COUNT(*) FROM worker_checkpoint_waits WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            self.assertIn(checkpoint_count, {0, 1})
+            if checkpoint_count == 0:
+                self.assertEqual(snapshot.status, "Running")
+            else:
+                self.assertEqual(snapshot.status, "Waiting")
+        finally:
+            connection.close()
+
+    def test_checkpoint_wait_and_timeout_race_serializes_timeout_priority(
+        self,
+    ) -> None:
+        (
+            task_id,
+            intent,
+            lease,
+            _,
+            proof,
+            _,
+            _,
+            checkpoint_event,
+            waiting_event,
+        ) = self._checkpoint_runtime(
+            key="timeout-wait-race",
+            wall_time_seconds=5,
+            commit=False,
+        )
+        timeout = self.store.get_task(task_id).timeout
+        self.assertIsNotNone(timeout)
+        assert timeout is not None
+        barrier = threading.Barrier(2)
+
+        def commit_checkpoint() -> str:
+            barrier.wait(timeout=5)
+            try:
+                self.store.record_supervised_checkpoint_wait(
+                    intent_id=intent.intent_id,
+                    checkpoint_proof=proof,
+                    checkpoint_event=checkpoint_event,
+                    waiting_event=waiting_event,
+                    supervisor_lease=lease,
+                    supervisor_clock=lambda: T_PLUS_1,
+                )
+            except TaskStoreConflict:
+                return "checkpoint_conflict"
+            return "checkpoint_committed"
+
+        def authorize_timeout() -> str:
+            barrier.wait(timeout=5)
+            authorization = self.store.authorize_supervised_timeout(
+                timeout_id=timeout.timeout_id,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+            self.assertTrue(authorization.authorized)
+            return "timeout_authorized"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = (
+                executor.submit(commit_checkpoint),
+                executor.submit(authorize_timeout),
+            )
+            results = {future.result() for future in futures}
+        self.assertIn("timeout_authorized", results)
+        self.assertTrue(
+            {"checkpoint_conflict", "checkpoint_committed"} & results
+        )
+        snapshot = self.store.get_task(task_id)
+        self.assertIsNotNone(snapshot.timeout)
+        assert snapshot.timeout is not None
+        self.assertEqual(snapshot.timeout.state, "requested")
+        connection = self._connection()
+        try:
+            checkpoint_count = connection.execute(
+                "SELECT COUNT(*) FROM worker_checkpoint_waits WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            self.assertIn(checkpoint_count, {0, 1})
+            self.assertEqual(
+                snapshot.status,
+                "Waiting" if checkpoint_count else "Running",
+            )
+        finally:
+            connection.close()
 
     def _timeout_runtime(self, *, key: str, wall_time_seconds: int = 5):
         task_id, dispatcher, runtime, _ = self._pending_runtime(
@@ -929,8 +1834,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             },
         }
 
-    def test_fresh_v16_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 16)
+    def test_fresh_v17_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 17)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -959,6 +1864,10 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "worker_exit_retry_exhaustions",
             "dispatch_reconciliation_observations",
             "dispatch_reconciliation_negative_resolutions",
+            "worker_checkpoint_waits",
+            "task_checkpoint_resume_requests",
+            "supervised_checkpoint_resume_authorizations",
+            "task_checkpoint_resume_outcomes",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -979,6 +1888,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "worker_attempt_observation_requires_active_term",
             "worker_attempt_observation_sequence_is_contiguous",
             "worker_attempt_observation_cannot_regress",
+            "worker_attempt_waiting_requires_checkpoint_capable_intent",
             "supervised_dispatch_adoption_requires_matching_attempt",
             "supervised_dispatch_adoption_requires_active_term",
             "worker_launch_attempts_are_append_only",
@@ -1070,6 +1980,22 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "dispatch_reconciliation_observations_cannot_be_deleted",
             "dispatch_reconciliation_negative_resolutions_are_immutable",
             "dispatch_reconciliation_negative_resolutions_cannot_be_deleted",
+            "worker_checkpoint_wait_requires_active_term",
+            "worker_checkpoint_wait_requires_exact_live_attempt",
+            "checkpoint_resume_request_requires_current_wait",
+            "checkpoint_resume_authorization_requires_active_term",
+            "checkpoint_resume_authorization_requires_current_wait",
+            "checkpoint_resume_authorization_reuses_worker_request",
+            "checkpoint_resume_outcome_requires_active_term",
+            "checkpoint_resume_outcome_requires_exact_ack",
+            "worker_checkpoint_waits_are_append_only",
+            "worker_checkpoint_waits_cannot_be_deleted",
+            "checkpoint_resume_requests_are_append_only",
+            "checkpoint_resume_requests_cannot_be_deleted",
+            "checkpoint_resume_authorizations_are_append_only",
+            "checkpoint_resume_authorizations_cannot_be_deleted",
+            "checkpoint_resume_outcomes_are_append_only",
+            "checkpoint_resume_outcomes_cannot_be_deleted",
         }
         expected_indexes = {
             "idx_worker_attempt_timeout_windows_scope_deadline",
@@ -1083,6 +2009,9 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "idx_worker_exit_retry_exhaustions_scope",
             "idx_dispatch_reconciliation_observations_scope",
             "idx_dispatch_reconciliation_negative_scope",
+            "idx_worker_checkpoint_waits_task",
+            "idx_checkpoint_resume_requests_task",
+            "idx_checkpoint_resume_authorizations_term",
         }
         connection = self._connection()
         try:
@@ -1169,6 +2098,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 negative_migration["name"],
                 "0016_dispatch_negative_reconciliation.sql",
             )
+            checkpoint_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 17"
+            ).fetchone()
+            self.assertEqual(
+                checkpoint_migration["name"],
+                "0017_checkpoint_wait_resume.sql",
+            )
         finally:
             connection.close()
 
@@ -1211,6 +2147,84 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 )
         finally:
             connection.rollback()
+            connection.close()
+
+    def test_real_v16_database_upgrades_catalog_constraints_to_v17(
+        self,
+    ) -> None:
+        historical_directory = Path(self.temporary.name) / "historical-v16"
+        historical_directory.mkdir(mode=0o700)
+        historical_path = historical_directory / "task.sqlite3"
+        connection = sqlite3.connect(historical_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(task_store_module.SCHEMA_MIGRATIONS_SQL)
+            for migration in task_store_module._load_migrations()[:16]:
+                for statement in task_store_module._migration_statements(
+                    migration.text
+                ):
+                    connection.execute(statement)
+                connection.execute(
+                    """
+                    INSERT INTO schema_migrations(
+                        version, name, checksum, applied_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        migration.version,
+                        migration.path.name,
+                        migration.checksum,
+                        NOW,
+                    ),
+                )
+                connection.execute(
+                    f"PRAGMA user_version = {migration.version}"
+                )
+            connection.execute(
+                f"PRAGMA application_id = {task_store_module.APPLICATION_ID}"
+            )
+            connection.commit()
+            heartbeat_schema = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' "
+                "AND name = 'worker_attempt_observations'"
+            ).fetchone()[0]
+            negative_schema = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' "
+                "AND name = 'dispatch_reconciliation_observations'"
+            ).fetchone()[0]
+            self.assertNotIn("'waiting'", heartbeat_schema)
+            self.assertNotIn("adapter_version = '1.6.0'", negative_schema)
+        finally:
+            connection.close()
+
+        upgraded = SQLiteTaskStore(historical_path)
+        self.assertEqual(upgraded.migration_version(), 17)
+        connection = sqlite3.connect(historical_path)
+        try:
+            heartbeat_schema = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' "
+                "AND name = 'worker_attempt_observations'"
+            ).fetchone()[0]
+            negative_schema = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' "
+                "AND name = 'dispatch_reconciliation_observations'"
+            ).fetchone()[0]
+            self.assertIn("'waiting'", heartbeat_schema)
+            self.assertIn("adapter_version = '1.6.0'", negative_schema)
+            self.assertEqual(
+                connection.execute("PRAGMA quick_check").fetchall(),
+                [("ok",)],
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+        finally:
             connection.close()
 
     def test_v15_worker_exit_retry_columns_are_a_stable_store_interface(
@@ -1313,7 +2327,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v14_database_upgrades_in_place_to_v16(self) -> None:
+    def test_v14_database_upgrades_in_place_to_v17(self) -> None:
         legacy_migrations = Path(self.temporary.name) / "v14-migrations"
         legacy_migrations.mkdir(mode=0o700)
         for migration in sorted(
@@ -1332,11 +2346,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 14)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 16)
+        self.assertEqual(upgraded.migration_version(), 17)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 16
+                connection.execute("PRAGMA user_version").fetchone()[0], 17
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -1350,7 +2364,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v15_database_upgrades_in_place_to_v16(self) -> None:
+    def test_v15_database_upgrades_in_place_to_v17(self) -> None:
         legacy_migrations = Path(self.temporary.name) / "v15-migrations"
         legacy_migrations.mkdir(mode=0o700)
         for migration in sorted(
@@ -1371,11 +2385,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 15)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 16)
+        self.assertEqual(upgraded.migration_version(), 17)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 16
+                connection.execute("PRAGMA user_version").fetchone()[0], 17
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -2024,12 +3038,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v16(self) -> None:
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v17(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            self._drop_checkpoint_schema(connection)
             self._drop_negative_reconciliation_schema(connection)
             self._drop_retry_schema(connection)
             connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
@@ -2060,7 +3075,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 16)
+        self.assertEqual(reopened.migration_version(), 17)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -2099,12 +3114,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v16(self) -> None:
+    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v17(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v12")
         acquired = self._acquire("upgrade-v12-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            self._drop_checkpoint_schema(connection)
             self._drop_negative_reconciliation_schema(connection)
             self._drop_retry_schema(connection)
             connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
@@ -2130,7 +3146,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 16)
+        self.assertEqual(reopened.migration_version(), 17)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -4894,7 +5910,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(
                 (binding["algorithm_version"], binding["adapter_version"]),
-                ("1.3.0", "1.5.0"),
+                ("1.3.0", "1.6.0"),
             )
             with self.assertRaisesRegex(
                 sqlite3.IntegrityError,

@@ -58,10 +58,11 @@ from tests.test_scientific_runtime_contracts import (
 
 
 NOW = "2026-07-15T03:00:00Z"
+CHECKPOINT_NOW = "2026-07-15T03:00:00.000000Z"
 PROJECT_ID = "project-1"
 PRINCIPAL_ID = "user-1"
-CURRENT_ALGORITHM_VERSION = "1.5.0"
-CURRENT_ADAPTER_VERSION = "1.5.0"
+CURRENT_ALGORITHM_VERSION = "1.6.0"
+CURRENT_ADAPTER_VERSION = "1.6.0"
 MANAGED_SUBMISSION_ID = "submission-" + "1" * 64
 MANAGED_ATTEMPT_ID = "attempt-" + "2" * 32
 MANAGED_JOB_ID = "fwi-20260715T030000Z-000000000001"
@@ -90,6 +91,23 @@ def executable_approval_decision(plan: dict) -> dict:
         ],
     }
     return value
+
+
+def current_optimizer_task_draft() -> dict:
+    return optimizer_task_draft(
+        algorithm_version=CURRENT_ALGORITHM_VERSION
+    )
+
+
+def current_optimizer_plan_graph() -> dict:
+    plan = optimizer_plan_graph(
+        algorithm_version=CURRENT_ALGORITHM_VERSION
+    )
+    plan["nodes"][0]["outputs"] = copy.deepcopy(
+        load_deepwave_manifest(CURRENT_ALGORITHM_VERSION)["outputs"]
+    )
+    plan["plan_hash"] = compute_plan_hash(plan)
+    return plan
 
 
 def executable_fingerprint(
@@ -125,6 +143,7 @@ def managed_worker_evidence(
     attempt_number: int = 1,
     job_id: str = MANAGED_JOB_ID,
     created_at: str = NOW,
+    worker_started_at: str = NOW,
 ) -> dict:
     binding = {
         "schema_version": "1.0.0",
@@ -170,7 +189,7 @@ def managed_worker_evidence(
         "capacity_slot": 0,
         "capacity_generation": 1,
         "worker_pid": 4242,
-        "started_at": NOW,
+        "started_at": worker_started_at,
     }
     heartbeat = None
     if heartbeat_sequence is not None:
@@ -199,11 +218,57 @@ def managed_worker_evidence(
         },
         "ready": {
             "worker_pid": 4242,
-            "started_at": NOW,
+            "started_at": worker_started_at,
             "record_hash": encode_document(ready)[1],
         },
         "heartbeat": heartbeat,
     }
+
+
+def checkpoint_wait_proof(
+    task_id: str,
+    observation: dict,
+    *,
+    checkpoint_index: int = 1,
+    checkpoint_created_at: str = CHECKPOINT_NOW,
+) -> dict:
+    """Build one exact same-attempt checkpoint proof for service tests."""
+
+    evidence = observation["evidence"]
+    checkpoint_identity = (
+        f"{task_id}:{evidence['attempt_id']}:{checkpoint_index}"
+    )
+    checkpoint_id = "checkpoint-" + hashlib.sha256(
+        checkpoint_identity.encode("utf-8")
+    ).hexdigest()[:32]
+    payload = {
+        "schema_version": "1.0.0",
+        "task_id": task_id,
+        "node_id": "invert",
+        "submission_id": evidence["submission_id"],
+        "attempt_id": evidence["attempt_id"],
+        "attempt_number": evidence["attempt_number"],
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_index": checkpoint_index,
+        "completed_updates": 1,
+        "binding_hash": evidence["binding_hash"],
+        "submission_receipt_record_hash": "sha256:" + "4" * 64,
+        "ready_record_hash": evidence["ready"]["record_hash"],
+        "checkpoint_manifest_relative_path": (
+            f"checkpoints/{checkpoint_id}/manifest.json"
+        ),
+        "checkpoint_manifest_size_bytes": 4096,
+        "checkpoint_manifest_hash": "sha256:" + "5" * 64,
+        "checkpoint_receipt_record_hash": "sha256:" + "6" * 64,
+        "checkpoint_proof_hash": None,
+        "checkpoint_created_at": checkpoint_created_at,
+        "state": "waiting",
+        "resume_id": None,
+        "resume_request_record_hash": None,
+        "resume_acknowledgement_record_hash": None,
+        "resume_acknowledged_at": None,
+    }
+    return {**payload, "proof_hash": encode_document(payload)[1]}
 
 
 class FakeDispatcher:
@@ -218,6 +283,7 @@ class FakeDispatcher:
         self.failure_code = failure_code
         self.adapter_version = adapter_version
         self.defer_dispatch = False
+        self.first_dispatch_heartbeat_state = "running"
         self.prepare_calls = 0
         self.dispatch_calls = 0
         self.receipt_recovery_calls = 0
@@ -250,6 +316,14 @@ class FakeDispatcher:
         self.timeout_result_state = "requested"
         self.timeout_terminal_status: str | None = None
         self.timeout_code: str | None = None
+        self.timeout_attempt_two_private_schema_version = "1.1.0"
+        self.checkpoint_probe_calls = 0
+        self.checkpoint_resume_calls = 0
+        self.checkpoint_probe_result: dict | None = None
+        self.checkpoint_probe_error: Exception | None = None
+        self.checkpoint_resume_state = "resumed"
+        self.checkpoint_resume_error: Exception | None = None
+        self.checkpoint_authorizations: list[dict] = []
         self.collect_calls = 0
         self.read_calls = 0
         self.purge_calls = 0
@@ -322,7 +396,10 @@ class FakeDispatcher:
             intent.task_id.encode("utf-8")
         ).hexdigest()[:32]
         self.worker_observation = {
-            "evidence": managed_worker_evidence(attempt_id=attempt_id),
+            "evidence": managed_worker_evidence(
+                attempt_id=attempt_id,
+                heartbeat_state=self.first_dispatch_heartbeat_state,
+            ),
             "handle": copy.deepcopy(handle),
         }
         return handle
@@ -435,6 +512,57 @@ class FakeDispatcher:
         )
         return value
 
+    def probe_runtime_checkpoint(self, intent):
+        del intent
+        with self.lock:
+            self.checkpoint_probe_calls += 1
+        if self.checkpoint_probe_error is not None:
+            raise self.checkpoint_probe_error
+        return copy.deepcopy(self.checkpoint_probe_result)
+
+    def resume_runtime_checkpoint(self, intent, *, authorization):
+        del intent
+        with self.lock:
+            self.checkpoint_resume_calls += 1
+            self.checkpoint_authorizations.append(copy.deepcopy(authorization))
+        if self.checkpoint_resume_error is not None:
+            raise self.checkpoint_resume_error
+        if self.checkpoint_probe_result is None:
+            raise AssertionError("checkpoint resume requires a prior proof")
+        payload = {
+            key: copy.deepcopy(value)
+            for key, value in self.checkpoint_probe_result.items()
+            if key != "proof_hash"
+        }
+        payload.update(
+            {
+                "state": self.checkpoint_resume_state,
+                "checkpoint_proof_hash": authorization[
+                    "checkpoint_proof_hash"
+                ],
+                "resume_id": authorization["resume_id"],
+                "resume_request_record_hash": authorization[
+                    "resume_request_record_hash"
+                ],
+                "resume_acknowledgement_record_hash": (
+                    "sha256:" + "7" * 64
+                    if self.checkpoint_resume_state == "resumed"
+                    else None
+                ),
+                "resume_acknowledged_at": (
+                    payload["checkpoint_created_at"]
+                    if self.checkpoint_resume_state == "resumed"
+                    else None
+                ),
+            }
+        )
+        result = {**payload, "proof_hash": encode_document(payload)[1]}
+        # A real Adapter's subsequent probe exposes the stable requested or
+        # resumed proof, rather than replaying the pre-resume waiting proof.
+        with self.lock:
+            self.checkpoint_probe_result = copy.deepcopy(result)
+        return result
+
     def supports_exact_cancel(self, intent, *, attempt_id):
         if self.exact_cancel_barrier is not None:
             self.exact_cancel_barrier.wait(timeout=5)
@@ -454,7 +582,11 @@ class FakeDispatcher:
             return None
         payload = {
             "schema_version": "2.0.0",
-            "private_schema_version": "1.1.0",
+            "private_schema_version": (
+                "1.1.0"
+                if evidence.get("attempt_number") == 1
+                else self.timeout_attempt_two_private_schema_version
+            ),
             "attempt_id": attempt_id,
             "binding_hash": evidence["binding_hash"],
             "capability_record_hash": "sha256:" + "e" * 64,
@@ -636,6 +768,7 @@ class PreRunningRetryFakeDispatcher(FakeDispatcher):
         exhaust_second_attempt: bool = False,
     ):
         super().__init__(store, failure_code="WORKER_LAUNCH_FAILED")
+        self.timeout_attempt_two_private_schema_version = "1.2.0"
         self.lose_first_retry_return = lose_first_retry_return
         self.exhaust_second_attempt = exhaust_second_attempt
         self.retry_probe_calls = 0
@@ -754,6 +887,7 @@ class WorkerExitRetryFakeDispatcher(FakeDispatcher):
         second_attempt_outcome: str = "running",
     ) -> None:
         super().__init__(store)
+        self.timeout_attempt_two_private_schema_version = "1.3.0"
         self.second_attempt_outcome = second_attempt_outcome
         self.worker_exit_retry_probe_calls = 0
         self.worker_exit_exhaustion_probe_calls = 0
@@ -882,6 +1016,11 @@ class WorkerExitRetryFakeDispatcher(FakeDispatcher):
                 attempt_number=2,
                 job_id=RETRY_JOB_ID,
                 created_at=authorization["authorized_at"],
+                heartbeat_state=(
+                    "waiting"
+                    if self.second_attempt_outcome == "waiting"
+                    else "running"
+                ),
             ),
             "handle": copy.deepcopy(handle),
         }
@@ -937,7 +1076,11 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
     def create_executable(
         self, *, draft: dict | None = None, key: str = "create-key"
     ):
-        return self.create(draft=draft or optimizer_task_draft(), key=key)
+        return self.create(
+            draft=draft
+            or current_optimizer_task_draft(),
+            key=key,
+        )
 
     def persist_executable_plan_and_approval(
         self, task_id: str, *, plan: dict | None = None
@@ -945,7 +1088,9 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         snapshot = self.store.get_task(task_id)
         self.assertIsNotNone(snapshot)
         current_plan = (
-            copy.deepcopy(plan) if plan is not None else optimizer_plan_graph()
+            copy.deepcopy(plan)
+            if plan is not None
+            else current_optimizer_plan_graph()
         )
         current_plan["draft"] = {
             "draft_id": snapshot.draft["draft_id"],
@@ -1001,6 +1146,10 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "worker_attempt_timeout_windows",
                 "supervised_timeout_attempts",
                 "task_timeout_outcomes",
+                "worker_checkpoint_waits",
+                "task_checkpoint_resume_requests",
+                "supervised_checkpoint_resume_authorizations",
+                "task_checkpoint_resume_outcomes",
             },
         )
         connection = sqlite3.connect(self.database_path)
@@ -1050,7 +1199,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 16)
+        self.assertEqual(self.store.migration_version(), 17)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -1066,7 +1215,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 16)
+        self.assertEqual(reopened.migration_version(), 17)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -1153,12 +1302,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 16)] * 8)
+        self.assertEqual(results, [("wal", 17)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 17")
+            connection.execute("PRAGMA user_version = 18")
             connection.commit()
         finally:
             connection.close()
@@ -1450,7 +1599,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 draft=revision,
             )
 
-        plan = optimizer_plan_graph()
+        plan = current_optimizer_plan_graph()
         with self.assertRaises(TaskNotFound):
             self.service.persist_plan(
                 task_id=task_id,
@@ -2190,11 +2339,14 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(accepted.approval, single_attempt)
         self.assertEqual(self.raw_count("approvals"), 1)
 
-    def test_store_direct_retry_approval_enforces_current_plan_invariant(
+    def test_store_direct_retry_approval_enforces_managed_plan_version_invariant(
         self,
     ) -> None:
         self.registry.register_algorithm(
             manifest=load_deepwave_manifest("1.4.0")
+        )
+        self.registry.register_algorithm(
+            manifest=load_deepwave_manifest("1.5.0")
         )
 
         def prepared(version: str, suffix: str) -> tuple[str, dict]:
@@ -2205,7 +2357,11 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 idempotency_key=f"create-store-approval-{suffix}",
                 **self.scope,
             )
-            plan = optimizer_plan_graph(algorithm_version=version)
+            plan = (
+                current_optimizer_plan_graph()
+                if version == CURRENT_ALGORITHM_VERSION
+                else optimizer_plan_graph(algorithm_version=version)
+            )
             plan["plan_id"] = f"plan-store-approval-{suffix}"
             plan["draft"] = {
                 "draft_id": draft["draft_id"],
@@ -2246,7 +2402,17 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         )
         self.assertEqual(stored_historical.approval, historical_single)
 
-        current_task, current_plan = prepared("1.5.0", "current")
+        legacy_task, legacy_plan = prepared("1.5.0", "legacy-managed")
+        legacy_retry = executable_approval_decision(legacy_plan)
+        legacy_retry["approval_id"] = "approval-store-legacy-retry"
+        stored_legacy = self.store.store_approval(
+            task_id=legacy_task,
+            approval=legacy_retry,
+            now=NOW,
+        )
+        self.assertEqual(stored_legacy.approval, legacy_retry)
+
+        current_task, current_plan = prepared("1.6.0", "current")
         current_retry = executable_approval_decision(current_plan)
         current_retry["approval_id"] = "approval-store-current-retry"
         mismatched_budget = copy.deepcopy(current_retry)
@@ -2275,14 +2441,15 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                     """
                     SELECT approval_id, max_attempts
                     FROM approval_retry_budgets
-                    WHERE task_id IN (?, ?)
+                    WHERE task_id IN (?, ?, ?)
                     """,
-                    (historical_task, current_task),
+                    (historical_task, legacy_task, current_task),
                 ).fetchall()
             )
         finally:
             connection.close()
         self.assertEqual(budgets[historical_single["approval_id"]], 1)
+        self.assertEqual(budgets[legacy_retry["approval_id"]], 2)
         self.assertEqual(budgets[current_retry["approval_id"]], 2)
 
     def test_exact_plan_or_approval_replay_does_not_reactivate_old_state(self) -> None:
@@ -2738,22 +2905,22 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 **self.scope,
             )
 
-        deferred = executable_run_event()
-        deferred.update(
+        retrying = executable_run_event()
+        retrying.update(
             {
-                "event_id": "event-waiting-002",
+                "event_id": "event-retrying-002",
                 "sequence": 2,
                 "task_id": task_id,
-                "event_type": "node_waiting",
-                "task_status": "Waiting",
+                "event_type": "node_retrying",
+                "task_status": "Retrying",
             }
         )
-        self.assertEqual(schema_errors("run-event.schema.json", deferred), [])
+        self.assertEqual(schema_errors("run-event.schema.json", retrying), [])
         with self.assertRaisesRegex(TaskValidationError, "RUN_EVENT_UNSUPPORTED_IN_P1"):
             self.service.record_run_event(
                 task_id=task_id,
                 expected_status="Queued",
-                event=deferred,
+                event=retrying,
                 **self.scope,
             )
         self.assertEqual(self.service.get_task(task_id, **self.scope).status, "Queued")
@@ -2867,7 +3034,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
             )
         self.assertEqual(len(self.service.list_run_events(task_id, **self.scope)), 3)
 
-    def test_p2_checkpoint_and_waiting_state_remain_unavailable(self) -> None:
+    def test_checkpoint_events_are_reserved_for_supervised_path(self) -> None:
         created = self.create_executable()
         task_id = created.snapshot.task_id
         self.persist_executable_plan_and_approval(task_id)
@@ -2890,12 +3057,14 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
                 "sequence": 3,
                 "task_id": task_id,
                 "event_type": "checkpoint_created",
-                "task_status": "Waiting",
+                "task_status": "Running",
                 "checkpoint": {"relative_path": "checkpoints/state.bin"},
             }
         )
         self.assertEqual(schema_errors("run-event.schema.json", checkpoint), [])
-        with self.assertRaisesRegex(TaskValidationError, "RUN_EVENT_UNSUPPORTED_IN_P1"):
+        with self.assertRaisesRegex(
+            TaskConflict, "checkpoint events are reserved"
+        ):
             self.service.record_run_event(
                 task_id=task_id,
                 expected_status="Running",
@@ -2906,6 +3075,802 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self.assertEqual(
             len(self.service.list_run_events(task_id, **self.scope)), 2
         )
+
+    def test_runtime_checkpoint_first_wait_is_atomic_and_same_attempt(self) -> None:
+        task_id, dispatcher, service, lease = self.running_checkpoint_runtime(
+            key="checkpoint-first-wait"
+        )
+        try:
+            result = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(result.state, "waiting")
+        self.assertFalse(result.replayed)
+        self.assertEqual(result.deferred_code, "CHECKPOINT_WAITING")
+        self.assertEqual(result.snapshot.status, "Waiting")
+        self.assertIsNotNone(result.snapshot.checkpoint)
+        checkpoint = result.snapshot.checkpoint
+        assert checkpoint is not None
+        proof = dispatcher.checkpoint_probe_result
+        assert proof is not None
+        self.assertEqual(checkpoint.checkpoint_id, proof["checkpoint_id"])
+        self.assertEqual(checkpoint.attempt_id, proof["attempt_id"])
+        self.assertEqual(checkpoint.attempt_number, 1)
+        self.assertEqual(checkpoint.checkpoint_index, 1)
+        self.assertEqual(checkpoint.completed_updates, 1)
+        self.assertEqual(checkpoint.state, "waiting")
+        self.assertEqual(dispatcher.checkpoint_probe_calls, 1)
+        self.assertEqual(dispatcher.checkpoint_resume_calls, 0)
+        self.assertEqual(self.raw_count("worker_checkpoint_waits"), 1)
+        self.assertEqual(self.raw_count("task_checkpoint_resume_requests"), 0)
+        events = service.list_run_events(task_id, **self.scope)
+        self.assertEqual(
+            [event["event_type"] for event in events[-2:]],
+            ["checkpoint_created", "node_waiting"],
+        )
+        for event in events[-2:]:
+            self.assertEqual(
+                event["extensions"]["org.agent_rpc.checkpoint_wait"],
+                {
+                    "checkpoint_id": proof["checkpoint_id"],
+                    "checkpoint_index": 1,
+                    "completed_updates": 1,
+                    "same_attempt": True,
+                },
+            )
+
+    def test_first_dispatch_projects_early_waiting_through_running(self) -> None:
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="checkpoint-early-first-dispatch"
+        )
+        dispatcher.first_dispatch_heartbeat_state = "waiting"
+        dispatcher.exact_timeout_supported = True
+        service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-checkpoint-early-first-dispatch",
+            **self.scope,
+        )
+        scheduled, lease = self.schedule_once(service, task_id)
+        dispatcher.checkpoint_probe_result = checkpoint_wait_proof(
+            task_id, dispatcher.worker_observation
+        )
+        try:
+            running = service.get_task(task_id, **self.scope)
+            waiting = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertTrue(scheduled.projected)
+        self.assertTrue(scheduled.adopted)
+        self.assertTrue(scheduled.timeout_armed)
+        self.assertEqual(running.status, "Running")
+        self.assertEqual(running.timeout.started_at, CHECKPOINT_NOW)
+        self.assertEqual(waiting.state, "waiting")
+        self.assertEqual(waiting.snapshot.status, "Waiting")
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            [
+                "task_queued",
+                "node_started",
+                "checkpoint_created",
+                "node_waiting",
+            ],
+        )
+
+    def test_early_waiting_timeout_normalizes_millisecond_ready_time(
+        self,
+    ) -> None:
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="checkpoint-early-millisecond-ready"
+        )
+        dispatcher.first_dispatch_heartbeat_state = "waiting"
+        dispatcher.exact_timeout_supported = True
+        service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-checkpoint-early-millisecond-ready",
+            **self.scope,
+        )
+        original_evidence = managed_worker_evidence
+
+        def millisecond_evidence(**kwargs):
+            return original_evidence(
+                worker_started_at="2026-07-15T02:59:59.123Z",
+                **kwargs,
+            )
+
+        with patch(
+            f"{__name__}.managed_worker_evidence",
+            side_effect=millisecond_evidence,
+        ):
+            scheduled, lease = self.schedule_once(service, task_id)
+        try:
+            current = service.get_task(task_id, **self.scope)
+            self.assertTrue(scheduled.timeout_armed)
+            self.assertEqual(
+                current.timeout.started_at,
+                "2026-07-15T02:59:59.123000Z",
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+    def test_positive_reconciliation_projects_early_waiting_without_launch(
+        self,
+    ) -> None:
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="checkpoint-early-reconciliation"
+        )
+        claimed = self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-checkpoint-early-reconciliation",
+            launch=True,
+        )
+        evidence = dispatcher.worker_observation["evidence"]
+        dispatcher.worker_observation["evidence"] = managed_worker_evidence(
+            attempt_id=evidence["attempt_id"],
+            heartbeat_state="waiting",
+        )
+        self.store.record_dispatch_reconciliation(
+            intent_id=claimed.intent_id,
+            failure_code="SUBMISSION_RECONCILIATION_REQUIRED",
+            now=NOW,
+        )
+        dispatcher.exact_timeout_supported = True
+        lease = service.acquire_runtime_supervisor_lease(
+            owner_id="checkpoint-early-reconciliation-owner",
+            lease_seconds=30,
+            **self.scope,
+        ).lease
+        try:
+            resolved = service.reconcile_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            running = service.get_task(task_id, **self.scope)
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(resolved.intent.state, "dispatched")
+        self.assertTrue(resolved.projected)
+        self.assertTrue(resolved.adopted)
+        self.assertTrue(resolved.timeout_armed)
+        self.assertEqual(running.status, "Running")
+        self.assertEqual(running.timeout.started_at, CHECKPOINT_NOW)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(dispatcher.reconciliation_probe_calls, 1)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 1)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            ["task_queued", "node_started"],
+        )
+
+    def test_attempt_two_replacement_projects_early_waiting_atomically(
+        self,
+    ) -> None:
+        task_id, dispatcher, service, lease = self.started_worker_exit_runtime(
+            key="checkpoint-early-attempt-two",
+            second_attempt_outcome="waiting",
+        )
+        dispatcher.exact_timeout_supported = True
+        try:
+            retrying = service.process_runtime_retry(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+            dispatched = service.process_runtime_retry(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+            dispatcher.checkpoint_probe_result = checkpoint_wait_proof(
+                task_id, dispatcher.worker_observation
+            )
+            waiting = service.process_runtime_checkpoint(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(retrying.state, "retrying")
+        self.assertEqual(dispatched.state, "dispatched")
+        self.assertEqual(dispatched.snapshot.status, "Running")
+        self.assertTrue(dispatched.timeout_armed)
+        self.assertEqual(dispatched.snapshot.timeout.started_at, CHECKPOINT_NOW)
+        self.assertEqual(waiting.state, "waiting")
+        self.assertEqual(waiting.snapshot.checkpoint.attempt_number, 2)
+        self.assertEqual(dispatcher.worker_exit_retry_calls, 2)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            [
+                "task_queued",
+                "node_retrying",
+                "node_started",
+                "checkpoint_created",
+                "node_waiting",
+            ],
+        )
+
+    def test_historical_v1_5_waiting_evidence_is_not_checkpoint_capable(
+        self,
+    ) -> None:
+        task_id, _, dispatcher, service = self.submitted_runtime(
+            key="checkpoint-historical-waiting-rejected"
+        )
+        current = service.get_task(task_id, **self.scope)
+        intent = service.get_dispatch_intent(task_id, **self.scope)
+        historical_request = copy.deepcopy(intent.request)
+        historical_request["algorithm"]["version"] = "1.5.0"
+        historical = replace(
+            intent,
+            adapter_version="1.5.0",
+            request=historical_request,
+        )
+        evidence = managed_worker_evidence(heartbeat_state="waiting")
+        lease = service.acquire_runtime_supervisor_lease(
+            owner_id="checkpoint-historical-waiting-owner",
+            lease_seconds=30,
+            **self.scope,
+        ).lease
+        try:
+            with self.assertRaisesRegex(
+                TaskDispatchError, "WORKER_EVIDENCE_INVALID"
+            ):
+                service._project_early_checkpoint_running(
+                    task_id=task_id,
+                    project_id=PROJECT_ID,
+                    principal_id=PRINCIPAL_ID,
+                    snapshot=current,
+                    intent=historical,
+                    evidence=evidence,
+                    supervisor_lease=lease,
+                )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            ["task_queued"],
+        )
+
+    def test_waiting_cancel_natural_success_is_control_owned(self) -> None:
+        task_id, dispatcher, service, lease = self.running_checkpoint_runtime(
+            key="checkpoint-waiting-cancel-terminal"
+        )
+        try:
+            waiting = service.process_runtime_checkpoint(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+            cancellation = service.cancel_task(
+                task_id=task_id,
+                reason="user_requested",
+                idempotency_key="cancel-checkpoint-waiting-terminal",
+                **self.scope,
+            )
+            dispatcher.cancel_result_state = "terminal_won"
+            dispatcher.cancel_terminal_status = "Succeeded"
+            dispatcher.adapter_status = {
+                "status": "Succeeded",
+                "stage": "complete",
+                "completed": 2,
+                "total": 2,
+                "message": "natural completion won the Waiting cancel race",
+                "updated_at": "2026-07-15T03:00:01Z",
+                "terminal": True,
+            }
+            completed = service.process_runtime_cancellation(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(waiting.snapshot.status, "Waiting")
+        self.assertEqual(cancellation.snapshot.cancellation.state, "requested")
+        self.assertEqual(completed.state, "superseded")
+        self.assertEqual(completed.snapshot.status, "Succeeded")
+        self.assertEqual(completed.snapshot.cancellation.result, "terminal_preempted")
+        self.assertEqual(dispatcher.cancel_calls, 1)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            [
+                "task_queued",
+                "node_started",
+                "node_progress",
+                "checkpoint_created",
+                "node_waiting",
+                "cancel_requested",
+                "node_succeeded",
+            ],
+        )
+
+    def test_waiting_timeout_confirmation_is_control_owned(self) -> None:
+        task_id, dispatcher, service, lease = self.running_checkpoint_runtime(
+            key="checkpoint-waiting-timeout-confirmed"
+        )
+        dispatcher.exact_timeout_supported = True
+        try:
+            projection = service.project_worker_attempt(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+            waiting = service.process_runtime_checkpoint(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+            lease = service.heartbeat_runtime_supervisor_lease(
+                lease, lease_seconds=3600
+            )
+            projection_timeout = waiting.snapshot.timeout
+            self.assertIsNotNone(projection_timeout)
+            service._clock = lambda: projection_timeout.deadline_at
+            dispatcher.timeout_result_state = "timed_out"
+            completed = service.process_runtime_timeout(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertTrue(projection.timeout_armed)
+        self.assertEqual(waiting.snapshot.status, "Waiting")
+        self.assertIsNotNone(projection_timeout)
+        self.assertEqual(completed.state, "timed_out")
+        self.assertEqual(completed.snapshot.status, "Failed")
+        self.assertEqual(completed.snapshot.timeout.failure_code, "WALL_TIME_EXCEEDED")
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            [
+                "task_queued",
+                "node_started",
+                "node_progress",
+                "checkpoint_created",
+                "node_waiting",
+                "node_failed",
+            ],
+        )
+
+    def test_waiting_timeout_natural_success_is_control_owned(self) -> None:
+        task_id, dispatcher, service, lease = self.running_checkpoint_runtime(
+            key="checkpoint-waiting-timeout-terminal"
+        )
+        dispatcher.exact_timeout_supported = True
+        try:
+            projection = service.project_worker_attempt(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+            waiting = service.process_runtime_checkpoint(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+            lease = service.heartbeat_runtime_supervisor_lease(
+                lease, lease_seconds=3600
+            )
+            timeout = waiting.snapshot.timeout
+            self.assertIsNotNone(timeout)
+            service._clock = lambda: timeout.deadline_at
+            dispatcher.timeout_result_state = "terminal_won"
+            dispatcher.timeout_terminal_status = "Succeeded"
+            dispatcher.adapter_status = {
+                "status": "Succeeded",
+                "stage": "complete",
+                "completed": 2,
+                "total": 2,
+                "message": "natural completion won the Waiting timeout race",
+                "updated_at": timeout.deadline_at,
+                "terminal": True,
+            }
+            completed = service.process_runtime_timeout(
+                task_id, supervisor_lease=lease, **self.scope
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertTrue(projection.timeout_armed)
+        self.assertEqual(waiting.snapshot.status, "Waiting")
+        self.assertEqual(completed.state, "superseded")
+        self.assertEqual(completed.snapshot.status, "Succeeded")
+        self.assertEqual(completed.snapshot.timeout.terminal_status, "Succeeded")
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in service.list_run_events(task_id, **self.scope)
+            ],
+            [
+                "task_queued",
+                "node_started",
+                "node_progress",
+                "checkpoint_created",
+                "node_waiting",
+                "node_succeeded",
+            ],
+        )
+
+    def test_runtime_checkpoint_resume_requested_then_acknowledged(self) -> None:
+        task_id, dispatcher, service, lease = self.running_checkpoint_runtime(
+            key="checkpoint-requested-ack"
+        )
+        try:
+            waiting = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            dispatcher.checkpoint_resume_state = "requested"
+            requested = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            dispatcher.checkpoint_resume_state = "resumed"
+            resumed = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            settled = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(waiting.state, "waiting")
+        self.assertEqual(requested.state, "resume_requested")
+        self.assertEqual(requested.snapshot.status, "Waiting")
+        self.assertEqual(requested.snapshot.checkpoint.state, "resume_requested")
+        self.assertEqual(
+            requested.deferred_code, "CHECKPOINT_RESUME_IN_PROGRESS"
+        )
+        self.assertEqual(resumed.state, "resumed")
+        self.assertEqual(resumed.snapshot.status, "Running")
+        self.assertEqual(resumed.snapshot.checkpoint.state, "resumed")
+        self.assertEqual(
+            resumed.snapshot.checkpoint.attempt_id,
+            waiting.snapshot.checkpoint.attempt_id,
+        )
+        self.assertIsNone(resumed.deferred_code)
+        self.assertEqual(settled.state, "none")
+        self.assertEqual(settled.snapshot.status, "Running")
+        self.assertEqual(dispatcher.checkpoint_probe_calls, 4)
+        self.assertEqual(dispatcher.checkpoint_resume_calls, 2)
+        self.assertEqual(
+            dispatcher.checkpoint_authorizations[0],
+            dispatcher.checkpoint_authorizations[1],
+        )
+        self.assertEqual(self.raw_count("worker_checkpoint_waits"), 1)
+        self.assertEqual(self.raw_count("task_checkpoint_resume_requests"), 1)
+        self.assertEqual(
+            self.raw_count("supervised_checkpoint_resume_authorizations"), 1
+        )
+        self.assertEqual(self.raw_count("task_checkpoint_resume_outcomes"), 1)
+        events = service.list_run_events(task_id, **self.scope)
+        self.assertEqual(events[-1]["event_type"], "node_started")
+        self.assertEqual(events[-1]["task_status"], "Running")
+        self.assertEqual(
+            events[-1]["extensions"]["org.agent_rpc.checkpoint_resume"],
+            {
+                "checkpoint_id": waiting.snapshot.checkpoint.checkpoint_id,
+                "resume_id": requested.snapshot.checkpoint.resume_id,
+                "same_attempt": True,
+            },
+        )
+
+    def test_resumed_attempt_one_allows_distinct_attempt_two_checkpoint(
+        self,
+    ) -> None:
+        dispatcher = WorkerExitRetryFakeDispatcher(self.store)
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="checkpoint-attempt-two",
+            dispatcher=dispatcher,
+        )
+        service.submit_task(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+            idempotency_key="submit-checkpoint-attempt-two",
+            **self.scope,
+        )
+        _, lease = self.schedule_once(service, task_id)
+        now = [NOW]
+        service._clock = lambda: now[0]
+        dispatcher.adapter_status = {
+            "status": "Running",
+            "stage": "inversion",
+            "completed": 1,
+            "total": 2,
+            "message": "attempt one running",
+            "updated_at": NOW,
+            "terminal": False,
+        }
+        service.refresh_runtime_status(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+        dispatcher.checkpoint_probe_result = checkpoint_wait_proof(
+            task_id,
+            dispatcher.worker_observation,
+        )
+        try:
+            waiting_one = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            resumed_one = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            first_checkpoint = resumed_one.snapshot.checkpoint
+            self.assertEqual(waiting_one.state, "waiting")
+            self.assertEqual(resumed_one.state, "resumed")
+            self.assertEqual(first_checkpoint.attempt_number, 1)
+
+            now[0] = "2026-07-15T03:00:01Z"
+            dispatcher.adapter_status = {
+                "status": "Failed",
+                "stage": "worker_exit",
+                "completed": 1,
+                "total": 2,
+                "message": "attempt one exited after resume",
+                "updated_at": "2026-07-15T03:00:01Z",
+                "terminal": True,
+            }
+            retrying = service.process_runtime_retry(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            dispatched = service.process_runtime_retry(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            self.assertEqual(retrying.state, "retrying")
+            self.assertEqual(dispatched.state, "dispatched")
+            self.assertEqual(dispatched.snapshot.status, "Running")
+            self.assertEqual(dispatched.intent.handle["job_id"], RETRY_JOB_ID)
+
+            dispatcher.checkpoint_probe_result = None
+            no_checkpoint = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            self.assertEqual(no_checkpoint.state, "none")
+            self.assertEqual(no_checkpoint.snapshot.status, "Running")
+            self.assertEqual(
+                no_checkpoint.snapshot.checkpoint.checkpoint_id,
+                first_checkpoint.checkpoint_id,
+            )
+
+            dispatcher.checkpoint_probe_result = checkpoint_wait_proof(
+                task_id,
+                dispatcher.worker_observation,
+                checkpoint_created_at="2026-07-15T03:00:01.000000Z",
+            )
+            waiting_two = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            events = service.list_run_events(task_id, **self.scope)
+            first_checkpoint_event = next(
+                event
+                for event in events
+                if event["event_type"] == "checkpoint_created"
+                and event.get("extensions", {})
+                .get("org.agent_rpc.checkpoint_wait", {})
+                .get("checkpoint_id")
+                == first_checkpoint.checkpoint_id
+            )
+            first_waiting_event = next(
+                event
+                for event in events
+                if event["event_type"] == "node_waiting"
+                and event.get("extensions", {})
+                .get("org.agent_rpc.checkpoint_wait", {})
+                .get("checkpoint_id")
+                == first_checkpoint.checkpoint_id
+            )
+            first_resume_event = next(
+                event
+                for event in events
+                if event["event_type"] == "node_started"
+                and event.get("extensions", {})
+                .get("org.agent_rpc.checkpoint_resume", {})
+                .get("checkpoint_id")
+                == first_checkpoint.checkpoint_id
+            )
+            replayed_wait = self.store.record_supervised_checkpoint_wait(
+                intent_id=dispatched.intent.intent_id,
+                checkpoint_proof=waiting_one.adapter_result,
+                checkpoint_event=first_checkpoint_event,
+                waiting_event=first_waiting_event,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: now[0],
+            )
+            replayed_resume = self.store.complete_supervised_checkpoint_resume(
+                resume_id=first_checkpoint.resume_id,
+                adapter_proof=resumed_one.adapter_result,
+                running_event=first_resume_event,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: now[0],
+            )
+            retry_while_waiting = service.process_runtime_retry(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(waiting_two.state, "waiting")
+        self.assertEqual(waiting_two.snapshot.status, "Waiting")
+        second_checkpoint = waiting_two.snapshot.checkpoint
+        self.assertNotEqual(
+            second_checkpoint.checkpoint_id,
+            first_checkpoint.checkpoint_id,
+        )
+        self.assertEqual(second_checkpoint.attempt_id, RETRY_ATTEMPT_ID)
+        self.assertEqual(second_checkpoint.attempt_number, 2)
+        self.assertEqual(second_checkpoint.checkpoint_index, 1)
+        self.assertTrue(replayed_wait.replayed)
+        self.assertEqual(
+            replayed_wait.checkpoint.checkpoint_id,
+            first_checkpoint.checkpoint_id,
+        )
+        self.assertEqual(
+            replayed_wait.snapshot.checkpoint.checkpoint_id,
+            second_checkpoint.checkpoint_id,
+        )
+        self.assertTrue(replayed_resume.replayed)
+        self.assertEqual(
+            replayed_resume.checkpoint.checkpoint_id,
+            first_checkpoint.checkpoint_id,
+        )
+        self.assertEqual(
+            replayed_resume.snapshot.checkpoint.checkpoint_id,
+            second_checkpoint.checkpoint_id,
+        )
+        self.assertEqual(retry_while_waiting.state, "none")
+        self.assertEqual(dispatcher.worker_exit_retry_calls, 2)
+        self.assertEqual(self.raw_count("worker_launch_attempts"), 2)
+        self.assertEqual(self.raw_count("worker_checkpoint_waits"), 2)
+
+    def test_runtime_checkpoint_deferred_and_action_required_are_bounded(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "transient",
+                DispatchDeferred("CHECKPOINT_EVIDENCE_PENDING"),
+                "none",
+                "CHECKPOINT_EVIDENCE_PENDING",
+            ),
+            (
+                "action-required",
+                DispatchDeferred("CHECKPOINT_ACTION_REQUIRED"),
+                "action_required",
+                "CHECKPOINT_ACTION_REQUIRED",
+            ),
+        )
+        for label, error, expected_state, expected_code in cases:
+            with self.subTest(label=label):
+                task_id, dispatcher, service, lease = (
+                    self.running_checkpoint_runtime(
+                        key=f"checkpoint-{label}"
+                    )
+                )
+                dispatcher.checkpoint_probe_error = error
+                try:
+                    result = service.process_runtime_checkpoint(
+                        task_id,
+                        supervisor_lease=lease,
+                        **self.scope,
+                    )
+                finally:
+                    service.release_runtime_supervisor_lease(lease)
+
+                self.assertEqual(result.state, expected_state)
+                self.assertEqual(result.deferred_code, expected_code)
+                self.assertEqual(result.snapshot.status, "Running")
+                self.assertTrue(result.replayed)
+                self.assertEqual(dispatcher.checkpoint_probe_calls, 1)
+                self.assertEqual(dispatcher.checkpoint_resume_calls, 0)
+        self.assertEqual(self.raw_count("worker_checkpoint_waits"), 0)
+
+    def test_runtime_checkpoint_running_without_proof_is_noop(self) -> None:
+        task_id, dispatcher, service, lease = self.running_checkpoint_runtime(
+            key="checkpoint-no-proof"
+        )
+        dispatcher.checkpoint_probe_result = None
+        before = service.list_run_events(task_id, **self.scope)
+        try:
+            result = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(result.state, "none")
+        self.assertTrue(result.replayed)
+        self.assertIsNone(result.adapter_result)
+        self.assertIsNone(result.deferred_code)
+        self.assertEqual(result.snapshot.status, "Running")
+        self.assertIsNone(result.snapshot.checkpoint)
+        self.assertEqual(dispatcher.checkpoint_probe_calls, 1)
+        self.assertEqual(dispatcher.checkpoint_resume_calls, 0)
+        self.assertEqual(service.list_run_events(task_id, **self.scope), before)
+        self.assertEqual(self.raw_count("worker_checkpoint_waits"), 0)
+
+    def test_waiting_refresh_is_read_only_and_cancel_capability_remains_exact(
+        self,
+    ) -> None:
+        task_id, dispatcher, service, lease = self.running_checkpoint_runtime(
+            key="checkpoint-waiting-read-only"
+        )
+        try:
+            waiting = service.process_runtime_checkpoint(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            status_calls = dispatcher.status_calls
+            events = service.list_run_events(task_id, **self.scope)
+            browser_poll = service.refresh_runtime_status(
+                task_id,
+                **self.scope,
+            )
+            active_poll = service.refresh_runtime_status(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            can_cancel = service.can_cancel_task(task_id, **self.scope)
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(waiting.snapshot.status, "Waiting")
+        for poll in (browser_poll, active_poll):
+            self.assertEqual(poll.snapshot.status, "Waiting")
+            self.assertEqual(poll.snapshot.checkpoint, waiting.snapshot.checkpoint)
+            self.assertIsNone(poll.adapter_status)
+        self.assertTrue(can_cancel)
+        self.assertEqual(dispatcher.status_calls, status_calls)
+        self.assertEqual(dispatcher.checkpoint_resume_calls, 0)
+        self.assertEqual(service.list_run_events(task_id, **self.scope), events)
 
     def test_run_event_must_match_plan_node_and_fingerprint(self) -> None:
         created = self.create_executable()
@@ -3105,11 +4070,11 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         self, *, key: str
     ) -> tuple[str, dict, FakeDispatcher, TaskService]:
         token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-        draft = optimizer_task_draft()
+        draft = current_optimizer_task_draft()
         draft["draft_id"] = f"draft-{token}"
         created = self.create_executable(draft=draft, key=f"create-{key}")
         task_id = created.snapshot.task_id
-        plan = optimizer_plan_graph()
+        plan = current_optimizer_plan_graph()
         plan["plan_id"] = f"plan-{token}"
         plan["draft"]["draft_id"] = draft["draft_id"]
         plan["nodes"][0]["idempotency_key"] = f"node-{token}-submit"
@@ -3134,17 +4099,48 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         service.release_runtime_supervisor_lease(lease)
         return task_id, plan, dispatcher, service
 
+    def running_checkpoint_runtime(
+        self, *, key: str
+    ) -> tuple[str, FakeDispatcher, TaskService, object]:
+        """Build one current 1.6 Running task with an active Supervisor term."""
+
+        task_id, plan, dispatcher, service = self.submitted_runtime(key=key)
+        dispatcher.adapter_status = {
+            "status": "Running",
+            "stage": "inversion",
+            "completed": 1,
+            "total": plan["nodes"][0]["parameters"]["iterations"],
+            "message": "iteration 1",
+            "updated_at": NOW,
+            "terminal": False,
+        }
+        acquisition = service.acquire_runtime_supervisor_lease(
+            owner_id=f"checkpoint-{key}",
+            lease_seconds=30,
+            **self.scope,
+        )
+        running = service.refresh_runtime_status(
+            task_id,
+            supervisor_lease=acquisition.lease,
+            **self.scope,
+        )
+        self.assertEqual(running.snapshot.status, "Running")
+        dispatcher.checkpoint_probe_result = checkpoint_wait_proof(
+            task_id, dispatcher.worker_observation
+        )
+        return task_id, dispatcher, service, acquisition.lease
+
     def approved_runtime(
         self, *, key: str, dispatcher: FakeDispatcher | None = None
     ) -> tuple[str, dict, FakeDispatcher, TaskService]:
         """Build one approved executable task without hiding submit crashes."""
 
         token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
-        draft = optimizer_task_draft()
+        draft = current_optimizer_task_draft()
         draft["draft_id"] = f"draft-{token}"
         created = self.create_executable(draft=draft, key=f"create-{key}")
         task_id = created.snapshot.task_id
-        plan = optimizer_plan_graph()
+        plan = current_optimizer_plan_graph()
         plan["plan_id"] = f"plan-{token}"
         plan["draft"]["draft_id"] = draft["draft_id"]
         plan["nodes"][0]["idempotency_key"] = f"node-{token}-submit"

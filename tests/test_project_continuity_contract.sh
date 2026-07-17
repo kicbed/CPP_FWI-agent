@@ -63,6 +63,8 @@ required_files=(
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1_2.json
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1_3.json
     scientific_runtime/registrations/deepwave_acoustic_fwi_v1_4.json
+    scientific_runtime/registrations/deepwave_acoustic_fwi_v1_5.json
+    scientific_runtime/registrations/deepwave_acoustic_fwi_v1_6.json
     scientific_runtime/task_store.py
     scientific_runtime/task_service.py
     scientific_runtime/task_dispatcher.py
@@ -86,6 +88,7 @@ required_files=(
     scientific_runtime/migrations/0014_task_retry.sql
     scientific_runtime/migrations/0015_worker_exit_retry.sql
     scientific_runtime/migrations/0016_dispatch_negative_reconciliation.sql
+    scientific_runtime/migrations/0017_checkpoint_wait_resume.sql
     tests/test_scientific_runtime_registry.py
     tests/test_scientific_runtime_fwi_adapter.py
     tests/test_scientific_runtime_fwi_purge.py
@@ -106,8 +109,10 @@ required_files=(
     fwi_worker/adapter_probe.py
     fwi_worker/__main__.py
     fwi_worker/artifacts.py
+    fwi_worker/checkpoint.py
     fwi_worker/inversion.py
     fwi_worker/job_state.py
+    tests/fwi_worker/test_checkpoint.py
     tests/fwi_worker/test_state_artifacts.py
     tests/fwi_worker/test_worker_failure.py
     web/serve.py

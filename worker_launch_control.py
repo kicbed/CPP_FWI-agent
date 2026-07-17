@@ -15,22 +15,25 @@ atomically replaced.
 
 from __future__ import annotations
 
+import ast
 import copy
 import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import stat
+import struct
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Literal, Mapping
 
 
 CONTROL_DIRECTORY = ".scientific-runtime-adapter-v1"
@@ -38,16 +41,24 @@ LAUNCH_TICKET_NAME = ".worker-launch.json"
 WORKER_READY_NAME = ".worker-ready.json"
 WORKER_HEARTBEAT_NAME = ".worker-heartbeat.json"
 WORKER_EXIT_NAME = ".worker-exit.json"
+WORKER_CHECKPOINT_NAME = ".worker-checkpoint.json"
+WORKER_RESUME_REQUEST_NAME = ".worker-resume.json"
+WORKER_RESUME_ACK_NAME = ".worker-resume-ack.json"
 WORKER_CANCEL_DIRECTORY = "worker-cancel"
 WORKER_STOP_DIRECTORY = "worker-stop"
 WORKER_TERMINAL_ARBITRATION_DIRECTORY = "worker-terminal-arbitration"
 CONTROL_SCHEMA_VERSION = "1.0.0"
+CHECKPOINT_PROTOCOL_VERSION = "1.0.0"
 STOP_PROTOCOL_VERSION = "2.0.0"
 MAX_CONTROL_JSON_BYTES = 64 * 1024
+MAX_CHECKPOINT_FILE_BYTES = 2 * 1024 * 1024
+MAX_CHECKPOINT_PAYLOAD_BYTES = 8 * 1024 * 1024
 MAX_CAPACITY = 64
 
 SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
 ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
+CHECKPOINT_ID = re.compile(r"^checkpoint-[0-9a-f]{32}$")
+RESUME_ID = re.compile(r"^resume-[0-9a-f]{32}$")
 JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 CANCEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -233,6 +244,9 @@ def _atomic_write_private_json(path: Path, value: Mapping[str, Any]) -> None:
         LAUNCH_TICKET_NAME,
         WORKER_READY_NAME,
         WORKER_HEARTBEAT_NAME,
+        WORKER_CHECKPOINT_NAME,
+        WORKER_RESUME_REQUEST_NAME,
+        WORKER_RESUME_ACK_NAME,
     }:
         # ``prepare_run_dir`` enumerates the queued job before numerical work.
         # Keep transient heartbeat/ticket files out of that artifact directory
@@ -719,6 +733,67 @@ class WorkerAttemptEvidence:
                     "updated_at": self.heartbeat_updated_at,
                     "record_hash": self.heartbeat_record_hash,
                 }
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class WorkerCheckpointEvidence:
+    """Exact path-bounded checkpoint and same-Worker resume evidence."""
+
+    submission_id: str
+    attempt_id: str
+    attempt_number: int
+    job_id: str
+    request_hash: str
+    binding_hash: str
+    ticket_record_hash: str
+    ready_record_hash: str
+    checkpoint_id: str
+    checkpoint_index: int
+    completed_updates: int
+    manifest_relative_path: str
+    manifest_size_bytes: int
+    manifest_hash: str
+    checkpoint_created_at: str
+    checkpoint_record_hash: str
+    state: Literal["waiting", "requested", "resumed"]
+    resume_id: str | None = None
+    checkpoint_proof_hash: str | None = None
+    authorized_at: str | None = None
+    resume_requested_at: str | None = None
+    resume_request_record_hash: str | None = None
+    resume_acknowledged_at: str | None = None
+    resume_acknowledgement_record_hash: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": CHECKPOINT_PROTOCOL_VERSION,
+            "submission_id": self.submission_id,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "job_id": self.job_id,
+            "request_hash": self.request_hash,
+            "binding_hash": self.binding_hash,
+            "ticket_record_hash": self.ticket_record_hash,
+            "ready_record_hash": self.ready_record_hash,
+            "checkpoint_id": self.checkpoint_id,
+            "checkpoint_index": self.checkpoint_index,
+            "completed_updates": self.completed_updates,
+            "manifest_relative_path": self.manifest_relative_path,
+            "manifest_size_bytes": self.manifest_size_bytes,
+            "manifest_hash": self.manifest_hash,
+            "checkpoint_created_at": self.checkpoint_created_at,
+            "checkpoint_record_hash": self.checkpoint_record_hash,
+            "state": self.state,
+            "resume_id": self.resume_id,
+            "checkpoint_proof_hash": self.checkpoint_proof_hash,
+            "authorized_at": self.authorized_at,
+            "resume_requested_at": self.resume_requested_at,
+            "resume_request_record_hash": self.resume_request_record_hash,
+            "resume_acknowledged_at": self.resume_acknowledged_at,
+            "resume_acknowledgement_record_hash": (
+                self.resume_acknowledgement_record_hash
             ),
         }
 
@@ -2175,6 +2250,745 @@ def execution_fence_is_held(
         raise
 
 
+def checkpoint_id_for_binding(binding: LaunchAttemptBinding) -> str:
+    """Derive the sole v1 checkpoint identity from the immutable attempt."""
+
+    material = _stable_json_bytes(
+        {
+            "schema_version": CHECKPOINT_PROTOCOL_VERSION,
+            "binding_hash": binding.binding_hash,
+            "checkpoint_index": 1,
+            "completed_updates": 1,
+        }
+    )
+    return "checkpoint-" + hashlib.sha256(material).hexdigest()[:32]
+
+
+def _checkpoint_manifest_relative_path(checkpoint_id: str) -> str:
+    if CHECKPOINT_ID.fullmatch(checkpoint_id) is None:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint identity is invalid"
+        )
+    return f"checkpoints/{checkpoint_id}/manifest.json"
+
+
+def _read_checkpoint_bytes(
+    job_dir: Path,
+    relative_path: str,
+    *,
+    maximum_bytes: int,
+) -> bytes:
+    """Read one fixed checkpoint child without following a symbolic link."""
+
+    relative = Path(relative_path)
+    if (
+        relative.is_absolute()
+        or relative.as_posix() != relative_path
+        or len(relative.parts) != 3
+        or relative.parts[0] != "checkpoints"
+        or CHECKPOINT_ID.fullmatch(relative.parts[1]) is None
+        or relative.parts[2]
+        not in {
+            "manifest.json",
+            "model.npy",
+            "losses.npy",
+            "gradient_clip_values.npy",
+            "optimizer_exp_avg.npy",
+            "optimizer_exp_avg_sq.npy",
+        }
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint path is unsafe"
+        )
+    checkpoints = _require_private_directory(job_dir / "checkpoints")
+    checkpoint_dir = _require_private_directory(checkpoints / relative.parts[1])
+    path = checkpoint_dir / relative.parts[2]
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        named = path.stat(follow_symlinks=False)
+        if (
+            opened.st_dev != named.st_dev
+            or opened.st_ino != named.st_ino
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) & 0o077
+            or opened.st_size < 1
+            or opened.st_size > maximum_bytes
+        ):
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: checkpoint file is unsafe"
+            )
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) != opened.st_size or len(data) > maximum_bytes:
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: checkpoint file size changed"
+            )
+        return data
+    except WorkerControlError:
+        raise
+    except OSError as error:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_UNAVAILABLE: checkpoint file is unavailable"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _validate_checkpoint_npy(
+    data: bytes,
+    descriptor: Mapping[str, Any],
+) -> None:
+    """Validate the bounded no-pickle NPY header and every finite scalar."""
+
+    if not data.startswith(b"\x93NUMPY") or len(data) < 10:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint array is not NPY"
+        )
+    major, minor = data[6], data[7]
+    if (major, minor) == (1, 0):
+        header_length = struct.unpack("<H", data[8:10])[0]
+        header_start = 10
+    elif major in {2, 3} and minor == 0 and len(data) >= 12:
+        header_length = struct.unpack("<I", data[8:12])[0]
+        header_start = 12
+    else:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint NPY version is unsupported"
+        )
+    header_end = header_start + header_length
+    if header_end > len(data) or header_length > 4096:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint NPY header is invalid"
+        )
+    try:
+        header = ast.literal_eval(data[header_start:header_end].decode("latin1"))
+    except (SyntaxError, ValueError, UnicodeDecodeError) as error:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint NPY header is invalid"
+        ) from error
+    expected_dtype = descriptor.get("dtype")
+    item_size = {"float32": 4, "float64": 8}.get(expected_dtype)
+    dtype_code = {"float32": "<f4", "float64": "<f8"}.get(expected_dtype)
+    shape = descriptor.get("shape")
+    if (
+        not isinstance(header, dict)
+        or set(header) != {"descr", "fortran_order", "shape"}
+        or header.get("descr") != dtype_code
+        or header.get("fortran_order") is not False
+        or not isinstance(shape, list)
+        or not shape
+        or len(shape) > 2
+        or any(type(value) is not int or not 1 <= value <= 4096 for value in shape)
+        or tuple(shape) != header.get("shape")
+        or item_size is None
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint NPY contract changed"
+        )
+    element_count = 1
+    for dimension in shape:
+        element_count *= dimension
+    if element_count > 1_000_000 or header_end + element_count * item_size != len(data):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint NPY payload size is invalid"
+        )
+    scalar_format = "<f" if item_size == 4 else "<d"
+    if any(
+        not math.isfinite(value[0])
+        for value in struct.iter_unpack(scalar_format, data[header_end:])
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint array is not finite"
+        )
+
+
+def _validate_checkpoint_file_descriptor_metadata(
+    checkpoint_id: str,
+    value: Any,
+    *,
+    name: str,
+    dtype: str,
+    shape: list[int],
+) -> int:
+    required = {"relative_path", "size_bytes", "sha256", "dtype", "shape"}
+    expected_path = f"checkpoints/{checkpoint_id}/{name}"
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("relative_path") != expected_path
+        or type(value.get("size_bytes")) is not int
+        or not 1 <= value["size_bytes"] <= MAX_CHECKPOINT_FILE_BYTES
+        or SHA256.fullmatch(value.get("sha256", "")) is None
+        or value.get("dtype") != dtype
+        or value.get("shape") != shape
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint file descriptor is invalid"
+        )
+    return value["size_bytes"]
+
+
+def _validate_checkpoint_file_descriptor(
+    job_dir: Path,
+    checkpoint_id: str,
+    value: Any,
+    *,
+    name: str,
+    dtype: str,
+    shape: list[int],
+) -> None:
+    _validate_checkpoint_file_descriptor_metadata(
+        checkpoint_id,
+        value,
+        name=name,
+        dtype=dtype,
+        shape=shape,
+    )
+    expected_path = f"checkpoints/{checkpoint_id}/{name}"
+    data = _read_checkpoint_bytes(
+        job_dir, expected_path, maximum_bytes=MAX_CHECKPOINT_FILE_BYTES
+    )
+    if (
+        len(data) != value["size_bytes"]
+        or "sha256:" + hashlib.sha256(data).hexdigest() != value["sha256"]
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint file integrity changed"
+        )
+    _validate_checkpoint_npy(data, value)
+
+
+def _validate_checkpoint_manifest(
+    job_dir: Path,
+    binding: LaunchAttemptBinding,
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_path = _checkpoint_manifest_relative_path(receipt["checkpoint_id"])
+    if receipt.get("manifest_relative_path") != expected_path:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint manifest path changed"
+        )
+    data = _read_checkpoint_bytes(
+        job_dir, expected_path, maximum_bytes=MAX_CONTROL_JSON_BYTES
+    )
+    if (
+        len(data) != receipt.get("manifest_size_bytes")
+        or "sha256:" + hashlib.sha256(data).hexdigest()
+        != receipt.get("manifest_hash")
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint manifest integrity changed"
+        )
+    try:
+        manifest = json.loads(
+            data.decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"invalid constant {value}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint manifest is malformed"
+        ) from error
+    required = {
+        "schema_version",
+        "checkpoint_id",
+        "checkpoint_index",
+        "completed_updates",
+        "next_state_index",
+        "binding_hash",
+        "job_id",
+        "request_hash",
+        "config_hash",
+        "optimizer",
+        "model",
+        "history",
+        "created_at",
+    }
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != required
+        or manifest.get("schema_version") != CHECKPOINT_PROTOCOL_VERSION
+        or manifest.get("checkpoint_id") != receipt["checkpoint_id"]
+        or manifest.get("checkpoint_index") != 1
+        or manifest.get("completed_updates") != 1
+        or manifest.get("next_state_index") != 1
+        or manifest.get("binding_hash") != binding.binding_hash
+        or manifest.get("job_id") != binding.job_id
+        or manifest.get("request_hash") != binding.request_hash
+        or SHA256.fullmatch(manifest.get("config_hash", "")) is None
+        or manifest.get("created_at") != receipt["checkpoint_created_at"]
+        or data != _stable_json_bytes(manifest) + b"\n"
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint manifest fields changed"
+        )
+    _parse_timestamp(manifest["created_at"])
+    model = manifest.get("model")
+    if not isinstance(model, Mapping):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint model descriptor is invalid"
+        )
+    model_shape = model.get("shape")
+    if (
+        not isinstance(model_shape, list)
+        or len(model_shape) != 2
+        or any(type(value) is not int or not 1 <= value <= 4096 for value in model_shape)
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint model shape is invalid"
+        )
+    history = manifest.get("history")
+    if not isinstance(history, Mapping) or set(history) != {
+        "losses",
+        "gradient_clip_values",
+    }:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint history is invalid"
+        )
+    optimizer = manifest.get("optimizer")
+    if not isinstance(optimizer, Mapping) or set(optimizer) != {
+        "name",
+        "learning_rate",
+        "step",
+        "state",
+    }:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint optimizer is invalid"
+        )
+    learning_rate = optimizer.get("learning_rate")
+    if (
+        optimizer.get("name") not in {"adam", "sgd"}
+        or isinstance(learning_rate, bool)
+        or not isinstance(learning_rate, (int, float))
+        or not 0 < float(learning_rate) < float("inf")
+        or optimizer.get("step") != 1
+        or not isinstance(optimizer.get("state"), Mapping)
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint optimizer fields changed"
+        )
+    optimizer_state = optimizer["state"]
+    if optimizer["name"] == "adam":
+        if set(optimizer_state) != {"exp_avg", "exp_avg_sq"}:
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: Adam checkpoint state is incomplete"
+            )
+    elif dict(optimizer_state):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: SGD checkpoint state is unexpected"
+        )
+
+    descriptor_specs: list[tuple[Any, str, str, list[int]]] = [
+        (model, "model.npy", "float32", model_shape),
+        (history["losses"], "losses.npy", "float64", [1]),
+        (
+            history["gradient_clip_values"],
+            "gradient_clip_values.npy",
+            "float64",
+            [1],
+        ),
+    ]
+    if optimizer["name"] == "adam":
+        descriptor_specs.extend(
+            (
+                optimizer_state[field],
+                name,
+                "float32",
+                model_shape,
+            )
+            for field, name in (
+                ("exp_avg", "optimizer_exp_avg.npy"),
+                ("exp_avg_sq", "optimizer_exp_avg_sq.npy"),
+            )
+        )
+    declared_payload_bytes = len(data) + sum(
+        _validate_checkpoint_file_descriptor_metadata(
+            receipt["checkpoint_id"],
+            descriptor,
+            name=name,
+            dtype=dtype,
+            shape=shape,
+        )
+        for descriptor, name, dtype, shape in descriptor_specs
+    )
+    if declared_payload_bytes > MAX_CHECKPOINT_PAYLOAD_BYTES:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint payload exceeds the aggregate bound"
+        )
+    for descriptor, name, dtype, shape in descriptor_specs:
+        _validate_checkpoint_file_descriptor(
+            job_dir,
+            receipt["checkpoint_id"],
+            descriptor,
+            name=name,
+            dtype=dtype,
+            shape=shape,
+        )
+    return manifest
+
+
+def _validate_checkpoint_receipt(
+    value: Mapping[str, Any],
+    binding: LaunchAttemptBinding,
+    job_dir: Path,
+) -> dict[str, Any]:
+    required = {
+        *binding.payload().keys(),
+        "binding_hash",
+        "ticket_record_hash",
+        "ready_record_hash",
+        "checkpoint_id",
+        "checkpoint_index",
+        "completed_updates",
+        "manifest_relative_path",
+        "manifest_size_bytes",
+        "manifest_hash",
+        "checkpoint_created_at",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint receipt fields are invalid"
+        )
+    _validate_record_hash(value)
+    expected = {
+        **binding.payload(),
+        "binding_hash": binding.binding_hash,
+        "checkpoint_id": checkpoint_id_for_binding(binding),
+        "checkpoint_index": 1,
+        "completed_updates": 1,
+    }
+    if any(value.get(key) != expected_value for key, expected_value in expected.items()):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint receipt binding changed"
+        )
+    if (
+        SHA256.fullmatch(value.get("ticket_record_hash", "")) is None
+        or SHA256.fullmatch(value.get("ready_record_hash", "")) is None
+        or SHA256.fullmatch(value.get("manifest_hash", "")) is None
+        or type(value.get("manifest_size_bytes")) is not int
+        or not 1 <= value["manifest_size_bytes"] <= MAX_CONTROL_JSON_BYTES
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint receipt evidence is invalid"
+        )
+    _parse_timestamp(value.get("checkpoint_created_at"))
+    _validate_checkpoint_manifest(job_dir, binding, value)
+    return copy.deepcopy(dict(value))
+
+
+def _checkpoint_resume_request_payload(
+    *,
+    resume_id: str,
+    submission_id: str,
+    attempt_id: str,
+    attempt_number: int,
+    checkpoint_id: str,
+    checkpoint_manifest_hash: str,
+    checkpoint_receipt_record_hash: str,
+    checkpoint_proof_hash: str,
+    authorized_at: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": CHECKPOINT_PROTOCOL_VERSION,
+        "resume_id": resume_id,
+        "submission_id": submission_id,
+        "attempt_id": attempt_id,
+        "attempt_number": attempt_number,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_manifest_hash": checkpoint_manifest_hash,
+        "checkpoint_receipt_record_hash": checkpoint_receipt_record_hash,
+        "checkpoint_proof_hash": checkpoint_proof_hash,
+        "authorized_at": authorized_at,
+    }
+
+
+def _validate_checkpoint_resume_request(
+    value: Mapping[str, Any],
+    binding: LaunchAttemptBinding,
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "resume_id",
+        "submission_id",
+        "attempt_id",
+        "attempt_number",
+        "checkpoint_id",
+        "checkpoint_manifest_hash",
+        "checkpoint_receipt_record_hash",
+        "checkpoint_proof_hash",
+        "authorized_at",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_RESUME_INVALID: resume request fields are invalid"
+        )
+    _validate_record_hash(value)
+    if (
+        value.get("schema_version") != CHECKPOINT_PROTOCOL_VERSION
+        or RESUME_ID.fullmatch(value.get("resume_id", "")) is None
+        or value.get("submission_id") != binding.submission_id
+        or value.get("attempt_id") != binding.attempt_id
+        or value.get("attempt_number") != binding.attempt_number
+        or value.get("checkpoint_id") != receipt["checkpoint_id"]
+        or value.get("checkpoint_manifest_hash") != receipt["manifest_hash"]
+        or value.get("checkpoint_receipt_record_hash") != receipt["record_hash"]
+        or SHA256.fullmatch(value.get("checkpoint_proof_hash", "")) is None
+    ):
+        raise WorkerControlError(
+            "WORKER_RESUME_INVALID: resume request binding changed"
+        )
+    _parse_timestamp(value.get("authorized_at"))
+    return copy.deepcopy(dict(value))
+
+
+def _validate_checkpoint_resume_ack(
+    value: Mapping[str, Any],
+    binding: LaunchAttemptBinding,
+    receipt: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "submission_id",
+        "attempt_id",
+        "attempt_number",
+        "checkpoint_id",
+        "checkpoint_receipt_record_hash",
+        "resume_id",
+        "resume_request_record_hash",
+        "resume_acknowledged_at",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_RESUME_INVALID: resume acknowledgement fields are invalid"
+        )
+    _validate_record_hash(value)
+    if any(
+        value.get(key) != expected
+        for key, expected in {
+            "schema_version": CHECKPOINT_PROTOCOL_VERSION,
+            "submission_id": binding.submission_id,
+            "attempt_id": binding.attempt_id,
+            "attempt_number": binding.attempt_number,
+            "checkpoint_id": receipt["checkpoint_id"],
+            "checkpoint_receipt_record_hash": receipt["record_hash"],
+            "resume_id": request["resume_id"],
+            "resume_request_record_hash": request["record_hash"],
+        }.items()
+    ):
+        raise WorkerControlError(
+            "WORKER_RESUME_INVALID: resume acknowledgement binding changed"
+        )
+    if _parse_timestamp(value.get("resume_acknowledged_at")) < _parse_timestamp(
+        request.get("authorized_at")
+    ):
+        raise WorkerControlError(
+            "WORKER_RESUME_INVALID: resume acknowledgement moved backwards"
+        )
+    return copy.deepcopy(dict(value))
+
+
+def read_worker_checkpoint_evidence(
+    run_root: Path | str,
+    run_dir: Path | str,
+    binding: LaunchAttemptBinding,
+) -> WorkerCheckpointEvidence | None:
+    """Read one exact checkpoint without launching or inferring restartability."""
+
+    root, job_dir = _validate_root_and_run(run_root, run_dir)
+    try:
+        receipt_value = _read_private_json(job_dir / WORKER_CHECKPOINT_NAME)
+    except FileNotFoundError:
+        for name in (WORKER_RESUME_REQUEST_NAME, WORKER_RESUME_ACK_NAME):
+            try:
+                _read_private_json(job_dir / name)
+            except FileNotFoundError:
+                continue
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: resume evidence has no checkpoint"
+            )
+        return None
+    receipt = _validate_checkpoint_receipt(receipt_value, binding, job_dir)
+    attempt = read_worker_attempt_evidence(root, job_dir, binding)
+    if (
+        attempt is None
+        or attempt.ticket_state != "spawned"
+        or not attempt.ready
+        or attempt.ticket_record_hash != receipt["ticket_record_hash"]
+        or attempt.ready_record_hash != receipt["ready_record_hash"]
+        or attempt.heartbeat_state
+        not in {"running", "waiting", "succeeded", "failed", "stopped"}
+    ):
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: active attempt evidence changed"
+        )
+    try:
+        request_value = _read_private_json(job_dir / WORKER_RESUME_REQUEST_NAME)
+    except FileNotFoundError:
+        request_value = None
+    try:
+        ack_value = _read_private_json(job_dir / WORKER_RESUME_ACK_NAME)
+    except FileNotFoundError:
+        ack_value = None
+    if request_value is None and ack_value is not None:
+        raise WorkerControlError(
+            "WORKER_RESUME_INVALID: acknowledgement has no request"
+        )
+    request = (
+        None
+        if request_value is None
+        else _validate_checkpoint_resume_request(request_value, binding, receipt)
+    )
+    ack = (
+        None
+        if ack_value is None or request is None
+        else _validate_checkpoint_resume_ack(ack_value, binding, receipt, request)
+    )
+    if ack is None:
+        if not execution_fence_is_held(root, binding):
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_ORPHANED: waiting Worker released its fence"
+            )
+        if attempt.heartbeat_state != "waiting":
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_PENDING: waiting heartbeat is not durable"
+            )
+        try:
+            status = _read_private_json(job_dir / "status.json")
+        except FileNotFoundError as error:
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_PENDING: waiting status is unavailable"
+            ) from error
+        if (
+            status.get("job_id") != binding.job_id
+            or status.get("status") != "waiting"
+            or status.get("stage") != "checkpoint_wait"
+            or status.get("checkpoint_id") != receipt["checkpoint_id"]
+            or status.get("checkpoint_record_hash") != receipt["record_hash"]
+        ):
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_PENDING: waiting status is not durable"
+            )
+    state: Literal["waiting", "requested", "resumed"]
+    if ack is not None:
+        state = "resumed"
+    elif request is not None:
+        state = "requested"
+    else:
+        state = "waiting"
+    return WorkerCheckpointEvidence(
+        submission_id=binding.submission_id,
+        attempt_id=binding.attempt_id,
+        attempt_number=binding.attempt_number,
+        job_id=binding.job_id,
+        request_hash=binding.request_hash,
+        binding_hash=binding.binding_hash,
+        ticket_record_hash=receipt["ticket_record_hash"],
+        ready_record_hash=receipt["ready_record_hash"],
+        checkpoint_id=receipt["checkpoint_id"],
+        checkpoint_index=receipt["checkpoint_index"],
+        completed_updates=receipt["completed_updates"],
+        manifest_relative_path=receipt["manifest_relative_path"],
+        manifest_size_bytes=receipt["manifest_size_bytes"],
+        manifest_hash=receipt["manifest_hash"],
+        checkpoint_created_at=receipt["checkpoint_created_at"],
+        checkpoint_record_hash=receipt["record_hash"],
+        state=state,
+        resume_id=None if request is None else request["resume_id"],
+        checkpoint_proof_hash=(
+            None if request is None else request["checkpoint_proof_hash"]
+        ),
+        authorized_at=None if request is None else request["authorized_at"],
+        resume_requested_at=None if request is None else request["authorized_at"],
+        resume_request_record_hash=(
+            None if request is None else request["record_hash"]
+        ),
+        resume_acknowledged_at=(
+            None if ack is None else ack["resume_acknowledged_at"]
+        ),
+        resume_acknowledgement_record_hash=(
+            None if ack is None else ack["record_hash"]
+        ),
+    )
+
+
+def request_worker_checkpoint_resume(
+    run_root: Path | str,
+    run_dir: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    request_document: Mapping[str, Any],
+) -> WorkerCheckpointEvidence:
+    """Append one exact same-live-attempt resume request; never launch."""
+
+    root, job_dir = _validate_root_and_run(run_root, run_dir)
+    with _hold_worker_terminal_arbitration(root, binding):
+        evidence = read_worker_checkpoint_evidence(root, job_dir, binding)
+        if evidence is None:
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_MISSING: no checkpoint is waiting"
+            )
+        receipt = _read_private_json(job_dir / WORKER_CHECKPOINT_NAME)
+        document = _validate_checkpoint_resume_request(
+            request_document, binding, receipt
+        )
+        if evidence.state == "resumed":
+            existing = _read_private_json(job_dir / WORKER_RESUME_REQUEST_NAME)
+            if existing != document:
+                raise WorkerControlError(
+                    "WORKER_RESUME_CONFLICT: another resume request was acknowledged"
+                )
+            return evidence
+        stop = read_worker_stop_evidence(root, binding)
+        if stop.requested or stop.acknowledged:
+            raise WorkerControlError(
+                "WORKER_RESUME_UNSAFE: exact Worker has a stop request"
+            )
+        path = job_dir / WORKER_RESUME_REQUEST_NAME
+        try:
+            existing = _read_private_json(path)
+        except FileNotFoundError:
+            try:
+                _create_private_json(path, document)
+                existing = document
+            except FileExistsError:
+                existing = _read_private_json(path)
+        validated = _validate_checkpoint_resume_request(existing, binding, receipt)
+        if validated != document:
+            raise WorkerControlError(
+                "WORKER_RESUME_CONFLICT: attempt has another resume request"
+            )
+    refreshed = read_worker_checkpoint_evidence(root, job_dir, binding)
+    if refreshed is None:
+        raise WorkerControlError(
+            "WORKER_CHECKPOINT_INVALID: checkpoint disappeared after resume request"
+        )
+    return refreshed
+
+
 def _ensure_capacity_policy(capacity: Path, max_active: int) -> None:
     lock = _open_private_lock(capacity / "policy.lock", blocking=True)
     if lock is None:
@@ -2552,10 +3366,11 @@ class WorkerHeartbeat:
         self._ready_published = threading.Event()
         self._cancel_requested = threading.Event()
         self._thread: threading.Thread | None = None
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         self._cancel_lock = threading.Lock()
         self._failure: BaseException | None = None
         self._sequence = 0
+        self._active_heartbeat_state = "running"
         self._started_at: str | None = None
         self._started_monotonic: float | None = None
         self._ticket: dict[str, Any] | None = None
@@ -2780,6 +3595,16 @@ class WorkerHeartbeat:
         with self._cancel_lock:
             return self._stop_evidence
 
+    @property
+    def checkpoint_binding(self) -> LaunchAttemptBinding:
+        """Return the already-validated immutable binding after start()."""
+
+        if self._binding is None or not self._ready_published.is_set():
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: Worker is not ready"
+            )
+        return self._binding
+
     def _write_ready(self) -> None:
         assert self._binding is not None
         assert self._ticket is not None
@@ -2817,33 +3642,224 @@ class WorkerHeartbeat:
         os.fstat(self.attempt_fd)
         os.fstat(self.capacity_fd)
 
-    def _write_heartbeat(self, state: str) -> None:
+    def _write_heartbeat_locked(self, state: str) -> None:
         assert self._binding is not None
         assert self._ticket is not None
         assert self._started_at is not None
+        self._validate_active_projection()
+        self._sequence += 1
+        heartbeat = _record_with_hash(
+            {
+                "schema_version": CONTROL_SCHEMA_VERSION,
+                "submission_id": self._binding.submission_id,
+                "attempt_id": self._binding.attempt_id,
+                "attempt_number": self._binding.attempt_number,
+                "binding_hash": self._binding.binding_hash,
+                "job_id": self._binding.job_id,
+                "capacity_slot": self._ticket["capacity_slot"],
+                "capacity_generation": self._ticket["capacity_generation"],
+                "sequence": self._sequence,
+                "state": state,
+                "worker_pid": os.getpid(),
+                "started_at": self._started_at,
+                "updated_at": _utc_now(),
+            }
+        )
+        _atomic_write_private_json(
+            self.run_dir / WORKER_HEARTBEAT_NAME, heartbeat
+        )
+
+    def _write_heartbeat(self, state: str) -> None:
         with self._write_lock:
-            self._validate_active_projection()
-            self._sequence += 1
-            heartbeat = _record_with_hash(
-                {
-                    "schema_version": CONTROL_SCHEMA_VERSION,
-                    "submission_id": self._binding.submission_id,
-                    "attempt_id": self._binding.attempt_id,
-                    "attempt_number": self._binding.attempt_number,
-                    "binding_hash": self._binding.binding_hash,
-                    "job_id": self._binding.job_id,
-                    "capacity_slot": self._ticket["capacity_slot"],
-                    "capacity_generation": self._ticket["capacity_generation"],
-                    "sequence": self._sequence,
-                    "state": state,
-                    "worker_pid": os.getpid(),
-                    "started_at": self._started_at,
-                    "updated_at": _utc_now(),
-                }
+            self._write_heartbeat_locked(state)
+
+    def _write_active_heartbeat(self) -> None:
+        with self._write_lock:
+            # Route through the public write seam while holding the re-entrant
+            # state lock.  Existing fault-injection tests and operational
+            # instrumentation therefore continue to observe active writes.
+            self._write_heartbeat(self._active_heartbeat_state)
+
+    def _set_active_heartbeat_state(self, state: str) -> None:
+        if state not in {"running", "waiting"}:
+            raise WorkerControlError(
+                "WORKER_HEARTBEAT_INVALID: active heartbeat state is invalid"
             )
-            _atomic_write_private_json(
-                self.run_dir / WORKER_HEARTBEAT_NAME, heartbeat
+        with self._write_lock:
+            self._active_heartbeat_state = state
+            self._write_heartbeat_locked(state)
+
+    def wait_for_checkpoint_resume(
+        self,
+        manifest_evidence: Mapping[str, Any],
+        *,
+        on_waiting: Callable[[Mapping[str, Any]], None],
+        on_resumed: Callable[[Mapping[str, Any], Mapping[str, Any]], None],
+    ) -> WorkerCheckpointEvidence:
+        """Publish the sole checkpoint and block the same fenced Worker.
+
+        No process is relaunched and neither inherited lease is released.  The
+        numerical main thread can leave this method only after the exact
+        append-only resume request is acknowledged, or by cooperative stop.
+        """
+
+        if self._binding is None or self._ticket is None:
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: Worker is not started"
             )
+        if not callable(on_waiting) or not callable(on_resumed):
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: checkpoint callbacks are invalid"
+            )
+        required_manifest_evidence = {
+            "checkpoint_id",
+            "checkpoint_index",
+            "completed_updates",
+            "manifest_relative_path",
+            "manifest_size_bytes",
+            "manifest_hash",
+            "checkpoint_created_at",
+        }
+        evidence = copy.deepcopy(dict(manifest_evidence))
+        if (
+            set(evidence) != required_manifest_evidence
+            or evidence.get("checkpoint_id")
+            != checkpoint_id_for_binding(self._binding)
+            or evidence.get("checkpoint_index") != 1
+            or evidence.get("completed_updates") != 1
+            or evidence.get("manifest_relative_path")
+            != _checkpoint_manifest_relative_path(evidence["checkpoint_id"])
+            or type(evidence.get("manifest_size_bytes")) is not int
+            or not 1 <= evidence["manifest_size_bytes"] <= MAX_CONTROL_JSON_BYTES
+            or SHA256.fullmatch(evidence.get("manifest_hash", "")) is None
+        ):
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: checkpoint manifest evidence is invalid"
+            )
+        _parse_timestamp(evidence.get("checkpoint_created_at"))
+        for name in (
+            WORKER_CHECKPOINT_NAME,
+            WORKER_RESUME_REQUEST_NAME,
+            WORKER_RESUME_ACK_NAME,
+        ):
+            path = self.run_dir / name
+            if path.exists() or path.is_symlink():
+                raise WorkerControlError(
+                    "WORKER_CHECKPOINT_REPLAY: checkpoint barrier already exists"
+                )
+        self._validate_active_projection()
+        attempt = read_worker_attempt_evidence(
+            self.root, self.run_dir, self._binding
+        )
+        if (
+            attempt is None
+            or attempt.ticket_state != "spawned"
+            or not attempt.ready
+            or attempt.heartbeat_state != "running"
+            or attempt.ready_record_hash is None
+        ):
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: running attempt evidence is unavailable"
+            )
+        receipt = _record_with_hash(
+            {
+                **self._binding.payload(),
+                "binding_hash": self._binding.binding_hash,
+                "ticket_record_hash": attempt.ticket_record_hash,
+                "ready_record_hash": attempt.ready_record_hash,
+                **evidence,
+            }
+        )
+        _validate_checkpoint_receipt(receipt, self._binding, self.run_dir)
+        try:
+            _create_private_json(self.run_dir / WORKER_CHECKPOINT_NAME, receipt)
+        except FileExistsError as error:
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_REPLAY: checkpoint receipt already exists"
+            ) from error
+
+        # Publish the waiting heartbeat before status.  A concurrent observer
+        # treats the tiny interval as CHECKPOINT_PENDING and never authorizes
+        # resume until both projections bind this receipt.
+        self._set_active_heartbeat_state("waiting")
+        on_waiting(copy.deepcopy(receipt))
+        waiting = read_worker_checkpoint_evidence(
+            self.root, self.run_dir, self._binding
+        )
+        if waiting is None or waiting.state != "waiting":
+            raise WorkerControlError(
+                "WORKER_CHECKPOINT_INVALID: waiting evidence was not durable"
+            )
+
+        while True:
+            self.raise_if_cancel_requested()
+            if self._failure is not None or self._stop.is_set():
+                raise WorkerControlError(
+                    "WORKER_HEARTBEAT_FAILED: heartbeat stopped during checkpoint wait"
+                ) from self._failure
+            try:
+                request_value = _read_private_json(
+                    self.run_dir / WORKER_RESUME_REQUEST_NAME
+                )
+            except FileNotFoundError:
+                self._stop.wait(min(0.05, self.interval_seconds))
+                continue
+            request = _validate_checkpoint_resume_request(
+                request_value, self._binding, receipt
+            )
+            # Resume acknowledgement and stop request publication share the
+            # same terminal arbitration.  If stop landed first, the final
+            # recheck acknowledges it and exits without a resume ack.  If the
+            # ack wins, a later stop observes an already-running Worker.
+            with _hold_worker_terminal_arbitration(self.root, self._binding):
+                ack_path = self.run_dir / WORKER_RESUME_ACK_NAME
+                if ack_path.exists() or ack_path.is_symlink():
+                    raise WorkerControlError(
+                        "WORKER_RESUME_REPLAY: resume acknowledgement already exists"
+                    )
+                self.raise_if_cancel_requested()
+                acknowledged_at = _utc_now()
+                if _parse_timestamp(acknowledged_at) < _parse_timestamp(
+                    request["authorized_at"]
+                ):
+                    raise WorkerControlError(
+                        "WORKER_RESUME_INVALID: authorization time is in the future"
+                    )
+                acknowledgement = _record_with_hash(
+                    {
+                        "schema_version": CHECKPOINT_PROTOCOL_VERSION,
+                        "submission_id": self._binding.submission_id,
+                        "attempt_id": self._binding.attempt_id,
+                        "attempt_number": self._binding.attempt_number,
+                        "checkpoint_id": receipt["checkpoint_id"],
+                        "checkpoint_receipt_record_hash": receipt["record_hash"],
+                        "resume_id": request["resume_id"],
+                        "resume_request_record_hash": request["record_hash"],
+                        "resume_acknowledged_at": acknowledged_at,
+                    }
+                )
+                try:
+                    _create_private_json(ack_path, acknowledgement)
+                except FileExistsError as error:
+                    raise WorkerControlError(
+                        "WORKER_RESUME_REPLAY: resume acknowledgement already exists"
+                    ) from error
+                _validate_checkpoint_resume_ack(
+                    acknowledgement, self._binding, receipt, request
+                )
+                # The append-only ack is the commit point.  Publish Running
+                # heartbeat/status only after it exists, while stop writers
+                # are still excluded by the same arbitration lock.
+                self._set_active_heartbeat_state("running")
+                on_resumed(copy.deepcopy(receipt), copy.deepcopy(request))
+            resumed = read_worker_checkpoint_evidence(
+                self.root, self.run_dir, self._binding
+            )
+            if resumed is None or resumed.state != "resumed":
+                raise WorkerControlError(
+                    "WORKER_RESUME_INVALID: resume acknowledgement was not durable"
+                )
+            return resumed
 
     def _enforce_acknowledged_stop(self) -> None:
         """Keep the exact acknowledged stop deadline authoritative.
@@ -2894,7 +3910,7 @@ class WorkerHeartbeat:
             if self._stop.is_set():
                 return
             try:
-                self._write_heartbeat("running")
+                self._write_active_heartbeat()
             except BaseException:
                 continue
 
@@ -2926,7 +3942,7 @@ class WorkerHeartbeat:
                     return
                 if self._stop.wait(self.interval_seconds):
                     return
-                self._write_heartbeat("running")
+                self._write_active_heartbeat()
         except BaseException as error:
             self._failure = error
             self._stop.set()
@@ -3096,7 +4112,8 @@ def read_worker_attempt_evidence(
     if (
         type(heartbeat["sequence"]) is not int
         or heartbeat["sequence"] < 1
-        or heartbeat["state"] not in {"running", "succeeded", "failed", "stopped"}
+        or heartbeat["state"]
+        not in {"running", "waiting", "succeeded", "failed", "stopped"}
         or type(heartbeat["worker_pid"]) is not int
         or heartbeat["worker_pid"] <= 0
     ):
@@ -3333,6 +4350,24 @@ def _read_worker_exit_context(
     run_dir: Path,
     binding: LaunchAttemptBinding,
 ) -> tuple[WorkerAttemptEvidence, dict[str, Any], str]:
+    try:
+        checkpoint = _read_private_json(run_dir / WORKER_CHECKPOINT_NAME)
+    except FileNotFoundError:
+        checkpoint = None
+    if checkpoint is not None:
+        _validate_checkpoint_receipt(checkpoint, binding, run_dir)
+        try:
+            checkpoint_evidence = read_worker_checkpoint_evidence(
+                run_root, run_dir, binding
+            )
+        except WorkerControlError as error:
+            raise WorkerControlError(
+                "WORKER_EXIT_UNSAFE: unresolved checkpoint wait is not retryable"
+            ) from error
+        if checkpoint_evidence is None or checkpoint_evidence.state != "resumed":
+            raise WorkerControlError(
+                "WORKER_EXIT_UNSAFE: unresolved checkpoint wait is not retryable"
+            )
     attempt = read_worker_attempt_evidence(run_root, run_dir, binding)
     if (
         attempt is None
@@ -3607,14 +4642,19 @@ def worker_attempt_started(
 
 __all__ = [
     "CANCELLED_WORKER_EXIT_CODE",
+    "CHECKPOINT_PROTOCOL_VERSION",
     "CONTROL_DIRECTORY",
     "STOP_PROTOCOL_VERSION",
     "SUPPORTED_STOP_REASONS",
     "WALL_TIME_EXCEEDED_WORKER_EXIT_CODE",
     "WORKER_EXIT_NAME",
+    "WORKER_CHECKPOINT_NAME",
+    "WORKER_RESUME_ACK_NAME",
+    "WORKER_RESUME_REQUEST_NAME",
     "LaunchAttemptBinding",
     "ParentLaunchLease",
     "WorkerAttemptEvidence",
+    "WorkerCheckpointEvidence",
     "WorkerCancelEvidence",
     "WorkerCancellationRequested",
     "WorkerControlError",
@@ -3623,6 +4663,7 @@ __all__ = [
     "WorkerStopEvidence",
     "WorkerWallTimeExceeded",
     "binding_from_submission_record",
+    "checkpoint_id_for_binding",
     "ensure_worker_cancel_capability",
     "ensure_worker_stop_capability",
     "execution_fence_is_held",
@@ -3634,10 +4675,12 @@ __all__ = [
     "read_pre_running_attempt_evidence",
     "read_worker_cancel_capability",
     "read_worker_cancel_evidence",
+    "read_worker_checkpoint_evidence",
     "read_worker_stop_capability",
     "read_worker_stop_evidence",
     "read_worker_attempt_evidence",
     "request_worker_cancel",
+    "request_worker_checkpoint_resume",
     "request_worker_stop",
     "record_worker_exit",
     "stage_launch_attempt",

@@ -11,8 +11,11 @@ from typing import Any, Literal, Mapping, Protocol
 
 from .fwi_adapter import (
     ADAPTER_VERSION,
+    ALGORITHM_ID,
     LOGICAL_ENTRYPOINT,
     SUPPORTED_ADAPTER_VERSIONS,
+    SUPPORTED_MANAGED_REQUEST_VERSIONS,
+    AdapterCheckpointProof,
     AdapterDispatchNotStartedProof,
     AdapterError,
     AdapterExistingDispatchReceiptProof,
@@ -37,6 +40,18 @@ _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MANAGED_SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
 _MANAGED_ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
 _MANAGED_JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+_MANAGED_CHECKPOINT_ID = re.compile(r"^checkpoint-[0-9a-f]{32}$")
+_MANAGED_RESUME_ID = re.compile(r"^resume-[0-9a-f]{32}$")
+
+
+def _timestamp_is_invalid(value: Any) -> bool:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return True
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return True
+    return parsed.tzinfo is None
 
 
 class DispatchError(RuntimeError):
@@ -117,6 +132,78 @@ class DispatchRetryProof:
     private_evidence: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class DispatchCheckpointProof:
+    """Validated path-bounded checkpoint observation."""
+
+    task_id: str
+    node_id: str
+    submission_id: str
+    attempt_id: str
+    attempt_number: int
+    checkpoint_id: str
+    checkpoint_index: int
+    completed_updates: int
+    binding_hash: str
+    submission_receipt_record_hash: str
+    ready_record_hash: str
+    checkpoint_manifest_relative_path: str
+    checkpoint_manifest_size_bytes: int
+    checkpoint_manifest_hash: str
+    checkpoint_receipt_record_hash: str
+    checkpoint_proof_hash: str | None
+    checkpoint_created_at: str
+    state: Literal["waiting", "requested", "resumed", "action_required"]
+    resume_id: str | None
+    resume_request_record_hash: str | None
+    resume_acknowledgement_record_hash: str | None
+    resume_acknowledged_at: str | None
+    proof_hash: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0.0",
+            "task_id": self.task_id,
+            "node_id": self.node_id,
+            "submission_id": self.submission_id,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "checkpoint_id": self.checkpoint_id,
+            "checkpoint_index": self.checkpoint_index,
+            "completed_updates": self.completed_updates,
+            "binding_hash": self.binding_hash,
+            "submission_receipt_record_hash": (
+                self.submission_receipt_record_hash
+            ),
+            "ready_record_hash": self.ready_record_hash,
+            "checkpoint_manifest_relative_path": (
+                self.checkpoint_manifest_relative_path
+            ),
+            "checkpoint_manifest_size_bytes": (
+                self.checkpoint_manifest_size_bytes
+            ),
+            "checkpoint_manifest_hash": self.checkpoint_manifest_hash,
+            "checkpoint_receipt_record_hash": (
+                self.checkpoint_receipt_record_hash
+            ),
+            "checkpoint_proof_hash": self.checkpoint_proof_hash,
+            "checkpoint_created_at": self.checkpoint_created_at,
+            "state": self.state,
+            "resume_id": self.resume_id,
+            "resume_request_record_hash": self.resume_request_record_hash,
+            "resume_acknowledgement_record_hash": (
+                self.resume_acknowledgement_record_hash
+            ),
+            "resume_acknowledged_at": self.resume_acknowledged_at,
+            "proof_hash": self.proof_hash,
+        }
+
+
+@dataclass(frozen=True)
+class DispatchCheckpointResumeResult(DispatchCheckpointProof):
+    """Result of one no-launch resume request or exact replay."""
+
+
 class TaskDispatcher(Protocol):
     """Fixed dispatcher with supervised submit and zero-relaunch receipt paths."""
 
@@ -191,6 +278,19 @@ class TaskDispatcher(Protocol):
     def retry_worker_exit(
         self, intent: DispatchIntentSnapshot, *, authorization: Mapping[str, Any]
     ) -> dict[str, Any]:
+        ...
+
+    def probe_runtime_checkpoint(
+        self, intent: DispatchIntentSnapshot
+    ) -> DispatchCheckpointProof | None:
+        ...
+
+    def resume_runtime_checkpoint(
+        self,
+        intent: DispatchIntentSnapshot,
+        *,
+        authorization: Mapping[str, Any],
+    ) -> DispatchCheckpointResumeResult:
         ...
 
     def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
@@ -332,12 +432,18 @@ class DeepwaveTaskDispatcher:
 
     @staticmethod
     def supports_supervised_dispatch(intent: DispatchIntentSnapshot) -> bool:
-        """Return true only for the current fixed managed Adapter identity."""
+        """Keep active managed intents operable without launching old pending work."""
 
         return (
             isinstance(intent, DispatchIntentSnapshot)
             and intent.adapter_id == LOGICAL_ENTRYPOINT
-            and intent.adapter_version == ADAPTER_VERSION
+            and (
+                intent.adapter_version == ADAPTER_VERSION
+                or (
+                    intent.adapter_version in SUPPORTED_MANAGED_REQUEST_VERSIONS
+                    and intent.state != "pending"
+                )
+            )
         )
 
     def ensure_first_dispatch(
@@ -389,7 +495,7 @@ class DeepwaveTaskDispatcher:
 
         if (
             intent.adapter_id != LOGICAL_ENTRYPOINT
-            or intent.adapter_version != ADAPTER_VERSION
+            or intent.adapter_version not in SUPPORTED_MANAGED_REQUEST_VERSIONS
             or intent.state != "dispatching"
             or intent.handle is not None
             or not isinstance(intent.request, Mapping)
@@ -420,6 +526,13 @@ class DeepwaveTaskDispatcher:
             or request["idempotency_key"] != intent.node_idempotency_key
             or intent.queue_fingerprint.get("normalized_config_hash")
             != normalized_config_hash
+            or request.get("algorithm")
+            != {"id": ALGORITHM_ID, "version": intent.adapter_version}
+            or not is_supported_receipt_binding(
+                request["algorithm"],
+                intent.adapter_version,
+                intent.queue_fingerprint,
+            )
         ):
             raise DispatchError("DISPATCH_INTENT_INVALID")
         try:
@@ -434,7 +547,7 @@ class DeepwaveTaskDispatcher:
         except Exception as error:
             raise DispatchError("DISPATCH_RECOVERY_UNAVAILABLE") from error
         if (
-            handle.adapter_version != ADAPTER_VERSION
+            handle.adapter_version != intent.adapter_version
             or handle.task_id != intent.task_id
             or handle.node_id != intent.node_id
             or handle.plan_hash != intent.plan_hash
@@ -498,6 +611,19 @@ class DeepwaveTaskDispatcher:
             heartbeat = (
                 evidence.get("heartbeat") if isinstance(evidence, Mapping) else None
             )
+            heartbeat_state = (
+                heartbeat.get("state")
+                if isinstance(heartbeat, Mapping)
+                else None
+            )
+            heartbeat_positive = heartbeat_state in {
+                "running",
+                "succeeded",
+                "failed",
+            } or (
+                intent.adapter_version == "1.6.0"
+                and heartbeat_state == "waiting"
+            )
             if (
                 proof.private_schema_version not in {"1.1.0", "1.2.0"}
                 or proof.receipt_record_hash is not None
@@ -505,8 +631,7 @@ class DeepwaveTaskDispatcher:
                 or ticket.get("state") != "spawned"
                 or not isinstance(ready, Mapping)
                 or not isinstance(heartbeat, Mapping)
-                or heartbeat.get("state")
-                not in {"running", "succeeded", "failed"}
+                or not heartbeat_positive
                 or evidence.get("submission_id") != handle.submission_id
                 or evidence.get("job_id") != handle.job_id
                 or evidence.get("request_hash") != handle.request_hash
@@ -539,7 +664,7 @@ class DeepwaveTaskDispatcher:
 
         if (
             intent.adapter_id != LOGICAL_ENTRYPOINT
-            or intent.adapter_version != ADAPTER_VERSION
+            or intent.adapter_version not in SUPPORTED_MANAGED_REQUEST_VERSIONS
             or intent.state != "reconciliation_required"
             or intent.handle is not None
             or not isinstance(intent.request, Mapping)
@@ -570,6 +695,13 @@ class DeepwaveTaskDispatcher:
             or request["idempotency_key"] != intent.node_idempotency_key
             or intent.queue_fingerprint.get("normalized_config_hash")
             != normalized_config_hash
+            or request.get("algorithm")
+            != {"id": ALGORITHM_ID, "version": intent.adapter_version}
+            or not is_supported_receipt_binding(
+                request["algorithm"],
+                intent.adapter_version,
+                intent.queue_fingerprint,
+            )
         ):
             raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_UNSUPPORTED")
         try:
@@ -599,7 +731,7 @@ class DeepwaveTaskDispatcher:
         if (
             not isinstance(intent, DispatchIntentSnapshot)
             or intent.adapter_id != LOGICAL_ENTRYPOINT
-            or intent.adapter_version not in {"1.4.0", "1.5.0"}
+            or intent.adapter_version not in {"1.4.0", "1.5.0", "1.6.0"}
             or intent.state != "reconciliation_required"
             or intent.handle is not None
             or not isinstance(intent.request, Mapping)
@@ -749,7 +881,11 @@ class DeepwaveTaskDispatcher:
                 adapter_result.adapter_version,
                 adapter_result.private_schema_version,
             )
-            not in {("1.4.0", "1.1.0"), ("1.5.0", "1.2.0")}
+            not in {
+                ("1.4.0", "1.1.0"),
+                ("1.5.0", "1.2.0"),
+                ("1.6.0", "1.2.0"),
+            }
             or not isinstance(adapter_result.private_record_hash, str)
             or _SHA256.fullmatch(adapter_result.private_record_hash) is None
             or not isinstance(adapter_result.private_proof_hash, str)
@@ -966,12 +1102,12 @@ class DeepwaveTaskDispatcher:
         if (
             intent.adapter_id == LOGICAL_ENTRYPOINT
             and intent.adapter_version in SUPPORTED_ADAPTER_VERSIONS
-            and intent.adapter_version != ADAPTER_VERSION
+            and intent.adapter_version not in SUPPORTED_MANAGED_REQUEST_VERSIONS
         ):
             raise DispatchError("WORKER_EVIDENCE_UNAVAILABLE")
         if (
             intent.adapter_id != LOGICAL_ENTRYPOINT
-            or intent.adapter_version != ADAPTER_VERSION
+            or intent.adapter_version not in SUPPORTED_MANAGED_REQUEST_VERSIONS
             or intent.state not in {"dispatching", "dispatched", "retrying"}
             or (intent.state == "dispatching" and intent.handle is not None)
             or (intent.state == "dispatched" and not isinstance(intent.handle, Mapping))
@@ -1004,6 +1140,13 @@ class DeepwaveTaskDispatcher:
             or request["idempotency_key"] != intent.node_idempotency_key
             or intent.queue_fingerprint.get("normalized_config_hash")
             != normalized_config_hash
+            or request.get("algorithm")
+            != {"id": ALGORITHM_ID, "version": intent.adapter_version}
+            or not is_supported_receipt_binding(
+                request["algorithm"],
+                intent.adapter_version,
+                intent.queue_fingerprint,
+            )
         ):
             raise DispatchError("DISPATCH_INTENT_INVALID")
         try:
@@ -1027,7 +1170,7 @@ class DeepwaveTaskDispatcher:
         if handle is not None and (
             not isinstance(handle, Mapping)
             or not isinstance(handle_fingerprint, Mapping)
-            or handle.get("adapter_version") != ADAPTER_VERSION
+            or handle.get("adapter_version") != intent.adapter_version
             or handle.get("task_id") != intent.task_id
             or handle.get("node_id") != intent.node_id
             or handle.get("plan_hash") != intent.plan_hash
@@ -1043,6 +1186,13 @@ class DeepwaveTaskDispatcher:
             or (handle is not None and handle.get("job_id") != evidence.get("job_id"))
         ):
             raise DispatchError("WORKER_EVIDENCE_INVALID")
+        heartbeat = evidence.get("heartbeat")
+        if (
+            isinstance(heartbeat, Mapping)
+            and heartbeat.get("state") == "waiting"
+            and intent.adapter_version != "1.6.0"
+        ):
+            raise DispatchError("WORKER_EVIDENCE_INVALID")
         return {
             "evidence": copy.deepcopy(dict(evidence)),
             "handle": None if handle is None else copy.deepcopy(dict(handle)),
@@ -1052,7 +1202,7 @@ class DeepwaveTaskDispatcher:
     def _pre_dispatch_request(intent: DispatchIntentSnapshot) -> tuple[dict[str, Any], str]:
         if (
             intent.adapter_id != LOGICAL_ENTRYPOINT
-            or intent.adapter_version != ADAPTER_VERSION
+            or intent.adapter_version not in SUPPORTED_MANAGED_REQUEST_VERSIONS
             or intent.state != "dispatching"
             or intent.handle is not None
             or not isinstance(intent.request, Mapping)
@@ -1083,6 +1233,13 @@ class DeepwaveTaskDispatcher:
             or request["idempotency_key"] != intent.node_idempotency_key
             or intent.queue_fingerprint.get("normalized_config_hash")
             != normalized_config_hash
+            or request.get("algorithm")
+            != {"id": ALGORITHM_ID, "version": intent.adapter_version}
+            or not is_supported_receipt_binding(
+                request["algorithm"],
+                intent.adapter_version,
+                intent.queue_fingerprint,
+            )
         ):
             raise DispatchError("DISPATCH_INTENT_INVALID")
         return request, normalized_config_hash
@@ -1187,7 +1344,7 @@ class DeepwaveTaskDispatcher:
     ) -> tuple[dict[str, Any], str]:
         if (
             intent.adapter_id != LOGICAL_ENTRYPOINT
-            or intent.adapter_version != ADAPTER_VERSION
+            or intent.adapter_version not in SUPPORTED_MANAGED_REQUEST_VERSIONS
             or intent.state not in allowed_states
             or (intent.state == "retrying" and intent.handle is not None)
             or not isinstance(intent.request, Mapping)
@@ -1218,6 +1375,13 @@ class DeepwaveTaskDispatcher:
             or request["idempotency_key"] != intent.node_idempotency_key
             or intent.queue_fingerprint.get("normalized_config_hash")
             != normalized_config_hash
+            or request.get("algorithm")
+            != {"id": ALGORITHM_ID, "version": intent.adapter_version}
+            or not is_supported_receipt_binding(
+                request["algorithm"],
+                intent.adapter_version,
+                intent.queue_fingerprint,
+            )
         ):
             raise DispatchError("DISPATCH_INTENT_INVALID")
         return request, normalized_config_hash
@@ -1340,7 +1504,7 @@ class DeepwaveTaskDispatcher:
             raise DispatchError("WORKER_RETRY_UNAVAILABLE") from error
         if (
             not isinstance(handle, AdapterHandle)
-            or handle.adapter_version != ADAPTER_VERSION
+            or handle.adapter_version != intent.adapter_version
             or handle.task_id != intent.task_id
             or handle.node_id != intent.node_id
             or handle.plan_hash != intent.plan_hash
@@ -1435,7 +1599,7 @@ class DeepwaveTaskDispatcher:
             raise DispatchError("WORKER_RETRY_UNAVAILABLE") from error
         if (
             not isinstance(handle, AdapterHandle)
-            or handle.adapter_version != ADAPTER_VERSION
+            or handle.adapter_version != intent.adapter_version
             or handle.task_id != intent.task_id
             or handle.node_id != intent.node_id
             or handle.plan_hash != intent.plan_hash
@@ -1478,6 +1642,280 @@ class DeepwaveTaskDispatcher:
         ):
             raise DispatchError("DISPATCH_RECEIPT_INVALID")
         return handle
+
+    @staticmethod
+    def _validated_checkpoint_result(
+        intent: DispatchIntentSnapshot,
+        handle: AdapterHandle,
+        result: AdapterCheckpointProof,
+        *,
+        resume_result: bool,
+    ) -> DispatchCheckpointProof | DispatchCheckpointResumeResult:
+        if not isinstance(result, AdapterCheckpointProof):
+            raise DispatchError("ADAPTER_CHECKPOINT_RESPONSE_INVALID")
+        proof = result.as_dict()
+        expected = {
+            "schema_version",
+            "task_id",
+            "node_id",
+            "submission_id",
+            "attempt_id",
+            "attempt_number",
+            "checkpoint_id",
+            "checkpoint_index",
+            "completed_updates",
+            "binding_hash",
+            "submission_receipt_record_hash",
+            "ready_record_hash",
+            "checkpoint_manifest_relative_path",
+            "checkpoint_manifest_size_bytes",
+            "checkpoint_manifest_hash",
+            "checkpoint_receipt_record_hash",
+            "checkpoint_proof_hash",
+            "checkpoint_created_at",
+            "state",
+            "resume_id",
+            "resume_request_record_hash",
+            "resume_acknowledgement_record_hash",
+            "resume_acknowledged_at",
+            "proof_hash",
+        }
+        payload = {
+            key: copy.deepcopy(value)
+            for key, value in proof.items()
+            if key != "proof_hash"
+        }
+        _, actual_hash = encode_document(payload)
+        state = proof.get("state")
+        resume_id = proof.get("resume_id")
+        request_hash = proof.get("resume_request_record_hash")
+        acknowledgement_hash = proof.get(
+            "resume_acknowledgement_record_hash"
+        )
+        checkpoint_proof_hash = proof.get("checkpoint_proof_hash")
+        acknowledged_at = proof.get("resume_acknowledged_at")
+
+        def timestamp(value: Any) -> datetime | None:
+            if not isinstance(value, str) or not value.endswith("Z"):
+                return None
+            try:
+                parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo is not None else None
+
+        created = timestamp(proof.get("checkpoint_created_at"))
+        acknowledged = (
+            None if acknowledged_at is None else timestamp(acknowledged_at)
+        )
+        hashes_valid = all(
+            isinstance(proof.get(field), str)
+            and _SHA256.fullmatch(proof[field]) is not None
+            for field in (
+                "binding_hash",
+                "submission_receipt_record_hash",
+                "ready_record_hash",
+                "checkpoint_manifest_hash",
+                "checkpoint_receipt_record_hash",
+                "proof_hash",
+            )
+        )
+        resume_fields_valid = False
+        if state in {"waiting", "action_required"}:
+            resume_fields_valid = all(
+                value is None
+                for value in (
+                    checkpoint_proof_hash,
+                    resume_id,
+                    request_hash,
+                    acknowledgement_hash,
+                    acknowledged_at,
+                )
+            )
+        elif state == "requested":
+            resume_fields_valid = (
+                isinstance(resume_id, str)
+                and _MANAGED_RESUME_ID.fullmatch(resume_id) is not None
+                and isinstance(checkpoint_proof_hash, str)
+                and _SHA256.fullmatch(checkpoint_proof_hash) is not None
+                and isinstance(request_hash, str)
+                and _SHA256.fullmatch(request_hash) is not None
+                and acknowledgement_hash is None
+                and acknowledged_at is None
+            )
+        elif state == "resumed":
+            resume_fields_valid = (
+                isinstance(resume_id, str)
+                and _MANAGED_RESUME_ID.fullmatch(resume_id) is not None
+                and isinstance(checkpoint_proof_hash, str)
+                and _SHA256.fullmatch(checkpoint_proof_hash) is not None
+                and isinstance(request_hash, str)
+                and _SHA256.fullmatch(request_hash) is not None
+                and isinstance(acknowledgement_hash, str)
+                and _SHA256.fullmatch(acknowledgement_hash) is not None
+                and acknowledged is not None
+                and created is not None
+                and acknowledged >= created
+            )
+        relative_path = proof.get("checkpoint_manifest_relative_path")
+        checkpoint_id = proof.get("checkpoint_id")
+        if (
+            set(proof) != expected
+            or proof.get("schema_version") != "1.0.0"
+            or proof.get("task_id") != intent.task_id
+            or proof.get("node_id") != intent.node_id
+            or proof.get("submission_id") != handle.submission_id
+            or not isinstance(handle.submission_id, str)
+            or _MANAGED_SUBMISSION_ID.fullmatch(handle.submission_id) is None
+            or proof.get("attempt_id") is None
+            or _MANAGED_ATTEMPT_ID.fullmatch(proof["attempt_id"]) is None
+            or type(proof.get("attempt_number")) is not int
+            or proof["attempt_number"] not in {1, 2}
+            or not isinstance(checkpoint_id, str)
+            or _MANAGED_CHECKPOINT_ID.fullmatch(checkpoint_id) is None
+            or proof.get("checkpoint_index") != 1
+            or proof.get("completed_updates") != 1
+            or not hashes_valid
+            or relative_path != f"checkpoints/{checkpoint_id}/manifest.json"
+            or not isinstance(relative_path, str)
+            or "\\" in relative_path
+            or type(proof.get("checkpoint_manifest_size_bytes")) is not int
+            or not 1 <= proof["checkpoint_manifest_size_bytes"] <= 64 * 1024
+            or created is None
+            or state
+            not in {"waiting", "requested", "resumed", "action_required"}
+            or (resume_result and state not in {"requested", "resumed"})
+            or not resume_fields_valid
+            or proof["proof_hash"] != actual_hash
+        ):
+            raise DispatchError("ADAPTER_CHECKPOINT_RESPONSE_INVALID")
+        arguments = {
+            key: copy.deepcopy(value)
+            for key, value in proof.items()
+            if key != "schema_version"
+        }
+        result_type = (
+            DispatchCheckpointResumeResult
+            if resume_result
+            else DispatchCheckpointProof
+        )
+        return result_type(**arguments)
+
+    def probe_runtime_checkpoint(
+        self, intent: DispatchIntentSnapshot
+    ) -> DispatchCheckpointProof | None:
+        """Read the exact checkpoint without launching or requesting resume."""
+
+        handle = self._handle_from_intent(intent)
+        try:
+            result = self._adapter.probe_runtime_checkpoint(handle)
+        except AdapterError as error:
+            if error.code in {
+                "ADAPTER_SUBMISSION_BUSY",
+                "CHECKPOINT_EVIDENCE_PENDING",
+                "CHECKPOINT_ACTION_REQUIRED",
+            }:
+                raise DispatchDeferred(error.code) from error
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("CHECKPOINT_PROBE_UNAVAILABLE") from error
+        if result is None:
+            return None
+        validated = self._validated_checkpoint_result(
+            intent, handle, result, resume_result=False
+        )
+        assert isinstance(validated, DispatchCheckpointProof)
+        return validated
+
+    def resume_runtime_checkpoint(
+        self,
+        intent: DispatchIntentSnapshot,
+        *,
+        authorization: Mapping[str, Any],
+    ) -> DispatchCheckpointResumeResult:
+        """Append/replay one exact same-live-attempt resume request."""
+
+        handle = self._handle_from_intent(intent)
+        required = {
+            "schema_version",
+            "intent_id",
+            "task_id",
+            "node_id",
+            "submission_id",
+            "attempt_id",
+            "attempt_number",
+            "checkpoint_id",
+            "checkpoint_manifest_hash",
+            "checkpoint_receipt_record_hash",
+            "checkpoint_proof_hash",
+            "resume_id",
+            "authorized_at",
+            "resume_request_record_hash",
+        }
+        if not isinstance(authorization, Mapping) or set(authorization) != required:
+            raise DispatchError("CHECKPOINT_RESUME_AUTHORIZATION_INVALID")
+        token = copy.deepcopy(dict(authorization))
+        request_payload = {
+            key: copy.deepcopy(token[key])
+            for key in (
+                "schema_version",
+                "resume_id",
+                "submission_id",
+                "attempt_id",
+                "attempt_number",
+                "checkpoint_id",
+                "checkpoint_manifest_hash",
+                "checkpoint_receipt_record_hash",
+                "checkpoint_proof_hash",
+                "authorized_at",
+            )
+        }
+        _, expected_request_hash = encode_document(request_payload)
+        if (
+            token.get("schema_version") != "1.0.0"
+            or token.get("intent_id") != intent.intent_id
+            or token.get("task_id") != intent.task_id
+            or token.get("node_id") != intent.node_id
+            or token.get("submission_id") != handle.submission_id
+            or _MANAGED_ATTEMPT_ID.fullmatch(token.get("attempt_id", "")) is None
+            or token.get("attempt_number") not in {1, 2}
+            or _MANAGED_CHECKPOINT_ID.fullmatch(
+                token.get("checkpoint_id", "")
+            )
+            is None
+            or any(
+                _SHA256.fullmatch(token.get(field, "")) is None
+                for field in (
+                    "checkpoint_manifest_hash",
+                    "checkpoint_receipt_record_hash",
+                    "checkpoint_proof_hash",
+                    "resume_request_record_hash",
+                )
+            )
+            or _MANAGED_RESUME_ID.fullmatch(token.get("resume_id", "")) is None
+            or _timestamp_is_invalid(token.get("authorized_at"))
+            or token["resume_request_record_hash"] != expected_request_hash
+        ):
+            raise DispatchError("CHECKPOINT_RESUME_AUTHORIZATION_INVALID")
+        try:
+            result = self._adapter.resume_runtime_checkpoint(
+                handle, authorization=token
+            )
+        except AdapterError as error:
+            if error.code in {
+                "ADAPTER_SUBMISSION_BUSY",
+                "CHECKPOINT_EVIDENCE_PENDING",
+                "CHECKPOINT_ACTION_REQUIRED",
+            }:
+                raise DispatchDeferred(error.code) from error
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("CHECKPOINT_RESUME_UNAVAILABLE") from error
+        validated = self._validated_checkpoint_result(
+            intent, handle, result, resume_result=True
+        )
+        assert isinstance(validated, DispatchCheckpointResumeResult)
+        return validated
 
     def status(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
         handle = self._handle_from_intent(intent)
@@ -1544,7 +1982,8 @@ class DeepwaveTaskDispatcher:
         if (
             set(proof) != expected
             or proof.get("schema_version") != "2.0.0"
-            or proof.get("private_schema_version") not in {"1.1.0", "1.2.0"}
+            or proof.get("private_schema_version")
+            not in {"1.1.0", "1.2.0", "1.3.0"}
             or proof.get("attempt_id") != attempt_id
             or not isinstance(attempt_id, str)
             or _MANAGED_ATTEMPT_ID.fullmatch(attempt_id) is None
@@ -1973,7 +2412,7 @@ class DeepwaveTaskDispatcher:
             or exhaustion.task_id != intent.task_id
             or exhaustion.approval_id != intent.approval_id
             or intent.adapter_id != LOGICAL_ENTRYPOINT
-            or intent.adapter_version != ADAPTER_VERSION
+            or intent.adapter_version not in SUPPORTED_MANAGED_REQUEST_VERSIONS
             or intent.state != "retry_exhausted"
             or intent.handle is not None
             or intent.failure_code != "WORKER_RETRY_EXHAUSTED"
@@ -2006,9 +2445,14 @@ class DeepwaveTaskDispatcher:
             or request["project_id"] != exhaustion.project_id
             or request["principal_id"] != exhaustion.principal_id
             or request["algorithm"]
-            != {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
+            != {"id": ALGORITHM_ID, "version": intent.adapter_version}
             or intent.queue_fingerprint.get("normalized_config_hash")
             != normalized_config_hash
+            or not is_supported_receipt_binding(
+                request["algorithm"],
+                intent.adapter_version,
+                intent.queue_fingerprint,
+            )
         ):
             raise DispatchError("WORKER_RETRY_EXHAUSTION_PURGE_INVALID")
         try:

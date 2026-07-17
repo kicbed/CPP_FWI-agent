@@ -18,6 +18,7 @@ from scientific_runtime.task_service import TaskCancellationResult, TaskService
 from scientific_runtime.task_store import (
     SQLiteTaskStore,
     TaskCancellationSnapshot,
+    TaskCheckpointSnapshot,
     TaskTimeoutSnapshot,
 )
 from scientific_runtime.workbench_service import (
@@ -66,8 +67,8 @@ def legacy_guided_form(**changes):
 
 def development_fingerprint() -> dict:
     value = fingerprint()
-    value["algorithm"]["version"] = "1.5.0"
-    value["adapter_version"] = "1.5.0"
+    value["algorithm"]["version"] = "1.6.0"
+    value["adapter_version"] = "1.6.0"
     value["provenance_mode"] = "development"
     value["source"] = {"identity_complete": False, "dirty": None}
     return value
@@ -90,7 +91,7 @@ class FakeDispatcher:
         ]
         return DispatchPreparation(
             adapter_id="fwi.deepwave_adapter",
-            adapter_version="1.5.0",
+            adapter_version="1.6.0",
             request=request,
             queue_fingerprint=queue_fingerprint,
         )
@@ -261,6 +262,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertTrue(capabilities["features"]["running_cancel"])
         self.assertTrue(capabilities["features"]["runtime_timeout"])
+        self.assertTrue(capabilities["features"]["checkpoint_wait_resume"])
         self.assertTrue(
             capabilities["features"]["positive_receipt_reconciliation"]
         )
@@ -309,7 +311,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertEqual(
             capabilities["algorithm"],
-            {"id": "deepwave.acoustic_fwi", "version": "1.5.0"},
+            {"id": "deepwave.acoustic_fwi", "version": "1.6.0"},
         )
         self.assertEqual(
             capabilities["capabilities"],
@@ -322,6 +324,12 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                     "max_concurrent_attempts": 1,
                     "pre_running_launch_failure": True,
                     "worker_exit": True,
+                },
+                "checkpoint_resume": {
+                    "automatic": True,
+                    "browser_mutation": False,
+                    "same_attempt": True,
+                    "capacity_released_while_waiting": False,
                 },
                 "sse": False,
                 "startup_dispatch_recovery": False,
@@ -342,10 +350,10 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(catalog["datasets"][0]["id"], "marmousi_94_288")
         self.assertNotIn("access_scope", catalog["datasets"][0])
         self.assertEqual(len(catalog["algorithms"]), 1)
-        self.assertEqual(catalog["algorithms"][0]["version"], "1.5.0")
+        self.assertEqual(catalog["algorithms"][0]["version"], "1.6.0")
         self.assertEqual(
             catalog["algorithms"][0]["adapter"],
-            {"protocol": "algorithm-adapter-v1", "version": "1.5.0"},
+            {"protocol": "algorithm-adapter-v1", "version": "1.6.0"},
         )
         serialized = repr(catalog)
         self.assertNotIn("entrypoint_ref", serialized)
@@ -462,7 +470,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         current = self.workbench.create_task(legacy_guided_form(), new_key)
         current_snapshot = self.store.get_task(current["task_id"])
         self.assertFalse(current["replayed"])
-        self.assertEqual(current_snapshot.draft["algorithm"]["version"], "1.5.0")
+        self.assertEqual(current_snapshot.draft["algorithm"]["version"], "1.6.0")
         self.assertEqual(current_snapshot.draft["parameters"]["optimizer"], "adam")
         self.assertEqual(current_snapshot.draft["parameters"]["learning_rate_milli"], 10_000)
         current_replay = self.workbench.create_task(legacy_guided_form(), new_key)
@@ -544,7 +552,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         )
         self.assertFalse(current["replayed"])
         self.assertEqual(current["draft"]["revision"], 3)
-        self.assertEqual(current["draft"]["algorithm"]["version"], "1.5.0")
+        self.assertEqual(current["draft"]["algorithm"]["version"], "1.6.0")
         self.assertEqual(current["draft"]["parameters"]["optimizer"], "adam")
         current_replay = self.workbench.revise_task(
             created.snapshot.task_id,
@@ -1857,6 +1865,191 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertTrue(armed_detail["can_cancel"])
         self.assertEqual(armed_detail["timeout"]["state"], "armed")
 
+    def test_checkpoint_wait_resume_projection_is_bounded_and_path_free(
+        self,
+    ) -> None:
+        created = self.workbench.create_task(
+            guided_form(goal="bounded checkpoint projection"),
+            "checkpoint-projection-create",
+        )
+        task_id = created["task_id"]
+        snapshot = self.store.get_task(task_id)
+        checkpoint = TaskCheckpointSnapshot(
+            checkpoint_id="checkpoint-" + "a" * 32,
+            intent_id="intent-private-checkpoint",
+            node_id="invert",
+            submission_id="submission-private-checkpoint",
+            attempt_id="attempt-" + "b" * 32,
+            attempt_number=1,
+            checkpoint_index=2,
+            completed_updates=17,
+            checkpoint_manifest_relative_path="checkpoints/private-state.bin",
+            checkpoint_manifest_size_bytes=4096,
+            checkpoint_manifest_hash="sha256:" + "c" * 64,
+            checkpoint_receipt_record_hash="sha256:" + "d" * 64,
+            checkpoint_created_at="2026-07-15T03:00:20.000000Z",
+            state="resume_requested",
+            resume_id="resume-" + "e" * 32,
+            resume_requested_at="2026-07-15T03:00:21.000000Z",
+        )
+        waiting = replace(snapshot, status="Waiting", checkpoint=checkpoint)
+        private_status = {
+            "status": "Waiting",
+            "stage": "checkpoint_wait",
+            "completed": 17,
+            "total": 100,
+            "updated_at": "2026-07-15T03:00:21.000000Z",
+            "submission_id": checkpoint.submission_id,
+            "attempt_id": checkpoint.attempt_id,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "checkpoint_manifest_relative_path": "/root/private/checkpoint.bin",
+            "checkpoint_manifest_hash": checkpoint.checkpoint_manifest_hash,
+            "checkpoint_receipt_record_hash": (
+                checkpoint.checkpoint_receipt_record_hash
+            ),
+            "checkpoint_proof_hash": "sha256:" + "f" * 64,
+            "resume_request_record_hash": "sha256:" + "1" * 64,
+            "resume_acknowledgement_record_hash": "sha256:" + "2" * 64,
+            "proof_hash": "sha256:" + "3" * 64,
+        }
+        original_refresh = self.tasks.refresh_runtime_status
+        original_list_tasks = self.tasks.list_tasks
+        original_can_cancel = self.tasks.can_cancel_task
+
+        def refresh_waiting_task(**scope):
+            self.assertEqual(
+                scope,
+                {"task_id": task_id, **self.workbench._scope},
+            )
+            return {
+                "snapshot": waiting,
+                "intent": None,
+                "adapter_status": private_status,
+            }
+
+        def list_waiting_tasks(**scope):
+            self.assertEqual(
+                scope,
+                {
+                    **self.workbench._scope,
+                    "cursor": None,
+                    "limit": 20,
+                    "view": "active",
+                },
+            )
+
+            class Page:
+                snapshots = (waiting,)
+                next_cursor = None
+
+            return Page()
+
+        self.tasks.refresh_runtime_status = refresh_waiting_task
+        self.tasks.list_tasks = list_waiting_tasks
+        self.tasks.can_cancel_task = lambda *_args, **_kwargs: False
+        try:
+            detail = self.workbench.get_task(task_id)
+            listed = self.workbench.list_tasks()["tasks"][0]
+            waiting_checkpoint = replace(
+                checkpoint,
+                state="waiting",
+                resume_id=None,
+                resume_requested_at=None,
+            )
+            waiting_projection = self.workbench._project(
+                replace(
+                    snapshot,
+                    status="Waiting",
+                    checkpoint=waiting_checkpoint,
+                )
+            )["checkpoint"]
+            resumed_projection = self.workbench._project(
+                replace(
+                    snapshot,
+                    status="Running",
+                    checkpoint=replace(
+                        checkpoint,
+                        state="resumed",
+                        resume_acknowledged_at=(
+                            "2026-07-15T03:00:22.000000Z"
+                        ),
+                    ),
+                )
+            )["checkpoint"]
+        finally:
+            self.tasks.refresh_runtime_status = original_refresh
+            self.tasks.list_tasks = original_list_tasks
+            self.tasks.can_cancel_task = original_can_cancel
+
+        expected = {
+            "state": "resume_requested",
+            "checkpoint_index": 2,
+            "completed_updates": 17,
+            "created_at": "2026-07-15T03:00:20.000000Z",
+            "resume_requested_at": "2026-07-15T03:00:21.000000Z",
+            "resumed_at": None,
+            "same_attempt": True,
+            "capacity_released_while_waiting": False,
+        }
+        self.assertEqual(detail["checkpoint"], expected)
+        self.assertEqual(listed["checkpoint"], expected)
+        self.assertEqual(
+            waiting_projection,
+            expected
+            | {
+                "state": "waiting",
+                "resume_requested_at": None,
+            },
+        )
+        self.assertEqual(
+            resumed_projection,
+            expected
+            | {
+                "state": "resumed",
+                "resumed_at": "2026-07-15T03:00:22.000000Z",
+            },
+        )
+
+        public_runtime = {
+            "checkpoint": detail["checkpoint"],
+            "runtime_status": detail["runtime_status"],
+            "listed_checkpoint": listed["checkpoint"],
+        }
+        serialized_public = repr(public_runtime)
+        for private_field in (
+            "attempt_id",
+            "attempt_number",
+            "submission_id",
+            "checkpoint_id",
+            "checkpoint_manifest_relative_path",
+            "checkpoint_manifest_size_bytes",
+            "checkpoint_manifest_hash",
+            "checkpoint_receipt_record_hash",
+            "checkpoint_proof_hash",
+            "resume_id",
+            "resume_request_record_hash",
+            "resume_acknowledgement_record_hash",
+            "proof_hash",
+        ):
+            self.assertNotIn(private_field, serialized_public)
+        serialized_all = repr({"detail": detail, "listed": listed})
+        for private_value in (
+            checkpoint.checkpoint_id,
+            checkpoint.intent_id,
+            checkpoint.submission_id,
+            checkpoint.attempt_id,
+            checkpoint.resume_id,
+            checkpoint.checkpoint_manifest_relative_path,
+            checkpoint.checkpoint_manifest_hash,
+            checkpoint.checkpoint_receipt_record_hash,
+            "/root/private/checkpoint.bin",
+            "sha256:" + "f" * 64,
+            "sha256:" + "1" * 64,
+            "sha256:" + "2" * 64,
+            "sha256:" + "3" * 64,
+        ):
+            self.assertNotIn(private_value, serialized_all)
+
     def test_get_refresh_events_and_artifact_projection_do_not_leak_runtime_ids(self) -> None:
         created = self.workbench.create_task(guided_form(), "create-read")
         self.workbench.approve_and_submit(
@@ -2054,6 +2247,143 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             "source_handle_hash",
             "4242",
             "fwi-private-retry-job",
+        ):
+            self.assertNotIn(private, serialized)
+
+    def test_list_events_bounds_checkpoint_wait_resume_evidence(self) -> None:
+        checkpoint_id = "checkpoint-" + "1" * 32
+        resume_id = "checkpoint-resume-" + "2" * 32
+        attempt_id = "attempt-" + "3" * 32
+        checkpoint_path = "task-private/checkpoints/checkpoint-private.json"
+        proof_hash = "sha256:" + "4" * 64
+        wait_extension = {
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_index": 1,
+            "completed_updates": 12,
+            "same_attempt": True,
+            "attempt_id": attempt_id,
+            "proof_hash": proof_hash,
+            "checkpoint_manifest_relative_path": checkpoint_path,
+        }
+        resume_extension = {
+            "checkpoint_id": checkpoint_id,
+            "resume_id": resume_id,
+            "same_attempt": True,
+            "attempt_id": attempt_id,
+            "proof_hash": proof_hash,
+            "private_path": "/root/private/checkpoint-resume",
+        }
+        canonical = [
+            {
+                "schema_version": "1.0.0",
+                "event_id": "event-private-checkpoint-created",
+                "sequence": 4,
+                "task_id": "task-private-checkpoint-events",
+                "node_id": "invert",
+                "event_type": "checkpoint_created",
+                "task_status": "Running",
+                "checkpoint": {"relative_path": checkpoint_path},
+                "occurred_at": NOW,
+                "fingerprint": {},
+                "extensions": {
+                    "org.agent_rpc.checkpoint_wait": wait_extension,
+                    "org.agent_rpc.public_progress": {"phase": "checkpoint"},
+                },
+            },
+            {
+                "schema_version": "1.0.0",
+                "event_id": "event-private-node-waiting",
+                "sequence": 5,
+                "task_id": "task-private-checkpoint-events",
+                "node_id": "invert",
+                "event_type": "node_waiting",
+                "task_status": "Waiting",
+                "occurred_at": NOW,
+                "fingerprint": {},
+                "extensions": {
+                    "org.agent_rpc.checkpoint_wait": wait_extension,
+                },
+            },
+            {
+                "schema_version": "1.0.0",
+                "event_id": "event-private-checkpoint-resumed",
+                "sequence": 6,
+                "task_id": "task-private-checkpoint-events",
+                "node_id": "invert",
+                "event_type": "node_started",
+                "task_status": "Running",
+                "occurred_at": NOW,
+                "fingerprint": {},
+                "extensions": {
+                    "org.agent_rpc.checkpoint_resume": resume_extension,
+                },
+            },
+        ]
+
+        class ExactCheckpointEventView:
+            def list_run_events(inner_self, *_args, **_kwargs):
+                return copy.deepcopy(canonical)
+
+        facade = GuidedWorkbench(
+            ExactCheckpointEventView(),
+            self.registry,
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            clock=lambda: NOW,
+        )
+        projected = facade.list_events(canonical[0]["task_id"])
+        self.assertEqual(
+            [
+                (event["sequence"], event["event_type"], event["task_status"])
+                for event in projected
+            ],
+            [
+                (4, "checkpoint_created", "Running"),
+                (5, "node_waiting", "Waiting"),
+                (6, "node_started", "Running"),
+            ],
+        )
+        self.assertEqual(
+            projected[0]["extensions"]["org.agent_rpc.public_progress"],
+            {"phase": "checkpoint"},
+        )
+        self.assertNotIn("checkpoint", projected[0])
+        for event in projected:
+            self.assertNotIn(
+                "org.agent_rpc.checkpoint_wait", event["extensions"]
+            )
+            self.assertNotIn(
+                "org.agent_rpc.checkpoint_resume", event["extensions"]
+            )
+
+        # Public projection is copy-based; canonical recovery evidence remains
+        # available to the service/store boundary.
+        self.assertEqual(
+            canonical[0]["checkpoint"]["relative_path"], checkpoint_path
+        )
+        self.assertEqual(
+            canonical[1]["extensions"]["org.agent_rpc.checkpoint_wait"],
+            wait_extension,
+        )
+        self.assertEqual(
+            canonical[2]["extensions"]["org.agent_rpc.checkpoint_resume"],
+            resume_extension,
+        )
+        serialized = repr(projected)
+        for private in (
+            checkpoint_id,
+            resume_id,
+            attempt_id,
+            checkpoint_path,
+            proof_hash,
+            resume_extension["private_path"],
+            "checkpoint_id",
+            "resume_id",
+            "attempt_id",
+            "proof_hash",
+            "relative_path",
+            "org.agent_rpc.checkpoint_wait",
+            "org.agent_rpc.checkpoint_resume",
         ):
             self.assertNotIn(private, serialized)
 

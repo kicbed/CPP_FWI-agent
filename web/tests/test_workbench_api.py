@@ -53,7 +53,22 @@ class FakeApplication:
         return {"operation": name}
 
     def session_capabilities(self):
-        return self._call("session_capabilities") | {"mode": "guided"}
+        return self._call("session_capabilities") | {
+            "mode": "guided",
+            "algorithm": {
+                "id": "deepwave.acoustic_fwi",
+                "version": "1.6.0",
+            },
+            "features": {"checkpoint_wait_resume": True},
+            "capabilities": {
+                "checkpoint_resume": {
+                    "automatic": True,
+                    "browser_mutation": False,
+                    "same_attempt": True,
+                    "capacity_released_while_waiting": False,
+                }
+            },
+        }
 
     def list_catalog(self):
         return self._call("list_catalog") | {"datasets": [], "algorithms": []}
@@ -185,12 +200,38 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["data"]["csrf_token"], CSRF)
         self.assertEqual(payload["data"]["mode"], "guided")
+        self.assertEqual(
+            payload["data"]["algorithm"],
+            {"id": "deepwave.acoustic_fwi", "version": "1.6.0"},
+        )
+        self.assertTrue(
+            payload["data"]["features"]["checkpoint_wait_resume"]
+        )
+        self.assertEqual(
+            payload["data"]["capabilities"]["checkpoint_resume"],
+            {
+                "automatic": True,
+                "browser_mutation": False,
+                "same_attempt": True,
+                "capacity_released_while_waiting": False,
+            },
+        )
 
         response = self.api.dispatch(
             "GET", f"{API_PREFIX}/catalog", {"Host": HOST}, b""
         )
         self.assertEqual(response.status, 403)
         self.assertEqual(self.decode(response)["error"]["code"], "CSRF_FORBIDDEN")
+
+        before_resume = len(self.application.calls)
+        response = self.mutation(
+            "POST",
+            f"{API_PREFIX}/tasks/task-1/resume",
+            {},
+        )
+        self.assertEqual(response.status, 404)
+        self.assertEqual(self.decode(response)["error"]["code"], "NOT_FOUND")
+        self.assertEqual(len(self.application.calls), before_resume)
 
         http_message = Message()
         http_message["Host"] = HOST
@@ -709,6 +750,146 @@ class WorkbenchAPITest(unittest.TestCase):
             "source_handle_hash",
             "4242",
             "/root/",
+        ):
+            self.assertNotIn(private, serialized)
+
+    def test_http_events_do_not_serialize_checkpoint_resume_evidence(self):
+        checkpoint_id = "checkpoint-" + "1" * 32
+        resume_id = "checkpoint-resume-" + "2" * 32
+        attempt_id = "attempt-" + "3" * 32
+        checkpoint_path = "task-http-private/checkpoints/checkpoint.json"
+        proof_hash = "sha256:" + "4" * 64
+        canonical = [
+            {
+                "schema_version": "1.0.0",
+                "event_id": "event-http-private-checkpoint",
+                "sequence": 7,
+                "task_id": "task-http-checkpoint-events",
+                "node_id": "invert",
+                "event_type": "checkpoint_created",
+                "task_status": "Running",
+                "checkpoint": {"relative_path": checkpoint_path},
+                "occurred_at": "2026-07-17T08:00:00Z",
+                "fingerprint": {},
+                "extensions": {
+                    "org.agent_rpc.checkpoint_wait": {
+                        "checkpoint_id": checkpoint_id,
+                        "checkpoint_index": 1,
+                        "completed_updates": 12,
+                        "same_attempt": True,
+                        "attempt_id": attempt_id,
+                        "proof_hash": proof_hash,
+                    },
+                    "org.agent_rpc.public_progress": {"phase": "checkpoint"},
+                },
+            },
+            {
+                "schema_version": "1.0.0",
+                "event_id": "event-http-private-waiting",
+                "sequence": 8,
+                "task_id": "task-http-checkpoint-events",
+                "node_id": "invert",
+                "event_type": "node_waiting",
+                "task_status": "Waiting",
+                "occurred_at": "2026-07-17T08:00:00Z",
+                "fingerprint": {},
+                "extensions": {
+                    "org.agent_rpc.checkpoint_wait": {
+                        "checkpoint_id": checkpoint_id,
+                        "checkpoint_index": 1,
+                        "completed_updates": 12,
+                        "same_attempt": True,
+                        "attempt_id": attempt_id,
+                        "proof_hash": proof_hash,
+                    }
+                },
+            },
+            {
+                "schema_version": "1.0.0",
+                "event_id": "event-http-private-resume",
+                "sequence": 9,
+                "task_id": "task-http-checkpoint-events",
+                "node_id": "invert",
+                "event_type": "node_started",
+                "task_status": "Running",
+                "occurred_at": "2026-07-17T08:00:01Z",
+                "fingerprint": {},
+                "extensions": {
+                    "org.agent_rpc.checkpoint_resume": {
+                        "checkpoint_id": checkpoint_id,
+                        "resume_id": resume_id,
+                        "same_attempt": True,
+                        "attempt_id": attempt_id,
+                        "proof_hash": proof_hash,
+                        "private_path": "/root/private/http-checkpoint-resume",
+                    }
+                },
+            },
+        ]
+
+        class ExactCheckpointEventView:
+            def list_run_events(inner_self, *_args, **_kwargs):
+                return copy.deepcopy(canonical)
+
+        application = GuidedWorkbench(
+            ExactCheckpointEventView(),
+            object(),
+            project_id="project-http-events",
+            principal_id="user-http-events",
+        )
+        api = WorkbenchAPI(
+            application,
+            CSRF,
+            allowed_hosts={HOST},
+            allowed_origins={ORIGIN},
+        )
+        response = api.dispatch(
+            "GET",
+            f"{API_PREFIX}/tasks/{canonical[0]['task_id']}/events",
+            self.get_headers(),
+            b"",
+        )
+        self.assertEqual(response.status, 200)
+        events = self.decode(response)["data"]["events"]
+        self.assertEqual(
+            [
+                (event["sequence"], event["event_type"], event["task_status"])
+                for event in events
+            ],
+            [
+                (7, "checkpoint_created", "Running"),
+                (8, "node_waiting", "Waiting"),
+                (9, "node_started", "Running"),
+            ],
+        )
+        self.assertEqual(
+            events[0]["extensions"]["org.agent_rpc.public_progress"],
+            {"phase": "checkpoint"},
+        )
+        self.assertNotIn("checkpoint", events[0])
+        for event in events:
+            self.assertNotIn(
+                "org.agent_rpc.checkpoint_wait", event["extensions"]
+            )
+            self.assertNotIn(
+                "org.agent_rpc.checkpoint_resume", event["extensions"]
+            )
+
+        serialized = response.body.decode("utf-8")
+        for private in (
+            checkpoint_id,
+            resume_id,
+            attempt_id,
+            checkpoint_path,
+            proof_hash,
+            "/root/private/http-checkpoint-resume",
+            "checkpoint_id",
+            "resume_id",
+            "attempt_id",
+            "proof_hash",
+            "relative_path",
+            "org.agent_rpc.checkpoint_wait",
+            "org.agent_rpc.checkpoint_resume",
         ):
             self.assertNotIn(private, serialized)
 
