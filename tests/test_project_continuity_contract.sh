@@ -18,12 +18,20 @@ require_text() {
     grep -Fq -- "$text" "$file" || fail "$file is missing required text: $text"
 }
 
+reject_text() {
+    local file="$1" text="$2"
+    if grep -Fq -- "$text" "$file"; then
+        fail "$file contains forbidden stale text: $text"
+    fi
+}
+
 required_files=(
     .dockerignore
     .gitignore
     AGENTS.md
     docs/PROJECT_CURRENT_STATE.md
     docs/PROJECT_CONTINUITY.md
+    docs/CODEX_WORKFLOW.md
     docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md
     docs/architecture/SCIENTIFIC_RUNTIME_P0_CONTRACTS.md
     docs/architecture/SCIENTIFIC_RUNTIME_P1_REGISTRY.md
@@ -120,18 +128,25 @@ require_text AGENTS.md 'docs/PROJECT_PROGRESS.md'
 require_text AGENTS.md 'docs/GIT_AND_PROMPT_POLICY.md'
 require_text AGENTS.md "Do not alter or reinterpret an Accepted plan's scope"
 require_text AGENTS.md 'Every estimate of remaining slices, time, or quantity must label its scope'
-require_text docs/PROJECT_CONTINUITY.md '## D-003：'
-require_text docs/PROJECT_CONTINUITY.md '## D-004：'
-require_text docs/PROJECT_CONTINUITY.md '## D-005：'
-require_text docs/PROJECT_CONTINUITY.md '## D-006：'
-require_text docs/PROJECT_CONTINUITY.md '## D-007：'
-require_text docs/PROJECT_CONTINUITY.md '## D-008：'
-require_text docs/PROJECT_CONTINUITY.md '## D-009：'
-require_text docs/PROJECT_CONTINUITY.md '## D-010：'
+require_text AGENTS.md 'Never allocate a new `D-*` number, including for a Proposed item'
+require_text AGENTS.md 'After every Verified delivery slice, update the rolling remainder'
+require_text AGENTS.md 'Any flat/increased result or new split requires the user'
+expected_decisions=(D-001 D-002 D-003 D-004 D-005 D-006 D-007 D-008 D-009 D-010 D-011 D-012)
+mapfile -t actual_decisions < <(
+    sed -nE 's/^## (D-[0-9]{3})[：:].*/\1/p' docs/PROJECT_CONTINUITY.md
+)
+[[ "${#actual_decisions[@]}" -eq "${#expected_decisions[@]}" ]] || \
+    fail 'PROJECT_CONTINUITY.md decision headings are missing, duplicated, or unapproved'
+for decision_index in "${!expected_decisions[@]}"; do
+    [[ "${actual_decisions[$decision_index]}" == "${expected_decisions[$decision_index]}" ]] || \
+        fail 'PROJECT_CONTINUITY.md decision headings are not exactly D-001 through D-012 in order'
+done
 require_text docs/PROJECT_CONTINUITY.md '## D-012：有限自动重试次数、预算与失败边界'
-require_text docs/PROJECT_CONTINUITY.md '## D-013：估算范围标注与已接受计划变更控制'
-require_text docs/PROJECT_CONTINUITY.md '当前“约十余个”覆盖从当前到整个 D-003 完成'
-require_text docs/PROJECT_CONTINUITY.md '用户再次明确同意不得修改、缩减、扩张、重新解释'
+require_text docs/PROJECT_CONTINUITY.md 'Codex 也不得自行分配新的 `D-*` 编号（包括 Proposed）'
+require_text docs/PROJECT_CONTINUITY.md '完整 D-003 的固定阶段顺序是 P0 → P1 → P2 → P3 → P4 → P5 → P6'
+require_text docs/PROJECT_CONTINUITY.md '覆盖当时完整 P2 余项与 P3–P6，不是当前余量或配额'
+require_text docs/PROJECT_CONTINUITY.md '本期剩余 = 上期剩余 - 本 checkpoint 新增 Verified + 本 checkpoint 用户明确批准的调整'
+require_text docs/PROJECT_CONTINUITY.md '每个 Verified 后若余量持平或上调'
 require_text docs/PROJECT_CONTINUITY.md 'P2-009B Implemented → Verified'
 require_text docs/PROJECT_CONTINUITY.md 'P2-009B2 运行后退出重试均已 Verified'
 require_text docs/PROJECT_CONTINUITY.md '低 token 自动接续与 CodeGraph 导航'
@@ -158,7 +173,7 @@ require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md 'P2.9B1 已于 2
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md 'P2.9B2 已于 2026-07-17 **Verified**'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md 'legacy-private schema `1.0` 的 exact launched receipt'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '公共 Adapter `1.0`–`1.3` 不进入该边界'
-require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '整个 D-003 项目完成（含完整 P2、'
+require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '及 P3–P6 的历史粗估基线，不是当前余量或单个 P 级别配额'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '仅就 P2，B2 完成后剩余工作压缩为两个不降低出口质量的交付切片'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '`positive_receipt_reconciliation=true`'
 require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md 'terminal heartbeat'
@@ -204,9 +219,19 @@ require_text docs/PROJECT_PROGRESS.md 'Runtime 360/360'
 require_text docs/PROJECT_PROGRESS.md 'managed spawned + exact ready + heartbeat'
 require_text docs/PROJECT_PROGRESS.md '有界 `action_required`/`resolved` 投影'
 require_text docs/PROJECT_PROGRESS.md '`automatic_reconciliation=false` 与 `retry=false`'
-require_text docs/PROJECT_PROGRESS.md '整个 D-003 完成（完整 P2、P3、P4、P5）的粗估'
+require_text docs/PROJECT_PROGRESS.md '## 滚动剩余交付估算（D-011）'
+require_text docs/PROJECT_PROGRESS.md '`0cbe131`（D-011 基线）'
+require_text docs/PROJECT_PROGRESS.md '约 6 个；P2 = 2，P3–P6 合计暂估约 4'
+require_text docs/PROJECT_PROGRESS.md '本 checkpoint 新增 Verified'
+require_text docs/PROJECT_PROGRESS.md '自基线累计 Verified'
+require_text docs/PROJECT_PROGRESS.md '本期剩余 = 上期剩余 - 本 checkpoint 新增 Verified + 本 checkpoint 用户明确批准的调整'
+require_text docs/PROJECT_PROGRESS.md '避免重复扣减'
+require_text docs/PROJECT_PROGRESS.md 'Verified 交付必须在同一 checkpoint 按公式递减'
 require_text docs/PROJECT_PROGRESS.md '仅就 P2，将剩余交付压缩为两个中等切片'
 require_text docs/PROJECT_PROGRESS.md 'launch/ticket failed'
+require_text docs/PROJECT_PROGRESS.md '合同当前 32/32'
+require_text docs/PROJECT_CURRENT_STATE.md '全项目 P2–P6 粗估基线约 12 个'
+require_text docs/PROJECT_CURRENT_STATE.md '当前滚动粗估约 6 个，其中 P2 明确剩 2 个，P3–P6 合计暂估约 4 个'
 require_text docs/PROJECT_CURRENT_STATE.md 'Failed / WALL_TIME_EXCEEDED'
 require_text docs/PROJECT_CURRENT_STATE.md 'Store 对该 current Worker 的首条 durable `spawned + ready + running` observation'
 require_text docs/PROJECT_CURRENT_STATE.md '`terminal_status` 七个字段'
@@ -218,6 +243,26 @@ require_text docs/PROJECT_CURRENT_STATE.md 'private 1.3'
 require_text docs/PROJECT_CURRENT_STATE.md '每个 Supervisor 周期最多执行一次 receipt probe'
 require_text docs/PROJECT_CURRENT_STATE.md 'reconcile/retry/timeout POST mutation'
 require_text docs/PROJECT_PROGRESS.md '完整 reconciliation 矩阵'
+for continuity_file in \
+    AGENTS.md \
+    docs/CODEX_WORKFLOW.md \
+    docs/PROJECT_CURRENT_STATE.md \
+    docs/PROJECT_CONTINUITY.md \
+    docs/PROJECT_PROGRESS.md \
+    docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md; do
+    if grep -Eq 'D-(01[3-9]|0[2-9][0-9]|[1-9][0-9]{2,})' "$continuity_file"; then
+        fail "$continuity_file contains an unapproved decision number above D-012"
+    fi
+    reject_text "$continuity_file" 'P3–P5'
+    reject_text "$continuity_file" 'P3、P4、P5）的粗估'
+    reject_text "$continuity_file" '尚未实现：有限 retry'
+    reject_text "$continuity_file" '视为明确批准'
+    reject_text "$continuity_file" '视为对该决定的明确批准'
+    reject_text "$continuity_file" '只有具体安全或验证证据才允许继续拆分'
+    reject_text "$continuity_file" '仍可记录后拆分'
+    reject_text "$continuity_file" '可以合理增加切片并在进度账本记录依据'
+    reject_text "$continuity_file" '若出现新的具体安全边界仍须记录后拆分'
+done
 require_text scientific_runtime/migrations/0011_task_cancellation.sql 'CREATE TABLE task_cancel_requests'
 require_text scientific_runtime/migrations/0011_task_cancellation.sql 'deliver_exact_attempt_cancel'
 require_text scientific_runtime/migrations/0012_task_timeout.sql 'CREATE TABLE worker_attempt_timeout_windows'
@@ -235,10 +280,15 @@ require_text docs/GIT_AND_PROMPT_POLICY.md '.local-prompts/'
 require_text .dockerignore '**/*.sqlite3-*'
 require_text .dockerignore '**/*.db-*'
 
+previous_phase_line=0
 for phase in P0 P1 P2 P3 P4 P5 P6; do
-    grep -Eq "^### ${phase}：" docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md || \
-        fail "runtime plan is missing phase $phase"
+    phase_line="$(grep -n -m1 -E "^### ${phase}：" \
+        docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md | cut -d: -f1 || true)"
+    [[ "$phase_line" =~ ^[0-9]+$ ]] || fail "runtime plan is missing phase $phase"
+    (( phase_line > previous_phase_line )) || fail "runtime plan phase $phase is out of order"
+    previous_phase_line="$phase_line"
 done
+require_text docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md '### P6：评测、观测和安全加固'
 
 ignore_source="$(git check-ignore -v -- .local-prompts/example.md 2>/dev/null || true)"
 [[ "$ignore_source" == .gitignore:* ]] || fail '.local-prompts/ is not ignored by the repository .gitignore'

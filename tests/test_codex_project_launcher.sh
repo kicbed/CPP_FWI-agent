@@ -43,8 +43,14 @@ grep -Fq '正常打开新会话后直接提问即可' "$PROJECT_README" || \
     fail "README does not advertise direct Codex questions"
 grep -Fq '**不是用户入口**' "$PROJECT_WORKFLOW" || \
     fail "workflow does not classify the helper as internal"
-grep -Fq '视为对该决定的明确批准' "$PROJECT_CONTINUITY" || \
-    fail "continuity file does not preserve explicit user approval"
+grep -Fq '表示相关内容需要持久化' "$PROJECT_CONTINUITY" || \
+    fail "continuity file does not preserve explicit persistence approval"
+grep -Fq '不代表用户授权新建一个编号决策' "$PROJECT_CONTINUITY" || \
+    fail "continuity file may treat persistence approval as decision-number approval"
+grep -Fq '表示授权持久化该内容' "$PROJECT_WORKFLOW" || \
+    fail "workflow does not distinguish content persistence approval"
+grep -Fq '不授权 Codex 自行新建编号' "$PROJECT_WORKFLOW" || \
+    fail "workflow may treat persistence approval as decision-number approval"
 grep -Fq '<!-- scientific-agent-runtime-plan: v1 -->' "$PROJECT_PLAN" || \
     fail "runtime plan does not declare its versioned contract"
 grep -Fq '<!-- project-progress-schema: v1 -->' "$PROJECT_PROGRESS" || \

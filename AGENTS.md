@@ -73,9 +73,12 @@ simulate real-time context.
 - The user owns product and workflow decisions.
 - Treat entries marked **Accepted** in `docs/PROJECT_CONTINUITY.md` as the
   current direction unless the user explicitly changes them.
-- User statements such as “保留这个”, “以后都这样”, or “记录下来” count as
-  explicit approval to make that decision durable. Update the continuity
-  document in the same change without asking the user which file to use.
+- User statements such as “保留这个”, “以后都这样”, or “记录下来” authorize
+  making that content durable under the most relevant existing decision. They
+  do not authorize creating a new numbered `D-*` decision.
+- Never allocate a new `D-*` number, including for a Proposed item, unless the
+  user explicitly approves adding a numbered decision after seeing its title
+  and scope. Otherwise update an existing decision or the progress ledger.
 - A technically promising new recommendation is not automatically accepted.
   Explain its evidence, benefit, cost, risk, and compatibility, then ask the
   user whether to adopt it.
@@ -93,6 +96,12 @@ simulate real-time context.
   (whole project, phase, or sub-slice), included phases, and whether it is a
   rough estimate or a commitment. Keep whole-project and current-phase
   estimates visibly separate in bootstrap summaries and progress ledgers.
+- After every Verified delivery slice, update the rolling remainder in
+  `docs/PROJECT_PROGRESS.md` in the same checkpoint. Record the baseline,
+  newly Verified slices, and new remainder; without an explicitly approved
+  adjustment, subtract every newly Verified slice and never carry a stale count
+  forward. Any flat/increased result or new split requires the user's explicit
+  approval.
 - Keep **Accepted direction**, **Implemented**, and **Verified** separate. A
   design can be accepted but still pending implementation.
 - Update the continuity document in the same change when an approved decision,
@@ -114,7 +123,9 @@ simulate real-time context.
   tests pass. `Implemented` is not the same as `Verified`.
 - Follow accepted D-011: use elastic medium-sized slices. Merge adjacent work
   that shares one state machine, interface, risk boundary, and exit test; split
-  only for a concrete safety, ownership, or verification reason and record it.
+  only for a concrete safety, ownership, or verification reason. Before a new
+  split, explain the evidence and obtain the user's explicit approval, then
+  record the approved adjustment in the progress ledger.
   Do not create a roadmap slice solely for one migration, field, receipt, or
   test, and do not treat the rough remaining-slice estimate as a quota.
 - Multi-algorithm support means independently discoverable/selectable tools by
