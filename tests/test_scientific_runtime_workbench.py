@@ -313,6 +313,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             capabilities["algorithm"],
             {"id": "deepwave.acoustic_fwi", "version": "1.6.0"},
         )
+        self.assertTrue(capabilities["features"]["streaming_events"])
         self.assertEqual(
             capabilities["capabilities"],
             {
@@ -331,7 +332,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                     "same_attempt": True,
                     "capacity_released_while_waiting": False,
                 },
-                "sse": False,
+                "sse": True,
                 "startup_dispatch_recovery": False,
                 "startup_receipt_recovery": False,
                 "startup_status_catchup": False,

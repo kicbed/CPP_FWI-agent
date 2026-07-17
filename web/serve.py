@@ -47,6 +47,8 @@ from web.workbench_api import (  # noqa: E402
     API_PREFIX as WORKBENCH_API_PREFIX,
     APIResponse,
     MAX_JSON_BYTES as WORKBENCH_MAX_JSON_BYTES,
+    SSE_BATCH_LIMIT,
+    SSEEventStream,
     WorkbenchAPI,
 )
 
@@ -60,6 +62,10 @@ MAX_EMBEDDING_HEALTH_BYTES = 32 * 1024
 HTTP_REQUEST_TIMEOUT_SECONDS = 10.0
 WORKBENCH_BODY_TIMEOUT_SECONDS = 5.0
 HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS = 10.0
+SSE_STREAM_POLL_INTERVAL_SECONDS = 0.25
+SSE_STREAM_KEEPALIVE_SECONDS = 5.0
+SSE_STREAM_MAX_SECONDS = 30.0
+SSE_STREAM_WRITE_TIMEOUT_SECONDS = 2.0
 FWI_JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 STABLE_RUNTIME_FAILURE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 FWI_CONTENT_TYPES = {
@@ -562,6 +568,76 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if send_body:
             self.wfile.write(response.body)
 
+    def _is_event_stream_target(self):
+        raw_path = getattr(self, "path", "").partition("?")[0]
+        return raw_path.startswith(WORKBENCH_API_PREFIX + "/tasks/") and raw_path.endswith(
+            "/events/stream"
+        )
+
+    def _serve_event_stream(self, stream):
+        """Write one finite SSE connection without owning runtime state."""
+
+        self.close_connection = True
+        previous_timeout = self.connection.gettimeout()
+        self.connection.settimeout(SSE_STREAM_WRITE_TIMEOUT_SECONDS)
+        started = time.monotonic()
+        last_write = started
+        stop_event = getattr(self.server, "sse_stop_event", None)
+        try:
+            self.send_response(http.HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.write(b"retry: 1000\n\n")
+            self.wfile.flush()
+            while time.monotonic() - started < SSE_STREAM_MAX_SECONDS:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                frames = stream.next_batch()
+                if frames:
+                    for frame in frames:
+                        self.wfile.write(frame)
+                    self.wfile.flush()
+                    last_write = time.monotonic()
+                    if stream.terminal:
+                        return
+                    # A full page may have more durable history immediately
+                    # available. Drain another bounded page without sleeping.
+                    if len(frames) == SSE_BATCH_LIMIT:
+                        continue
+                now = time.monotonic()
+                if now - last_write >= SSE_STREAM_KEEPALIVE_SECONDS:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_write = now
+                remaining = SSE_STREAM_MAX_SECONDS - (now - started)
+                delay = max(0.0, min(SSE_STREAM_POLL_INTERVAL_SECONDS, remaining))
+                if stop_event is None:
+                    time.sleep(delay)
+                elif stop_event.wait(delay):
+                    return
+            self.wfile.write(b": stream-end\n\n")
+            self.wfile.flush()
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            TimeoutError,
+            socket.timeout,
+        ):
+            return
+        except Exception:
+            # Headers are already committed. Closing is the only fail-closed
+            # response; a safe client reconnects from the last durable id.
+            return
+        finally:
+            try:
+                self.connection.settimeout(previous_timeout)
+            except OSError:
+                pass
+
     def _serve_workbench(self, method, send_body=True):
         # One handler owns one stable facade even while the main thread drains
         # requests during shutdown.  Never read the publication global twice.
@@ -600,6 +676,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 ),
                 send_body,
             )
+            return
+        if method == "GET" and self._is_event_stream_target():
+            stream = api.open_event_stream(
+                method, self.path, self.headers.items(), body
+            )
+            if isinstance(stream, APIResponse):
+                self._send_workbench_response(stream, send_body)
+                return
+            if not isinstance(stream, SSEEventStream) or not send_body:
+                self._send_workbench_response(
+                    _workbench_error_response(
+                        http.HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "INTERNAL_ERROR",
+                        "internal server error",
+                    ),
+                    send_body,
+                )
+                return
+            self._serve_event_stream(stream)
             return
         response = api.dispatch(method, self.path, self.headers.items(), body)
         self._send_workbench_response(response, send_body)
@@ -719,6 +814,7 @@ class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
 
     def __init__(self, *args, **kwargs):
         self.runtime_supervisor = None
+        self.sse_stop_event = threading.Event()
         super().__init__(*args, **kwargs)
 
     def service_actions(self):
@@ -735,6 +831,9 @@ class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
     def close_listener(self):
         """Close the listening socket without waiting on application handlers."""
 
+        stop_event = getattr(self, "sse_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
         socketserver.TCPServer.server_close(self)
 
     def drain_request_threads(self, timeout=HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS):

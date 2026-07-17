@@ -555,7 +555,7 @@ class GuidedWorkbench:
                 "positive_receipt_reconciliation": True,
                 "exact_negative_reconciliation": True,
                 "automatic_reconciliation": False,
-                "streaming_events": False,
+                "streaming_events": True,
             },
             "capabilities": {
                 "cancel": True,
@@ -576,7 +576,7 @@ class GuidedWorkbench:
                     "same_attempt": True,
                     "capacity_released_while_waiting": False,
                 },
-                "sse": False,
+                "sse": True,
                 "startup_dispatch_recovery": False,
                 "startup_receipt_recovery": False,
                 "startup_status_catchup": False,

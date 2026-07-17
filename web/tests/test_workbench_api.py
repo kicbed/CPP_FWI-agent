@@ -9,7 +9,13 @@ import unittest
 from email.message import Message
 
 from scientific_runtime.workbench_service import GuidedWorkbench
-from web.workbench_api import API_PREFIX, MAX_JSON_BYTES, WorkbenchAPI
+from web.workbench_api import (
+    API_PREFIX,
+    APIResponse,
+    MAX_JSON_BYTES,
+    SSEEventStream,
+    WorkbenchAPI,
+)
 
 
 CSRF = "csrf-token-0123456789"
@@ -189,6 +195,187 @@ class WorkbenchAPITest(unittest.TestCase):
             path,
             self.mutation_headers(body, **header_updates),
             body,
+        )
+
+    @staticmethod
+    def run_event(task_id: str, sequence: int, status: str = "Running"):
+        return {
+            "schema_version": "1.0.0",
+            "event_id": f"event-{sequence}",
+            "sequence": sequence,
+            "task_id": task_id,
+            "node_id": "invert",
+            "event_type": "node_succeeded" if status == "Succeeded" else "node_progress",
+            "task_status": status,
+            "occurred_at": "2026-07-17T12:00:00Z",
+            "fingerprint": {},
+            "extensions": {},
+        }
+
+    def test_event_stream_requires_transport_headers_and_replays_exact_sequence(self):
+        task_id = "task-stream-1"
+        events = [
+            self.run_event(task_id, 8),
+            self.run_event(task_id, 9, "Succeeded"),
+        ]
+
+        class StreamApplication(FakeApplication):
+            def list_events(inner_self, requested_task_id, *, after_sequence=0, limit=100):
+                inner_self._call(
+                    "list_events",
+                    requested_task_id,
+                    after_sequence=after_sequence,
+                    limit=limit,
+                )
+                return [
+                    copy.deepcopy(event)
+                    for event in events
+                    if event["sequence"] > after_sequence
+                ][:limit]
+
+        application = StreamApplication()
+        api = WorkbenchAPI(
+            application,
+            CSRF,
+            allowed_hosts={HOST},
+            allowed_origins={ORIGIN},
+        )
+        headers = self.get_headers() | {"Accept": "text/event-stream"}
+        stream = api.open_event_stream(
+            "GET",
+            f"{API_PREFIX}/tasks/{task_id}/events/stream?after_sequence=7",
+            headers,
+            b"",
+        )
+        self.assertIsInstance(stream, SSEEventStream)
+        frames = stream.next_batch()
+        self.assertEqual(len(frames), 2)
+        self.assertTrue(frames[0].startswith(b"id: 8\nevent: run_event\ndata: "))
+        self.assertTrue(frames[1].startswith(b"id: 9\nevent: run_event\ndata: "))
+        first = json.loads(frames[0].split(b"data: ", 1)[1].strip())
+        self.assertEqual(first["task_id"], task_id)
+        self.assertEqual(first["sequence"], 8)
+        self.assertTrue(stream.terminal)
+        self.assertEqual(stream.after_sequence, 9)
+        self.assertEqual(stream.next_batch(), ())
+        self.assertEqual(
+            application.calls[0],
+            ("list_events", (task_id,), {"after_sequence": 7, "limit": 100}),
+        )
+
+        for path, request_headers, expected_status, expected_code in (
+            (
+                f"{API_PREFIX}/tasks/{task_id}/events/stream",
+                {"Host": HOST, "Accept": "text/event-stream"},
+                403,
+                "CSRF_FORBIDDEN",
+            ),
+            (
+                f"{API_PREFIX}/tasks/{task_id}/events/stream",
+                self.get_headers(),
+                406,
+                "EVENT_STREAM_REQUIRED",
+            ),
+            (
+                f"{API_PREFIX}/tasks/{task_id}/events/stream?limit=10",
+                headers,
+                400,
+                "INVALID_QUERY",
+            ),
+        ):
+            with self.subTest(path=path, expected_code=expected_code):
+                response = api.open_event_stream("GET", path, request_headers, b"")
+                self.assertIsInstance(response, APIResponse)
+                self.assertEqual(response.status, expected_status)
+                self.assertEqual(self.decode(response)["error"]["code"], expected_code)
+
+    def test_event_stream_fails_before_headers_for_scope_and_sequence_errors(self):
+        task_id = "task-stream-invalid"
+
+        self.application.error = WorkbenchNotFound("private task path")
+        response = self.api.open_event_stream(
+            "GET",
+            f"{API_PREFIX}/tasks/{task_id}/events/stream",
+            self.get_headers() | {"Accept": "text/event-stream"},
+            b"",
+        )
+        self.assertIsInstance(response, APIResponse)
+        self.assertEqual(response.status, 404)
+        self.assertNotIn(b"private", response.body)
+
+        self.application.error = None
+
+        def wrong_sequence(_task_id, *, after_sequence=0, limit=100):
+            return [self.run_event(task_id, after_sequence + 2)]
+
+        self.application.list_events = wrong_sequence
+        response = self.api.open_event_stream(
+            "GET",
+            f"{API_PREFIX}/tasks/{task_id}/events/stream?after_sequence=3",
+            self.get_headers() | {"Accept": "text/event-stream"},
+            b"",
+        )
+        self.assertIsInstance(response, APIResponse)
+        self.assertEqual(response.status, 500)
+        self.assertEqual(self.decode(response)["error"]["code"], "INTERNAL_ERROR")
+
+    def test_event_stream_pages_backlog_and_resumes_after_last_durable_id(self):
+        task_id = "task-stream-backlog"
+        events = [
+            self.run_event(
+                task_id,
+                sequence,
+                "Succeeded" if sequence == 105 else "Running",
+            )
+            for sequence in range(1, 106)
+        ]
+
+        class BacklogApplication(FakeApplication):
+            def list_events(inner_self, requested_task_id, *, after_sequence=0, limit=100):
+                inner_self._call(
+                    "list_events",
+                    requested_task_id,
+                    after_sequence=after_sequence,
+                    limit=limit,
+                )
+                return [
+                    copy.deepcopy(event)
+                    for event in events
+                    if event["sequence"] > after_sequence
+                ][:limit]
+
+        application = BacklogApplication()
+        api = WorkbenchAPI(
+            application,
+            CSRF,
+            allowed_hosts={HOST},
+            allowed_origins={ORIGIN},
+        )
+        headers = self.get_headers() | {"Accept": "text/event-stream"}
+        path = f"{API_PREFIX}/tasks/{task_id}/events/stream"
+        stream = api.open_event_stream("GET", path, headers, b"")
+        self.assertIsInstance(stream, SSEEventStream)
+        first = stream.next_batch()
+        second = stream.next_batch()
+        self.assertEqual((len(first), len(second)), (100, 5))
+        self.assertFalse(any(b"id: 101\n" in frame for frame in first))
+        self.assertTrue(second[0].startswith(b"id: 101\n"))
+        self.assertTrue(second[-1].startswith(b"id: 105\n"))
+        self.assertTrue(stream.terminal)
+        self.assertEqual(
+            [call[2]["after_sequence"] for call in application.calls],
+            [0, 100],
+        )
+
+        resumed = api.open_event_stream(
+            "GET", path + "?after_sequence=100", headers, b""
+        )
+        self.assertIsInstance(resumed, SSEEventStream)
+        resumed_frames = resumed.next_batch()
+        self.assertEqual(len(resumed_frames), 5)
+        self.assertEqual(
+            [int(frame.split(b"\n", 1)[0].split(b": ", 1)[1]) for frame in resumed_frames],
+            [101, 102, 103, 104, 105],
         )
 
     def test_session_is_the_only_csrf_free_endpoint_and_returns_transport_token(self):
@@ -726,6 +913,14 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertNotIn("org.agent_rpc.retry_exhaustion", event["extensions"])
         self.assertNotIn("org.agent_rpc.worker_exit_retry", event["extensions"])
         serialized = response.body.decode("utf-8")
+        stream = api.open_event_stream(
+            "GET",
+            f"{API_PREFIX}/tasks/{canonical['task_id']}/events/stream?after_sequence=1",
+            self.get_headers() | {"Accept": "text/event-stream"},
+            b"",
+        )
+        self.assertIsInstance(stream, SSEEventStream)
+        serialized += b"".join(stream.next_batch()).decode("utf-8")
         for private in (
             private_extension["intent_id"],
             private_extension["attempt_id"],
@@ -876,6 +1071,14 @@ class WorkbenchAPITest(unittest.TestCase):
             )
 
         serialized = response.body.decode("utf-8")
+        stream = api.open_event_stream(
+            "GET",
+            f"{API_PREFIX}/tasks/{canonical[0]['task_id']}/events/stream?after_sequence=6",
+            self.get_headers() | {"Accept": "text/event-stream"},
+            b"",
+        )
+        self.assertIsInstance(stream, SSEEventStream)
+        serialized += b"".join(stream.next_batch()).decode("utf-8")
         for private in (
             checkpoint_id,
             resume_id,

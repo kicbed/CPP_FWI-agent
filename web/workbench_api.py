@@ -19,6 +19,8 @@ from urllib.parse import unquote_to_bytes, urlsplit
 
 API_PREFIX = "/api/scientific-runtime/v1"
 MAX_JSON_BYTES = 64 * 1024
+MAX_SSE_EVENT_BYTES = 128 * 1024
+SSE_BATCH_LIMIT = 100
 
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -67,6 +69,87 @@ class APIResponse:
     status: int
     headers: Mapping[str, str]
     body: bytes
+
+
+class SSEEventStream:
+    """Bounded, read-only projection of one task's durable RunEvents."""
+
+    def __init__(self, application: Any, task_id: str, after_sequence: int) -> None:
+        self._application = application
+        self._task_id = task_id
+        self._after_sequence = after_sequence
+        self._buffered: tuple[bytes, ...] | None = None
+        self._terminal = False
+
+    @property
+    def after_sequence(self) -> int:
+        return self._after_sequence
+
+    @property
+    def terminal(self) -> bool:
+        return self._terminal
+
+    def prime(self) -> None:
+        """Authorize scope and validate the first page before HTTP headers."""
+
+        if self._buffered is not None:
+            raise _ApplicationInvariantError("event stream was already primed")
+        self._buffered = self._read_batch()
+
+    def next_batch(self) -> tuple[bytes, ...]:
+        if self._buffered is not None:
+            frames = self._buffered
+            self._buffered = None
+            return frames
+        if self._terminal:
+            return ()
+        return self._read_batch()
+
+    def _read_batch(self) -> tuple[bytes, ...]:
+        events = self._application.list_events(
+            self._task_id,
+            after_sequence=self._after_sequence,
+            limit=SSE_BATCH_LIMIT,
+        )
+        if not isinstance(events, list) or len(events) > SSE_BATCH_LIMIT:
+            raise _ApplicationInvariantError("invalid event stream page")
+        frames: list[bytes] = []
+        terminal_seen = False
+        for event in events:
+            if not isinstance(event, Mapping):
+                raise _ApplicationInvariantError("invalid event stream item")
+            sequence = event.get("sequence")
+            if (
+                type(sequence) is not int
+                or sequence != self._after_sequence + 1
+                or sequence > 2**63 - 1
+                or event.get("task_id") != self._task_id
+                or terminal_seen
+            ):
+                raise _ApplicationInvariantError("invalid event stream sequence")
+            encoded = json.dumps(
+                dict(event),
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(encoded) > MAX_SSE_EVENT_BYTES:
+                raise _ApplicationInvariantError("event stream item is too large")
+            frames.append(
+                b"id: "
+                + str(sequence).encode("ascii")
+                + b"\nevent: run_event\ndata: "
+                + encoded
+                + b"\n\n"
+            )
+            self._after_sequence = sequence
+            terminal_seen = event.get("task_status") in {
+                "Succeeded",
+                "Failed",
+                "Cancelled",
+            }
+        self._terminal = terminal_seen
+        return tuple(frames)
 
 
 class _RequestError(Exception):
@@ -357,6 +440,8 @@ def _route(path: str) -> _Route:
         matched = endpoints.get(parts[1])
         if matched is not None:
             return _Route(matched[0], matched[1], task_id=task_id)
+    if len(parts) == 3 and parts[1:] == ["events", "stream"]:
+        return _Route("event_stream", ("GET",), task_id=task_id)
     if len(parts) == 3 and parts[1] == "artifacts":
         artifact_id = parts[2]
         if _OPAQUE_ID.fullmatch(artifact_id) is None:
@@ -373,12 +458,17 @@ def _route(path: str) -> _Route:
 def _query_values(route: _Route, raw_query: str | None) -> dict[str, int | str]:
     if raw_query is None:
         return {}
-    if route.endpoint not in {"events", "task_collection"} or _QUERY.fullmatch(raw_query) is None:
+    if (
+        route.endpoint not in {"events", "event_stream", "task_collection"}
+        or _QUERY.fullmatch(raw_query) is None
+    ):
         raise _RequestError(400, "INVALID_QUERY", "request query is invalid")
     values: dict[str, int | str] = {}
     allowed = (
         {"after_sequence", "limit"}
         if route.endpoint == "events"
+        else {"after_sequence"}
+        if route.endpoint == "event_stream"
         else {"cursor", "limit", "view"}
     )
     for item in raw_query.split("&"):
@@ -588,6 +678,58 @@ class WorkbenchAPI:
                 actual_body_length=None,
             )
             return None
+        except _RequestError as error:
+            return _error_response(
+                error.status,
+                error.code,
+                error.message,
+                extra_headers=error.extra_headers,
+            )
+        except Exception:
+            return _error_response(500, "INTERNAL_ERROR", "internal server error")
+
+    def open_event_stream(
+        self,
+        method: str,
+        raw_target: str,
+        headers: Mapping[str, str] | Iterable[tuple[str, str]],
+        body: bytes,
+    ) -> SSEEventStream | APIResponse:
+        """Authorize and prime one task-scoped SSE stream.
+
+        The first bounded Store read happens before the HTTP server commits a
+        streaming response, so missing/cross-scope tasks and corrupt pages
+        retain normal JSON error semantics. Later failures close the stream;
+        they never synthesize task state or mutate the runtime.
+        """
+
+        try:
+            if not isinstance(body, bytes):
+                raise _RequestError(400, "INVALID_BODY", "request body is invalid")
+            context = self._prepare_request(
+                method,
+                raw_target,
+                headers,
+                actual_body_length=len(body),
+            )
+            if context.route.endpoint != "event_stream":
+                raise _RequestError(404, "NOT_FOUND", "requested resource was not found")
+            if context.headers.get("accept") != "text/event-stream":
+                raise _RequestError(
+                    406,
+                    "EVENT_STREAM_REQUIRED",
+                    "text/event-stream is required",
+                )
+            stream = SSEEventStream(
+                self._application,
+                context.route.task_id,
+                int(context.query.get("after_sequence", 0)),
+            )
+            try:
+                stream.prime()
+            except Exception as error:
+                return _application_error(error)
+            return stream
         except _RequestError as error:
             return _error_response(
                 error.status,
@@ -849,6 +991,12 @@ class WorkbenchAPI:
                 if not isinstance(events, list):
                     raise _ApplicationInvariantError("invalid event list")
                 return _success_response({"events": events})
+            if route.endpoint == "event_stream":
+                raise _RequestError(
+                    406,
+                    "EVENT_STREAM_REQUIRED",
+                    "streaming transport is required",
+                )
             if route.endpoint == "artifacts":
                 artifacts = self._application.list_artifacts(route.task_id)
                 if not isinstance(artifacts, list):
@@ -889,4 +1037,11 @@ class WorkbenchAPI:
         return APIResponse(status=200, headers=headers, body=content)
 
 
-__all__ = ["API_PREFIX", "APIResponse", "MAX_JSON_BYTES", "WorkbenchAPI"]
+__all__ = [
+    "API_PREFIX",
+    "APIResponse",
+    "MAX_JSON_BYTES",
+    "MAX_SSE_EVENT_BYTES",
+    "SSEEventStream",
+    "WorkbenchAPI",
+]

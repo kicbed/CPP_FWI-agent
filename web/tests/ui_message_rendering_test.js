@@ -228,6 +228,39 @@ function loadSseParser() {
   return sandbox.module.exports;
 }
 
+function loadGuidedEventFrameParser() {
+  const sandbox = { module: { exports: {} }, JSON, Number };
+  const source = [
+    'const GUIDED_SSE_MAX_BUFFER_CHARS = 256 * 1024;',
+    extractFunction('isSafeGuidedOpaqueId'),
+    extractFunction('parseGuidedEventStreamFrame'),
+    'module.exports = { parseGuidedEventStreamFrame };',
+  ].join('\n');
+  vm.runInNewContext(source, sandbox);
+  return sandbox.module.exports.parseGuidedEventStreamFrame;
+}
+
+function loadGuidedEventConsumer(refreshResult = true) {
+  const sandbox = {
+    module: { exports: {} },
+    JSON,
+    Number,
+    TextDecoder,
+  };
+  const source = [
+    'const GUIDED_SSE_MAX_BUFFER_CHARS = 256 * 1024;',
+    "const state = { guided: { generation: 7, taskId: 'task-stream-ui', eventCursor: 0, phase: 'monitoring' } };",
+    'let refreshCalls = 0;',
+    `async function refreshGuidedTask() { refreshCalls += 1; return ${refreshResult ? 'true' : 'false'}; }`,
+    extractFunction('isSafeGuidedOpaqueId'),
+    extractFunction('parseGuidedEventStreamFrame'),
+    `async ${extractFunction('consumeGuidedEventStream')}`,
+    'module.exports = { state, consumeGuidedEventStream, refreshCalls: () => refreshCalls };',
+  ].join('\n');
+  vm.runInNewContext(source, sandbox);
+  return sandbox.module.exports;
+}
+
 function loadModeFunctions() {
   const elements = {
     modeHttp: { className: '' },
@@ -627,6 +660,148 @@ async function testSseTransportPreservesStructuredFwiReceipt() {
   assert.equal(result.answer, '任务已提交');
   assert.equal(result.fwiPayload.job_id, 'fwi-sse-50');
   assert.equal(result.fwiPayload.status, 'queued');
+}
+
+async function testGuidedTaskEventSseIsStrictResumableAndFallsBackSafely() {
+  const parseFrame = loadGuidedEventFrameParser();
+  const taskId = 'task-stream-ui';
+  const event = sequence => ({
+    schema_version: '1.0.0',
+    event_id: `event-ui-${sequence}`,
+    sequence,
+    task_id: taskId,
+    node_id: 'invert',
+    event_type: sequence === 2 ? 'node_succeeded' : 'node_progress',
+    task_status: sequence === 2 ? 'Succeeded' : 'Running',
+    occurred_at: '2026-07-17T12:00:00Z',
+    fingerprint: {},
+    extensions: {},
+  });
+  const frame = sequence => (
+    `id: ${sequence}\nevent: run_event\ndata: ${JSON.stringify(event(sequence))}`
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(parseFrame('retry: 1000', taskId, 0))),
+    { control: true, streamEnd: false },
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(parseFrame(': keepalive', taskId, 0))),
+    { control: true, streamEnd: false },
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(parseFrame(': stream-end', taskId, 0))),
+    { control: true, streamEnd: true },
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(parseFrame(frame(1), taskId, 0))),
+    { control: false, sequence: 1, terminal: false },
+  );
+  assert.equal(parseFrame(frame(1), taskId, 1), null, 'duplicate ids are rejected');
+  assert.equal(parseFrame(frame(2), taskId, 0), null, 'sequence gaps are rejected');
+  assert.equal(
+    parseFrame(frame(1).replace(taskId, 'task-other'), taskId, 0),
+    null,
+    'cross-task data is rejected',
+  );
+  assert.equal(parseFrame(`id: 1\nevent: run_event\ndata: {`, taskId, 0), null);
+
+  function responseFor(wire, splitPoints = []) {
+    const encoded = new TextEncoder().encode(wire);
+    const chunks = [];
+    let previous = 0;
+    [...splitPoints, encoded.length].forEach(point => {
+      chunks.push(encoded.slice(previous, point));
+      previous = point;
+    });
+    const reader = {
+      async read() {
+        return chunks.length ? { done: false, value: chunks.shift() } : { done: true };
+      },
+      releaseLock() {},
+    };
+    return {
+      ok: true,
+      headers: { get(name) { return name === 'content-type' ? 'text/event-stream; charset=utf-8' : ''; } },
+      body: { getReader() { return reader; } },
+    };
+  }
+
+  const wire = `retry: 1000\n\n${frame(1)}\n\n: keepalive\n\n${frame(2)}\n\n`;
+  const consumer = loadGuidedEventConsumer(true);
+  const controller = { signal: { aborted: false } };
+  const completed = await consumer.consumeGuidedEventStream(
+    responseFor(wire, [7, 31, 97]), taskId, 7, controller,
+  );
+  assert.equal(completed, true);
+  assert.equal(consumer.state.guided.eventCursor, 2);
+  assert.ok(consumer.refreshCalls() >= 1 && consumer.refreshCalls() <= 2);
+
+  const failingConsumer = loadGuidedEventConsumer(false);
+  await assert.rejects(
+    failingConsumer.consumeGuidedEventStream(
+      responseFor(`${frame(1)}\n\n`), taskId, 7, controller,
+    ),
+    error => error && error.guidedEventRefreshFailed === true,
+  );
+  assert.equal(failingConsumer.state.guided.eventCursor, 1);
+
+  const startSandbox = {
+    module: { exports: {} },
+    AbortController,
+    scheduled: [],
+    fetchCalls: [],
+    fetch: async (path, options) => {
+      startSandbox.fetchCalls.push({ path, options });
+      return { ok: true };
+    },
+  };
+  const startSource = [
+    'const GUIDED_SSE_MAX_RECONNECTS = 4;',
+    'const GUIDED_SSE_RECONNECT_BASE_MS = 500;',
+    "const state = { guided: { taskId: 'task-stream-ui', generation: 7, phase: 'monitoring', eventStreamFallback: false, session: { streamingEvents: true }, eventAbortController: null, eventReconnectTimer: null, eventReconnectAttempts: 0, eventCursor: 1, eventStreamActive: false, csrfToken: 'csrf-token-abcdefghijkl' } };",
+    "function isSafeGuidedOpaqueId(value) { return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value); }",
+    "function isSafeGuidedCsrfToken(value) { return typeof value === 'string' && value.length >= 16; }",
+    "function guidedApiPath() { return '/api/scientific-runtime/v1/tasks/task-stream-ui/events/stream'; }",
+    'function scheduleGuidedPoll(delay, force) { scheduled.push([delay, force]); }',
+    "async function consumeGuidedEventStream() { const error = new Error('refresh failed'); error.guidedEventRefreshFailed = true; throw error; }",
+    `async ${extractFunction('startGuidedEventStream')}`,
+    'module.exports = { state, startGuidedEventStream };',
+  ].join('\n');
+  vm.runInNewContext(startSource, startSandbox);
+  assert.equal(await startSandbox.module.exports.startGuidedEventStream(), false);
+  assert.equal(startSandbox.module.exports.state.guided.eventStreamFallback, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(startSandbox.scheduled)), [[4000, true]]);
+  assert.equal(startSandbox.fetchCalls[0].path.endsWith('?after_sequence=1'), true);
+  assert.equal(startSandbox.fetchCalls[0].options.headers.Accept, 'text/event-stream');
+  assert.equal(
+    startSandbox.fetchCalls[0].options.headers['X-Workbench-CSRF'],
+    'csrf-token-abcdefghijkl',
+  );
+  assert.equal(startSandbox.fetchCalls[0].options.credentials, 'same-origin');
+
+  const cappedSandbox = {
+    module: { exports: {} },
+    AbortController,
+    scheduled: [],
+    fetch: async () => ({ ok: true }),
+  };
+  const cappedSource = startSource
+    .replace('eventReconnectAttempts: 0', 'eventReconnectAttempts: 4')
+    .replace(
+      "const error = new Error('refresh failed'); error.guidedEventRefreshFailed = true; throw error;",
+      "throw new Error('network failed');",
+    );
+  vm.runInNewContext(cappedSource, cappedSandbox);
+  assert.equal(await cappedSandbox.module.exports.startGuidedEventStream(), false);
+  assert.equal(cappedSandbox.module.exports.state.guided.eventStreamFallback, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(cappedSandbox.scheduled)), [[4000, true]]);
+
+  const startFunctionSource = extractFunction('startGuidedEventStream');
+  assert.match(startFunctionSource, /eventReconnectAttempts > GUIDED_SSE_MAX_RECONNECTS/);
+  assert.doesNotMatch(startFunctionSource, /EventSource|localStorage|sessionStorage/);
+  assert.match(extractFunction('stopGuidedEventStream'), /controller\.abort\(\)/);
+  assert.match(extractFunction('refreshGuidedTask'), /clearGuidedPoll\(true\)/);
+  assert.match(extractFunction('scheduleGuidedPoll'), /startGuidedEventStream\(\)/);
 }
 
 function testFwiExecutionWithoutReceiptIsReportedHonestly() {
@@ -1464,6 +1639,10 @@ function testGuidedIdentifiersAndRoutesAreConstrained() {
   assert.equal(
     api.guidedApiPath('cancel', 'task-safe:1'),
     '/api/scientific-runtime/v1/tasks/task-safe%3A1/cancel',
+  );
+  assert.equal(
+    api.guidedApiPath('eventStream', 'task-safe:1'),
+    '/api/scientific-runtime/v1/tasks/task-safe%3A1/events/stream',
   );
   assert.equal(api.guidedApiPath('artifact', 'task-1', "bad'id"), '');
   assert.equal(api.guidedApiPath('unknown', 'task-1'), '');
@@ -2447,11 +2626,16 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
     csrf_token: 'csrf-token-1234567890+/=',
     mode: 'guided',
     task_type: 'acoustic_fwi_2d',
-    features: { approval_required: true, running_cancel: true },
+    features: {
+      approval_required: true,
+      running_cancel: true,
+      streaming_events: true,
+    },
     capabilities: {
       cancel: true,
       retry: false,
       manual_retry: false,
+      sse: true,
       finite_automatic_retry: {
         max_attempts: 2,
         max_concurrent_attempts: 1,
@@ -2475,6 +2659,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
     JSON.parse(JSON.stringify(session.capabilities)),
     [
       'cancel',
+      'sse',
       'supervised_runtime_scheduling',
       'continuous_status_supervision',
       'supervisor_leases',
@@ -2483,6 +2668,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
     ],
   );
   assert.equal(session.manualRetry, false);
+  assert.equal(session.streamingEvents, true);
   assert.deepEqual(
     JSON.parse(JSON.stringify(session.finiteAutomaticRetry)),
     {
@@ -3797,6 +3983,7 @@ async function main() {
   testKatexIsSafeLazyAndBounded();
   testFwiSubmittedAndWrappedResultParsing();
   await testSseTransportPreservesStructuredFwiReceipt();
+  await testGuidedTaskEventSseIsStrictResumableAndFallsBackSafely();
   testFwiExecutionWithoutReceiptIsReportedHonestly();
   testFwiResultMetricsImagesAndEscaping();
   testFwiMissingImageFallback();

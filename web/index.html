@@ -490,6 +490,9 @@
     const MAX_MESSAGE_CHARACTERS = 250000;
     const GUIDED_API_PREFIX = '/api/scientific-runtime/v1';
     const GUIDED_POLL_INTERVAL_MS = 1500;
+    const GUIDED_SSE_RECONNECT_BASE_MS = 500;
+    const GUIDED_SSE_MAX_RECONNECTS = 4;
+    const GUIDED_SSE_MAX_BUFFER_CHARS = 256 * 1024;
     let fallbackIdCounter = 0;
 
     function normalizeMode(value) {
@@ -763,6 +766,12 @@
         mutationKeys: Object.create(null),
         pollTimer: null,
         pollInFlight: false,
+        eventAbortController: null,
+        eventReconnectTimer: null,
+        eventReconnectAttempts: 0,
+        eventCursor: 0,
+        eventStreamActive: false,
+        eventStreamFallback: false,
         artifactLoadInFlight: false,
         generation: 0,
         error: '',
@@ -1978,6 +1987,7 @@
       if (resource === 'restore') return `${GUIDED_API_PREFIX}/tasks/${task}/restore`;
       if (resource === 'purge') return `${GUIDED_API_PREFIX}/tasks/${task}/purge`;
       if (resource === 'task') return `${GUIDED_API_PREFIX}/tasks/${task}`;
+      if (resource === 'eventStream') return `${GUIDED_API_PREFIX}/tasks/${task}/events/stream`;
       if (resource === 'artifacts') return `${GUIDED_API_PREFIX}/tasks/${task}/artifacts`;
       if (resource === 'artifact' && artifact) {
         return `${GUIDED_API_PREFIX}/tasks/${task}/artifacts/${artifact}`;
@@ -2000,6 +2010,12 @@
         mutationKeys: Object.create(null),
         pollTimer: null,
         pollInFlight: false,
+        eventAbortController: null,
+        eventReconnectTimer: null,
+        eventReconnectAttempts: 0,
+        eventCursor: 0,
+        eventStreamActive: false,
+        eventStreamFallback: false,
         artifactLoadInFlight: false,
         generation,
         error: '',
@@ -2075,6 +2091,8 @@
         : [];
       const capabilityObject = source.capabilities && typeof source.capabilities === 'object'
         && !Array.isArray(source.capabilities) ? source.capabilities : null;
+      const featureObject = source.features && typeof source.features === 'object'
+        && !Array.isArray(source.features) ? source.features : null;
       const capabilitiesSource = Array.isArray(source.capabilities)
         ? source.capabilities
         : (capabilityObject
@@ -2149,6 +2167,10 @@
           .slice(0, 20)
           .map(item => item.slice(0, 80)),
         manualRetry: capabilityObject ? capabilityObject.manual_retry === true : false,
+        streamingEvents: Boolean(
+          featureObject && featureObject.streaming_events === true
+          && capabilityObject && capabilityObject.sse === true
+        ),
         finiteAutomaticRetry,
         optimization: {
           optimizers: (Array.isArray(formSource.optimizers) ? formSource.optimizers : [])
@@ -3427,14 +3449,218 @@
       return key;
     }
 
-    function clearGuidedPoll() {
+    function clearGuidedPoll(preserveEventStream = false) {
       if (state.guided.pollTimer) clearTimeout(state.guided.pollTimer);
       state.guided.pollTimer = null;
+      if (!preserveEventStream) stopGuidedEventStream();
     }
 
-    function scheduleGuidedPoll(delayMs = GUIDED_POLL_INTERVAL_MS) {
-      clearGuidedPoll();
+    function stopGuidedEventStream() {
+      if (state.guided.eventReconnectTimer) {
+        clearTimeout(state.guided.eventReconnectTimer);
+      }
+      state.guided.eventReconnectTimer = null;
+      const controller = state.guided.eventAbortController;
+      state.guided.eventAbortController = null;
+      state.guided.eventStreamActive = false;
+      if (controller && typeof controller.abort === 'function') controller.abort();
+    }
+
+    function parseGuidedEventStreamFrame(frame, taskId, afterSequence) {
+      if (typeof frame !== 'string' || frame.length > GUIDED_SSE_MAX_BUFFER_CHARS
+          || !isSafeGuidedOpaqueId(taskId)
+          || !Number.isSafeInteger(afterSequence) || afterSequence < 0) return null;
+      const lines = frame.split('\n');
+      let id = '';
+      let eventName = '';
+      let data = '';
+      let controlOnly = true;
+      let streamEnd = false;
+      for (const line of lines) {
+        if (!line) continue;
+        if (line.startsWith(':')) {
+          if (line === ': stream-end') streamEnd = true;
+          continue;
+        }
+        if (/^retry: (?:0|[1-9][0-9]{0,8})$/.test(line)) continue;
+        controlOnly = false;
+        if (line.startsWith('id: ') && !id) id = line.slice(4);
+        else if (line.startsWith('event: ') && !eventName) eventName = line.slice(7);
+        else if (line.startsWith('data: ') && !data) data = line.slice(6);
+        else return null;
+      }
+      if (controlOnly) return { control: true, streamEnd };
+      if (!/^(?:0|[1-9][0-9]{0,18})$/.test(id)
+          || eventName !== 'run_event' || !data) return null;
+      const sequence = Number(id);
+      if (!Number.isSafeInteger(sequence) || sequence !== afterSequence + 1) return null;
+      let value;
+      try {
+        value = JSON.parse(data);
+      } catch (error) {
+        return null;
+      }
+      if (!value || typeof value !== 'object' || Array.isArray(value)
+          || value.sequence !== sequence || value.task_id !== taskId
+          || !isSafeGuidedOpaqueId(value.event_id)
+          || !/^[a-z][a-z0-9_]{0,63}$/.test(value.event_type || '')
+          || ![
+            'Draft', 'NeedsInput', 'AwaitingApproval', 'Queued', 'Running',
+            'Waiting', 'Retrying', 'Succeeded', 'Failed', 'Cancelled',
+          ].includes(value.task_status)) return null;
+      return {
+        control: false,
+        sequence,
+        terminal: ['Succeeded', 'Failed', 'Cancelled'].includes(value.task_status),
+      };
+    }
+
+    async function consumeGuidedEventStream(response, taskId, generation, controller) {
+      const contentType = response && response.headers
+        && typeof response.headers.get === 'function'
+        ? (response.headers.get('content-type') || '') : '';
+      if (!response || response.ok !== true
+          || !contentType.toLowerCase().startsWith('text/event-stream')
+          || !response.body || typeof response.body.getReader !== 'function') {
+        throw new Error('Guided event stream is unavailable');
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      let buffer = '';
+      let complete = false;
+      let normalEnd = false;
+      try {
+        while (true) {
+          const chunk = await reader.read();
+          if (controller.signal.aborted || state.guided.generation !== generation
+              || state.guided.taskId !== taskId) return false;
+          if (chunk.done) {
+            buffer += decoder.decode();
+            if (buffer) throw new Error('Guided event stream ended mid-frame');
+            if (!normalEnd) throw new Error('Guided event stream ended unexpectedly');
+            complete = true;
+            return true;
+          }
+          buffer += decoder.decode(chunk.value, { stream: true });
+          let boundary = buffer.indexOf('\n\n');
+          let advanced = false;
+          while (boundary >= 0) {
+            if (boundary > GUIDED_SSE_MAX_BUFFER_CHARS) {
+              throw new Error('Guided event stream frame is too large');
+            }
+            const frame = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            if (normalEnd) throw new Error('Guided event stream continued after completion');
+            const parsed = parseGuidedEventStreamFrame(
+              frame, taskId, state.guided.eventCursor,
+            );
+            if (!parsed) throw new Error('Guided event stream frame is invalid');
+            if (parsed.control) {
+              normalEnd = normalEnd || parsed.streamEnd === true;
+            } else {
+              state.guided.eventCursor = parsed.sequence;
+              normalEnd = normalEnd || parsed.terminal === true;
+              advanced = true;
+            }
+            boundary = buffer.indexOf('\n\n');
+          }
+          if (buffer.length > GUIDED_SSE_MAX_BUFFER_CHARS) {
+            throw new Error('Guided event stream frame is too large');
+          }
+          if (advanced && state.guided.phase === 'monitoring') {
+            const refreshed = await refreshGuidedTask({ fromEventStream: true });
+            if (!refreshed && state.guided.phase === 'monitoring') {
+              const error = new Error('Guided event refresh failed');
+              error.guidedEventRefreshFailed = true;
+              throw error;
+            }
+            if (state.guided.phase !== 'monitoring') return true;
+          }
+        }
+      } finally {
+        if (!complete && typeof reader.cancel === 'function') {
+          try {
+            await reader.cancel();
+          } catch (error) {
+            // Closing/reopening a task can race the network teardown.
+          }
+        }
+        if (typeof reader.releaseLock === 'function') reader.releaseLock();
+      }
+    }
+
+    async function startGuidedEventStream() {
+      const taskId = state.guided.taskId;
+      const generation = state.guided.generation;
+      if (!isSafeGuidedOpaqueId(taskId) || state.guided.phase !== 'monitoring'
+          || state.guided.eventStreamFallback
+          || state.guided.session?.streamingEvents !== true
+          || state.guided.eventAbortController || state.guided.eventReconnectTimer) return false;
+      if (!isSafeGuidedCsrfToken(state.guided.csrfToken || '')) return false;
+      const controller = new AbortController();
+      state.guided.eventAbortController = controller;
+      state.guided.eventStreamActive = true;
+      let failed = false;
+      let refreshFailed = false;
+      try {
+        const path = `${guidedApiPath('eventStream', taskId)}?after_sequence=${state.guided.eventCursor}`;
+        const response = await fetch(path, {
+          method: 'GET',
+          headers: {
+            Accept: 'text/event-stream',
+            'X-Workbench-CSRF': state.guided.csrfToken,
+          },
+          credentials: 'same-origin',
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        await consumeGuidedEventStream(response, taskId, generation, controller);
+      } catch (error) {
+        failed = !controller.signal.aborted;
+        refreshFailed = failed && error && error.guidedEventRefreshFailed === true;
+      } finally {
+        if (state.guided.eventAbortController === controller) {
+          state.guided.eventAbortController = null;
+          state.guided.eventStreamActive = false;
+        }
+      }
+      if (controller.signal.aborted || state.guided.generation !== generation
+          || state.guided.taskId !== taskId || state.guided.phase !== 'monitoring') return !failed;
+      if (refreshFailed) {
+        // The durable cursor may already have advanced. Keep polling the task
+        // projection for this generation so a terminal event cannot be lost
+        // merely because its first follow-up GET failed.
+        state.guided.eventStreamFallback = true;
+        scheduleGuidedPoll(4000, true);
+        return false;
+      }
+      if (failed) state.guided.eventReconnectAttempts += 1;
+      else state.guided.eventReconnectAttempts = 0;
+      if (state.guided.eventReconnectAttempts > GUIDED_SSE_MAX_RECONNECTS) {
+        state.guided.eventStreamFallback = true;
+        scheduleGuidedPoll(4000, true);
+        return false;
+      }
+      const exponent = Math.max(0, state.guided.eventReconnectAttempts - 1);
+      const delay = failed
+        ? Math.min(4000, GUIDED_SSE_RECONNECT_BASE_MS * (2 ** exponent))
+        : GUIDED_SSE_RECONNECT_BASE_MS;
+      state.guided.eventReconnectTimer = setTimeout(() => {
+        state.guided.eventReconnectTimer = null;
+        startGuidedEventStream();
+      }, delay);
+      return !failed;
+    }
+
+    function scheduleGuidedPoll(delayMs = GUIDED_POLL_INTERVAL_MS, forcePoll = false) {
+      clearGuidedPoll(true);
       if (!state.guided.taskId || state.guided.phase === 'closed') return;
+      if (!forcePoll && state.guided.phase === 'monitoring'
+          && state.guided.session?.streamingEvents === true
+          && state.guided.eventStreamFallback !== true) {
+        startGuidedEventStream();
+        return;
+      }
       state.guided.pollTimer = setTimeout(() => {
         state.guided.pollTimer = null;
         refreshGuidedTask();
@@ -4275,7 +4501,7 @@
         && isSafeGuidedPlanHash(state.guided.task?.plan?.hash)
         ? state.guided.task.plan.hash : '';
       state.guided.pollInFlight = true;
-      clearGuidedPoll();
+      clearGuidedPoll(true);
       try {
         const data = await guidedApiRequest(guidedApiPath('task', taskId));
         if (state.guided.generation !== generation) return false;

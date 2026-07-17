@@ -7,6 +7,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,7 @@ class _Application:
         self.listed = []
         self.cancelled = []
         self.purged = []
+        self.event_reads = []
 
     def session_capabilities(self):
         return {
@@ -75,6 +77,36 @@ class _Application:
             },
             "replayed": False,
         }
+
+    def list_events(self, task_id, *, after_sequence=0, limit=100):
+        self.event_reads.append((task_id, after_sequence, limit))
+        events = [
+            {
+                "schema_version": "1.0.0",
+                "event_id": "event-route-1",
+                "sequence": 1,
+                "task_id": task_id,
+                "node_id": "invert",
+                "event_type": "node_started",
+                "task_status": "Running",
+                "occurred_at": "2026-07-17T12:00:00Z",
+                "fingerprint": {},
+                "extensions": {},
+            },
+            {
+                "schema_version": "1.0.0",
+                "event_id": "event-route-2",
+                "sequence": 2,
+                "task_id": task_id,
+                "node_id": "invert",
+                "event_type": "node_succeeded",
+                "task_status": "Succeeded",
+                "occurred_at": "2026-07-17T12:00:01Z",
+                "fingerprint": {},
+                "extensions": {},
+            },
+        ]
+        return [event for event in events if event["sequence"] > after_sequence][:limit]
 
 
 class WorkbenchRouteTest(unittest.TestCase):
@@ -233,6 +265,46 @@ class WorkbenchRouteTest(unittest.TestCase):
                 self.assertEqual(status, 405)
                 self.assertNotIn("access-control-allow-origin", headers)
                 self.assertEqual(json.loads(body)["error"]["code"], "METHOD_NOT_ALLOWED")
+
+    def test_task_event_stream_is_finite_replayable_and_scope_authenticated(self):
+        path = (
+            "/api/scientific-runtime/v1/tasks/task-route-test/events/stream"
+            "?after_sequence=1"
+        )
+        status, headers, body = self.request(
+            "GET",
+            path,
+            headers={
+                "Accept": "text/event-stream",
+                "X-Workbench-CSRF": self.csrf,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "text/event-stream; charset=utf-8")
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(headers["connection"], "close")
+        self.assertEqual(headers["x-accel-buffering"], "no")
+        self.assertNotIn("content-length", headers)
+        self.assertNotIn("access-control-allow-origin", headers)
+        self.assertTrue(body.startswith(b"retry: 1000\n\nid: 2\n"))
+        self.assertIn(b"event: run_event\n", body)
+        payload = json.loads(body.split(b"data: ", 1)[1].strip())
+        self.assertEqual(payload["task_id"], "task-route-test")
+        self.assertEqual(payload["sequence"], 2)
+        self.assertEqual(payload["task_status"], "Succeeded")
+        self.assertEqual(
+            self.application.event_reads[-1],
+            ("task-route-test", 1, 100),
+        )
+
+        status, headers, body = self.request(
+            "GET",
+            path,
+            headers={"Accept": "text/event-stream"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"]["code"], "CSRF_FORBIDDEN")
+        self.assertIn("content-length", headers)
 
     def test_framing_is_rejected_before_a_caller_controlled_body_read(self):
         prefix = (
@@ -921,10 +993,115 @@ class WorkbenchRouteTest(unittest.TestCase):
             self.assertNotIn("_threads", vars(server))
             server.close_listener()
             self.assertEqual(server.socket.fileno(), -1)
+            self.assertTrue(server.sse_stop_event.is_set())
             self.assertTrue(server.drain_request_threads(0.01))
         finally:
             if server.socket.fileno() >= 0:
                 server.server_close()
+
+    def test_active_nonterminal_event_stream_stops_before_handler_drain_bound(self):
+        class IdleApplication(_Application):
+            def list_events(self, task_id, *, after_sequence=0, limit=100):
+                self.event_reads.append((task_id, after_sequence, limit))
+                return []
+
+        previous_api = serve.WORKBENCH_API
+        server = serve.ReusableThreadingTCPServer(
+            ("127.0.0.1", 0), serve.Handler
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        connection = None
+        try:
+            port = server.server_address[1]
+            csrf = "active-stream-shutdown-csrf"
+            serve.WORKBENCH_API = WorkbenchAPI(
+                IdleApplication(),
+                csrf_token=csrf,
+                allowed_hosts={f"127.0.0.1:{port}"},
+                allowed_origins={f"http://127.0.0.1:{port}"},
+            )
+            thread.start()
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            connection.request(
+                "GET",
+                "/api/scientific-runtime/v1/tasks/task-idle/events/stream",
+                headers={
+                    "Accept": "text/event-stream",
+                    "X-Workbench-CSRF": csrf,
+                },
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(len(b"retry: 1000\n\n")), b"retry: 1000\n\n")
+            self.assertLess(
+                serve.SSE_STREAM_WRITE_TIMEOUT_SECONDS,
+                serve.HTTP_HANDLER_DRAIN_TIMEOUT_SECONDS,
+            )
+
+            server.shutdown()
+            started = time.monotonic()
+            server.close_listener()
+            self.assertTrue(server.drain_request_threads(2.0))
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertTrue(server.sse_stop_event.is_set())
+        finally:
+            if connection is not None:
+                connection.close()
+            if thread.is_alive():
+                server.shutdown()
+            if server.socket.fileno() >= 0:
+                server.close_listener()
+            server.drain_request_threads(2.0)
+            thread.join(timeout=2)
+            serve.WORKBENCH_API = previous_api
+
+    def test_planned_finite_event_stream_close_has_explicit_marker(self):
+        class IdleApplication(_Application):
+            def list_events(self, task_id, *, after_sequence=0, limit=100):
+                self.event_reads.append((task_id, after_sequence, limit))
+                return []
+
+        previous_api = serve.WORKBENCH_API
+        server = serve.ReusableThreadingTCPServer(
+            ("127.0.0.1", 0), serve.Handler
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        connection = None
+        try:
+            port = server.server_address[1]
+            csrf = "finite-stream-marker-csrf"
+            serve.WORKBENCH_API = WorkbenchAPI(
+                IdleApplication(),
+                csrf_token=csrf,
+                allowed_hosts={f"127.0.0.1:{port}"},
+                allowed_origins={f"http://127.0.0.1:{port}"},
+            )
+            thread.start()
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            with mock.patch.object(serve, "SSE_STREAM_MAX_SECONDS", 0.05), mock.patch.object(
+                serve, "SSE_STREAM_POLL_INTERVAL_SECONDS", 0.01
+            ):
+                connection.request(
+                    "GET",
+                    "/api/scientific-runtime/v1/tasks/task-idle/events/stream",
+                    headers={
+                        "Accept": "text/event-stream",
+                        "X-Workbench-CSRF": csrf,
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                body = response.read()
+            self.assertTrue(body.startswith(b"retry: 1000\n\n"))
+            self.assertTrue(body.endswith(b": stream-end\n\n"))
+        finally:
+            if connection is not None:
+                connection.close()
+            server.shutdown()
+            server.close_listener()
+            server.drain_request_threads(2.0)
+            thread.join(timeout=2)
+            serve.WORKBENCH_API = previous_api
 
     def test_shutdown_signal_ignores_both_signals_before_unwinding(self):
         installed = {}
