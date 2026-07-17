@@ -264,6 +264,9 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertTrue(
             capabilities["features"]["positive_receipt_reconciliation"]
         )
+        self.assertTrue(
+            capabilities["features"]["exact_negative_reconciliation"]
+        )
         self.assertNotIn("can_timeout", capabilities["features"])
         self.assertNotIn("timeout", capabilities["capabilities"])
         self.assertFalse(capabilities["features"]["automatic_reconciliation"])
@@ -328,6 +331,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                 "continuous_status_supervision": True,
                 "supervisor_leases": True,
                 "positive_receipt_reconciliation": True,
+                "exact_negative_reconciliation": True,
                 "automatic_reconciliation": False,
                 "dag": False,
             },
@@ -1240,11 +1244,53 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             private_receipt["dispatch"]["reconciliation"]["evidence_kind"],
             "private_receipt",
         )
+        not_dispatched = self.workbench._project(
+            replace(snapshot, status="Failed"),
+            intent={
+                "state": "not_dispatched",
+                "failure_code": "DISPATCH_NOT_STARTED",
+                "created_at": base_intent.created_at,
+                "dispatch_claimed_at": recorded_at,
+                "outcome_recorded_at": resolved_at,
+                "reconciliation": {
+                    "failure_code": "SUBMISSION_RECONCILIATION_REQUIRED",
+                    "recorded_at": recorded_at,
+                    "state": "resolved",
+                    "result": "not_dispatched",
+                    "evidence_kind": "managed_pre_running_failure",
+                    "resolved_at": resolved_at,
+                    "attempt_id": "attempt-must-not-project",
+                    "private_proof_hash": "sha256:" + "d" * 64,
+                    "pid": 5252,
+                    "relative_path": "/root/private/failed-run",
+                },
+            },
+        )
+        self.assertEqual(not_dispatched["status"], "Failed")
+        self.assertEqual(
+            not_dispatched["dispatch"],
+            {
+                "state": "not_dispatched",
+                "failure_code": "DISPATCH_NOT_STARTED",
+                "created_at": base_intent.created_at,
+                "dispatch_claimed_at": recorded_at,
+                "outcome_recorded_at": resolved_at,
+                "reconciliation": {
+                    "failure_code": "SUBMISSION_RECONCILIATION_REQUIRED",
+                    "recorded_at": recorded_at,
+                    "state": "resolved",
+                    "result": "not_dispatched",
+                    "evidence_kind": "managed_pre_running_failure",
+                    "resolved_at": resolved_at,
+                },
+            },
+        )
         serialized = repr(
             (
                 required["dispatch"],
                 resolved["dispatch"],
                 private_receipt["dispatch"],
+                not_dispatched["dispatch"],
             )
         )
         for private_value in (
@@ -1254,7 +1300,11 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             "sha256:" + "a" * 64,
             "sha256:" + "b" * 64,
             "sha256:" + "c" * 64,
+            "sha256:" + "d" * 64,
             "4242",
+            "5252",
+            "attempt-must-not-project",
+            "/root/private/failed-run",
         ):
             self.assertNotIn(private_value, serialized)
         self.assertFalse(
@@ -1276,6 +1326,39 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                     },
                 },
             )
+
+        negative_reconciliation = {
+            "failure_code": "SUBMISSION_RECONCILIATION_REQUIRED",
+            "recorded_at": recorded_at,
+            "state": "resolved",
+            "result": "not_dispatched",
+            "evidence_kind": "managed_pre_running_failure",
+            "resolved_at": resolved_at,
+        }
+        for invalid_snapshot, invalid_intent in (
+            (
+                snapshot,
+                {
+                    "state": "not_dispatched",
+                    "failure_code": "DISPATCH_NOT_STARTED",
+                    "reconciliation": negative_reconciliation,
+                },
+            ),
+            (
+                replace(snapshot, status="Failed"),
+                {
+                    "state": "dispatched",
+                    "failure_code": None,
+                    "reconciliation": negative_reconciliation,
+                },
+            ),
+        ):
+            with self.subTest(invalid_intent=invalid_intent):
+                with self.assertRaises(WorkbenchRuntimeError):
+                    self.workbench._project(
+                        invalid_snapshot,
+                        intent=invalid_intent,
+                    )
 
     def test_worker_exit_retrying_projection_is_bounded_and_path_free(self) -> None:
         created = self.workbench.create_task(
@@ -1861,6 +1944,17 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             "pid": 4242,
             "private_path": "/root/private/worker-exit-retry",
         }
+        reconciliation_extension = {
+            "intent_id": "intent-private-dispatch-reconciliation",
+            "attempt_id": "attempt-" + "6" * 32,
+            "attempt_number": 1,
+            "evidence_hash": "sha256:" + "5" * 64,
+            "adapter_version": "1.5.0",
+            "private_schema_version": "1.2.0",
+            "private_record_hash": "sha256:" + "4" * 64,
+            "private_proof_hash": "sha256:" + "3" * 64,
+            "result": "not_dispatched",
+        }
         canonical = {
             "schema_version": "1.0.0",
             "event_id": "event-retry-exhausted-public",
@@ -1879,6 +1973,9 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             "extensions": {
                 "org.agent_rpc.retry_exhaustion": private_extension,
                 "org.agent_rpc.worker_exit_retry": worker_exit_extension,
+                "org.agent_rpc.dispatch_reconciliation": (
+                    reconciliation_extension
+                ),
                 "org.agent_rpc.adapter_status": {
                     "stage": "submit",
                     "job_id": "fwi-private-retry-job",
@@ -1905,6 +2002,10 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertNotIn(
             "org.agent_rpc.worker_exit_retry", projected[0]["extensions"]
         )
+        self.assertNotIn(
+            "org.agent_rpc.dispatch_reconciliation",
+            projected[0]["extensions"],
+        )
         self.assertEqual(
             projected[0]["extensions"]["org.agent_rpc.adapter_status"],
             {"stage": "submit"},
@@ -1918,6 +2019,10 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(
             canonical["extensions"]["org.agent_rpc.worker_exit_retry"],
             worker_exit_extension,
+        )
+        self.assertEqual(
+            canonical["extensions"]["org.agent_rpc.dispatch_reconciliation"],
+            reconciliation_extension,
         )
         serialized = repr(projected)
         for private in (
@@ -1934,6 +2039,11 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             worker_exit_extension["source_outcome_document_hash"],
             worker_exit_extension["source_handle_hash"],
             worker_exit_extension["private_path"],
+            reconciliation_extension["intent_id"],
+            reconciliation_extension["attempt_id"],
+            reconciliation_extension["evidence_hash"],
+            reconciliation_extension["private_record_hash"],
+            reconciliation_extension["private_proof_hash"],
             "intent_id",
             "attempt_id",
             "previous_attempt_id",

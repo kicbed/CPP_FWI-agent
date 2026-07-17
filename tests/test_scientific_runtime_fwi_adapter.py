@@ -38,6 +38,7 @@ from scientific_runtime import (
     TaskStoreConflict,
 )
 from scientific_runtime.fwi_adapter import (
+    AdapterDispatchNotStartedProof,
     AdapterExistingDispatchReceiptProof,
     AdapterIdempotencyConflict,
     AdapterManagedCancelProof,
@@ -46,6 +47,11 @@ from scientific_runtime.fwi_adapter import (
     AdapterUnavailable,
     DeepwaveAdapter,
     SafeSubprocessWorkerLauncher,
+)
+from scientific_runtime.task_dispatcher import (
+    DispatchNotStartedProof,
+    DispatchReconciliationDeferred,
+    DispatchReceiptProbe,
 )
 from scientific_runtime_contracts import compute_plan_hash, schema_errors
 from worker_launch_control import (
@@ -650,6 +656,43 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             outcome_recorded_at=NOW,
         )
 
+    def stopped_reconciliation_fixture(
+        self, *, task_id: str
+    ) -> tuple[
+        DeepwaveAdapter,
+        dict[str, Any],
+        Path,
+        Path,
+        Any,
+    ]:
+        """Create one exact current attempt stopped before ready."""
+
+        launcher = StoppedThenSuccessfulSafeLauncher()
+        adapter = self.make_adapter(launcher=launcher)
+        request = self.submit_kwargs(
+            task_id=task_id,
+            idempotency_key=f"{task_id}:invert:0001",
+        )
+        with self.assertRaises(AdapterUnavailable) as stopped:
+            adapter.submit(**copy.deepcopy(request))
+        self.assertEqual(stopped.exception.code, "WORKER_LAUNCH_FAILED")
+        submission_id = adapter._submission_id(
+            request["task_id"],
+            request["plan_hash"],
+            request["idempotency_key"],
+        )
+        record_path = (
+            self.run_root
+            / fwi_adapter_module.CONTROL_DIRECTORY
+            / "submissions"
+            / f"{submission_id.removeprefix('submission-')}.json"
+        )
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        handle = adapter._handle_from_record(record)
+        ticket_path = self.run_root / record["job_id"] / ".worker-launch.json"
+        self.assertEqual(launcher.calls, 1)
+        return adapter, request, record_path, ticket_path, handle
+
     def write_status(self, run_dir: Path, status: str) -> None:
         config = json.loads(
             (run_dir / "config.original.json").read_text(encoding="utf-8")
@@ -1202,6 +1245,13 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             self.assertEqual(promoted["launch_attempt"], record["launch_attempt"])
             self.assertEqual(self.root_snapshot(), before_paths)
             self.assertEqual(replacement_launcher.calls, [])
+            matrix_proof = dispatcher.probe_dispatch_reconciliation(intent)
+            self.assertIsInstance(matrix_proof, DispatchReceiptProbe)
+            assert isinstance(matrix_proof, DispatchReceiptProbe)
+            self.assertEqual(matrix_proof.handle, handle.as_dict())
+            self.assertEqual(
+                matrix_proof.evidence_kind, "managed_worker_receipt"
+            )
         finally:
             heartbeat.stop("succeeded")
 
@@ -1236,6 +1286,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(record_path.read_bytes(), before_record)
         self.assertEqual(self.root_snapshot(), before_paths)
         self.assertEqual(replacement_launcher.calls, [])
+        matrix_proof = dispatcher.probe_dispatch_reconciliation(intent)
+        self.assertIsInstance(matrix_proof, DispatchReceiptProbe)
+        assert isinstance(matrix_proof, DispatchReceiptProbe)
+        self.assertEqual(matrix_proof.evidence_kind, "private_receipt")
+        self.assertEqual(matrix_proof.handle, handle.as_dict())
 
     def test_reconciliation_probe_defers_nonpositive_evidence_without_launch(
         self,
@@ -1306,6 +1361,384 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             history.exception.code, "DISPATCH_RECEIPT_PROBE_UNSUPPORTED"
         )
         adapter_probe.assert_not_called()
+        self.assertEqual(replacement_launcher.calls, [])
+
+    def test_reconciliation_matrix_proves_all_idle_pre_running_ticket_states(
+        self,
+    ) -> None:
+        ticket_states = {
+            "staged": (None, None, None),
+            "leased": (0, 1, None),
+            "spawned": (0, 1, 4242),
+            "failed": (0, 1, None),
+        }
+        for ticket_state, projection in ticket_states.items():
+            with self.subTest(ticket_state=ticket_state):
+                task_id = f"task-reconcile-negative-{ticket_state}"
+                (
+                    adapter,
+                    request,
+                    record_path,
+                    ticket_path,
+                    handle,
+                ) = self.stopped_reconciliation_fixture(task_id=task_id)
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                record.pop("launch_failure")
+                adapter._write_submission(record_path, record)
+                ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+                ticket.update(
+                    {
+                        "state": ticket_state,
+                        "capacity_slot": projection[0],
+                        "capacity_generation": projection[1],
+                        "worker_pid": projection[2],
+                    }
+                )
+                ticket.pop("record_hash")
+                ticket["record_hash"] = fwi_adapter_module._sha256_document(
+                    ticket
+                )
+                ticket_path.write_text(json.dumps(ticket), encoding="utf-8")
+                replacement_launcher = FakeLauncher()
+                reopened = self.make_adapter(launcher=replacement_launcher)
+                dispatcher = DeepwaveTaskDispatcher(reopened)
+                intent = self.reconciliation_intent(handle, request)
+                before_record = record_path.read_bytes()
+                before_paths = self.root_snapshot()
+
+                with (
+                    patch.object(reopened, "submit") as submit,
+                    patch.object(reopened, "retry_pre_running") as retry_pre,
+                    patch.object(reopened, "retry_worker_exit") as retry_exit,
+                ):
+                    proof = dispatcher.probe_dispatch_reconciliation(intent)
+
+                self.assertIsInstance(proof, DispatchNotStartedProof)
+                assert isinstance(proof, DispatchNotStartedProof)
+                self.assertEqual(proof.result, "not_dispatched")
+                self.assertEqual(
+                    proof.evidence_kind, "managed_pre_running_failure"
+                )
+                self.assertEqual(proof.adapter_version, "1.5.0")
+                self.assertEqual(proof.private_schema_version, "1.2.0")
+                self.assertEqual(
+                    proof.private_record_hash, record["record_hash"]
+                )
+                self.assertEqual(proof.attempt_number, 1)
+                self.assertEqual(proof.evidence["ticket"]["state"], ticket_state)
+                self.assertIsNone(proof.evidence["ready"])
+                self.assertIsNone(proof.evidence["heartbeat"])
+                evidence_hash = fwi_adapter_module._sha256_document(
+                    proof.evidence
+                )
+                expected_proof_hash = fwi_adapter_module._sha256_document(
+                    {
+                        "schema_version": "1.0.0",
+                        "result": "not_dispatched",
+                        "evidence_kind": "managed_pre_running_failure",
+                        "adapter_version": "1.5.0",
+                        "private_schema_version": "1.2.0",
+                        "private_record_hash": record["record_hash"],
+                        "attempt_id": proof.attempt_id,
+                        "attempt_number": 1,
+                        "evidence_hash": evidence_hash,
+                    }
+                )
+                self.assertEqual(proof.private_proof_hash, expected_proof_hash)
+                self.assertNotIn(
+                    str(self.run_root), json.dumps(dataclasses.asdict(proof))
+                )
+                self.assertEqual(record_path.read_bytes(), before_record)
+                self.assertEqual(self.root_snapshot(), before_paths)
+                self.assertEqual(replacement_launcher.calls, [])
+                submit.assert_not_called()
+                retry_pre.assert_not_called()
+                retry_exit.assert_not_called()
+
+    def test_reconciliation_matrix_supports_historical_v1_4_stopped_proof(
+        self,
+    ) -> None:
+        (
+            adapter,
+            request,
+            record_path,
+            ticket_path,
+            _handle,
+        ) = self.stopped_reconciliation_fixture(
+            task_id="task-reconcile-negative-v1-4"
+        )
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["schema_version"] = "1.1.0"
+        record.pop("attempt_history")
+        record.pop("launch_failure")
+        record["adapter_version"] = "1.4.0"
+        record["algorithm"]["version"] = "1.4.0"
+        record["fingerprint"]["adapter_version"] = "1.4.0"
+        record["fingerprint"]["algorithm"]["version"] = "1.4.0"
+        historical_config_hash = "sha256:" + hashlib.sha256(
+            b"historical-v1.4-reconciliation"
+        ).hexdigest()
+        record["normalized_config_hash"] = historical_config_hash
+        record["fingerprint"][
+            "normalized_config_hash"
+        ] = historical_config_hash
+        record["request_hash"] = fwi_adapter_module._sha256_document(
+            adapter._record_request_payload(record)
+        )
+        historical_binding = LaunchAttemptBinding(
+            submission_id=record["submission_id"],
+            attempt_id=record["launch_attempt"]["attempt_id"],
+            attempt_number=1,
+            job_id=record["job_id"],
+            request_hash=record["request_hash"],
+            created_at=record["created_at"],
+        )
+        record["launch_attempt"] = historical_binding.record()
+        adapter._write_submission(record_path, record)
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+        ticket["request_hash"] = historical_binding.request_hash
+        ticket["binding_hash"] = historical_binding.binding_hash
+        ticket.pop("record_hash")
+        ticket["record_hash"] = fwi_adapter_module._sha256_document(ticket)
+        ticket_path.write_text(json.dumps(ticket), encoding="utf-8")
+        request["algorithm"]["version"] = "1.4.0"
+        historical_handle = adapter._handle_from_record(record)
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        dispatcher = DeepwaveTaskDispatcher(reopened)
+        intent = self.reconciliation_intent(historical_handle, request)
+        before_record = record_path.read_bytes()
+        before_paths = self.root_snapshot()
+
+        proof = dispatcher.probe_dispatch_reconciliation(intent)
+
+        self.assertIsInstance(proof, DispatchNotStartedProof)
+        assert isinstance(proof, DispatchNotStartedProof)
+        self.assertEqual(proof.adapter_version, "1.4.0")
+        self.assertEqual(proof.private_schema_version, "1.1.0")
+        self.assertEqual(proof.private_record_hash, record["record_hash"])
+        self.assertEqual(proof.evidence["attempt_id"], historical_binding.attempt_id)
+        self.assertEqual(record_path.read_bytes(), before_record)
+        self.assertEqual(self.root_snapshot(), before_paths)
+        self.assertEqual(replacement_launcher.calls, [])
+
+    def test_reconciliation_matrix_marks_active_fence_transient_without_launch(
+        self,
+    ) -> None:
+        (
+            _adapter,
+            request,
+            record_path,
+            _ticket_path,
+            handle,
+        ) = self.stopped_reconciliation_fixture(
+            task_id="task-reconcile-active-fence"
+        )
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        fence_path = (
+            self.run_root
+            / fwi_adapter_module.CONTROL_DIRECTORY
+            / "worker-capacity"
+            / "attempts"
+            / f"{record['submission_id']}.lock"
+        )
+        descriptor = os.open(fence_path, os.O_RDWR)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        replacement_launcher = FakeLauncher()
+        dispatcher = DeepwaveTaskDispatcher(
+            self.make_adapter(launcher=replacement_launcher)
+        )
+        intent = self.reconciliation_intent(handle, request)
+        before_record = record_path.read_bytes()
+        before_paths = self.root_snapshot()
+        try:
+            result = dispatcher.probe_dispatch_reconciliation(intent)
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+        self.assertEqual(
+            result,
+            DispatchReconciliationDeferred(
+                classification="transient",
+                failure_code="WORKER_ATTEMPT_BUSY",
+            ),
+        )
+        self.assertEqual(record_path.read_bytes(), before_record)
+        self.assertEqual(self.root_snapshot(), before_paths)
+        self.assertEqual(replacement_launcher.calls, [])
+
+    def test_reconciliation_matrix_fails_closed_for_uncertain_states(
+        self,
+    ) -> None:
+        request = self.submit_kwargs(
+            task_id="task-reconcile-uncertain-unfenced",
+            idempotency_key="task-reconcile-uncertain-unfenced:invert:0001",
+        )
+        handle = self.adapter.submit(**copy.deepcopy(request))
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        dispatcher = DeepwaveTaskDispatcher(reopened)
+        intent = self.reconciliation_intent(handle, request)
+        before_paths = self.root_snapshot()
+
+        unfenced = dispatcher.probe_dispatch_reconciliation(intent)
+
+        self.assertIsInstance(unfenced, DispatchReconciliationDeferred)
+        assert isinstance(unfenced, DispatchReconciliationDeferred)
+        self.assertEqual(unfenced.classification, "uncertain")
+        self.assertEqual(
+            unfenced.failure_code, "DISPATCH_RECONCILIATION_UNCERTAIN"
+        )
+        self.assertEqual(self.root_snapshot(), before_paths)
+
+        old_request = copy.deepcopy(intent.request)
+        old_request["algorithm"]["version"] = "1.3.0"
+        old_fingerprint = copy.deepcopy(intent.queue_fingerprint)
+        old_fingerprint["adapter_version"] = "1.3.0"
+        old_fingerprint["algorithm"]["version"] = "1.3.0"
+        old_intent = dataclasses.replace(
+            intent,
+            adapter_version="1.3.0",
+            request=old_request,
+            queue_fingerprint=old_fingerprint,
+        )
+        with patch.object(reopened, "probe_dispatch_reconciliation") as probe:
+            unsupported = dispatcher.probe_dispatch_reconciliation(old_intent)
+        self.assertEqual(
+            unsupported,
+            DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_UNSUPPORTED",
+            ),
+        )
+        probe.assert_not_called()
+        self.assertEqual(replacement_launcher.calls, [])
+
+    def test_reconciliation_matrix_rejects_tampered_negative_proof(
+        self,
+    ) -> None:
+        (
+            _adapter,
+            request,
+            _record_path,
+            _ticket_path,
+            handle,
+        ) = self.stopped_reconciliation_fixture(
+            task_id="task-reconcile-negative-tamper"
+        )
+        replacement_launcher = FakeLauncher()
+        reopened = self.make_adapter(launcher=replacement_launcher)
+        adapter_request = copy.deepcopy(request)
+        normalized_config_hash = handle.fingerprint["normalized_config_hash"]
+        adapter_proof = reopened.probe_dispatch_reconciliation(
+            **adapter_request,
+            normalized_config_hash=normalized_config_hash,
+        )
+        self.assertIsInstance(adapter_proof, AdapterDispatchNotStartedProof)
+        assert isinstance(adapter_proof, AdapterDispatchNotStartedProof)
+        tampered = dataclasses.replace(
+            adapter_proof,
+            private_proof_hash="sha256:" + "f" * 64,
+        )
+        dispatcher = DeepwaveTaskDispatcher(reopened)
+        intent = self.reconciliation_intent(handle, request)
+
+        with patch.object(
+            reopened,
+            "probe_dispatch_reconciliation",
+            return_value=tampered,
+        ):
+            result = dispatcher.probe_dispatch_reconciliation(intent)
+
+        self.assertEqual(
+            result,
+            DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+            ),
+        )
+
+        foreign_evidence = copy.deepcopy(adapter_proof.evidence)
+        foreign_submission_id = "submission-" + "f" * 64
+        foreign_request_hash = "sha256:" + "e" * 64
+        foreign_job_id = (
+            foreign_evidence["job_id"].rsplit("-", 1)[0]
+            + "-"
+            + hashlib.sha256(foreign_submission_id.encode("utf-8")).hexdigest()[:12]
+        )
+        foreign_evidence.update(
+            {
+                "submission_id": foreign_submission_id,
+                "job_id": foreign_job_id,
+                "request_hash": foreign_request_hash,
+            }
+        )
+        binding_payload = {
+            key: foreign_evidence[key]
+            for key in (
+                "schema_version",
+                "submission_id",
+                "attempt_id",
+                "attempt_number",
+                "job_id",
+                "request_hash",
+                "created_at",
+            )
+        }
+        foreign_evidence["binding_hash"] = (
+            fwi_adapter_module._sha256_document(binding_payload)
+        )
+        foreign_ticket = foreign_evidence["ticket"]
+        foreign_ticket["record_hash"] = fwi_adapter_module._sha256_document(
+            {
+                **binding_payload,
+                "binding_hash": foreign_evidence["binding_hash"],
+                **{
+                    key: foreign_ticket[key]
+                    for key in (
+                        "state",
+                        "capacity_slot",
+                        "capacity_generation",
+                        "worker_pid",
+                        "updated_at",
+                    )
+                },
+            }
+        )
+        foreign_evidence_hash = fwi_adapter_module._sha256_document(
+            foreign_evidence
+        )
+        foreign_proof = dataclasses.replace(
+            adapter_proof,
+            evidence=foreign_evidence,
+            private_proof_hash=fwi_adapter_module._sha256_document(
+                {
+                    "schema_version": "1.0.0",
+                    "result": "not_dispatched",
+                    "evidence_kind": "managed_pre_running_failure",
+                    "adapter_version": adapter_proof.adapter_version,
+                    "private_schema_version": adapter_proof.private_schema_version,
+                    "private_record_hash": adapter_proof.private_record_hash,
+                    "attempt_id": adapter_proof.attempt_id,
+                    "attempt_number": adapter_proof.attempt_number,
+                    "evidence_hash": foreign_evidence_hash,
+                }
+            ),
+        )
+        with patch.object(
+            reopened,
+            "probe_dispatch_reconciliation",
+            return_value=foreign_proof,
+        ):
+            cross_bound = dispatcher.probe_dispatch_reconciliation(intent)
+        self.assertEqual(
+            cross_bound,
+            DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+            ),
+        )
         self.assertEqual(replacement_launcher.calls, [])
 
     def test_preparing_observation_does_not_recreate_a_missing_job_directory(

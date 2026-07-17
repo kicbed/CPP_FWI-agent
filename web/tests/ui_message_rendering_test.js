@@ -1901,6 +1901,65 @@ function testGuidedTaskAndCrashStatesAreHonest() {
     }).evidenceKind,
     'private_receipt',
   );
+  const negativeReconciliation = {
+    failure_code: 'SUBMISSION_RECONCILIATION_REQUIRED',
+    recorded_at: '2026-07-16T12:00:00.000000Z',
+    state: 'resolved',
+    result: 'not_dispatched',
+    evidence_kind: 'managed_pre_running_failure',
+    resolved_at: '2026-07-16T12:00:01.000000Z',
+  };
+  const notDispatched = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Failed',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: {
+      state: 'not_dispatched',
+      failure_code: 'DISPATCH_NOT_STARTED',
+      reconciliation: negativeReconciliation,
+    },
+  }));
+  assert.ok(notDispatched);
+  assert.deepEqual(JSON.parse(JSON.stringify(notDispatched.dispatch)), {
+    state: 'not_dispatched',
+    failureCode: 'DISPATCH_NOT_STARTED',
+    reconciliation: {
+      state: 'resolved',
+      failureCode: 'SUBMISSION_RECONCILIATION_REQUIRED',
+      recordedAt: '2026-07-16T12:00:00.000000Z',
+      result: 'not_dispatched',
+      evidenceKind: 'managed_pre_running_failure',
+      resolvedAt: '2026-07-16T12:00:01.000000Z',
+    },
+  });
+  assert.equal(api.isGuidedApprovalCompleted(
+    notDispatched, notDispatched.plan.hash,
+  ), true);
+  const negativeDispatchExplanation = api.guidedDispatchExplanation('not_dispatched');
+  const negativeReconciliationExplanation = api.guidedReconciliationExplanation(
+    notDispatched.dispatch.reconciliation,
+  );
+  assert.match(negativeDispatchExplanation, /精确证明.*Worker 未到达受管运行边界.*Failed.*浏览器不会重试/);
+  assert.match(negativeReconciliationExplanation, /pre-running.*Worker 未到达受管运行边界.*不会向浏览器公开/);
+  assert.doesNotMatch(
+    `${negativeDispatchExplanation} ${negativeReconciliationExplanation}`,
+    /attempt[_-]?id|hash|PID|path|sha256|\/root\//i,
+  );
+  for (const malformedNegative of [
+    { status: 'Queued', state: 'not_dispatched', code: 'DISPATCH_NOT_STARTED', reconciliation: negativeReconciliation },
+    { status: 'Failed', state: 'dispatched', code: null, reconciliation: negativeReconciliation },
+    { status: 'Failed', state: 'not_dispatched', code: 'SUBMISSION_RECONCILIATION_REQUIRED', reconciliation: negativeReconciliation },
+    { status: 'Failed', state: 'not_dispatched', code: 'DISPATCH_NOT_STARTED', reconciliation: { ...negativeReconciliation, private_proof_hash: `sha256:${'e'.repeat(64)}` } },
+  ]) {
+    assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+      status: malformedNegative.status,
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+      dispatch: {
+        state: malformedNegative.state,
+        failure_code: malformedNegative.code,
+        reconciliation: malformedNegative.reconciliation,
+      },
+    })), null);
+  }
   for (const malformedReconciliation of [
     { ...resolvedReconciliation, handle: { job_id: 'private-job' } },
     { ...resolvedReconciliation, receipt_record_hash: `sha256:${'a'.repeat(64)}` },
@@ -2406,6 +2465,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       continuous_status_supervision: true,
       supervisor_leases: true,
       positive_receipt_reconciliation: true,
+      exact_negative_reconciliation: true,
       automatic_reconciliation: false,
     },
   });
@@ -2419,6 +2479,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       'continuous_status_supervision',
       'supervisor_leases',
       'positive_receipt_reconciliation',
+      'exact_negative_reconciliation',
     ],
   );
   assert.equal(session.manualRetry, false);

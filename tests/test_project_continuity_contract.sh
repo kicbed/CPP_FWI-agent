@@ -85,6 +85,7 @@ required_files=(
     scientific_runtime/migrations/0013_dispatch_reconciliation.sql
     scientific_runtime/migrations/0014_task_retry.sql
     scientific_runtime/migrations/0015_worker_exit_retry.sql
+    scientific_runtime/migrations/0016_dispatch_negative_reconciliation.sql
     tests/test_scientific_runtime_registry.py
     tests/test_scientific_runtime_fwi_adapter.py
     tests/test_scientific_runtime_fwi_purge.py
@@ -328,11 +329,13 @@ require_text docs/PROJECT_PROGRESS.md '自基线累计 Verified'
 require_text docs/PROJECT_PROGRESS.md '本期剩余 = 上期剩余 - 本 checkpoint 新增 Verified + 本 checkpoint 用户明确批准的调整'
 require_text docs/PROJECT_PROGRESS.md '避免重复扣减'
 require_text docs/PROJECT_PROGRESS.md 'Verified 交付必须在同一 checkpoint 按公式递减'
-require_text docs/PROJECT_PROGRESS.md '仅就 P2，将剩余交付压缩为两个中等切片'
+require_text docs/PROJECT_PROGRESS.md 'P2 剩余一个路线切片但跨两个工作轮次'
+require_text docs/PROJECT_PROGRESS.md '约 5 个；P2 = 1，P3–P6 合计暂估约 4'
+require_text docs/PROJECT_PROGRESS.md 'checkpoint / Waiting / resume'
 require_text docs/PROJECT_PROGRESS.md 'launch/ticket failed'
 require_text docs/PROJECT_PROGRESS.md '合同当前 32/32'
 require_text docs/PROJECT_CURRENT_STATE.md '全项目 P2–P6 粗估基线约 12 个'
-require_text docs/PROJECT_CURRENT_STATE.md '当前约 6 个，其中 P2 为 2'
+require_text docs/PROJECT_CURRENT_STATE.md '当前约 5 个，其中 P2 为 1'
 require_text docs/PROJECT_CURRENT_STATE.md 'P2-009A 已验证'
 require_text docs/PROJECT_CURRENT_STATE.md 'P2-009B1 已验证'
 require_text docs/PROJECT_CURRENT_STATE.md 'P2-009B2 已验证'
@@ -456,6 +459,8 @@ require_text scientific_runtime/migrations/0014_task_retry.sql 'CREATE TABLE wor
 require_text scientific_runtime/migrations/0015_worker_exit_retry.sql 'CREATE TABLE worker_exit_retry_reservations'
 require_text scientific_runtime/migrations/0015_worker_exit_retry.sql 'CREATE TABLE worker_exit_retry_dispatch_replacements'
 require_text scientific_runtime/migrations/0015_worker_exit_retry.sql 'CREATE TABLE worker_exit_retry_exhaustions'
+require_text scientific_runtime/migrations/0016_dispatch_negative_reconciliation.sql 'CREATE TABLE dispatch_reconciliation_observations'
+require_text scientific_runtime/migrations/0016_dispatch_negative_reconciliation.sql 'CREATE TABLE dispatch_reconciliation_negative_resolutions'
 require_text docs/PROJECT_PROGRESS.md 'D-010 / PREP-004'
 require_text docs/GIT_AND_PROMPT_POLICY.md '<!-- git-prompt-policy: v1 -->'
 require_text docs/GIT_AND_PROMPT_POLICY.md 'feature/scientific-agent-runtime'

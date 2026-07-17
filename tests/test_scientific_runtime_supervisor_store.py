@@ -224,6 +224,27 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         connection.execute("DROP TABLE worker_retry_reservations")
         connection.execute("DROP TABLE approval_retry_budgets")
 
+    @staticmethod
+    def _drop_negative_reconciliation_schema(
+        connection: sqlite3.Connection,
+    ) -> None:
+        for trigger in (
+            "dispatch_reconciliation_observation_requires_exact_case",
+            "dispatch_reconciliation_observation_requires_active_term",
+            "dispatch_reconciliation_observation_sequence_is_contiguous",
+            "dispatch_reconciliation_negative_requires_exact_case",
+            "dispatch_reconciliation_negative_requires_active_term",
+            "dispatch_reconciliation_observations_are_immutable",
+            "dispatch_reconciliation_observations_cannot_be_deleted",
+            "dispatch_reconciliation_negative_resolutions_are_immutable",
+            "dispatch_reconciliation_negative_resolutions_cannot_be_deleted",
+        ):
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        connection.execute(
+            "DROP TABLE dispatch_reconciliation_negative_resolutions"
+        )
+        connection.execute("DROP TABLE dispatch_reconciliation_observations")
+
     def _acquire(
         self,
         owner_id: str,
@@ -360,6 +381,94 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         self.assertEqual(reconciled.state, "reconciliation_required")
         self.assertIsNotNone(reconciled.reconciliation)
         return task_id, dispatcher, runtime, reconciled
+
+    def _negative_reconciliation_inputs(
+        self,
+        intent,
+        *,
+        attempt_id: str | None = None,
+    ) -> dict:
+        if attempt_id is None:
+            attempt_id = "attempt-" + hashlib.sha256(
+                intent.intent_id.encode("utf-8")
+            ).hexdigest()[:32]
+        evidence = managed_worker_evidence(
+            ticket_state="failed",
+            attempt_id=attempt_id,
+        )
+        adapter_version = intent.adapter_version
+        private_schema_version = {
+            "1.4.0": "1.1.0",
+            "1.5.0": "1.2.0",
+        }[adapter_version]
+        private_record_hash = "sha256:" + hashlib.sha256(
+            (intent.intent_id + "\x1fprivate-negative-proof").encode("utf-8")
+        ).hexdigest()
+        evidence_hash = encode_document(evidence)[1]
+        proof_payload = {
+            "schema_version": "1.0.0",
+            "result": "not_dispatched",
+            "evidence_kind": "managed_pre_running_failure",
+            "adapter_version": adapter_version,
+            "private_schema_version": private_schema_version,
+            "private_record_hash": private_record_hash,
+            "attempt_id": attempt_id,
+            "attempt_number": 1,
+            "evidence_hash": evidence_hash,
+        }
+        private_proof_hash = encode_document(proof_payload)[1]
+        sequence = self.store.latest_run_event_sequence(intent.task_id) + 1
+        identity = {
+            "intent_id": intent.intent_id,
+            "attempt_id": attempt_id,
+            "evidence_hash": evidence_hash,
+            "private_proof_hash": private_proof_hash,
+            "event_type": "node_failed",
+            "sequence": sequence,
+        }
+        event_id = "event-" + encode_document(identity)[1].removeprefix(
+            "sha256:"
+        )[:32]
+        terminal_event = {
+            "schema_version": "1.0.0",
+            "event_id": event_id,
+            "sequence": sequence,
+            "task_id": intent.task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "dispatch_not_started",
+                "message": "FWI Worker did not reach its running boundary",
+                "retryable": False,
+            },
+            "occurred_at": evidence["ticket"]["updated_at"],
+            "fingerprint": intent.queue_fingerprint,
+            "extensions": {
+                "org.agent_rpc.dispatch_reconciliation": {
+                    "intent_id": intent.intent_id,
+                    "attempt_id": attempt_id,
+                    "attempt_number": 1,
+                    "evidence_hash": evidence_hash,
+                    "adapter_version": adapter_version,
+                    "private_schema_version": private_schema_version,
+                    "private_record_hash": private_record_hash,
+                    "private_proof_hash": private_proof_hash,
+                    "result": "not_dispatched",
+                }
+            },
+        }
+        return {
+            "intent_id": intent.intent_id,
+            "attempt_id": attempt_id,
+            "attempt_number": 1,
+            "adapter_version": adapter_version,
+            "private_schema_version": private_schema_version,
+            "private_record_hash": private_record_hash,
+            "private_proof_hash": private_proof_hash,
+            "evidence": evidence,
+            "terminal_event": terminal_event,
+        }
 
     def _cancellable_runtime(self, *, key: str):
         task_id, dispatcher, runtime, _ = self._pending_runtime(key=key)
@@ -820,8 +929,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             },
         }
 
-    def test_fresh_v15_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 15)
+    def test_fresh_v16_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 16)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -848,6 +957,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "worker_exit_retry_timeout_retirements",
             "worker_exit_retry_dispatch_replacements",
             "worker_exit_retry_exhaustions",
+            "dispatch_reconciliation_observations",
+            "dispatch_reconciliation_negative_resolutions",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -950,6 +1061,15 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "worker_exit_retry_dispatch_replacements_cannot_be_deleted",
             "worker_exit_retry_exhaustions_are_immutable",
             "worker_exit_retry_exhaustions_cannot_be_deleted",
+            "dispatch_reconciliation_observation_requires_exact_case",
+            "dispatch_reconciliation_observation_requires_active_term",
+            "dispatch_reconciliation_observation_sequence_is_contiguous",
+            "dispatch_reconciliation_negative_requires_exact_case",
+            "dispatch_reconciliation_negative_requires_active_term",
+            "dispatch_reconciliation_observations_are_immutable",
+            "dispatch_reconciliation_observations_cannot_be_deleted",
+            "dispatch_reconciliation_negative_resolutions_are_immutable",
+            "dispatch_reconciliation_negative_resolutions_cannot_be_deleted",
         }
         expected_indexes = {
             "idx_worker_attempt_timeout_windows_scope_deadline",
@@ -961,6 +1081,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "idx_supervised_worker_exit_retry_attempts_term",
             "idx_worker_exit_retry_replacements_scope",
             "idx_worker_exit_retry_exhaustions_scope",
+            "idx_dispatch_reconciliation_observations_scope",
+            "idx_dispatch_reconciliation_negative_scope",
         }
         connection = self._connection()
         try:
@@ -1039,6 +1161,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(
                 worker_exit_retry_migration["name"],
                 "0015_worker_exit_retry.sql",
+            )
+            negative_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 16"
+            ).fetchone()
+            self.assertEqual(
+                negative_migration["name"],
+                "0016_dispatch_negative_reconciliation.sql",
             )
         finally:
             connection.close()
@@ -1184,7 +1313,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v14_database_upgrades_in_place_to_v15(self) -> None:
+    def test_v14_database_upgrades_in_place_to_v16(self) -> None:
         legacy_migrations = Path(self.temporary.name) / "v14-migrations"
         legacy_migrations.mkdir(mode=0o700)
         for migration in sorted(
@@ -1203,20 +1332,65 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 14)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 15)
+        self.assertEqual(upgraded.migration_version(), 16)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 15
+                connection.execute("PRAGMA user_version").fetchone()[0], 16
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
             )
             self.assertEqual(
                 connection.execute(
-                    "SELECT name FROM schema_migrations WHERE version = 15"
+                    "SELECT name FROM schema_migrations WHERE version = 16"
                 ).fetchone()[0],
-                "0015_worker_exit_retry.sql",
+                "0016_dispatch_negative_reconciliation.sql",
+            )
+        finally:
+            connection.close()
+
+    def test_v15_database_upgrades_in_place_to_v16(self) -> None:
+        legacy_migrations = Path(self.temporary.name) / "v15-migrations"
+        legacy_migrations.mkdir(mode=0o700)
+        for migration in sorted(
+            task_store_module.MIGRATIONS_DIRECTORY.glob(
+                "[0-9][0-9][0-9][0-9]_*.sql"
+            )
+        ):
+            if int(migration.name.split("_", 1)[0]) <= 15:
+                shutil.copy2(migration, legacy_migrations / migration.name)
+
+        legacy_database = Path(self.temporary.name) / "legacy-v15.sqlite3"
+        with mock.patch.object(
+            task_store_module,
+            "MIGRATIONS_DIRECTORY",
+            legacy_migrations,
+        ):
+            legacy = SQLiteTaskStore(legacy_database)
+            self.assertEqual(legacy.migration_version(), 15)
+
+        upgraded = SQLiteTaskStore(legacy_database)
+        self.assertEqual(upgraded.migration_version(), 16)
+        connection = sqlite3.connect(legacy_database)
+        try:
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0], 16
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT name FROM schema_migrations WHERE version = 16"
+                ).fetchone()[0],
+                "0016_dispatch_negative_reconciliation.sql",
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_reconciliation_observations"
+                ).fetchone()[0],
+                0,
             )
         finally:
             connection.close()
@@ -1850,12 +2024,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v15(self) -> None:
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v16(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            self._drop_negative_reconciliation_schema(connection)
             self._drop_retry_schema(connection)
             connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
             connection.execute(
@@ -1885,7 +2060,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 15)
+        self.assertEqual(reopened.migration_version(), 16)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -1924,12 +2099,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v15(self) -> None:
+    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v16(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v12")
         acquired = self._acquire("upgrade-v12-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
+            self._drop_negative_reconciliation_schema(connection)
             self._drop_retry_schema(connection)
             connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
             connection.execute(
@@ -1954,7 +2130,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 15)
+        self.assertEqual(reopened.migration_version(), 16)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -1972,6 +2148,379 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
             )
+        finally:
+            connection.close()
+
+    def test_unresolved_reconciliation_observations_are_append_only(self) -> None:
+        task_id, _, _, reconciled = self._reconciliation_runtime(
+            key="negative-observation-matrix"
+        )
+        lease = self._acquire(
+            "negative-observation-owner", lease_seconds=30
+        ).lease
+        connection = self._connection()
+        try:
+            outcome_before = tuple(
+                connection.execute(
+                    "SELECT outcome, document_json, document_hash, recorded_at "
+                    "FROM dispatch_outcomes WHERE intent_id = ?",
+                    (reconciled.intent_id,),
+                ).fetchone()
+            )
+            budget_before = tuple(
+                connection.execute(
+                    "SELECT max_tasks, tasks_used FROM approval_budgets "
+                    "WHERE task_id = ? AND approval_id = ?",
+                    (task_id, reconciled.approval_id),
+                ).fetchone()
+            )
+            event_count_before = connection.execute(
+                "SELECT COUNT(*) FROM run_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        transient = (
+            self.store.record_supervised_dispatch_reconciliation_observation(
+                intent_id=reconciled.intent_id,
+                classification="transient",
+                failure_code="ADAPTER_PROBE_UNAVAILABLE",
+                supervisor_lease=lease,
+                supervisor_clock=lambda: NOW,
+            )
+        )
+        self.assertFalse(transient.replayed)
+        self.assertEqual(transient.observation_sequence, 1)
+        replay = (
+            self.store.record_supervised_dispatch_reconciliation_observation(
+                intent_id=reconciled.intent_id,
+                classification="transient",
+                failure_code="ADAPTER_PROBE_UNAVAILABLE",
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.observation_sequence, 1)
+        uncertain = (
+            self.store.record_supervised_dispatch_reconciliation_observation(
+                intent_id=reconciled.intent_id,
+                classification="uncertain",
+                failure_code="PRIVATE_STATE_UNCERTAIN",
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+        )
+        self.assertFalse(uncertain.replayed)
+        self.assertEqual(uncertain.observation_sequence, 2)
+        self.assertEqual(uncertain.intent.state, "reconciliation_required")
+        self.assertIsNotNone(uncertain.intent.reconciliation)
+        assert uncertain.intent.reconciliation is not None
+        self.assertEqual(
+            uncertain.intent.reconciliation.action_classification,
+            "uncertain",
+        )
+        self.assertEqual(
+            uncertain.intent.reconciliation.action_failure_code,
+            "PRIVATE_STATE_UNCERTAIN",
+        )
+
+        connection = self._connection()
+        try:
+            rows = connection.execute(
+                "SELECT observation_sequence, classification, failure_code "
+                "FROM dispatch_reconciliation_observations "
+                "WHERE intent_id = ? ORDER BY observation_sequence",
+                (reconciled.intent_id,),
+            ).fetchall()
+            self.assertEqual(
+                [tuple(row) for row in rows],
+                [
+                    (1, "transient", "ADAPTER_PROBE_UNAVAILABLE"),
+                    (2, "uncertain", "PRIVATE_STATE_UNCERTAIN"),
+                ],
+            )
+            self.assertEqual(
+                tuple(
+                    connection.execute(
+                        "SELECT outcome, document_json, document_hash, "
+                        "recorded_at FROM dispatch_outcomes "
+                        "WHERE intent_id = ?",
+                        (reconciled.intent_id,),
+                    ).fetchone()
+                ),
+                outcome_before,
+            )
+            self.assertEqual(
+                tuple(
+                    connection.execute(
+                        "SELECT max_tasks, tasks_used FROM approval_budgets "
+                        "WHERE task_id = ? AND approval_id = ?",
+                        (task_id, reconciled.approval_id),
+                    ).fetchone()
+                ),
+                budget_before,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM run_events WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                event_count_before,
+            )
+        finally:
+            connection.close()
+
+    def test_exact_negative_reconciliation_is_atomic_and_replay_safe(
+        self,
+    ) -> None:
+        task_id, _, _, reconciled = self._reconciliation_runtime(
+            key="negative-exact-close"
+        )
+        lease = self._acquire("negative-exact-owner", lease_seconds=30).lease
+        self.store.record_supervised_dispatch_reconciliation_observation(
+            intent_id=reconciled.intent_id,
+            classification="uncertain",
+            failure_code="PRIVATE_STATE_UNCERTAIN",
+            supervisor_lease=lease,
+            supervisor_clock=lambda: NOW,
+        )
+        inputs = self._negative_reconciliation_inputs(reconciled)
+        connection = self._connection()
+        try:
+            outcome_before = tuple(
+                connection.execute(
+                    "SELECT outcome, document_json, document_hash, recorded_at "
+                    "FROM dispatch_outcomes WHERE intent_id = ?",
+                    (reconciled.intent_id,),
+                ).fetchone()
+            )
+            budget_before = tuple(
+                connection.execute(
+                    "SELECT max_tasks, tasks_used FROM approval_budgets "
+                    "WHERE task_id = ? AND approval_id = ?",
+                    (task_id, reconciled.approval_id),
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+        closed = self.store.finalize_supervised_negative_dispatch_reconciliation(
+            **inputs,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertFalse(closed.replayed)
+        self.assertEqual(closed.snapshot.status, "Failed")
+        self.assertEqual(closed.intent.state, "not_dispatched")
+        self.assertEqual(closed.intent.failure_code, "DISPATCH_NOT_STARTED")
+        self.assertIsNone(closed.intent.handle)
+        self.assertIsNotNone(closed.intent.reconciliation)
+        assert closed.intent.reconciliation is not None
+        self.assertEqual(closed.intent.reconciliation.state, "resolved")
+        self.assertEqual(
+            closed.intent.reconciliation.result, "not_dispatched"
+        )
+        replay = self.store.finalize_supervised_negative_dispatch_reconciliation(
+            **inputs,
+            supervisor_lease=lease,
+            supervisor_clock=lambda: T_PLUS_1,
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.terminal_event_sequence, 2)
+
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                tuple(
+                    connection.execute(
+                        "SELECT outcome, document_json, document_hash, "
+                        "recorded_at FROM dispatch_outcomes "
+                        "WHERE intent_id = ?",
+                        (reconciled.intent_id,),
+                    ).fetchone()
+                ),
+                outcome_before,
+            )
+            self.assertEqual(
+                tuple(
+                    connection.execute(
+                        "SELECT max_tasks, tasks_used FROM approval_budgets "
+                        "WHERE task_id = ? AND approval_id = ?",
+                        (task_id, reconciled.approval_id),
+                    ).fetchone()
+                ),
+                budget_before,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM run_events WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_reconciliation_observations "
+                    "WHERE intent_id = ?",
+                    (reconciled.intent_id,),
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM "
+                    "dispatch_reconciliation_negative_resolutions "
+                    "WHERE intent_id = ?",
+                    (reconciled.intent_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_retry_reservations "
+                    "WHERE intent_id = ?",
+                    (reconciled.intent_id,),
+                ).fetchone()[0],
+                0,
+            )
+            resolution = connection.execute(
+                "SELECT approval_tasks_used, approval_budget_refunded "
+                "FROM dispatch_reconciliation_negative_resolutions "
+                "WHERE intent_id = ?",
+                (reconciled.intent_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(resolution), (budget_before[1], 0)
+            )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute(
+                    "UPDATE dispatch_reconciliation_negative_resolutions "
+                    "SET result = 'not_dispatched' WHERE intent_id = ?",
+                    (reconciled.intent_id,),
+                )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_negative_reconciliation_rejects_stale_term_without_partial_rows(
+        self,
+    ) -> None:
+        task_id, _, _, reconciled = self._reconciliation_runtime(
+            key="negative-stale-term"
+        )
+        first = self._acquire(
+            "negative-stale-owner", lease_seconds=1
+        ).lease
+        self._acquire(
+            "negative-takeover-owner", now=T_PLUS_5, lease_seconds=30
+        )
+        inputs = self._negative_reconciliation_inputs(reconciled)
+        with self.assertRaises(RuntimeSupervisorLeaseLost):
+            self.store.finalize_supervised_negative_dispatch_reconciliation(
+                **inputs,
+                supervisor_lease=first,
+                supervisor_clock=lambda: T_PLUS_5,
+            )
+        connection = self._connection()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_reconciliation_observations "
+                    "WHERE intent_id = ?",
+                    (reconciled.intent_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM "
+                    "dispatch_reconciliation_negative_resolutions "
+                    "WHERE intent_id = ?",
+                    (reconciled.intent_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM run_events WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_positive_and_negative_reconciliation_have_one_winner(self) -> None:
+        _, dispatcher, _, reconciled = self._reconciliation_runtime(
+            key="negative-positive-race"
+        )
+        lease = self._acquire("negative-race-owner", lease_seconds=30).lease
+        self.store.authorize_supervised_dispatch_reconciliation(
+            intent_id=reconciled.intent_id,
+            evidence_kind="managed_worker_receipt",
+            supervisor_lease=lease,
+            supervisor_clock=lambda: NOW,
+        )
+        negative = self._negative_reconciliation_inputs(reconciled)
+        positive_attempt_id = "attempt-" + "9" * 32
+        handle = dispatcher.recover_existing_receipt(reconciled)
+        barrier = threading.Barrier(2)
+
+        def close_negative():
+            barrier.wait()
+            return self.store.finalize_supervised_negative_dispatch_reconciliation(
+                **negative,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+
+        def close_positive():
+            barrier.wait()
+            return self.store.record_supervised_worker_observation(
+                intent_id=reconciled.intent_id,
+                evidence=managed_worker_evidence(
+                    attempt_id=positive_attempt_id
+                ),
+                handle=handle,
+                supervisor_lease=lease,
+                supervisor_clock=lambda: T_PLUS_1,
+            )
+
+        outcomes: list[object] = []
+        failures: list[Exception] = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(close_negative),
+                executor.submit(close_positive),
+            ]
+            for future in futures:
+                try:
+                    outcomes.append(future.result())
+                except Exception as error:  # exact loser is timing-dependent
+                    failures.append(error)
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], TaskStoreConflict)
+        projected = self.store.get_dispatch_intent(reconciled.task_id)
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        self.assertIn(projected.state, {"dispatched", "not_dispatched"})
+        connection = self._connection()
+        try:
+            positive_count = connection.execute(
+                "SELECT COUNT(*) FROM dispatch_reconciliation_resolutions "
+                "WHERE intent_id = ?",
+                (reconciled.intent_id,),
+            ).fetchone()[0]
+            negative_count = connection.execute(
+                "SELECT COUNT(*) FROM "
+                "dispatch_reconciliation_negative_resolutions "
+                "WHERE intent_id = ?",
+                (reconciled.intent_id,),
+            ).fetchone()[0]
+            self.assertEqual(positive_count + negative_count, 1)
         finally:
             connection.close()
 

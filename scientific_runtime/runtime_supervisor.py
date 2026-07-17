@@ -927,12 +927,17 @@ class RuntimeSupervisor:
                 if (
                     getattr(reconciled_intent, "task_id", None) != task_id
                     or reconciled_state
-                    not in {"reconciliation_required", "dispatched"}
+                    not in {
+                        "reconciliation_required",
+                        "dispatched",
+                        "not_dispatched",
+                    }
                     or evidence_kind
                     not in {
                         None,
                         "managed_worker_receipt",
                         "private_receipt",
+                        "managed_pre_running_failure",
                     }
                     or type(authorized_flag) is not bool
                     or type(authorization_replayed) is not bool
@@ -941,7 +946,14 @@ class RuntimeSupervisor:
                     or type(reconciled_adopted) is not bool
                     or type(reconciliation_timeout_armed) is not bool
                     or (probe_attempted and not authorized_flag)
-                    or (reconciled_projected and evidence_kind != "managed_worker_receipt")
+                    or (
+                        reconciled_projected
+                        and evidence_kind
+                        not in {
+                            "managed_worker_receipt",
+                            "managed_pre_running_failure",
+                        }
+                    )
                     or (
                         reconciled_adopted
                         and reconciled_state != "dispatched"
@@ -949,6 +961,15 @@ class RuntimeSupervisor:
                     or (
                         reconciled_state == "dispatched"
                         and deferred_code is not None
+                    )
+                    or (
+                        reconciled_state == "not_dispatched"
+                        and (
+                            evidence_kind != "managed_pre_running_failure"
+                            or reconciled_adopted
+                            or reconciliation_timeout_armed
+                            or deferred_code is not None
+                        )
                     )
                     or (
                         deferred_code is not None
@@ -959,6 +980,11 @@ class RuntimeSupervisor:
                     )
                 ):
                     raise _SupervisorFailure(FATAL)
+                if reconciled_state == "not_dispatched":
+                    reconciled.append(task_id)
+                    if reconciled_projected:
+                        projected.append(task_id)
+                    continue
                 if reconciled_state != "dispatched":
                     deferred.append(
                         (

@@ -37,6 +37,8 @@ from scientific_runtime.fwi_registry import load_deepwave_manifest
 from scientific_runtime.fwi_adapter import AdapterManagedTimeoutProof
 from scientific_runtime.task_dispatcher import (
     DeepwaveTaskDispatcher,
+    DispatchNotStartedProof,
+    DispatchReconciliationDeferred,
     DispatchReceiptProbe,
     DispatchRetryProof,
 )
@@ -228,7 +230,12 @@ class FakeDispatcher:
         self.reconciliation_probe_calls = 0
         self.reconciliation_probe_barrier: threading.Barrier | None = None
         self.reconciliation_probe_failure_code: str | None = None
-        self.reconciliation_probe_result: DispatchReceiptProbe | None = None
+        self.reconciliation_probe_result: (
+            DispatchReceiptProbe
+            | DispatchNotStartedProof
+            | DispatchReconciliationDeferred
+            | None
+        ) = None
         self.status_calls = 0
         self.exact_cancel_supported = True
         self.exact_cancel_barrier: threading.Barrier | None = None
@@ -403,6 +410,9 @@ class FakeDispatcher:
             private_schema_version="1.1.0",
             receipt_record_hash=None,
         )
+
+    def probe_dispatch_reconciliation(self, intent):
+        return self.probe_existing_dispatch_receipt(intent)
 
     def status(self, intent):
         with self.lock:
@@ -1040,7 +1050,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 15)
+        self.assertEqual(self.store.migration_version(), 16)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -1056,7 +1066,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 15)
+        self.assertEqual(reopened.migration_version(), 16)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -1143,12 +1153,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 15)] * 8)
+        self.assertEqual(results, [("wal", 16)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 16")
+            connection.execute("PRAGMA user_version = 17")
             connection.commit()
         finally:
             connection.close()
@@ -6051,6 +6061,191 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(outcome, "reconciliation_required")
+
+    def test_reconciliation_exact_negative_terminalizes_without_budget_refund(
+        self,
+    ) -> None:
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="managed-reconciliation-negative"
+        )
+        claimed = self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-managed-reconciliation-negative",
+            launch=False,
+        )
+        original = self.store.record_dispatch_reconciliation(
+            intent_id=claimed.intent_id,
+            failure_code="SUBMISSION_RECONCILIATION_REQUIRED",
+            now=NOW,
+        )
+        evidence = managed_worker_evidence(ticket_state="failed")
+        private_record_hash = "sha256:" + "c" * 64
+        evidence_hash = encode_document(evidence)[1]
+        private_proof_hash = encode_document(
+            {
+                "schema_version": "1.0.0",
+                "result": "not_dispatched",
+                "evidence_kind": "managed_pre_running_failure",
+                "adapter_version": CURRENT_ADAPTER_VERSION,
+                "private_schema_version": "1.2.0",
+                "private_record_hash": private_record_hash,
+                "attempt_id": evidence["attempt_id"],
+                "attempt_number": 1,
+                "evidence_hash": evidence_hash,
+            }
+        )[1]
+        dispatcher.reconciliation_probe_result = DispatchNotStartedProof(
+            result="not_dispatched",
+            evidence_kind="managed_pre_running_failure",
+            attempt_id=evidence["attempt_id"],
+            attempt_number=1,
+            adapter_version=CURRENT_ADAPTER_VERSION,
+            private_schema_version="1.2.0",
+            private_record_hash=private_record_hash,
+            private_proof_hash=private_proof_hash,
+            evidence=evidence,
+        )
+        lease = service.acquire_runtime_supervisor_lease(
+            owner_id="negative-reconciliation-owner",
+            lease_seconds=30,
+            **self.scope,
+        ).lease
+        try:
+            resolved = service.reconcile_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            replayed = service.reconcile_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(original.state, "reconciliation_required")
+        self.assertEqual(resolved.intent.state, "not_dispatched")
+        self.assertEqual(resolved.intent.failure_code, "DISPATCH_NOT_STARTED")
+        self.assertIsNone(resolved.intent.handle)
+        self.assertEqual(resolved.evidence_kind, "managed_pre_running_failure")
+        self.assertTrue(resolved.authorized)
+        self.assertTrue(resolved.probe_attempted)
+        self.assertTrue(resolved.projected)
+        self.assertFalse(resolved.adopted)
+        self.assertFalse(resolved.timeout_armed)
+        self.assertEqual(replayed.intent, resolved.intent)
+        self.assertFalse(replayed.probe_attempted)
+        self.assertEqual(self.store.get_task(task_id).status, "Failed")
+        event = self.store.list_run_events(task_id)[-1]
+        self.assertEqual(event["event_type"], "node_failed")
+        self.assertEqual(event["task_status"], "Failed")
+        self.assertEqual(event["error"]["code"], "dispatch_not_started")
+        budget = self.store.get_approval_budget(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+        )
+        self.assertIsNotNone(budget)
+        assert budget is not None
+        self.assertEqual((budget.tasks_used, budget.max_tasks), (1, 1))
+        trashed = service.trash_task(
+            task_id=task_id,
+            expected_visibility_revision=0,
+            idempotency_key="trash-negative-reconciliation",
+            **self.scope,
+        )
+        self.assertEqual(trashed.snapshot.visibility_revision, 1)
+        with self.assertRaisesRegex(
+            TaskConflict, "no authorized purge cleanup"
+        ):
+            service.purge_task(
+                task_id=task_id,
+                expected_visibility_revision=1,
+                idempotency_key="purge-negative-reconciliation",
+                **self.scope,
+            )
+        self.assertEqual(self.raw_count("task_purge_requests"), 0)
+        self.assertEqual(dispatcher.reconciliation_probe_calls, 1)
+        self.assertEqual(dispatcher.dispatch_calls, 0)
+
+    def test_reconciliation_transient_and_uncertain_remain_action_required(
+        self,
+    ) -> None:
+        task_id, approval, dispatcher, service = self.approved_runtime(
+            key="managed-reconciliation-deferred-matrix"
+        )
+        claimed = self.seed_dispatching_intent(
+            task_id=task_id,
+            approval=approval,
+            dispatcher=dispatcher,
+            service=service,
+            key="submit-managed-reconciliation-deferred-matrix",
+            launch=False,
+        )
+        self.store.record_dispatch_reconciliation(
+            intent_id=claimed.intent_id,
+            failure_code="SUBMISSION_RECONCILIATION_REQUIRED",
+            now=NOW,
+        )
+        lease = service.acquire_runtime_supervisor_lease(
+            owner_id="deferred-reconciliation-owner",
+            lease_seconds=30,
+            **self.scope,
+        ).lease
+        try:
+            dispatcher.reconciliation_probe_result = (
+                DispatchReconciliationDeferred(
+                    classification="transient",
+                    failure_code="ADAPTER_SUBMISSION_BUSY",
+                )
+            )
+            transient = service.reconcile_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            transient_replay = service.reconcile_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+            dispatcher.reconciliation_probe_result = (
+                DispatchReconciliationDeferred(
+                    classification="uncertain",
+                    failure_code="ADAPTER_SUBMISSION_NOT_FOUND",
+                )
+            )
+            uncertain = service.reconcile_runtime_dispatch(
+                task_id,
+                supervisor_lease=lease,
+                **self.scope,
+            )
+        finally:
+            service.release_runtime_supervisor_lease(lease)
+
+        self.assertEqual(transient.deferred_code, "RECONCILIATION_TRANSIENT")
+        self.assertEqual(
+            transient_replay.deferred_code, "RECONCILIATION_TRANSIENT"
+        )
+        self.assertEqual(uncertain.deferred_code, "RECONCILIATION_UNCERTAIN")
+        for result in (transient, transient_replay, uncertain):
+            self.assertEqual(result.intent.state, "reconciliation_required")
+            self.assertTrue(result.authorized)
+            self.assertTrue(result.probe_attempted)
+            self.assertFalse(result.projected)
+            self.assertFalse(result.adopted)
+        self.assertEqual(self.store.get_task(task_id).status, "Queued")
+        budget = self.store.get_approval_budget(
+            task_id=task_id,
+            approval_id=approval["approval_id"],
+        )
+        self.assertIsNotNone(budget)
+        assert budget is not None
+        self.assertEqual((budget.tasks_used, budget.max_tasks), (1, 1))
+        self.assertEqual(dispatcher.dispatch_calls, 0)
 
     def test_v1_5_reconciliation_rejects_private_v1_receipt(
         self,

@@ -290,13 +290,21 @@ def _public_dispatch_reconciliation(value: Any) -> dict[str, Any]:
         and evidence_kind is None
         and resolved_at is None
     )
-    resolved = (
+    positive_resolved = (
         state == "resolved"
         and result == "dispatched"
         and evidence_kind in {"managed_worker_receipt", "private_receipt"}
         and isinstance(resolved_at, str)
         and 0 < len(resolved_at) <= 80
     )
+    negative_resolved = (
+        state == "resolved"
+        and result == "not_dispatched"
+        and evidence_kind == "managed_pre_running_failure"
+        and isinstance(resolved_at, str)
+        and 0 < len(resolved_at) <= 80
+    )
+    resolved = positive_resolved or negative_resolved
     if not valid_failure_code or not valid_recorded_at or not (required or resolved):
         raise WorkbenchRuntimeError(
             "SERVICE_RESPONSE_INVALID",
@@ -492,6 +500,7 @@ class GuidedWorkbench:
                 "running_cancel": True,
                 "runtime_timeout": True,
                 "positive_receipt_reconciliation": True,
+                "exact_negative_reconciliation": True,
                 "automatic_reconciliation": False,
                 "streaming_events": False,
             },
@@ -516,6 +525,7 @@ class GuidedWorkbench:
                 "continuous_status_supervision": True,
                 "supervisor_leases": True,
                 "positive_receipt_reconciliation": True,
+                "exact_negative_reconciliation": True,
                 "automatic_reconciliation": False,
                 "dag": False,
             },
@@ -1415,6 +1425,11 @@ class GuidedWorkbench:
             dispatch_state = _value(intent, "state")
             dispatch_failure_code = _value(intent, "failure_code")
             reconciliation = _value(intent, "reconciliation")
+            reconciliation_projection = (
+                None
+                if reconciliation is None
+                else _public_dispatch_reconciliation(reconciliation)
+            )
             if dispatch_state == "retrying" and (
                 dispatch_failure_code is not None
                 or (
@@ -1426,17 +1441,35 @@ class GuidedWorkbench:
                     "SERVICE_RESPONSE_INVALID",
                     ["worker-exit retry projection is invalid"],
                 )
+            negative_resolution = (
+                reconciliation_projection is not None
+                and reconciliation_projection["state"] == "resolved"
+                and reconciliation_projection["result"] == "not_dispatched"
+                and reconciliation_projection["evidence_kind"]
+                == "managed_pre_running_failure"
+            )
+            if dispatch_state == "not_dispatched":
+                if (
+                    snapshot.status != "Failed"
+                    or dispatch_failure_code != "DISPATCH_NOT_STARTED"
+                    or not negative_resolution
+                ):
+                    raise WorkbenchRuntimeError(
+                        "SERVICE_RESPONSE_INVALID",
+                        ["negative dispatch reconciliation projection is invalid"],
+                    )
+            elif negative_resolution:
+                raise WorkbenchRuntimeError(
+                    "SERVICE_RESPONSE_INVALID",
+                    ["negative dispatch reconciliation state is invalid"],
+                )
             dispatch = {
                 "state": dispatch_state,
                 "failure_code": dispatch_failure_code,
                 "created_at": _value(intent, "created_at"),
                 "dispatch_claimed_at": _value(intent, "dispatch_claimed_at"),
                 "outcome_recorded_at": _value(intent, "outcome_recorded_at"),
-                "reconciliation": (
-                    None
-                    if reconciliation is None
-                    else _public_dispatch_reconciliation(reconciliation)
-                ),
+                "reconciliation": reconciliation_projection,
             }
         status = _as_mapping(adapter_status)
         if status is not None:
@@ -1776,6 +1809,7 @@ class GuidedWorkbench:
                 for internal_retry_extension in (
                     "org.agent_rpc.retry_exhaustion",
                     "org.agent_rpc.worker_exit_retry",
+                    "org.agent_rpc.dispatch_reconciliation",
                 ):
                     extensions.pop(internal_retry_extension, None)
                 adapter_detail = extensions.get("org.agent_rpc.adapter_status")

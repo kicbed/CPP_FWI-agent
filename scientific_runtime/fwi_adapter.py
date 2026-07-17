@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Literal, Mapping, Protocol
 
 from jsonschema import Draft7Validator
 from PIL import Image
@@ -91,6 +91,12 @@ SUPPORTED_RECEIPT_BINDINGS = frozenset(
 )
 SUPPORTED_ADAPTER_VERSIONS = frozenset(
     adapter_version for _, adapter_version in SUPPORTED_RECEIPT_BINDINGS
+)
+_EXACT_NEGATIVE_RECONCILIATION_VERSIONS = frozenset(
+    {("1.4.0", "1.1.0"), ("1.5.0", "1.2.0")}
+)
+_TRANSIENT_RECONCILIATION_CODES = frozenset(
+    {"ADAPTER_SUBMISSION_BUSY", "WORKER_ATTEMPT_BUSY"}
 )
 LOGICAL_ENTRYPOINT = "fwi.deepwave_adapter"
 MODEL_ID = "marmousi_94_288"
@@ -408,6 +414,48 @@ class AdapterExistingDispatchReceiptProof:
                 if self.worker_evidence is None
                 else copy.deepcopy(self.worker_evidence)
             ),
+        }
+
+
+@dataclass(frozen=True)
+class AdapterDispatchNotStartedProof:
+    """Exact path-free proof that dispatch never crossed the ready barrier."""
+
+    result: Literal["not_dispatched"]
+    evidence_kind: Literal["managed_pre_running_failure"]
+    adapter_version: str
+    private_schema_version: str
+    private_record_hash: str
+    private_proof_hash: str
+    attempt_id: str
+    attempt_number: int
+    evidence: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "result": self.result,
+            "evidence_kind": self.evidence_kind,
+            "adapter_version": self.adapter_version,
+            "private_schema_version": self.private_schema_version,
+            "private_record_hash": self.private_record_hash,
+            "private_proof_hash": self.private_proof_hash,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "evidence": copy.deepcopy(self.evidence),
+        }
+
+
+@dataclass(frozen=True)
+class AdapterReconciliationDeferred:
+    """Typed fail-closed result for a transient or uncertain private state."""
+
+    classification: Literal["transient", "uncertain"]
+    failure_code: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "classification": self.classification,
+            "failure_code": self.failure_code,
         }
 
 
@@ -4107,6 +4155,306 @@ class DeepwaveAdapter:
                 validated=live,
                 job_dir=retry_job_dir,
                 launch_binding=retry_binding,
+            )
+
+    @staticmethod
+    def _reconciliation_deferred(
+        error: AdapterError | WorkerControlError,
+    ) -> AdapterReconciliationDeferred:
+        """Convert private failures to one stable fail-closed matrix arm."""
+
+        code = error.code
+        return AdapterReconciliationDeferred(
+            classification=(
+                "transient"
+                if code in _TRANSIENT_RECONCILIATION_CODES
+                else "uncertain"
+            ),
+            failure_code=code,
+        )
+
+    @staticmethod
+    def _validate_reconciliation_fingerprint(
+        record: Mapping[str, Any], *, normalized_config_hash: str
+    ) -> None:
+        """Validate a retained 1.4/1.5 fingerprint without live revalidation."""
+
+        fingerprint = record.get("fingerprint")
+        if not isinstance(fingerprint, Mapping):
+            raise AdapterHandleError(
+                "FINGERPRINT_INVALID: reconciliation fingerprint is missing"
+            )
+        value = copy.deepcopy(dict(fingerprint))
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "adapter-reconciliation-fingerprint-validation",
+            "sequence": 1,
+            "task_id": "adapter-reconciliation-fingerprint-validation",
+            "node_id": "invert",
+            "event_type": "node_started",
+            "task_status": "Running",
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "fingerprint": value,
+            "extensions": {},
+        }
+        errors = schema_errors("run-event.schema.json", event)
+        dataset = record.get("dataset")
+        parameters = record.get("parameters")
+        resources = record.get("resources")
+        if (
+            errors
+            or not isinstance(dataset, Mapping)
+            or not isinstance(parameters, Mapping)
+            or not isinstance(resources, Mapping)
+            or not is_supported_receipt_binding(
+                record.get("algorithm"),
+                record.get("adapter_version"),
+                value,
+            )
+            or value.get("provenance_mode") != "development"
+            or not isinstance(value.get("source"), Mapping)
+            or value["source"].get("identity_complete") is not False
+            or value.get("seed") != parameters.get("seed")
+            or not isinstance(value.get("hardware"), Mapping)
+            or value["hardware"].get("device") != resources.get("device")
+            or value.get("normalized_config_hash") != normalized_config_hash
+            or value.get("input_hashes") != [dataset.get("content_hash")]
+        ):
+            raise AdapterHandleError(
+                "FINGERPRINT_INVALID: retained reconciliation fingerprint changed"
+            )
+
+    def _probe_dispatch_reconciliation(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+        normalized_config_hash: str,
+    ) -> AdapterExistingDispatchReceiptProof | AdapterDispatchNotStartedProof:
+        """Read one exact positive or exact pre-running negative result."""
+
+        self._validate_submit_identity(
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+        )
+        if (
+            not isinstance(project_id, str)
+            or OPAQUE_ID.fullmatch(project_id) is None
+            or not isinstance(principal_id, str)
+            or OPAQUE_ID.fullmatch(principal_id) is None
+            or not isinstance(algorithm, Mapping)
+            or set(algorithm) != {"id", "version"}
+            or algorithm.get("id") != ALGORITHM_ID
+            or algorithm.get("version") not in {"1.4.0", "1.5.0"}
+            or not isinstance(dataset, Mapping)
+            or not isinstance(dataset.get("access_scope"), Mapping)
+            or not isinstance(parameters, Mapping)
+            or not isinstance(resources, Mapping)
+            or not isinstance(normalized_config_hash, str)
+            or PLAN_HASH.fullmatch(normalized_config_hash) is None
+        ):
+            raise AdapterUnavailable(
+                "DISPATCH_RECONCILIATION_UNSUPPORTED: immutable request is unsupported"
+            )
+
+        adapter_version = algorithm["version"]
+        submission_id = self._submission_id(
+            task_id, plan_hash, idempotency_key
+        )
+        dataset_identity = {
+            key: copy.deepcopy(dataset.get(key))
+            for key in ("id", "version", "content_hash", "data_type")
+        }
+        request_payload = {
+            "submission_id": submission_id,
+            "task_id": task_id,
+            "node_id": node_id,
+            "plan_hash": plan_hash,
+            "idempotency_key": idempotency_key,
+            "project_id": project_id,
+            "principal_id": principal_id,
+            "algorithm": copy.deepcopy(dict(algorithm)),
+            "dataset": dataset_identity,
+            "dataset_access_scope": copy.deepcopy(dict(dataset["access_scope"])),
+            "task_type": task_type,
+            "parameters": copy.deepcopy(dict(parameters)),
+            "resources": copy.deepcopy(dict(resources)),
+            "normalized_config_hash": normalized_config_hash,
+        }
+        request_hash = _sha256_document(request_payload)
+        index_name = submission_id.removeprefix("submission-") + ".json"
+        control = self._run_root / CONTROL_DIRECTORY
+        index_path = control / "submissions" / index_name
+        lock_path = control / "locks" / (index_name + ".lock")
+
+        with self._lock_submission(
+            lock_path, create=False, timeout_seconds=5.0
+        ):
+            if not index_path.exists() and not index_path.is_symlink():
+                raise AdapterUnavailable(
+                    "ADAPTER_SUBMISSION_NOT_FOUND: no private submission record exists"
+                )
+            record = self._read_submission(index_path)
+            if (
+                record.get("adapter_version") != adapter_version
+                or record.get("algorithm") != dict(algorithm)
+                or record.get("submission_id") != submission_id
+                or record.get("request_hash") != request_hash
+                or self._record_request_payload(record) != request_payload
+            ):
+                raise AdapterIdempotencyConflict(
+                    "ADAPTER_IDEMPOTENCY_CONFLICT: reconciliation request changed"
+                )
+            self._validate_reconciliation_fingerprint(
+                record, normalized_config_hash=normalized_config_hash
+            )
+            if record.get("job_id") != self._expected_job_id(record):
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: private job identity is invalid"
+                )
+
+            launch_state = record["launch_state"]
+            private_schema_version = record["schema_version"]
+            if private_schema_version == "1.0.0":
+                if launch_state != "launched":
+                    raise AdapterUnavailable(
+                        "DISPATCH_RECONCILIATION_UNCERTAIN: unmanaged receipt is not positive"
+                    )
+                return AdapterExistingDispatchReceiptProof(
+                    evidence_kind="private_receipt",
+                    handle=self._handle_from_record(record),
+                    private_schema_version=private_schema_version,
+                    receipt_record_hash=record["record_hash"],
+                    worker_evidence=None,
+                )
+            if private_schema_version not in {"1.1.0", "1.2.0"}:
+                raise AdapterUnavailable(
+                    "DISPATCH_RECONCILIATION_UNSUPPORTED: managed schema is unsupported"
+                )
+            if launch_state in {"purging", "purged"}:
+                raise AdapterUnavailable(
+                    "DISPATCH_RECONCILIATION_UNCERTAIN: private receipt is being purged"
+                )
+
+            try:
+                binding = binding_from_submission_record(record)
+                if (
+                    binding.attempt_number != 1
+                    or binding.job_id != record["job_id"]
+                ):
+                    raise WorkerControlError(
+                        "WORKER_CONTROL_INVALID: reconciliation attempt changed"
+                    )
+                job_dir = self._run_root / record["job_id"]
+                evidence = read_worker_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+            except FileNotFoundError as error:
+                raise AdapterUnavailable(
+                    "WORKER_EVIDENCE_UNAVAILABLE: managed job evidence is missing"
+                ) from error
+            except WorkerControlError:
+                raise
+
+            if evidence is not None and evidence.started:
+                if (
+                    launch_state not in {"launching", "launched"}
+                    or evidence.heartbeat_state
+                    not in {"running", "succeeded", "failed"}
+                ):
+                    raise AdapterUnavailable(
+                        "DISPATCH_RECONCILIATION_UNCERTAIN: started evidence conflicts with private state"
+                    )
+                if launch_state == "launching":
+                    record["launch_state"] = "launched"
+                    self._write_submission(index_path, record)
+                return AdapterExistingDispatchReceiptProof(
+                    evidence_kind="managed_worker_receipt",
+                    handle=self._handle_from_record(record),
+                    private_schema_version="1.1.0",
+                    receipt_record_hash=None,
+                    worker_evidence=evidence.as_dict(),
+                )
+
+            if launch_state not in {"preparing", "launching", "failed"}:
+                raise AdapterUnavailable(
+                    "DISPATCH_RECONCILIATION_UNCERTAIN: private state contradicts no-start evidence"
+                )
+            if (
+                adapter_version,
+                private_schema_version,
+            ) not in _EXACT_NEGATIVE_RECONCILIATION_VERSIONS:
+                raise AdapterUnavailable(
+                    "DISPATCH_RECONCILIATION_UNSUPPORTED: no exact negative proof exists for this version"
+                )
+
+            with hold_idle_execution_fence(self._run_root, binding):
+                stopped = read_pre_running_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+                if stopped is None:
+                    raise WorkerControlError(
+                        "WORKER_RECONCILIATION_UNSAFE: managed launch ticket is unavailable"
+                    )
+                evidence_document = stopped.as_dict()
+                evidence_hash = _sha256_document(evidence_document)
+                private_record_hash = record["record_hash"]
+                proof_payload = {
+                    "schema_version": "1.0.0",
+                    "result": "not_dispatched",
+                    "evidence_kind": "managed_pre_running_failure",
+                    "adapter_version": adapter_version,
+                    "private_schema_version": private_schema_version,
+                    "private_record_hash": private_record_hash,
+                    "attempt_id": binding.attempt_id,
+                    "attempt_number": binding.attempt_number,
+                    "evidence_hash": evidence_hash,
+                }
+                return AdapterDispatchNotStartedProof(
+                    result="not_dispatched",
+                    evidence_kind="managed_pre_running_failure",
+                    adapter_version=adapter_version,
+                    private_schema_version=private_schema_version,
+                    private_record_hash=private_record_hash,
+                    private_proof_hash=_sha256_document(proof_payload),
+                    attempt_id=binding.attempt_id,
+                    attempt_number=binding.attempt_number,
+                    evidence=evidence_document,
+                )
+
+    def probe_dispatch_reconciliation(
+        self, **request: Any
+    ) -> (
+        AdapterExistingDispatchReceiptProof
+        | AdapterDispatchNotStartedProof
+        | AdapterReconciliationDeferred
+    ):
+        """Return one closed positive/negative/transient/uncertain result."""
+
+        try:
+            return self._probe_dispatch_reconciliation(**request)
+        except (AdapterError, WorkerControlError) as error:
+            return self._reconciliation_deferred(error)
+        except (FileNotFoundError, OSError):
+            return AdapterReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_UNAVAILABLE",
+            )
+        except Exception:
+            return AdapterReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_UNAVAILABLE",
             )
 
     def probe_existing_dispatch_receipt(

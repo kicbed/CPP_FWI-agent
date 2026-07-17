@@ -1103,6 +1103,42 @@ class RuntimeSupervisorTests(unittest.TestCase):
         finally:
             runtime.stop()
 
+    def test_reconciliation_exact_negative_closes_without_status_or_dispatch(self) -> None:
+        task_id = "reconciliation-not-dispatched"
+        service = FakeTaskService(
+            [snapshot(task_id, "Queued")],
+            {task_id: FakeIntent(task_id, "reconciliation_required")},
+        )
+        service.reconciliation_results[task_id] = FakeReconciliation(
+            intent=FakeIntent(task_id, "not_dispatched"),
+            evidence_kind="managed_pre_running_failure",
+            authorized=True,
+            authorization_replayed=False,
+            probe_attempted=True,
+            projected=True,
+            adopted=False,
+        )
+        runtime = supervisor(service)
+        try:
+            self.assertTrue(runtime.start())
+            self.assertTrue(runtime.wait_for_cycle(timeout=1))
+            cycle = runtime.last_cycle
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertEqual(cycle.reconciled_task_ids, (task_id,))
+            self.assertEqual(cycle.projected_task_ids, (task_id,))
+            self.assertEqual(cycle.dispatched_task_ids, ())
+            self.assertEqual(cycle.refreshed_task_ids, ())
+            self.assertEqual(cycle.timeout_armed_task_ids, ())
+            self.assertEqual(cycle.deferred, ())
+            self.assertEqual(cycle.task_failures, ())
+            self.assertEqual(service.reconciliation_calls, [task_id])
+            self.assertEqual(service.schedule_calls, [])
+            self.assertEqual(service.projection_calls, [])
+            self.assertEqual(service.refresh_calls, [])
+        finally:
+            runtime.stop()
+
     def test_concurrent_managed_resolution_is_projected_in_same_cycle(self) -> None:
         task_id = "reconciliation-concurrent-managed"
         service = FakeTaskService(

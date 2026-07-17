@@ -27,7 +27,9 @@ from .fwi_registry import (
 from .task_dispatcher import (
     DispatchDeferred,
     DispatchError,
+    DispatchNotStartedProof,
     DispatchPreparation,
+    DispatchReconciliationDeferred,
     DispatchReceiptProbe,
     DispatchRetryProof,
     TaskDispatcher,
@@ -2450,6 +2452,194 @@ class TaskService:
             "failed": "WORKER_ATTEMPT_FAILED",
         }.get(state, "WORKER_ATTEMPT_STARTING" if evidence is not None else None)
 
+    def _finalize_negative_dispatch_reconciliation(
+        self,
+        *,
+        task_id: str,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        proof: DispatchNotStartedProof,
+        supervisor_lease: RuntimeSupervisorLease,
+        authorization_replayed: bool,
+    ) -> TaskDispatchReconciliationResult:
+        """Atomically close one exact pre-running negative dispatch proof."""
+
+        evidence = proof.evidence
+        ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
+        if (
+            proof.result != "not_dispatched"
+            or proof.evidence_kind != "managed_pre_running_failure"
+            or proof.attempt_number != 1
+            or not isinstance(proof.attempt_id, str)
+            or not OPAQUE_ID.fullmatch(proof.attempt_id)
+            or proof.adapter_version != intent.adapter_version
+            or (
+                proof.adapter_version,
+                proof.private_schema_version,
+            )
+            not in {("1.4.0", "1.1.0"), ("1.5.0", "1.2.0")}
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", proof.private_record_hash)
+            is None
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", proof.private_proof_hash)
+            is None
+            or not isinstance(evidence, Mapping)
+            or not isinstance(ticket, Mapping)
+            or ticket.get("state") not in {"staged", "leased", "spawned", "failed"}
+            or evidence.get("attempt_id") != proof.attempt_id
+            or evidence.get("attempt_number") != 1
+            or evidence.get("ready") is not None
+            or evidence.get("heartbeat") is not None
+        ):
+            raise TaskDispatchError("RECONCILIATION_NEGATIVE_PROOF_INVALID")
+        try:
+            _, evidence_hash = encode_document(dict(evidence))
+            _, expected_private_proof_hash = encode_document(
+                {
+                    "schema_version": "1.0.0",
+                    "result": "not_dispatched",
+                    "evidence_kind": "managed_pre_running_failure",
+                    "adapter_version": proof.adapter_version,
+                    "private_schema_version": proof.private_schema_version,
+                    "private_record_hash": proof.private_record_hash,
+                    "attempt_id": proof.attempt_id,
+                    "attempt_number": proof.attempt_number,
+                    "evidence_hash": evidence_hash,
+                }
+            )
+        except TaskStoreConflict as error:
+            raise TaskDispatchError(
+                "RECONCILIATION_NEGATIVE_PROOF_INVALID"
+            ) from error
+        if proof.private_proof_hash != expected_private_proof_hash:
+            raise TaskDispatchError("RECONCILIATION_NEGATIVE_PROOF_INVALID")
+
+        sequence = self._store.latest_run_event_sequence(task_id) + 1
+        extension = {
+            "intent_id": intent.intent_id,
+            "attempt_id": proof.attempt_id,
+            "attempt_number": proof.attempt_number,
+            "evidence_hash": evidence_hash,
+            "adapter_version": proof.adapter_version,
+            "private_schema_version": proof.private_schema_version,
+            "private_record_hash": proof.private_record_hash,
+            "private_proof_hash": proof.private_proof_hash,
+            "result": "not_dispatched",
+        }
+        _, identity_hash = encode_document(
+            {
+                "intent_id": intent.intent_id,
+                "attempt_id": proof.attempt_id,
+                "evidence_hash": evidence_hash,
+                "private_proof_hash": proof.private_proof_hash,
+                "event_type": "node_failed",
+                "sequence": sequence,
+            }
+        )
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-" + identity_hash.removeprefix("sha256:")[:32],
+            "sequence": sequence,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "dispatch_not_started",
+                "message": "FWI Worker did not reach its running boundary",
+                "retryable": False,
+            },
+            "occurred_at": ticket.get("updated_at"),
+            "fingerprint": copy.deepcopy(intent.queue_fingerprint),
+            "extensions": {
+                "org.agent_rpc.dispatch_reconciliation": extension,
+            },
+        }
+        self._validate_schema("run-event.schema.json", event)
+        _validate_run_event_semantics(event)
+        _validate_run_event_binding(snapshot, event)
+        try:
+            completion = (
+                self._store.finalize_supervised_negative_dispatch_reconciliation(
+                    intent_id=intent.intent_id,
+                    attempt_id=proof.attempt_id,
+                    attempt_number=proof.attempt_number,
+                    adapter_version=proof.adapter_version,
+                    private_schema_version=proof.private_schema_version,
+                    private_record_hash=proof.private_record_hash,
+                    private_proof_hash=proof.private_proof_hash,
+                    evidence=evidence,
+                    terminal_event=event,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict:
+            current = self._store.get_dispatch_intent(task_id)
+            current_reconciliation = getattr(current, "reconciliation", None)
+            if (
+                current is not None
+                and current.intent_id == intent.intent_id
+                and current.state == "not_dispatched"
+                and current.failure_code == "DISPATCH_NOT_STARTED"
+                and getattr(current_reconciliation, "state", None) == "resolved"
+                and getattr(current_reconciliation, "result", None)
+                == "not_dispatched"
+                and getattr(current_reconciliation, "evidence_kind", None)
+                == "managed_pre_running_failure"
+            ):
+                return TaskDispatchReconciliationResult(
+                    intent=current,
+                    evidence_kind="managed_pre_running_failure",
+                    authorized=True,
+                    authorization_replayed=True,
+                    probe_attempted=True,
+                    projected=False,
+                    adopted=False,
+                )
+            return TaskDispatchReconciliationResult(
+                intent=current or intent,
+                evidence_kind="managed_pre_running_failure",
+                authorized=True,
+                authorization_replayed=authorization_replayed,
+                probe_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code="RECONCILIATION_NEGATIVE_CONFLICT",
+            )
+        resolved_reconciliation = getattr(completion.intent, "reconciliation", None)
+        if (
+            completion.snapshot.status != "Failed"
+            or completion.intent.intent_id != intent.intent_id
+            or completion.intent.state != "not_dispatched"
+            or completion.intent.failure_code != "DISPATCH_NOT_STARTED"
+            or completion.intent.handle is not None
+            or getattr(resolved_reconciliation, "state", None) != "resolved"
+            or getattr(resolved_reconciliation, "result", None)
+            != "not_dispatched"
+            or getattr(resolved_reconciliation, "evidence_kind", None)
+            != "managed_pre_running_failure"
+            or completion.attempt_id != proof.attempt_id
+            or completion.attempt_number != proof.attempt_number
+            or completion.evidence_hash != evidence_hash
+            or completion.private_record_hash != proof.private_record_hash
+            or completion.private_proof_hash != proof.private_proof_hash
+            or type(completion.replayed) is not bool
+        ):
+            raise TaskDispatchError("RECONCILIATION_NEGATIVE_OUTCOME_INVALID")
+        return TaskDispatchReconciliationResult(
+            intent=completion.intent,
+            evidence_kind="managed_pre_running_failure",
+            authorized=True,
+            authorization_replayed=(
+                authorization_replayed and completion.replayed
+            ),
+            probe_attempted=True,
+            projected=True,
+            adopted=False,
+        )
+
     def reconcile_runtime_dispatch(
         self,
         task_id: str,
@@ -2458,7 +2648,7 @@ class TaskService:
         principal_id: str,
         supervisor_lease: RuntimeSupervisorLease,
     ) -> TaskDispatchReconciliationResult:
-        """Resolve one exact positive receipt without launching a Worker."""
+        """Classify one dispatch ambiguity without launching a Worker."""
 
         snapshot = self.get_task(
             task_id, project_id=project_id, principal_id=principal_id
@@ -2473,7 +2663,7 @@ class TaskService:
         if intent is None:
             raise TaskConflict("runtime task has no dispatch intent")
         reconciliation = getattr(intent, "reconciliation", None)
-        if intent.state == "dispatched" and getattr(
+        if intent.state in {"dispatched", "not_dispatched"} and getattr(
             reconciliation, "state", None
         ) == "resolved":
             return TaskDispatchReconciliationResult(
@@ -2509,9 +2699,11 @@ class TaskService:
             )
         if self._dispatcher is None:
             raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
-        probe = getattr(
-            self._dispatcher, "probe_existing_dispatch_receipt", None
-        )
+        probe = getattr(self._dispatcher, "probe_dispatch_reconciliation", None)
+        if not callable(probe):
+            probe = getattr(
+                self._dispatcher, "probe_existing_dispatch_receipt", None
+            )
         if not callable(probe):
             return TaskDispatchReconciliationResult(
                 intent=intent,
@@ -2547,7 +2739,7 @@ class TaskService:
                 )
                 if (
                     current is not None
-                    and current.state == "dispatched"
+                    and current.state in {"dispatched", "not_dispatched"}
                     and getattr(current_reconciliation, "state", None)
                     == "resolved"
                 ):
@@ -2585,7 +2777,7 @@ class TaskService:
                 authorization.intent, "reconciliation", None
             )
             if (
-                authorization.intent.state == "dispatched"
+                authorization.intent.state in {"dispatched", "not_dispatched"}
                 and getattr(authorized_reconciliation, "state", None)
                 == "resolved"
             ):
@@ -2609,7 +2801,7 @@ class TaskService:
             value.replayed for value in authorizations
         )
         try:
-            positive = probe(intent)
+            probe_result = probe(intent)
         except (DispatchDeferred, DispatchError) as error:
             return TaskDispatchReconciliationResult(
                 intent=self._store.get_dispatch_intent(task_id) or intent,
@@ -2632,6 +2824,92 @@ class TaskService:
                 adopted=False,
                 deferred_code="RECONCILIATION_PROBE_UNAVAILABLE",
             )
+        if isinstance(probe_result, DispatchReconciliationDeferred):
+            if (
+                probe_result.classification not in {"transient", "uncertain"}
+                or not isinstance(probe_result.failure_code, str)
+                or re.fullmatch(
+                    r"[A-Z0-9_]{1,128}", probe_result.failure_code
+                )
+                is None
+            ):
+                raise TaskDispatchError("RECONCILIATION_PROBE_INVALID")
+            try:
+                observation = self._store.record_supervised_dispatch_reconciliation_observation(
+                    intent_id=intent.intent_id,
+                    classification=probe_result.classification,
+                    failure_code=probe_result.failure_code,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+            except RuntimeSupervisorLeaseLost as error:
+                raise TaskSupervisorLeaseLost() from error
+            except TaskStoreConflict:
+                current = self._store.get_dispatch_intent(task_id)
+                current_reconciliation = getattr(current, "reconciliation", None)
+                if (
+                    current is not None
+                    and current.state in {"dispatched", "not_dispatched"}
+                    and getattr(current_reconciliation, "state", None)
+                    == "resolved"
+                ):
+                    return TaskDispatchReconciliationResult(
+                        intent=current,
+                        evidence_kind=getattr(
+                            current_reconciliation, "evidence_kind", None
+                        ),
+                        authorized=True,
+                        authorization_replayed=authorization_replayed,
+                        probe_attempted=True,
+                        projected=False,
+                        adopted=False,
+                    )
+                return TaskDispatchReconciliationResult(
+                    intent=current or intent,
+                    evidence_kind=None,
+                    authorized=True,
+                    authorization_replayed=authorization_replayed,
+                    probe_attempted=True,
+                    projected=False,
+                    adopted=False,
+                    deferred_code="RECONCILIATION_OBSERVATION_CONFLICT",
+                )
+            if (
+                observation.intent.intent_id != intent.intent_id
+                or observation.intent.state != "reconciliation_required"
+                or observation.classification != probe_result.classification
+                or observation.failure_code != probe_result.failure_code
+                or type(observation.observation_sequence) is not int
+                or observation.observation_sequence < 1
+                or type(observation.replayed) is not bool
+            ):
+                raise TaskDispatchError("RECONCILIATION_OBSERVATION_INVALID")
+            return TaskDispatchReconciliationResult(
+                intent=observation.intent,
+                evidence_kind=None,
+                authorized=True,
+                authorization_replayed=(
+                    authorization_replayed and observation.replayed
+                ),
+                probe_attempted=True,
+                projected=False,
+                adopted=False,
+                deferred_code=(
+                    "RECONCILIATION_TRANSIENT"
+                    if observation.classification == "transient"
+                    else "RECONCILIATION_UNCERTAIN"
+                ),
+            )
+        if isinstance(probe_result, DispatchNotStartedProof):
+            return self._finalize_negative_dispatch_reconciliation(
+                task_id=task_id,
+                snapshot=snapshot,
+                intent=intent,
+                proof=probe_result,
+                supervisor_lease=supervisor_lease,
+                authorization_replayed=authorization_replayed,
+            )
+        positive = probe_result
         if not isinstance(positive, DispatchReceiptProbe):
             return TaskDispatchReconciliationResult(
                 intent=intent,

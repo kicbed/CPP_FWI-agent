@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Literal, Mapping, Protocol
 
 from .fwi_adapter import (
     ADAPTER_VERSION,
     LOGICAL_ENTRYPOINT,
     SUPPORTED_ADAPTER_VERSIONS,
+    AdapterDispatchNotStartedProof,
     AdapterError,
     AdapterExistingDispatchReceiptProof,
     AdapterHandle,
     AdapterManagedCancelProof,
     AdapterManagedTimeoutProof,
     AdapterPreRunningRetryProof,
+    AdapterReconciliationDeferred,
     AdapterWorkerExitRetryProof,
     DeepwaveAdapter,
     is_supported_receipt_binding,
@@ -30,7 +34,9 @@ from .task_store import (
 
 
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MANAGED_SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
 _MANAGED_ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
+_MANAGED_JOB_ID = re.compile(r"^fwi-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 
 
 class DispatchError(RuntimeError):
@@ -73,6 +79,29 @@ class DispatchReceiptProbe:
     evidence: dict[str, Any] | None
     private_schema_version: str
     receipt_record_hash: str | None
+
+
+@dataclass(frozen=True)
+class DispatchNotStartedProof:
+    """Independently validated exact pre-running negative dispatch proof."""
+
+    result: Literal["not_dispatched"]
+    evidence_kind: Literal["managed_pre_running_failure"]
+    adapter_version: str
+    private_schema_version: str
+    private_record_hash: str
+    private_proof_hash: str
+    attempt_id: str
+    attempt_number: int
+    evidence: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DispatchReconciliationDeferred:
+    """Typed reconciliation result that preserves a recoverable intent."""
+
+    classification: Literal["transient", "uncertain"]
+    failure_code: str
 
 
 @dataclass(frozen=True)
@@ -123,6 +152,15 @@ class TaskDispatcher(Protocol):
     def probe_existing_dispatch_receipt(
         self, intent: DispatchIntentSnapshot
     ) -> DispatchReceiptProbe:
+        ...
+
+    def probe_dispatch_reconciliation(
+        self, intent: DispatchIntentSnapshot
+    ) -> (
+        DispatchReceiptProbe
+        | DispatchNotStartedProof
+        | DispatchReconciliationDeferred
+    ):
         ...
 
     def probe_pre_running_retry(
@@ -421,59 +459,23 @@ class DeepwaveTaskDispatcher:
 
         return self._recover_existing_receipt(intent, private_proof=True)
 
-    def probe_existing_dispatch_receipt(
-        self, intent: DispatchIntentSnapshot
+    @staticmethod
+    def _validated_reconciliation_receipt(
+        *,
+        proof: Any,
+        intent: DispatchIntentSnapshot,
+        request: Mapping[str, Any],
+        normalized_config_hash: str,
     ) -> DispatchReceiptProbe:
-        """Recognize one exact positive receipt without launching a Worker."""
+        """Validate positive Adapter evidence independently of its reader."""
 
-        if (
-            intent.adapter_id != LOGICAL_ENTRYPOINT
-            or intent.adapter_version != ADAPTER_VERSION
-            or intent.state != "reconciliation_required"
-            or intent.handle is not None
-            or not isinstance(intent.request, Mapping)
-            or not isinstance(intent.queue_fingerprint, Mapping)
-        ):
-            raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_UNSUPPORTED")
-        request = copy.deepcopy(dict(intent.request))
-        normalized_config_hash = request.pop("normalized_config_hash", None)
-        expected = {
-            "task_id",
-            "node_id",
-            "plan_hash",
-            "idempotency_key",
-            "project_id",
-            "principal_id",
-            "algorithm",
-            "dataset",
-            "task_type",
-            "parameters",
-            "resources",
-        }
-        if (
-            set(request) != expected
-            or not isinstance(normalized_config_hash, str)
-            or request["task_id"] != intent.task_id
-            or request["node_id"] != intent.node_id
-            or request["plan_hash"] != intent.plan_hash
-            or request["idempotency_key"] != intent.node_idempotency_key
-            or intent.queue_fingerprint.get("normalized_config_hash")
-            != normalized_config_hash
-        ):
-            raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_UNSUPPORTED")
-        try:
-            proof = self._adapter.probe_existing_dispatch_receipt(**request)
-        except AdapterError as error:
-            raise DispatchDeferred(error.code) from error
-        except Exception as error:
-            raise DispatchDeferred(
-                "DISPATCH_RECEIPT_PROBE_UNAVAILABLE"
-            ) from error
         if not isinstance(proof, AdapterExistingDispatchReceiptProof):
             raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_INVALID")
         handle = proof.handle
         if (
-            handle.adapter_version != ADAPTER_VERSION
+            not isinstance(handle, AdapterHandle)
+            or not isinstance(handle.fingerprint, Mapping)
+            or handle.adapter_version != intent.adapter_version
             or handle.task_id != intent.task_id
             or handle.node_id != intent.node_id
             or handle.plan_hash != intent.plan_hash
@@ -528,6 +530,432 @@ class DeepwaveTaskDispatcher:
             ),
             private_schema_version=proof.private_schema_version,
             receipt_record_hash=proof.receipt_record_hash,
+        )
+
+    def probe_existing_dispatch_receipt(
+        self, intent: DispatchIntentSnapshot
+    ) -> DispatchReceiptProbe:
+        """Recognize one exact positive receipt without launching a Worker."""
+
+        if (
+            intent.adapter_id != LOGICAL_ENTRYPOINT
+            or intent.adapter_version != ADAPTER_VERSION
+            or intent.state != "reconciliation_required"
+            or intent.handle is not None
+            or not isinstance(intent.request, Mapping)
+            or not isinstance(intent.queue_fingerprint, Mapping)
+        ):
+            raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_UNSUPPORTED")
+        request = copy.deepcopy(dict(intent.request))
+        normalized_config_hash = request.pop("normalized_config_hash", None)
+        expected = {
+            "task_id",
+            "node_id",
+            "plan_hash",
+            "idempotency_key",
+            "project_id",
+            "principal_id",
+            "algorithm",
+            "dataset",
+            "task_type",
+            "parameters",
+            "resources",
+        }
+        if (
+            set(request) != expected
+            or not isinstance(normalized_config_hash, str)
+            or request["task_id"] != intent.task_id
+            or request["node_id"] != intent.node_id
+            or request["plan_hash"] != intent.plan_hash
+            or request["idempotency_key"] != intent.node_idempotency_key
+            or intent.queue_fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+        ):
+            raise DispatchDeferred("DISPATCH_RECEIPT_PROBE_UNSUPPORTED")
+        try:
+            proof = self._adapter.probe_existing_dispatch_receipt(**request)
+        except AdapterError as error:
+            raise DispatchDeferred(error.code) from error
+        except Exception as error:
+            raise DispatchDeferred(
+                "DISPATCH_RECEIPT_PROBE_UNAVAILABLE"
+            ) from error
+        return self._validated_reconciliation_receipt(
+            proof=proof,
+            intent=intent,
+            request=request,
+            normalized_config_hash=normalized_config_hash,
+        )
+
+    def probe_dispatch_reconciliation(
+        self, intent: DispatchIntentSnapshot
+    ) -> (
+        DispatchReceiptProbe
+        | DispatchNotStartedProof
+        | DispatchReconciliationDeferred
+    ):
+        """Classify one exact ambiguity without launch or retry capability."""
+
+        if (
+            not isinstance(intent, DispatchIntentSnapshot)
+            or intent.adapter_id != LOGICAL_ENTRYPOINT
+            or intent.adapter_version not in {"1.4.0", "1.5.0"}
+            or intent.state != "reconciliation_required"
+            or intent.handle is not None
+            or not isinstance(intent.request, Mapping)
+            or not isinstance(intent.queue_fingerprint, Mapping)
+        ):
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_UNSUPPORTED",
+            )
+        request = copy.deepcopy(dict(intent.request))
+        normalized_config_hash = request.pop("normalized_config_hash", None)
+        expected = {
+            "task_id",
+            "node_id",
+            "plan_hash",
+            "idempotency_key",
+            "project_id",
+            "principal_id",
+            "algorithm",
+            "dataset",
+            "task_type",
+            "parameters",
+            "resources",
+        }
+        algorithm = request.get("algorithm")
+        if (
+            set(request) != expected
+            or not isinstance(normalized_config_hash, str)
+            or request["task_id"] != intent.task_id
+            or request["node_id"] != intent.node_id
+            or request["plan_hash"] != intent.plan_hash
+            or request["idempotency_key"] != intent.node_idempotency_key
+            or intent.queue_fingerprint.get("normalized_config_hash")
+            != normalized_config_hash
+            or algorithm
+            != {
+                "id": "deepwave.acoustic_fwi",
+                "version": intent.adapter_version,
+            }
+        ):
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_UNSUPPORTED",
+            )
+        try:
+            adapter_result = self._adapter.probe_dispatch_reconciliation(
+                **request,
+                normalized_config_hash=normalized_config_hash,
+            )
+        except AdapterError as error:
+            return DispatchReconciliationDeferred(
+                classification=(
+                    "transient"
+                    if error.code
+                    in {"ADAPTER_SUBMISSION_BUSY", "WORKER_ATTEMPT_BUSY"}
+                    else "uncertain"
+                ),
+                failure_code=error.code,
+            )
+        except Exception:
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_UNAVAILABLE",
+            )
+
+        if isinstance(adapter_result, AdapterReconciliationDeferred):
+            valid_code = (
+                isinstance(adapter_result.failure_code, str)
+                and re.fullmatch(
+                    r"[A-Z][A-Z0-9_]{0,127}",
+                    adapter_result.failure_code,
+                )
+                is not None
+            )
+            transient_code = valid_code and adapter_result.failure_code in {
+                "ADAPTER_SUBMISSION_BUSY",
+                "WORKER_ATTEMPT_BUSY",
+            }
+            if (
+                adapter_result.classification not in {"transient", "uncertain"}
+                or not valid_code
+                or (adapter_result.classification == "transient")
+                != transient_code
+            ):
+                return DispatchReconciliationDeferred(
+                    classification="uncertain",
+                    failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+                )
+            return DispatchReconciliationDeferred(
+                classification=adapter_result.classification,
+                failure_code=adapter_result.failure_code,
+            )
+
+        if isinstance(adapter_result, AdapterExistingDispatchReceiptProof):
+            try:
+                return self._validated_reconciliation_receipt(
+                    proof=adapter_result,
+                    intent=intent,
+                    request=request,
+                    normalized_config_hash=normalized_config_hash,
+                )
+            except DispatchDeferred as error:
+                return DispatchReconciliationDeferred(
+                    classification="uncertain",
+                    failure_code=error.code,
+                )
+            except Exception:
+                return DispatchReconciliationDeferred(
+                    classification="uncertain",
+                    failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+                )
+
+        if not isinstance(adapter_result, AdapterDispatchNotStartedProof):
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+            )
+        evidence = adapter_result.evidence
+        ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
+        required_evidence = {
+            "schema_version",
+            "submission_id",
+            "attempt_id",
+            "attempt_number",
+            "job_id",
+            "request_hash",
+            "binding_hash",
+            "created_at",
+            "ticket",
+            "ready",
+            "heartbeat",
+        }
+        ticket_fields = {
+            "state",
+            "capacity_slot",
+            "capacity_generation",
+            "worker_pid",
+            "updated_at",
+            "record_hash",
+        }
+        if (
+            adapter_result.result != "not_dispatched"
+            or adapter_result.evidence_kind
+            != "managed_pre_running_failure"
+            or adapter_result.adapter_version != intent.adapter_version
+            or (
+                adapter_result.adapter_version,
+                adapter_result.private_schema_version,
+            )
+            not in {("1.4.0", "1.1.0"), ("1.5.0", "1.2.0")}
+            or not isinstance(adapter_result.private_record_hash, str)
+            or _SHA256.fullmatch(adapter_result.private_record_hash) is None
+            or not isinstance(adapter_result.private_proof_hash, str)
+            or _SHA256.fullmatch(adapter_result.private_proof_hash) is None
+            or not isinstance(adapter_result.attempt_id, str)
+            or _MANAGED_ATTEMPT_ID.fullmatch(adapter_result.attempt_id) is None
+            or adapter_result.attempt_number != 1
+            or not isinstance(evidence, Mapping)
+            or set(evidence) != required_evidence
+            or evidence.get("schema_version") != "1.0.0"
+            or evidence.get("attempt_id") != adapter_result.attempt_id
+            or evidence.get("attempt_number") != 1
+            or not isinstance(evidence.get("submission_id"), str)
+            or _MANAGED_SUBMISSION_ID.fullmatch(evidence["submission_id"])
+            is None
+            or not isinstance(evidence.get("job_id"), str)
+            or _MANAGED_JOB_ID.fullmatch(evidence["job_id"]) is None
+            or evidence.get("ready") is not None
+            or evidence.get("heartbeat") is not None
+            or not isinstance(evidence.get("created_at"), str)
+            or not evidence["created_at"].endswith("Z")
+            or not isinstance(ticket, Mapping)
+            or set(ticket) != ticket_fields
+            or ticket.get("state")
+            not in {"staged", "leased", "spawned", "failed"}
+            or not isinstance(evidence.get("request_hash"), str)
+            or _SHA256.fullmatch(evidence["request_hash"]) is None
+            or not isinstance(evidence.get("binding_hash"), str)
+            or _SHA256.fullmatch(evidence["binding_hash"]) is None
+            or not isinstance(ticket.get("record_hash"), str)
+            or _SHA256.fullmatch(ticket["record_hash"]) is None
+            or not isinstance(ticket.get("updated_at"), str)
+            or not ticket["updated_at"].endswith("Z")
+        ):
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+            )
+
+        dataset = request.get("dataset")
+        access_scope = (
+            dataset.get("access_scope") if isinstance(dataset, Mapping) else None
+        )
+        try:
+            if not isinstance(dataset, Mapping) or not isinstance(
+                access_scope, Mapping
+            ):
+                raise ValueError("durable dataset binding is invalid")
+            submission_hash = encode_document(
+                {
+                    "task_id": intent.task_id,
+                    "plan_hash": intent.plan_hash,
+                    "idempotency_key": intent.node_idempotency_key,
+                }
+            )[1]
+            expected_submission_id = (
+                "submission-" + submission_hash.removeprefix("sha256:")
+            )
+            expected_request_hash = encode_document(
+                {
+                    "submission_id": expected_submission_id,
+                    "task_id": intent.task_id,
+                    "node_id": intent.node_id,
+                    "plan_hash": intent.plan_hash,
+                    "idempotency_key": intent.node_idempotency_key,
+                    "project_id": request["project_id"],
+                    "principal_id": request["principal_id"],
+                    "algorithm": copy.deepcopy(dict(request["algorithm"])),
+                    "dataset": {
+                        key: copy.deepcopy(dataset.get(key))
+                        for key in ("id", "version", "content_hash", "data_type")
+                    },
+                    "dataset_access_scope": copy.deepcopy(dict(access_scope)),
+                    "task_type": request["task_type"],
+                    "parameters": copy.deepcopy(dict(request["parameters"])),
+                    "resources": copy.deepcopy(dict(request["resources"])),
+                    "normalized_config_hash": normalized_config_hash,
+                }
+            )[1]
+            created_at = datetime.fromisoformat(
+                evidence["created_at"].replace("Z", "+00:00")
+            )
+            if created_at.tzinfo is None:
+                raise ValueError("attempt timestamp has no timezone")
+            created_stamp = created_at.astimezone(timezone.utc).strftime(
+                "%Y%m%dT%H%M%SZ"
+            )
+            job_suffix = hashlib.sha256(
+                expected_submission_id.encode("utf-8")
+            ).hexdigest()[:12]
+            expected_job_id = f"fwi-{created_stamp}-{job_suffix}"
+        except (KeyError, TypeError, ValueError):
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+            )
+        if (
+            evidence["submission_id"] != expected_submission_id
+            or evidence["request_hash"] != expected_request_hash
+            or evidence["job_id"] != expected_job_id
+        ):
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+            )
+
+        state = ticket["state"]
+        slot = ticket["capacity_slot"]
+        generation = ticket["capacity_generation"]
+        worker_pid = ticket["worker_pid"]
+        if state == "staged":
+            valid_ticket = slot is None and generation is None and worker_pid is None
+        elif state == "leased":
+            valid_ticket = (
+                type(slot) is int
+                and slot >= 0
+                and type(generation) is int
+                and generation >= 1
+                and worker_pid is None
+            )
+        elif state == "spawned":
+            valid_ticket = (
+                type(slot) is int
+                and slot >= 0
+                and type(generation) is int
+                and generation >= 1
+                and type(worker_pid) is int
+                and worker_pid >= 1
+            )
+        else:
+            valid_ticket = worker_pid is None and (
+                (slot is None and generation is None)
+                or (
+                    type(slot) is int
+                    and slot >= 0
+                    and type(generation) is int
+                    and generation >= 1
+                )
+            )
+        if not valid_ticket:
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+            )
+
+        try:
+            binding_payload = {
+                "schema_version": "1.0.0",
+                "submission_id": evidence["submission_id"],
+                "attempt_id": evidence["attempt_id"],
+                "attempt_number": evidence["attempt_number"],
+                "job_id": evidence["job_id"],
+                "request_hash": evidence["request_hash"],
+                "created_at": evidence["created_at"],
+            }
+            ticket_payload = {
+                **binding_payload,
+                "binding_hash": evidence["binding_hash"],
+                "state": state,
+                "capacity_slot": slot,
+                "capacity_generation": generation,
+                "worker_pid": worker_pid,
+                "updated_at": ticket["updated_at"],
+            }
+            _, binding_hash = encode_document(binding_payload)
+            _, ticket_hash = encode_document(ticket_payload)
+            _, evidence_hash = encode_document(dict(evidence))
+            _, private_proof_hash = encode_document(
+                {
+                    "schema_version": "1.0.0",
+                    "result": "not_dispatched",
+                    "evidence_kind": "managed_pre_running_failure",
+                    "adapter_version": adapter_result.adapter_version,
+                    "private_schema_version": (
+                        adapter_result.private_schema_version
+                    ),
+                    "private_record_hash": adapter_result.private_record_hash,
+                    "attempt_id": adapter_result.attempt_id,
+                    "attempt_number": adapter_result.attempt_number,
+                    "evidence_hash": evidence_hash,
+                }
+            )
+        except Exception:
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+            )
+        if (
+            binding_hash != evidence["binding_hash"]
+            or ticket_hash != ticket["record_hash"]
+            or private_proof_hash != adapter_result.private_proof_hash
+        ):
+            return DispatchReconciliationDeferred(
+                classification="uncertain",
+                failure_code="DISPATCH_RECONCILIATION_PROBE_INVALID",
+            )
+        return DispatchNotStartedProof(
+            result="not_dispatched",
+            evidence_kind="managed_pre_running_failure",
+            adapter_version=adapter_result.adapter_version,
+            private_schema_version=adapter_result.private_schema_version,
+            private_record_hash=adapter_result.private_record_hash,
+            private_proof_hash=adapter_result.private_proof_hash,
+            attempt_id=adapter_result.attempt_id,
+            attempt_number=adapter_result.attempt_number,
+            evidence=copy.deepcopy(dict(evidence)),
         )
 
     def observe_existing_worker_attempt(

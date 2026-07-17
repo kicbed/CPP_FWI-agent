@@ -11,12 +11,12 @@
 
 - 活跃分支：`feature/scientific-agent-runtime`；基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`。
 - Accepted：D-003 固定 P0→P1→P2→P3→P4→P5→P6；只有 P6 出口通过才算全项目完成。
-- Verified：P0、P1，以及 P2-001～P2-009A、P2-009B1、P2-009B2 的账本所列有界范围。
-  P2-009A 已验证正向 receipt resolution；P2-009B1 已验证 pre-running retry；P2-009B2 已验证
-  post-ready `worker_exit` retry。完整 P2 仍在进行，不得把这些子项表述为完整 P2。
-- Pending：P2 先关闭负向/不确定 reconciliation 矩阵，再完成 SSE 与完整 P2 故障、代表性
-  CPU/CUDA 阶段出口；P3–P6 仍按顺序 Pending。
-- 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 6 个，当前约 6 个，其中 P2 为 2、
+- Verified：P0、P1，以及 P2-001～P2-009A、P2-009B1、P2-009B2 和负向/不确定
+  reconciliation 矩阵的账本所列有界范围。P2-009A 已验证正向 receipt resolution；P2-009B1 已验证
+  pre-running retry；P2-009B2 已验证 post-ready `worker_exit` retry。完整 P2 仍在进行。
+- Pending：P2 剩余一个路线切片、两个工作轮次：先实现 checkpoint / Waiting / resume，再完成
+  SSE 与完整 P2 故障、代表性 CPU/CUDA 阶段出口；P3–P6 仍按顺序 Pending。
+- 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 7 个，当前约 5 个，其中 P2 为 1、
   P3–P6 暂估约 4；这是弹性估算，不是配额。
 - 当前阻塞：无；开始前仍须检查分支、工作树、最近提交和相关 diff。
 - D-005 仍为 Proposed，不迁移或删除现有 runtime prompt-like 文件。
@@ -48,6 +48,8 @@
   timeout、retry 或终态推断。不完整、损坏、分歧或模糊证据一律 fail closed。
 - D-012 只允许新 Approval 最多两个 append-only attempt，并只重试 exact stopped 的 pre-running
   launch failure 或 post-ready `worker_exit`；普通数值失败、timeout、cancel、成功和不确定状态不重试。
+- reconciliation 的精确负向证明只终结为 Failed，不退款、不重试；transient/uncertain 保持
+  action_required。该负向证明可进入 Trash，但无授权清理协议时 purge 必须 fail closed。
 - P3 DAG 只在用户明确选择工作流或任务确需拆解时运行；多算法默认是独立可发现、可选择的工具，
   不自动串成端到端流水线。P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
 - 不读取、打印或提交 `.env`、密钥、凭证、私有 prompt、模型、运行 artifact、数据库、日志、

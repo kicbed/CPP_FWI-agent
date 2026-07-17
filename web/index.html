@@ -2430,9 +2430,12 @@
         ? value.failure_code : '';
       const recordedAt = boundedGuidedText(value.recorded_at, 80);
       const result = value.result === null
-        ? null : (value.result === 'dispatched' ? value.result : '');
+        ? null : (['dispatched', 'not_dispatched'].includes(value.result)
+          ? value.result : '');
       const evidenceKind = value.evidence_kind === null
-        ? null : (['managed_worker_receipt', 'private_receipt'].includes(value.evidence_kind)
+        ? null : ([
+          'managed_worker_receipt', 'private_receipt', 'managed_pre_running_failure',
+        ].includes(value.evidence_kind)
           ? value.evidence_kind : '');
       const resolvedAt = value.resolved_at === null
         ? null : boundedGuidedText(value.resolved_at, 80);
@@ -2442,8 +2445,12 @@
           || (resolvedAt !== null && !timestamp.test(resolvedAt))) return null;
       if (stateName === 'action_required'
           && (result !== null || evidenceKind !== null || resolvedAt !== null)) return null;
+      const positiveResolved = result === 'dispatched'
+        && ['managed_worker_receipt', 'private_receipt'].includes(evidenceKind);
+      const negativeResolved = result === 'not_dispatched'
+        && evidenceKind === 'managed_pre_running_failure';
       if (stateName === 'resolved'
-          && (result !== 'dispatched' || evidenceKind === null || !resolvedAt)) return null;
+          && ((!positiveResolved && !negativeResolved) || !resolvedAt)) return null;
       return {
         state: stateName,
         failureCode,
@@ -2595,7 +2602,7 @@
         dispatch: {
           state: [
             'pending', 'dispatching', 'dispatched', 'reconciliation_required',
-            'retrying', 'retry_exhausted',
+            'retrying', 'retry_exhausted', 'not_dispatched',
           ].includes(dispatchState)
             ? dispatchState : '',
           failureCode: /^[A-Z0-9_]{1,128}$/.test(dispatchSource.failure_code || '')
@@ -2697,25 +2704,36 @@
       if (hasDispatch) {
         if (![
           'pending', 'dispatching', 'dispatched', 'reconciliation_required',
-          'retrying', 'retry_exhausted',
+          'retrying', 'retry_exhausted', 'not_dispatched',
         ]
           .includes(normalized.dispatch.state)) return null;
         if (normalized.dispatch.state === 'retry_exhausted'
             && (normalized.status !== 'Failed'
               || normalized.dispatch.failureCode !== 'WORKER_RETRY_EXHAUSTED'
               || normalized.dispatch.reconciliation !== null)) return null;
+        if (normalized.dispatch.state === 'not_dispatched'
+            && (normalized.status !== 'Failed'
+              || normalized.dispatch.failureCode !== 'DISPATCH_NOT_STARTED'
+              || normalized.dispatch.reconciliation?.state !== 'resolved'
+              || normalized.dispatch.reconciliation.result !== 'not_dispatched'
+              || normalized.dispatch.reconciliation.evidenceKind
+                !== 'managed_pre_running_failure')) return null;
         if (normalized.dispatch.state === 'reconciliation_required'
             && (!normalized.dispatch.reconciliation
               || normalized.dispatch.reconciliation.state !== 'action_required'
               || normalized.dispatch.failureCode
                 !== normalized.dispatch.reconciliation.failureCode)) return null;
-        if (!['reconciliation_required', 'retry_exhausted']
+        if (!['reconciliation_required', 'retry_exhausted', 'not_dispatched']
           .includes(normalized.dispatch.state)
             && normalized.dispatch.failureCode) return null;
         if (normalized.dispatch.reconciliation?.state === 'action_required'
             && normalized.dispatch.state !== 'reconciliation_required') return null;
-        if (normalized.dispatch.reconciliation?.state === 'resolved'
-            && !['dispatched', 'retrying'].includes(normalized.dispatch.state)) return null;
+        if (normalized.dispatch.reconciliation?.state === 'resolved') {
+          if (normalized.dispatch.reconciliation.result === 'dispatched'
+              && !['dispatched', 'retrying'].includes(normalized.dispatch.state)) return null;
+          if (normalized.dispatch.reconciliation.result === 'not_dispatched'
+              && normalized.dispatch.state !== 'not_dispatched') return null;
+        }
         if (['pending', 'dispatching'].includes(normalized.dispatch.state)
             && normalized.dispatch.reconciliation !== null) return null;
       } else if (normalized.dispatch.state || normalized.dispatch.failureCode
@@ -2809,7 +2827,7 @@
         && task.approval.decision === 'approved'
         && [
           'pending', 'dispatching', 'dispatched', 'reconciliation_required',
-          'retrying', 'retry_exhausted',
+          'retrying', 'retry_exhausted', 'not_dispatched',
         ]
           .includes(task.dispatch.state)
         && ['Queued', 'Running', 'Waiting', 'Retrying', 'Succeeded', 'Failed', 'Cancelled']
@@ -3623,12 +3641,17 @@
         reconciliation_required: '派发结果仍需处理；只有受围栏 Supervisor 的严格正向回执可解决，浏览器不会重试。',
         retrying: '服务端已精确证明运行后 Worker 退出，并由受围栏 Supervisor 启动或收养唯一一次替代尝试；浏览器只读等待，不会发起 retry。',
         retry_exhausted: '任务已使用两次受控尝试，有限自动重试预算已经耗尽；任务已由服务端关闭为 Failed。浏览器不会重试。',
+        not_dispatched: '受围栏 Supervisor 已精确证明 Worker 未到达受管运行边界；任务由服务端关闭为 Failed，浏览器不会重试。',
       };
       return explanations[stateName] || '等待持久派发状态。';
     }
 
     function guidedReconciliationExplanation(reconciliation) {
       if (!reconciliation) return '';
+      if (reconciliation.state === 'resolved'
+          && reconciliation.result === 'not_dispatched') {
+        return '精确的 pre-running 停止证据已关闭 reconciliation；Worker 未到达受管运行边界，私有证明不会向浏览器公开。';
+      }
       const explanations = {
         action_required: '尚无可认领的严格正向回执；保持 action_required，不自动重试或退款。',
         resolved: '严格正向回执已由受围栏 Supervisor 认领；这是 receipt adoption，不是任务 retry。',

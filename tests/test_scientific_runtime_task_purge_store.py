@@ -333,7 +333,7 @@ class ScientificRuntimeTaskPurgeMigrationTest(unittest.TestCase):
                 connection.close()
 
             store = SQLiteTaskStore(database_path)
-            self.assertEqual(store.migration_version(), 15)
+            self.assertEqual(store.migration_version(), 16)
             connection = sqlite3.connect(database_path)
             try:
                 tables = {
