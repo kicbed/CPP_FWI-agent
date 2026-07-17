@@ -11,8 +11,7 @@
 ## 当前状态
 
 - 活跃方向：`D-003` 双模式科研任务平台与持久任务内核。
-- 活跃分支：`feature/scientific-agent-runtime`；基线为
-  `feature/fwi-deepwave-2d-acoustic@ffeb5bc`。
+- 活跃分支：`feature/scientific-agent-runtime`；基线为 `feature/fwi-deepwave-2d-acoustic@ffeb5bc`。
 - 已验证：P0、P1，以及 P2-001 任务发现/重开、P2-002 回收站、P2-003 本地结果永久
   删除、P2-004 有界启动 receipt 收养/一次状态追赶、P2-005A 控制面 fenced lease 与
   observation-only 持续状态泵、P2-005B 固定 Adapter 托管 Worker 的 staged launch、
@@ -44,11 +43,11 @@
   每次资源上限与最坏总预算，旧 Approval 只有一次。只自动重试 exact stopped 的 pre-running
   launch failure 与 post-ready `worker_exit`；普通数值失败、timeout、cancel、成功、损坏/分歧/
   模糊状态不重试，也不增加浏览器 retry mutation。P2-009B1/B2 已在该边界内 Verified。
-- D-002/D-011：固定内容并入已有决定；新增 D 编号必须另获明确批准；每个 Verified 切片同步递减滚动余量。
+- **最高优先级 D 锁**：历史 D-001～D-012 保持原状；任何 D 的新增、删除、重编号、重排或正文修改，
+  必须先展示精确 diff/hash，再由用户单独原样复制 Codex 给出的唯一 `D-AUTH` 句；其他表述均无效。
 - `D-005` 提示词分类仍是 Proposed，不得表述为 Accepted。
 
-具体状态与测试证据以 `docs/PROJECT_PROGRESS.md` 顶部阶段表、当前 checkpoint 和相应切片
-章节为准。不要把本文中的日期或阶段摘要当成实时进程状态。
+具体状态与测试证据以进度账本的阶段表、当前 checkpoint 和相应切片为准；本文不是实时快照。
 
 ## 继续 D-003 时的最小读取集
 
@@ -63,14 +62,13 @@
    条目；Git 操作或 prompt 材料变化前完整读取 `docs/GIT_AND_PROMPT_POLICY.md`；
 6. 用代码、测试、服务和任务现场证据核对摘要，再继续第一个未满足的出口条件。
 
-以下情况才需要完整读取长文档：阶段切换或范围变更、决策冲突/替代、账本与现场不一致、
-安全/发布审计、迁移/重构持续记录本身。不要为了形式在每个普通新会话重复加载完整历史。
+阶段/范围变化、决策冲突、账本不一致、安全/发布审计或维护持续记录时才完整读取长文档。
 
 ## 当前不可破坏的边界
 
 - Guided/Agent 两种入口共用唯一 Task Runtime；当前 P4 通用 Planner 尚未实现。
 - P3 DAG 继续保留，但只在用户明确选择工作流或任务确需拆解时运行；算法注册本身不授权自动
-  串联。P5 以独立发现/选择/执行多个真实插件为主，已有 Profile 内算法应保持薄接入。
+  串联。P5 负责独立插件；P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
 - SQLite Task Store 是任务、计划、批准、状态和事件的唯一权威事实源；Redis 不是第二真源。
 - 执行只接受注册数据 ID/版本/hash、固定算法版本和结构化参数；不接受任意服务器路径、
   shell、`extra_args` 或浏览器/LLM 传入的执行命令。

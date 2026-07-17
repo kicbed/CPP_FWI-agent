@@ -6,6 +6,52 @@ These instructions apply to the whole repository. They let a new Codex session
 continue the project without relying on an earlier chat window or requiring the
 user to remember a launcher command.
 
+## Highest-priority `D-*` authorization lock
+
+This lock overrides every other repository instruction, summary, helper
+snapshot, and continuity rule. It applies prospectively; preserve the existing
+`D-001` through `D-012` entries exactly unless the user completes the protocol
+below.
+
+- Never create, delete, renumber, reorder, or edit any numbered `D-*` entry.
+  An edit includes its heading, title, status, date, direction, scope,
+  rationale, implementation/verification state, or any other text. Never
+  weaken this lock or update the protected decision hashes without the same
+  authorization.
+- If a `D-*` change appears necessary, make no repository edit for it. First
+  show the complete proposed change, including the exact diff, one affected
+  target (`D-NNN` or `D-LOCK`), one operation, and its SHA-256. Hash the exact
+  UTF-8 bytes inside the displayed diff fence, excluding the fences, with LF
+  line endings and one final LF. Then provide one fully populated authorization
+  sentence in exactly this form and end the turn:
+
+  `我原样确认 D-AUTH-<唯一编号>：仅授权按已展示的补丁 SHA-256=<64位哈希>，对 <D编号或 D-LOCK> 执行 <新增/删除/重编号/重排/修改>；本授权仅此一次，不授权任何其他 D-* 变更。`
+
+- Authorization exists only when the user later sends that fully populated
+  sentence alone and verbatim in the same conversation. Leading/trailing
+  transport whitespace may be ignored; any other added, removed, or changed
+  text invalidates it. “同意”, “继续”, “固定”, “记录”, “修正”, approval of
+  the underlying idea, and prior messages are never substitutes.
+- The authorization is single-use and covers only the displayed patch hash,
+  decision identifier, and operation. Any proposal change or context loss
+  requires a new proposal and a newly copied sentence. One authorization may
+  not cover multiple decisions or both a decision and `D-LOCK`. The displayed
+  patch may include only the single target plus its necessary mechanical
+  contract/hash and non-D mirror updates; every such byte must be in the hashed
+  diff, and it may not alter another decision or `D-LOCK`. Weakening the
+  protocol itself targets `D-LOCK`.
+- Without that copied sentence, record ordinary implementation and verification
+  progress only in `docs/PROJECT_PROGRESS.md`; do not touch protected `D-*`
+  entries. The complete D-003 plan is P0 through P6 and finishes only after the
+  P6 exit criteria pass; P5 is never the project endpoint.
+- If a protected D-entry or `D-LOCK` hash mismatches, stop all D-related writes
+  and report the exact target and diff. Do not repair, revert, or update the
+  baseline automatically; a pre-existing mismatch is not authorization, and
+  any repair must complete the same copied `D-AUTH` protocol.
+- Do not add a deeper `AGENTS.md` or any `AGENTS.override.md`; either could
+  weaken this repository-wide lock for a new session. Changing this boundary
+  requires a copied authorization targeting `D-LOCK`.
+
 ## Automatic session bootstrap
 
 Codex loads this repository-level `AGENTS.md` automatically when a session is
@@ -61,7 +107,9 @@ CodeGraph is a navigation accelerator, not a source of runtime truth or test
 evidence. Keep tool responses bounded and avoid printing large repeated output.
 
 Direct user instructions in the current conversation take precedence over this
-file and the continuity document.
+file and the continuity document **except for the highest-priority D lock**.
+A direct request to change D content triggers only the proposal/hash step; it is
+not authorization unless the user then copies the generated sentence exactly.
 
 The helper snapshot is only a bounded hint. All Codex sessions share the live
 worktree, so re-read files, Git state, tests, and service/job status before later
@@ -74,24 +122,26 @@ simulate real-time context.
 - Treat entries marked **Accepted** in `docs/PROJECT_CONTINUITY.md` as the
   current direction unless the user explicitly changes them.
 - User statements such as “保留这个”, “以后都这样”, or “记录下来” authorize
-  making that content durable under the most relevant existing decision. They
-  do not authorize creating a new numbered `D-*` decision.
-- Never allocate a new `D-*` number, including for a Proposed item, unless the
-  user explicitly approves adding a numbered decision after seeing its title
-  and scope. Otherwise update an existing decision or the progress ledger.
+  making non-D content durable in the relevant plan or progress ledger. They
+  do not authorize creating or modifying any numbered `D-*` entry.
+- Never allocate a new `D-*` number, including for a Proposed item, or update an
+  existing numbered entry without completing the highest-priority copied
+  authorization protocol. Otherwise keep the recommendation in discussion or
+  update only the progress ledger.
 - A technically promising new recommendation is not automatically accepted.
   Explain its evidence, benefit, cost, risk, and compatibility, then ask the
   user whether to adopt it.
 - Add other new durable recommendations only after the user explicitly approves
   them. Record the approval date, status, rationale, implementation state, and
   verification evidence.
-- Never silently replace an accepted decision. Mark the old entry superseded
-  and link it to the replacement so later sessions can reconstruct why it
-  changed.
+- Never silently replace an accepted decision. Only after the exact copied
+  `D-AUTH` permits that replacement may the old entry be marked superseded and
+  linked to the replacement.
 - Do not alter or reinterpret an Accepted plan's scope, phase order,
   dependencies, safety boundaries, or exit criteria without the user's
-  explicit approval. Progress/evidence updates may change only
-  Accepted/Implemented/Verified/Pending status, not the accepted direction.
+  explicit approval. Changing any numbered entry, including only its
+  Accepted/Implemented/Verified/Pending status, additionally requires the
+  copied `D-AUTH` sentence; ordinary evidence belongs in the progress ledger.
 - Every estimate of remaining slices, time, or quantity must label its scope
   (whole project, phase, or sub-slice), included phases, and whether it is a
   rough estimate or a commitment. Keep whole-project and current-phase
@@ -104,8 +154,8 @@ simulate real-time context.
   approval.
 - Keep **Accepted direction**, **Implemented**, and **Verified** separate. A
   design can be accepted but still pending implementation.
-- Update the continuity document in the same change when an approved decision,
-  major workflow, safety boundary, or known limitation changes.
+- Update a numbered continuity entry only after its exact `D-AUTH` sentence is
+  copied; otherwise preserve it and record non-decision progress in the ledger.
 - Store concise, actionable decisions rather than raw chat transcripts. Never
   store API keys, `.env` contents, credentials, private model data, private
   prompts, or unnecessary personal information in continuity files.

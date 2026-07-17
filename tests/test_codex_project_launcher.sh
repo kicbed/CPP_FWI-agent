@@ -35,8 +35,14 @@ grep -Fq '<!-- codex-auto-bootstrap: v2 -->' "$PROJECT_AGENTS" || \
     fail "AGENTS.md does not declare the automatic bootstrap contract"
 grep -Fq 'Token-efficient code navigation' "$PROJECT_AGENTS" || \
     fail "AGENTS.md does not define bounded CodeGraph navigation"
+grep -Fq 'Highest-priority `D-*` authorization lock' "$PROJECT_AGENTS" || \
+    fail "AGENTS.md does not define the highest-priority D authorization lock"
+grep -Fq 'Authorization exists only when the user later sends that fully populated' "$PROJECT_AGENTS" || \
+    fail "AGENTS.md does not require verbatim copied D authorization"
 grep -Fq '<!-- project-current-state: v1 -->' "$PROJECT_CURRENT_STATE" || \
     fail "current-state router does not declare its versioned contract"
+grep -Fq '最高优先级 D 锁' "$PROJECT_CURRENT_STATE" || \
+    fail "current-state router does not surface the D authorization lock"
 grep -Fq 'Never ask the user to run `scripts/codex-project.sh`' "$PROJECT_AGENTS" || \
     fail "AGENTS.md may delegate the internal helper to the user"
 grep -Fq '正常打开新会话后直接提问即可' "$PROJECT_README" || \
@@ -47,10 +53,14 @@ grep -Fq '表示相关内容需要持久化' "$PROJECT_CONTINUITY" || \
     fail "continuity file does not preserve explicit persistence approval"
 grep -Fq '不代表用户授权新建一个编号决策' "$PROJECT_CONTINUITY" || \
     fail "continuity file may treat persistence approval as decision-number approval"
-grep -Fq '表示授权持久化该内容' "$PROJECT_WORKFLOW" || \
-    fail "workflow does not distinguish content persistence approval"
-grep -Fq '不授权 Codex 自行新建编号' "$PROJECT_WORKFLOW" || \
-    fail "workflow may treat persistence approval as decision-number approval"
+grep -Fq '`D-*` 条目最高优先级授权锁' "$PROJECT_CONTINUITY" || \
+    fail "continuity file does not preserve the highest-priority D lock"
+grep -Fq '单独、原样复制 Codex 给出的完整实值句子才构成一次授权' "$PROJECT_CONTINUITY" || \
+    fail "continuity file does not require verbatim copied D authorization"
+grep -Fq '单独、原样复制该句才' "$PROJECT_WORKFLOW" || \
+    fail "workflow does not require verbatim copied D authorization"
+grep -Fq '只有 P6 出口通过才算全项目完成' "$PROJECT_WORKFLOW" || \
+    fail "workflow may present P5 as the project endpoint"
 grep -Fq '<!-- scientific-agent-runtime-plan: v1 -->' "$PROJECT_PLAN" || \
     fail "runtime plan does not declare its versioned contract"
 grep -Fq '<!-- project-progress-schema: v1 -->' "$PROJECT_PROGRESS" || \
@@ -189,6 +199,9 @@ assert_contains "$context" 'Read docs/PROJECT_CURRENT_STATE.md completely.'
 assert_contains "$context" 'read only the active plan phase'
 assert_contains "$context" 'Prefer bounded CodeGraph exploration'
 assert_contains "$context" 'Read docs/GIT_AND_PROMPT_POLICY.md before Git operations'
+assert_contains "$context" 'Highest-priority D-* lock'
+assert_contains "$context" 'fully populated one-time D-AUTH sentence alone and verbatim'
+assert_contains "$context" 'completes only after P6 passes'
 assert_contains "$context" 'branch: test/codex-context'
 assert_contains "$context" 'recent_commit:'
 assert_contains "$context" 'working_tree_summary:'
