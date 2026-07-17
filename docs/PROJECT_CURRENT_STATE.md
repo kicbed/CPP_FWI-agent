@@ -28,20 +28,23 @@
 - P2-009B1 已验证 SQLite v14/Approval 1.1 的两次串行预算、current Algorithm/Adapter `1.5.0`
   的 exact stopped pre-running failure attempt 2、第二次失败终结，以及无 handle 的双 attempt
   Trash/Purge；历史 `1.4.0`/Approval 1.0 仍只有一次。
-- 当前阶段：D-012 finite retry 已 Accepted，P2-009B1 pre-running launch failure 重试已
-  Verified，P2-009B2 post-ready `worker_exit` Pending；完整 P2 仍在进行，
+- P2-009B2 已验证 SQLite v15 的 exact post-ready `worker_exit` receipt、active-term
+  `Running → Retrying → Running/Failed` 决策、private 1.3 attempt 2、effective handle 替换，以及
+  status/artifact/cancel/timeout 的统一 current target；attempt 2 失败后绝不产生 attempt 3。
+- 当前阶段：D-012 finite retry 已 Accepted，P2-009B1/B2 均已 Verified；完整 P2 仍在进行，
   上述 P2 子项不得表述为完整 P2 已完成。
-- 下一安全方向：以 effective handle、artifact、cancel 与 timeout 共同迁移为出口推进
-  post-ready `worker_exit` 的 B2；随后依次关闭剩余负向/不确定 reconciliation、SSE 和完整 P2
-  阶段出口。当前是 3 个实现工作流加 1 次阶段出口的弹性估算，不是固定配额。
+- 下一安全方向：仅就 P2，把剩余工作压缩为两个不降质的交付切片：先一次性关闭负向/不确定
+  reconciliation 矩阵，再把 SSE 与完整 P2 故障、代表性 CPU/CUDA 阶段出口合并验证；这是弹性
+  估算，不是固定配额，若出现新的具体安全边界仍须记录后拆分。
 - 当前阻塞：无。工作树中的未提交内容可能属于另一个活跃窗口，必须现场检查并保护。
-- 已接受 D-011：继续保留逐切片开发，但采用弹性中等粒度；约十余个剩余切片只是估算，允许
-  按真实风险小幅增加，不为 migration/字段/单项测试制造路线切片，也不得无说明膨胀成几十个。
+- 已接受 D-011：“约十余个”是从当前到整个 D-003 完成（完整 P2 及 P3–P5）的粗估，不是
+  单个 P 级别的配额；上述两个只是 P2 子集，不为 migration/字段/单项测试制造路线切片。
   多算法首先是独立可选工具，自动全流程不是当前验收要求；测试分级执行但阶段质量门不降低。
 - 已接受 D-012：同一 Task/Plan/Approval/intent 最多两个 append-only attempt；新 Approval 绑定
   每次资源上限与最坏总预算，旧 Approval 只有一次。只自动重试 exact stopped 的 pre-running
   launch failure 与 post-ready `worker_exit`；普通数值失败、timeout、cancel、成功、损坏/分歧/
-  模糊状态不重试，也不增加浏览器 retry mutation。
+  模糊状态不重试，也不增加浏览器 retry mutation。P2-009B1/B2 已在该边界内 Verified。
+- 已接受 D-013：数量/工期/切片估算必须标明范围与性质；Accepted 计划未经用户明确同意不得修改或重新解释。
 - `D-005` 提示词分类仍是 Proposed，不得表述为 Accepted。
 
 具体状态与测试证据以 `docs/PROJECT_PROGRESS.md` 顶部阶段表、当前 checkpoint 和相应切片
@@ -82,15 +85,14 @@
   历史 Algorithm/Adapter identity 1.0–1.3、legacy CLI/MCP 仍不在首次派发/容量投影边界，升级前
   已终态任务不保证 evidence backfill。不完整 staging 保持 fail-closed，等待 reconciliation。
 - P2-007 当前允许受支持的 managed Algorithm/Adapter 1.4/1.5；private schema 1.1 用于 attempt 1，
-  B1 的 current 1.5 attempt 2 使用 private 1.2。durable `dispatched`、最新
+  B1 attempt 2 使用 private 1.2，B2 replacement 使用 private 1.3。durable `dispatched`、最新
   v9 observation 为 spawned+ready+running 且 exact Worker 已发布 capability 的任务接受取消。
   HTTP 只持久化请求，Task 仍为 Queued/Running；active Supervisor term 只在 exact request +
   Worker ack + stopped heartbeat + idle execution `flock` 全部成立后提交 Cancelled。自然
   Succeeded/Failed 先到则 cancellation 为 superseded 且不改写终态。控制面不根据持久 PID
   发 signal；pending/staged、legacy private schema 1.0、公共历史 1.0–1.3 均不支持该入口。
-- P2-008 当前只对受支持的 managed Algorithm/Adapter 1.4/1.5、对应 attempt 的 private 1.1/1.2、
-  durable dispatched 且能证明 v2 exact-stop capability 的最新 managed attempt 自动执行 wall-time
-  timeout。时钟精确
+- P2-008 只对受支持的 managed Algorithm/Adapter 1.4/1.5、对应 private 1.1/1.2/1.3、durable
+  dispatched 且能证明 v2 exact-stop capability 的最新 managed attempt 自动执行 timeout。时钟精确
   从 Store 对该 current Worker 的首条 durable `spawned + ready + running` observation 的
   `observed_at` 开始；deadline 到来且 active term 持久授权前 Worker mutation 为零。自然终态在
   authorization 前完成记 `not_triggered`；durable user-cancel admission 先赢记 `suppressed`；
@@ -119,7 +121,15 @@
   attempt 2 再次 exact pre-running failure 会原子进入 `Failed/retry_exhausted`；Workbench/API/UI
   不暴露内部 intent/attempt/hash/private proof，也没有 retry mutation。Trash/Purge 以 Store cleanup
   proof、同一 idle fence 和先墓碑后删除清理两个 attempt，支持目录内部分删除后的同 purge replay。
-  B2 在已 dispatched 场景下仍须统一迁移 effective handle、artifact、cancel 与 timeout 目标。
+- P2-009B2 已验证：只有 exact ready、running heartbeat、idle execution fence、非 `0/75/76` 的
+  unexpected exit code、append-only worker-exit receipt 与 SQLite current observation 全部一致时，
+  active Supervisor 才能原子隐藏旧 effective handle 并授权 private 1.3 attempt 2。替代 attempt
+  ready 后一次性发布新 effective handle，status/artifact/cancel/timeout 只消费它；旧 timeout window
+  同 reservation 退役。cancel、到期 timeout、自然终态、证据损坏/模糊均不能进入 retry。普通状态
+  bridge 对任何 `worker_exit` 都只读，避免同周期绕过 retry 决策；B1/B2 的 attempt 2 exit 均以 exact
+  proof 终结且绝不 attempt 3。无 handle 的 `worker_exit → attempt 2 pre-running failure` Trash/Purge
+  使用兼容的 Store cleanup token 清理两条精确 lineage；公开 Web 只显示有限自动重试能力/状态，
+  不暴露 handle/hash/PID/path，也没有手工 retry mutation。
 - 不读取、打印或提交 `.env`、API Key、凭证、私有 prompt、模型、运行 artifact、数据库、
   日志、构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开报告；科学结论只限实际实验边界。

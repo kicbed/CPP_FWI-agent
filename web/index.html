@@ -2092,12 +2092,12 @@
         && automaticRetrySource.max_attempts === 2
         && automaticRetrySource.max_concurrent_attempts === 1
         && automaticRetrySource.pre_running_launch_failure === true
-        && automaticRetrySource.worker_exit === false
+        && automaticRetrySource.worker_exit === true
         ? {
             maxAttempts: 2,
             maxConcurrentAttempts: 1,
             preRunningLaunchFailure: true,
-            workerExit: false,
+            workerExit: true,
           }
         : null;
       const formSource = source.form && typeof source.form === 'object' ? source.form : {};
@@ -2535,13 +2535,12 @@
         : (source.runtime_status && typeof source.runtime_status === 'object' ? source.runtime_status : {});
       const dispatchState = dispatchSource.state || dispatchSource.status || '';
       if (hasDispatch && !Object.hasOwn(dispatchSource, 'reconciliation')) return null;
-      const privateDispatchKeys = [
-        'attempt_id', 'document_hash', 'evidence_hash', 'handle', 'job_id',
-        'path', 'private_proof_hash', 'proof', 'proof_hash', 'relative_path',
-        'submission_id',
+      const publicDispatchKeys = [
+        'created_at', 'dispatch_claimed_at', 'failure_code',
+        'outcome_recorded_at', 'reconciliation', 'state', 'status',
       ];
       if (hasDispatch
-          && privateDispatchKeys.some(key => Object.hasOwn(dispatchSource, key))) return null;
+          && Object.keys(dispatchSource).some(key => !publicDispatchKeys.includes(key))) return null;
       const hasReconciliation = hasDispatch && dispatchSource.reconciliation !== null;
       const normalizedReconciliation = hasReconciliation
         ? normalizeGuidedReconciliationProjection(dispatchSource.reconciliation) : null;
@@ -2596,7 +2595,7 @@
         dispatch: {
           state: [
             'pending', 'dispatching', 'dispatched', 'reconciliation_required',
-            'retry_exhausted',
+            'retrying', 'retry_exhausted',
           ].includes(dispatchState)
             ? dispatchState : '',
           failureCode: /^[A-Z0-9_]{1,128}$/.test(dispatchSource.failure_code || '')
@@ -2698,7 +2697,7 @@
       if (hasDispatch) {
         if (![
           'pending', 'dispatching', 'dispatched', 'reconciliation_required',
-          'retry_exhausted',
+          'retrying', 'retry_exhausted',
         ]
           .includes(normalized.dispatch.state)) return null;
         if (normalized.dispatch.state === 'retry_exhausted'
@@ -2716,7 +2715,7 @@
         if (normalized.dispatch.reconciliation?.state === 'action_required'
             && normalized.dispatch.state !== 'reconciliation_required') return null;
         if (normalized.dispatch.reconciliation?.state === 'resolved'
-            && normalized.dispatch.state !== 'dispatched') return null;
+            && !['dispatched', 'retrying'].includes(normalized.dispatch.state)) return null;
         if (['pending', 'dispatching'].includes(normalized.dispatch.state)
             && normalized.dispatch.reconciliation !== null) return null;
       } else if (normalized.dispatch.state || normalized.dispatch.failureCode
@@ -2810,7 +2809,7 @@
         && task.approval.decision === 'approved'
         && [
           'pending', 'dispatching', 'dispatched', 'reconciliation_required',
-          'retry_exhausted',
+          'retrying', 'retry_exhausted',
         ]
           .includes(task.dispatch.state)
         && ['Queued', 'Running', 'Waiting', 'Retrying', 'Succeeded', 'Failed', 'Cancelled']
@@ -3440,7 +3439,7 @@
       const scope = session.scope;
       const retry = session.finiteAutomaticRetry;
       const retryCapability = retry
-        ? `automatic: max ${retry.maxAttempts} attempts, serial; pre-running launch failure: enabled; worker_exit: pending; manual/browser: ${session.manualRetry ? 'enabled' : 'disabled'}`
+        ? `automatic: max ${retry.maxAttempts} attempts, serial; pre-running launch failure: enabled; worker_exit: ${retry.workerExit ? 'enabled' : 'disabled'}; manual/browser: ${session.manualRetry ? 'enabled' : 'disabled'}`
         : `automatic: not declared; manual/browser: ${session.manualRetry ? 'enabled' : 'disabled'}`;
       return `<div class="grid grid-cols-1 md:grid-cols-2 gap-3">
         <section class="rounded-lg border border-slate-200 bg-slate-50 p-3">
@@ -3622,7 +3621,8 @@
         dispatching: '派发认领已持久化；若回执缺失，结果需要后续核对。',
         dispatched: '固定 Adapter 已返回可验证派发回执。',
         reconciliation_required: '派发结果仍需处理；只有受围栏 Supervisor 的严格正向回执可解决，浏览器不会重试。',
-        retry_exhausted: '两次受控尝试均在进入运行前停止，有限自动重试预算已经耗尽；任务已由服务端关闭为 Failed。浏览器不会重试。',
+        retrying: '服务端已精确证明运行后 Worker 退出，并由受围栏 Supervisor 启动或收养唯一一次替代尝试；浏览器只读等待，不会发起 retry。',
+        retry_exhausted: '任务已使用两次受控尝试，有限自动重试预算已经耗尽；任务已由服务端关闭为 Failed。浏览器不会重试。',
       };
       return explanations[stateName] || '等待持久派发状态。';
     }
@@ -3665,7 +3665,7 @@
       const adapter = task.adapter;
       const completed = adapter.completed === null ? '—' : adapter.completed;
       const total = adapter.total === null ? '—' : adapter.total;
-      const isCrashState = ['pending', 'dispatching', 'reconciliation_required'].includes(task.dispatch.state);
+      const isCrashState = ['pending', 'dispatching', 'reconciliation_required', 'retrying'].includes(task.dispatch.state);
       const linkedToCurrent = isTaskReferencedByChat(state.chats[state.chatId], task.taskId);
       const cancellationPending = task.cancellation?.state === 'requested';
       const timeoutPending = task.timeout?.state === 'requested';

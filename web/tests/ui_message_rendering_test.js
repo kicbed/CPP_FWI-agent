@@ -1698,6 +1698,51 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   }
   assert.match(api.guidedDispatchExplanation('pending'), /不会由浏览器重发/);
   assert.match(api.guidedDispatchExplanation('reconciliation_required'), /浏览器不会重试/);
+  const retryingReconciliation = {
+    failure_code: 'DISPATCH_RECEIPT_UNKNOWN',
+    recorded_at: '2026-07-17T11:59:58.000000Z',
+    state: 'resolved',
+    result: 'dispatched',
+    evidence_kind: 'managed_worker_receipt',
+    resolved_at: '2026-07-17T11:59:59.000000Z',
+  };
+  const retrying = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    dispatch: {
+      state: 'retrying',
+      failure_code: null,
+      created_at: '2026-07-17T11:00:00.000000Z',
+      dispatch_claimed_at: '2026-07-17T11:00:01.000000Z',
+      outcome_recorded_at: '2026-07-17T12:00:00.000000Z',
+      reconciliation: retryingReconciliation,
+    },
+    adapter_status: {
+      status: 'Running', stage: 'worker_exit_retry', completed: 1, total: 2,
+      message: 'supervised replacement is starting',
+    },
+  }));
+  assert.ok(retrying);
+  assert.deepEqual(JSON.parse(JSON.stringify(retrying.dispatch)), {
+    state: 'retrying',
+    failureCode: '',
+    reconciliation: {
+      state: 'resolved',
+      failureCode: 'DISPATCH_RECEIPT_UNKNOWN',
+      recordedAt: '2026-07-17T11:59:58.000000Z',
+      result: 'dispatched',
+      evidenceKind: 'managed_worker_receipt',
+      resolvedAt: '2026-07-17T11:59:59.000000Z',
+    },
+  });
+  assert.equal(api.isGuidedApprovalCompleted(retrying, retrying.plan.hash), true);
+  const retryingExplanation = api.guidedDispatchExplanation('retrying');
+  assert.match(
+    retryingExplanation,
+    /精确证明.*Worker 退出.*Supervisor.*唯一一次替代尝试.*浏览器只读等待.*不会发起 retry/,
+  );
+  assert.doesNotMatch(retryingExplanation, /intent|attempt[_-]?id|hash|PID|path|sha256/i);
+
   const retryExhaustedSource = makeGuidedTask({
     status: 'Failed',
     approval: { approval_id: 'approval-guided-1', decision: 'approved' },
@@ -1752,7 +1797,35 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   assert.match(exhaustionHtml, /border-slate-200 bg-white/);
   assert.doesNotMatch(exhaustionHtml, /border-amber-300 bg-amber-50[^>]*data-guided-view="task"/);
   assert.match(exhaustionHtml, /有限自动重试预算已经耗尽/);
+  assert.doesNotMatch(exhaustionHtml, /均在进入运行前/);
   assert.doesNotMatch(exhaustionHtml, /onclick="[^"]*retry/i);
+
+  renderSandbox.state.guided.task = retrying;
+  const retryingHtml = renderSandbox.module.exports.renderGuidedTaskHtml();
+  assert.match(retryingHtml, /border-amber-300 bg-amber-50/);
+  assert.match(retryingHtml, />retrying</);
+  assert.match(retryingHtml, /浏览器只读等待，不会发起 retry/);
+  assert.doesNotMatch(retryingHtml, /onclick="[^"]*retry/i);
+
+  for (const [privateKey, privateValue] of [
+    ['intent_id', 'intent-private-worker-exit'],
+    ['attempt_id', 'attempt-private-worker-exit'],
+    ['attempt_number', 2],
+    ['evidence_hash', `sha256:${'b'.repeat(64)}`],
+    ['handle', { job_id: 'fwi-private-worker-exit-job' }],
+    ['pid', 4242],
+    ['relative_path', '/root/private/worker-exit'],
+    ['private_proof', { stopped: true }],
+  ]) {
+    assert.equal(api.normalizeGuidedTaskProjection(makeGuidedTask({
+      status: 'Running',
+      approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+      dispatch: {
+        state: 'retrying', failure_code: null, reconciliation: null,
+        [privateKey]: privateValue,
+      },
+    })), null, `${privateKey} must fail closed instead of reaching the retrying UI`);
+  }
 
   for (const malformed of [
     { status: 'Queued', failure_code: 'WORKER_RETRY_EXHAUSTED', reconciliation: null },
@@ -2324,7 +2397,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
         max_attempts: 2,
         max_concurrent_attempts: 1,
         pre_running_launch_failure: true,
-        worker_exit: false,
+        worker_exit: true,
       },
       startup_dispatch_recovery: false,
       startup_receipt_recovery: false,
@@ -2355,7 +2428,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       maxAttempts: 2,
       maxConcurrentAttempts: 1,
       preRunningLaunchFailure: true,
-      workerExit: false,
+      workerExit: true,
     },
   );
   const catalog = api.normalizeGuidedCatalog({
@@ -2406,7 +2479,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
   }), null, 'mixed Algorithm/Adapter versions fail closed');
   const catalogPreviewSource = extractFunction('renderGuidedCatalogPreview');
   assert.match(catalogPreviewSource, /pre-running launch failure: enabled/);
-  assert.match(catalogPreviewSource, /worker_exit: pending/);
+  assert.match(catalogPreviewSource, /worker_exit:.*enabled/);
   assert.match(catalogPreviewSource, /manual\/browser/);
   assert.doesNotMatch(extractFunction('renderGuidedCatalogPreview'), /relative_path|entrypoint|JSON\.stringify/);
 }

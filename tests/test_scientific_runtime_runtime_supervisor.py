@@ -85,6 +85,20 @@ class FakeTimeoutProcess:
 
 
 @dataclass(frozen=True)
+class FakeRetryProcess:
+    snapshot: FakeSnapshot
+    intent: "FakeIntent"
+    state: str
+    authorized: bool
+    authorization_replayed: bool
+    dispatch_attempted: bool
+    projected: bool
+    adopted: bool
+    deferred_code: str | None = None
+    timeout_armed: bool = False
+
+
+@dataclass(frozen=True)
 class FakeIntent:
     task_id: str
     state: str
@@ -177,6 +191,7 @@ class FakeTaskService:
         self.refresh_calls: list[str] = []
         self.cancel_calls: list[str] = []
         self.timeout_calls: list[str] = []
+        self.retry_calls: list[str] = []
         self.dispatch_calls = 0
         self.lease_held = False
         self.lose_on_heartbeat = False
@@ -192,6 +207,8 @@ class FakeTaskService:
         self.cancel_results: dict[str, FakeCancelProcess] = {}
         self.timeout_failures: dict[str, Exception] = {}
         self.timeout_results: dict[str, FakeTimeoutProcess] = {}
+        self.retry_failures: dict[str, Exception] = {}
+        self.retry_results: dict[str, FakeRetryProcess] = {}
         self.refresh_hook: Callable[[str], None] | None = None
         self.release_failures_remaining = 0
         self.active_lease: FakeLease | None = None
@@ -515,6 +532,42 @@ class FakeTaskService:
             deferred_code="TIMEOUT_NOT_DUE" if state == "armed" else None,
         )
 
+    def process_runtime_retry(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: FakeLease,
+    ) -> FakeRetryProcess:
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        with self.lock:
+            if supervisor_lease != self.active_lease:
+                raise RuntimeSupervisorLeaseLost("simulated stale retry write")
+            self.calls.append("retry")
+            self.retry_calls.append(task_id)
+        failure = self.retry_failures.get(task_id)
+        if failure is not None:
+            raise failure
+        configured = self.retry_results.get(task_id)
+        if configured is not None:
+            self.intents[task_id] = configured.intent
+            return configured
+        current = next(value for value in self.snapshots if value.task_id == task_id)
+        intent = self.intents.get(task_id)
+        assert isinstance(intent, FakeIntent)
+        return FakeRetryProcess(
+            snapshot=current,
+            intent=intent,
+            state="none",
+            authorized=False,
+            authorization_replayed=False,
+            dispatch_attempted=False,
+            projected=False,
+            adopted=False,
+        )
+
     def dispatch(self) -> None:
         self.dispatch_calls += 1
         raise AssertionError("the observation-only supervisor must not dispatch")
@@ -661,6 +714,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertEqual(cycle.task_failures, ())
             self.assertEqual(service.cancel_calls, [task_id])
             self.assertEqual(service.timeout_calls, [])
+            self.assertEqual(service.retry_calls, [])
             self.assertEqual(service.intent_calls, [])
             self.assertEqual(service.projection_calls, [])
             self.assertEqual(service.schedule_calls, [])
@@ -702,12 +756,161 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertEqual(cycle.refreshed_task_ids, ())
             self.assertEqual(service.timeout_calls, [task_id])
             self.assertEqual(service.cancel_calls, [])
+            self.assertEqual(service.retry_calls, [])
             self.assertEqual(service.intent_calls, [])
             self.assertEqual(service.projection_calls, [])
             self.assertEqual(service.schedule_calls, [])
             self.assertEqual(service.refresh_calls, [])
         finally:
             runtime.stop()
+
+    def test_worker_exit_retry_runs_after_timeout_and_preempts_generic_status(
+        self,
+    ) -> None:
+        task_id = "worker-exit-attempt-one"
+        current = snapshot(task_id, "Running", timeout_state="armed")
+        retrying_snapshot = snapshot(task_id, "Retrying")
+        dispatched_intent = FakeIntent(task_id, "dispatched")
+        retrying_intent = FakeIntent(task_id, "retrying")
+        service = FakeTaskService([current], {task_id: dispatched_intent})
+        service.projection_results[task_id] = FakeProjection(
+            intent=dispatched_intent,
+            evidence={"ticket": {"state": "spawned"}},
+            projected=True,
+            adopted=False,
+            replayed=False,
+        )
+        service.timeout_results[task_id] = FakeTimeoutProcess(
+            snapshot=current,
+            state="armed",
+            adapter_result=None,
+            replayed=True,
+            deferred_code="TIMEOUT_NOT_DUE",
+        )
+        service.retry_results[task_id] = FakeRetryProcess(
+            snapshot=retrying_snapshot,
+            intent=retrying_intent,
+            state="retrying",
+            authorized=True,
+            authorization_replayed=False,
+            dispatch_attempted=True,
+            projected=True,
+            adopted=False,
+            deferred_code="ADAPTER_CONCURRENCY_LIMIT",
+        )
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks([current], lease, float("inf"))
+
+        self.assertEqual(cycle.timeout_processed_task_ids, (task_id,))
+        self.assertEqual(cycle.retry_processed_task_ids, (task_id,))
+        self.assertEqual(cycle.retry_dispatched_task_ids, ())
+        self.assertEqual(cycle.retry_exhausted_task_ids, ())
+        self.assertEqual(
+            cycle.deferred, ((task_id, "ADAPTER_CONCURRENCY_LIMIT"),)
+        )
+        self.assertEqual(cycle.refreshed_task_ids, ())
+        self.assertEqual(service.timeout_calls, [task_id])
+        self.assertEqual(service.retry_calls, [task_id])
+        self.assertEqual(service.refresh_calls, [])
+        self.assertLess(service.calls.index("timeout"), service.calls.index("retry"))
+        self.assertNotIn("refresh", service.calls)
+
+    def test_retry_none_is_checked_before_same_cycle_status_refresh(self) -> None:
+        task_id = "worker-exit-race-window"
+        current = snapshot(task_id, "Running")
+        dispatched_intent = FakeIntent(task_id, "dispatched")
+        service = FakeTaskService([current], {task_id: dispatched_intent})
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks([current], lease, float("inf"))
+
+        self.assertEqual(cycle.retry_processed_task_ids, ())
+        self.assertEqual(cycle.refreshed_task_ids, (task_id,))
+        self.assertEqual(service.retry_calls, [task_id])
+        self.assertEqual(service.refresh_calls, [task_id])
+        self.assertLess(service.calls.index("retry"), service.calls.index("refresh"))
+
+    def test_retrying_attempt_two_dispatches_and_refreshes_in_same_cycle(
+        self,
+    ) -> None:
+        task_id = "worker-exit-attempt-two-ready"
+        current = snapshot(task_id, "Retrying")
+        retrying_intent = FakeIntent(task_id, "retrying")
+        dispatched_intent = FakeIntent(task_id, "dispatched")
+        service = FakeTaskService([current], {task_id: retrying_intent})
+        service.retry_results[task_id] = FakeRetryProcess(
+            snapshot=snapshot(task_id, "Running"),
+            intent=dispatched_intent,
+            state="dispatched",
+            authorized=True,
+            authorization_replayed=True,
+            dispatch_attempted=True,
+            projected=True,
+            adopted=True,
+            timeout_armed=True,
+        )
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks([current], lease, float("inf"))
+
+        self.assertEqual(cycle.retry_processed_task_ids, (task_id,))
+        self.assertEqual(cycle.retry_dispatched_task_ids, (task_id,))
+        self.assertEqual(cycle.retry_exhausted_task_ids, ())
+        self.assertEqual(cycle.timeout_armed_task_ids, (task_id,))
+        self.assertEqual(cycle.refreshed_task_ids, (task_id,))
+        self.assertEqual(cycle.deferred, ())
+        self.assertEqual(service.retry_calls, [task_id])
+        self.assertEqual(service.refresh_calls, [task_id])
+        self.assertEqual(service.projection_calls, [])
+        self.assertEqual(service.timeout_calls, [])
+        self.assertLess(service.calls.index("retry"), service.calls.index("refresh"))
+
+    def test_attempt_two_exhaustion_is_counted_without_status_projection(
+        self,
+    ) -> None:
+        cases = (
+            ("pre-ready", "Retrying", "retrying", "retry_exhausted"),
+            ("post-ready", "Running", "dispatched", "dispatched"),
+        )
+        for label, status, initial_state, exhausted_state in cases:
+            with self.subTest(label=label):
+                task_id = f"worker-exit-exhausted-{label}"
+                current = snapshot(task_id, status)
+                initial_intent = FakeIntent(task_id, initial_state)
+                service = FakeTaskService([current], {task_id: initial_intent})
+                service.retry_results[task_id] = FakeRetryProcess(
+                    snapshot=snapshot(task_id, "Failed"),
+                    intent=FakeIntent(task_id, exhausted_state),
+                    state="exhausted",
+                    authorized=False,
+                    authorization_replayed=False,
+                    dispatch_attempted=False,
+                    projected=True,
+                    adopted=False,
+                    deferred_code="WORKER_RETRY_EXHAUSTED",
+                )
+                runtime = supervisor(service)
+                lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+                service.active_lease = lease
+
+                cycle, _, _ = runtime._observe_tasks(
+                    [current], lease, float("inf")
+                )
+
+                self.assertEqual(cycle.retry_processed_task_ids, (task_id,))
+                self.assertEqual(cycle.retry_dispatched_task_ids, ())
+                self.assertEqual(cycle.retry_exhausted_task_ids, (task_id,))
+                self.assertEqual(cycle.refreshed_task_ids, ())
+                self.assertEqual(cycle.deferred, ())
+                self.assertEqual(service.retry_calls, [task_id])
+                self.assertEqual(service.refresh_calls, [])
 
     def test_newly_armed_not_due_timeout_keeps_ordinary_status_observation(
         self,

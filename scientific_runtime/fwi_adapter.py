@@ -48,6 +48,8 @@ from worker_launch_control import (
     WorkerAttemptEvidence,
     WorkerCancelEvidence,
     WorkerControlError,
+    WorkerExitEvidence,
+    WORKER_EXIT_NAME,
     WorkerStopEvidence,
     binding_from_submission_record,
     hold_idle_execution_fence,
@@ -58,9 +60,11 @@ from worker_launch_control import (
     read_worker_cancel_evidence,
     read_worker_stop_capability,
     read_worker_stop_evidence,
+    read_worker_exit_evidence,
     read_worker_attempt_evidence,
     request_worker_cancel,
     request_worker_stop,
+    record_worker_exit,
     stage_launch_attempt,
     worker_attempt_started,
 )
@@ -210,7 +214,7 @@ def _is_supported_managed_record(record: Mapping[str, Any]) -> bool:
         (version == "1.4.0" and record.get("schema_version") == "1.1.0")
         or (
             version == "1.5.0"
-            and record.get("schema_version") in {"1.1.0", "1.2.0"}
+            and record.get("schema_version") in {"1.1.0", "1.2.0", "1.3.0"}
         )
     )
 
@@ -426,6 +430,30 @@ class AdapterPreRunningRetryProof:
             "private_schema_version": self.private_schema_version,
             "private_proof_hash": self.private_proof_hash,
             "evidence": copy.deepcopy(self.evidence),
+        }
+
+
+@dataclass(frozen=True)
+class AdapterWorkerExitRetryProof:
+    """Exact post-ready Worker exit proof; it never launches by itself."""
+
+    failure_kind: str
+    previous_attempt_id: str
+    previous_attempt_number: int
+    private_schema_version: str
+    private_proof_hash: str
+    evidence: dict[str, Any]
+    exit_evidence: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "failure_kind": self.failure_kind,
+            "previous_attempt_id": self.previous_attempt_id,
+            "previous_attempt_number": self.previous_attempt_number,
+            "private_schema_version": self.private_schema_version,
+            "private_proof_hash": self.private_proof_hash,
+            "evidence": copy.deepcopy(self.evidence),
+            "exit_evidence": copy.deepcopy(self.exit_evidence),
         }
 
 
@@ -1345,13 +1373,57 @@ class SafeSubprocessWorkerLauncher:
                         "failure_code": "WALL_TIME_EXCEEDED",
                     }
                 else:
+                    if (
+                        run_root is None
+                        or launch_binding is None
+                        or return_code in {0, 75, 76}
+                    ):
+                        return
                     update = {
                         "status": "failed",
                         "stage": "worker_exit",
                         "message": f"FWI worker exited with code {return_code}",
                     }
-                value.update({**update, "updated_at": _utc_now()})
-                _atomic_write_json(status_path, value)
+                post_status = {**value, **update, "updated_at": _utc_now()}
+                if stop_reason is None:
+                    try:
+                        existing_exit = read_worker_exit_evidence(
+                            run_root, run_dir, launch_binding
+                        )
+                    except WorkerControlError as error:
+                        if error.code != "WORKER_EXIT_MISSING":
+                            raise
+                        record_worker_exit(
+                            run_root,
+                            run_dir,
+                            launch_binding,
+                            return_code=return_code,
+                            pre_status=value,
+                            post_status=post_status,
+                            observed_at=post_status["updated_at"],
+                        )
+                    else:
+                        if existing_exit.return_code != return_code:
+                            return
+                        post_status = {
+                            **value,
+                            "status": "failed",
+                            "stage": "worker_exit",
+                            "message": (
+                                "FWI worker exited with code "
+                                f"{existing_exit.return_code}"
+                            ),
+                            "updated_at": existing_exit.observed_at,
+                        }
+                        if (
+                            _sha256_document(post_status)
+                            != existing_exit.post_status_hash
+                        ):
+                            return
+                    # The evidence API owns the receipt/status arbitration and
+                    # has already installed this exact post document.
+                    return
+                _atomic_write_json(status_path, post_status)
             except Exception:
                 # Status is Worker evidence, while SQLite remains task truth.  A
                 # malformed/missing file is surfaced by status() rather than
@@ -2479,7 +2551,9 @@ class DeepwaveAdapter:
             )
 
     @staticmethod
-    def _validate_retry_authorization_document(value: Any) -> dict[str, Any]:
+    def _validate_retry_authorization_document(
+        value: Any, *, expected_failure_kind: str = "pre_running_launch_failure"
+    ) -> dict[str, Any]:
         required = {
             "schema_version",
             "intent_id",
@@ -2503,7 +2577,7 @@ class DeepwaveAdapter:
             or MANAGED_ATTEMPT_ID.fullmatch(result["previous_attempt_id"]) is None
             or type(result.get("previous_observation_sequence")) is not int
             or result["previous_observation_sequence"] < 1
-            or result.get("failure_kind") != "pre_running_launch_failure"
+            or result.get("failure_kind") != expected_failure_kind
             or not isinstance(result.get("private_proof_hash"), str)
             or PLAN_HASH.fullmatch(result["private_proof_hash"]) is None
             or result.get("next_attempt_number") != 2
@@ -2515,12 +2589,75 @@ class DeepwaveAdapter:
         return result
 
     @staticmethod
+    def _validate_worker_exit_document(
+        evidence: Any, binding: LaunchAttemptBinding
+    ) -> dict[str, Any]:
+        required = {
+            "schema_version",
+            "submission_id",
+            "attempt_id",
+            "attempt_number",
+            "job_id",
+            "request_hash",
+            "binding_hash",
+            "created_at",
+            "ticket_record_hash",
+            "ready_record_hash",
+            "heartbeat_sequence",
+            "heartbeat_state",
+            "heartbeat_record_hash",
+            "pre_status_hash",
+            "post_status_hash",
+            "return_code",
+            "observed_at",
+            "record_hash",
+        }
+        if not isinstance(evidence, Mapping) or set(evidence) != required:
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: Worker exit proof is invalid"
+            )
+        result = copy.deepcopy(dict(evidence))
+        payload = {key: result[key] for key in required - {"record_hash"}}
+        if (
+            result.get("schema_version") != "1.0.0"
+            or result.get("submission_id") != binding.submission_id
+            or result.get("attempt_id") != binding.attempt_id
+            or result.get("attempt_number") != binding.attempt_number
+            or result.get("job_id") != binding.job_id
+            or result.get("request_hash") != binding.request_hash
+            or result.get("binding_hash") != binding.binding_hash
+            or result.get("created_at") != binding.created_at
+            or any(
+                PLAN_HASH.fullmatch(str(result.get(field))) is None
+                for field in (
+                    "ticket_record_hash",
+                    "ready_record_hash",
+                    "heartbeat_record_hash",
+                    "pre_status_hash",
+                    "post_status_hash",
+                    "record_hash",
+                )
+            )
+            or type(result.get("heartbeat_sequence")) is not int
+            or result["heartbeat_sequence"] < 1
+            or result.get("heartbeat_state") != "running"
+            or type(result.get("return_code")) is not int
+            or result["return_code"] in {0, 75, 76}
+            or _sha256_document(payload) != result["record_hash"]
+        ):
+            raise AdapterHandleError(
+                "ADAPTER_SUBMISSION_INVALID: Worker exit proof changed"
+            )
+        _parse_timestamp(result.get("observed_at"), code="ADAPTER_RETRY_INVALID")
+        return result
+
+    @staticmethod
     def _validate_retry_exhaustion_cleanup_document(
         value: Any,
     ) -> dict[str, Any]:
         """Validate the path-free Store token used only by exhausted purge."""
 
-        required = {
+        common = {
             "schema_version",
             "purge_id",
             "intent_id",
@@ -2545,11 +2682,22 @@ class DeepwaveAdapter:
             "exhausted_at",
             "proof_hash",
         }
-        if not isinstance(value, Mapping) or set(value) != required:
+        if not isinstance(value, Mapping):
             raise AdapterPurgeError(
                 "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: cleanup proof is invalid"
             )
         result = copy.deepcopy(dict(value))
+        schema_version = result.get("schema_version")
+        worker_exit_lineage = schema_version == "1.1.0"
+        required = common | (
+            {"previous_failure_kind", "previous_private_schema_version"}
+            if worker_exit_lineage
+            else set()
+        )
+        if schema_version not in {"1.0.0", "1.1.0"} or set(result) != required:
+            raise AdapterPurgeError(
+                "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: cleanup proof is invalid"
+            )
         payload = {
             key: copy.deepcopy(result[key])
             for key in required - {"proof_hash"}
@@ -2557,8 +2705,7 @@ class DeepwaveAdapter:
         evidence = result.get("evidence")
         ticket = evidence.get("ticket") if isinstance(evidence, Mapping) else None
         if (
-            result.get("schema_version") != "1.0.0"
-            or any(
+            any(
                 not isinstance(result.get(key), str)
                 or OPAQUE_ID.fullmatch(result[key]) is None
                 for key in (
@@ -2586,7 +2733,8 @@ class DeepwaveAdapter:
             or not isinstance(result.get("evidence_hash"), str)
             or PLAN_HASH.fullmatch(result["evidence_hash"]) is None
             or _sha256_document(evidence) != result["evidence_hash"]
-            or result.get("private_schema_version") != "1.2.0"
+            or result.get("private_schema_version")
+            != ("1.3.0" if worker_exit_lineage else "1.2.0")
             or not isinstance(result.get("private_proof_hash"), str)
             or PLAN_HASH.fullmatch(result["private_proof_hash"]) is None
             or result.get("failure_kind") != "pre_running_launch_failure"
@@ -2607,6 +2755,15 @@ class DeepwaveAdapter:
             raise AdapterPurgeError(
                 "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: cleanup proof changed"
             )
+        if worker_exit_lineage:
+            if (
+                result.get("previous_failure_kind") != "worker_exit"
+                or result.get("previous_private_schema_version")
+                not in {"1.1.0", "1.2.0"}
+            ):
+                raise AdapterPurgeError(
+                    "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: cleanup lineage changed"
+                )
         failure_payload = {
             "schema_version": "1.0.0",
             "failure_kind": "pre_running_launch_failure",
@@ -2662,9 +2819,9 @@ class DeepwaveAdapter:
             "record_hash",
         }
         schema_version = value.get("schema_version")
-        if schema_version in {"1.1.0", "1.2.0"}:
+        if schema_version in {"1.1.0", "1.2.0", "1.3.0"}:
             required.add("launch_attempt")
-        if schema_version == "1.2.0":
+        if schema_version in {"1.2.0", "1.3.0"}:
             required.add("attempt_history")
             if "retry_authorization" in value:
                 required.add("retry_authorization")
@@ -2678,7 +2835,7 @@ class DeepwaveAdapter:
                 "ADAPTER_SUBMISSION_INVALID: private record fields are inconsistent"
             )
         if (
-            schema_version not in {"1.0.0", "1.1.0", "1.2.0"}
+            schema_version not in {"1.0.0", "1.1.0", "1.2.0", "1.3.0"}
             or not is_supported_receipt_binding(
                 value["algorithm"],
                 value["adapter_version"],
@@ -2688,7 +2845,7 @@ class DeepwaveAdapter:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private record version is unsupported"
             )
-        if schema_version in {"1.1.0", "1.2.0"}:
+        if schema_version in {"1.1.0", "1.2.0", "1.3.0"}:
             try:
                 binding = binding_from_submission_record(value)
             except WorkerControlError as error:
@@ -2765,6 +2922,61 @@ class DeepwaveAdapter:
                     ):
                         raise AdapterHandleError(
                             "ADAPTER_SUBMISSION_INVALID: purge failure chain is invalid"
+                        )
+                    DeepwaveAdapter._validate_failure_document(
+                        value["launch_failure"], binding
+                    )
+            if schema_version == "1.3.0":
+                history = value.get("attempt_history")
+                if binding.attempt_number != 2 or not isinstance(history, list):
+                    raise AdapterHandleError(
+                        "ADAPTER_SUBMISSION_INVALID: Worker-exit retry budget changed"
+                    )
+                authorization = DeepwaveAdapter._validate_retry_authorization_document(
+                    value.get("retry_authorization"),
+                    expected_failure_kind="worker_exit",
+                )
+                expected_history = {
+                    "submission_id",
+                    "job_id",
+                    "request_hash",
+                    "created_at",
+                    "launch_attempt",
+                    "worker_exit",
+                    "retired_at",
+                }
+                if len(history) != 1 or set(history[0]) != expected_history:
+                    raise AdapterHandleError(
+                        "ADAPTER_SUBMISSION_INVALID: Worker-exit retry history is invalid"
+                    )
+                try:
+                    prior = binding_from_submission_record(history[0])
+                except WorkerControlError as error:
+                    raise AdapterHandleError(
+                        "ADAPTER_SUBMISSION_INVALID: prior attempt binding is invalid"
+                    ) from error
+                exit_evidence = DeepwaveAdapter._validate_worker_exit_document(
+                    history[0]["worker_exit"], prior
+                )
+                _parse_timestamp(
+                    history[0]["retired_at"], code="ADAPTER_RETRY_INVALID"
+                )
+                if (
+                    prior.submission_id != binding.submission_id
+                    or prior.request_hash != binding.request_hash
+                    or prior.attempt_number != 1
+                    or authorization["previous_attempt_id"] != prior.attempt_id
+                    or authorization["private_proof_hash"]
+                    != exit_evidence["record_hash"]
+                    or history[0]["retired_at"] != authorization["authorized_at"]
+                ):
+                    raise AdapterHandleError(
+                        "ADAPTER_SUBMISSION_INVALID: Worker-exit retry chain changed"
+                    )
+                if "launch_failure" in value:
+                    if launch_state not in {"failed", "purging", "purged"}:
+                        raise AdapterHandleError(
+                            "ADAPTER_SUBMISSION_INVALID: nonfailed attempt has failure proof"
                         )
                     DeepwaveAdapter._validate_failure_document(
                         value["launch_failure"], binding
@@ -2961,7 +3173,7 @@ class DeepwaveAdapter:
                 raise AdapterHandleError(
                     "ADAPTER_SUBMISSION_INVALID: private job identity is invalid"
                 )
-            if record["schema_version"] not in {"1.1.0", "1.2.0"}:
+            if record["schema_version"] not in {"1.1.0", "1.2.0", "1.3.0"}:
                 raise AdapterUnavailable(
                     "WORKER_EVIDENCE_UNAVAILABLE: private receipt has no managed attempt"
                 )
@@ -3076,6 +3288,183 @@ class DeepwaveAdapter:
             resources=resources,
         )
 
+    def probe_worker_exit_retry(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterWorkerExitRetryProof:
+        """Prove exact attempt 1 exited after ready without stop control."""
+
+        return self._probe_worker_exit_failure(
+            expected_attempt_number=1,
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+        )
+
+    def probe_worker_exit_retry_exhaustion(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterWorkerExitRetryProof:
+        """Prove exact attempt 2 also exited after ready, without attempt 3."""
+
+        return self._probe_worker_exit_failure(
+            expected_attempt_number=2,
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+        )
+
+    def _probe_worker_exit_failure(
+        self,
+        *,
+        expected_attempt_number: int,
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterWorkerExitRetryProof:
+        """Read one receipt-first post-ready exit under the submission lock."""
+
+        if expected_attempt_number not in {1, 2}:
+            raise AdapterUnavailable(
+                "WORKER_RETRY_UNSUPPORTED: attempt is outside the finite budget"
+            )
+        (
+            validated,
+            submission_id,
+            request_payload,
+            request_hash,
+            index_path,
+            lock_path,
+        ) = self._retry_request_material(
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+        )
+        with self._lock_submission(lock_path, create=False, timeout_seconds=5.0):
+            record = self._read_submission(index_path)
+            expected_schemas = (
+                {"1.1.0", "1.2.0"}
+                if expected_attempt_number == 1
+                else {"1.2.0", "1.3.0"}
+            )
+            if (
+                record["schema_version"] not in expected_schemas
+                or record["adapter_version"] != ADAPTER_VERSION
+                or record["algorithm"] != validated.algorithm
+                or record["submission_id"] != submission_id
+                or record["request_hash"] != request_hash
+                or self._record_request_payload(record) != request_payload
+                or record["launch_state"] != "launched"
+            ):
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSUPPORTED: no exact post-ready exit exists"
+                )
+            try:
+                binding = binding_from_submission_record(record)
+                self._validate_fingerprint(record["fingerprint"], validated=validated)
+                if (
+                    binding.attempt_number != expected_attempt_number
+                    or record["job_id"] != self._expected_job_id(record)
+                ):
+                    raise AdapterHandleError(
+                        "ADAPTER_SUBMISSION_INVALID: failed attempt identity changed"
+                    )
+                job_dir = self._run_root / record["job_id"]
+                attempt = read_worker_attempt_evidence(
+                    self._run_root, job_dir, binding
+                )
+                exit_evidence = read_worker_exit_evidence(
+                    self._run_root, job_dir, binding
+                )
+                status = _read_json_file(
+                    job_dir / "status.json", code="ADAPTER_STATUS_INVALID"
+                )
+                attempt_document = None if attempt is None else attempt.as_dict()
+                private_document = exit_evidence.as_dict()
+                if (
+                    attempt is None
+                    or attempt.ticket_state != "spawned"
+                    or not attempt.ready
+                    or attempt.heartbeat_state != "running"
+                    or status.get("job_id") != binding.job_id
+                    or status.get("status") != "failed"
+                    or status.get("stage") != "worker_exit"
+                    or status.get("failure_code") is not None
+                    or _sha256_document(status) != exit_evidence.post_status_hash
+                    or exit_evidence.return_code in {0, 75, 76}
+                ):
+                    raise WorkerControlError(
+                        "WORKER_EXIT_UNSAFE: exact post-ready proof is unavailable"
+                    )
+                self._validate_worker_exit_document(private_document, binding)
+            except (FileNotFoundError, WorkerControlError) as error:
+                raise AdapterUnavailable(
+                    "WORKER_EXIT_UNSAFE: exact post-ready proof is unavailable"
+                ) from error
+            return AdapterWorkerExitRetryProof(
+                failure_kind="worker_exit",
+                previous_attempt_id=binding.attempt_id,
+                previous_attempt_number=expected_attempt_number,
+                private_schema_version=record["schema_version"],
+                private_proof_hash=exit_evidence.record_hash,
+                evidence=copy.deepcopy(attempt_document),
+                exit_evidence=copy.deepcopy(private_document),
+            )
+
     def _probe_pre_running_failure(
         self,
         *,
@@ -3125,8 +3514,13 @@ class DeepwaveAdapter:
                     "ADAPTER_SUBMISSION_NOT_FOUND: no private submission record exists"
                 )
             record = self._read_submission(index_path)
+            expected_schema_versions = (
+                {"1.2.0"}
+                if expected_attempt_number == 1
+                else {"1.2.0", "1.3.0"}
+            )
             if (
-                record["schema_version"] != "1.2.0"
+                record["schema_version"] not in expected_schema_versions
                 or record["adapter_version"] != ADAPTER_VERSION
                 or record["algorithm"] != validated.algorithm
                 or record["submission_id"] != submission_id
@@ -3189,7 +3583,7 @@ class DeepwaveAdapter:
                         failure_kind="pre_running_launch_failure",
                         previous_attempt_id=binding.attempt_id,
                         previous_attempt_number=expected_attempt_number,
-                        private_schema_version="1.2.0",
+                        private_schema_version=record["schema_version"],
                         private_proof_hash=expected_failure["proof_hash"],
                         evidence=evidence.as_dict(),
                     )
@@ -3431,6 +3825,266 @@ class DeepwaveAdapter:
                             "created_at": record["created_at"],
                             "launch_attempt": copy.deepcopy(record["launch_attempt"]),
                             "launch_failure": copy.deepcopy(record["launch_failure"]),
+                            "retired_at": created_at,
+                        }
+                    ]
+                    record["retry_authorization"] = copy.deepcopy(token)
+                    record.pop("launch_failure", None)
+                    record.update(
+                        {
+                            "job_id": job_id,
+                            "created_at": created_at,
+                            "launch_attempt": retry_binding.record(),
+                            "launch_state": "preparing",
+                        }
+                    )
+                    self._write_submission(index_path, record)
+            except WorkerControlError as error:
+                raise AdapterUnavailable(error.code) from error
+            return self._launch_prepared_submission(
+                index_path=index_path,
+                record=record,
+                validated=live,
+                job_dir=retry_job_dir,
+                launch_binding=retry_binding,
+            )
+
+    def retry_worker_exit(
+        self,
+        *,
+        authorization: Mapping[str, Any],
+        task_id: str,
+        node_id: str,
+        plan_hash: str,
+        idempotency_key: str,
+        project_id: str,
+        principal_id: str,
+        algorithm: Mapping[str, Any],
+        dataset: Mapping[str, Any],
+        task_type: str,
+        parameters: Mapping[str, Any],
+        resources: Mapping[str, Any],
+    ) -> AdapterHandle:
+        """Append and launch attempt 2 from one exact post-ready exit receipt."""
+
+        token = self._validate_retry_authorization_document(
+            authorization, expected_failure_kind="worker_exit"
+        )
+        (
+            validated,
+            submission_id,
+            request_payload,
+            request_hash,
+            index_path,
+            lock_path,
+        ) = self._retry_request_material(
+            task_id=task_id,
+            node_id=node_id,
+            plan_hash=plan_hash,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            principal_id=principal_id,
+            algorithm=algorithm,
+            dataset=dataset,
+            task_type=task_type,
+            parameters=parameters,
+            resources=resources,
+        )
+        with self._lock_submission(lock_path, create=False, timeout_seconds=5.0):
+            record = self._read_submission(index_path)
+            if (
+                record["adapter_version"] != ADAPTER_VERSION
+                or record["algorithm"] != validated.algorithm
+                or record["submission_id"] != submission_id
+                or record["request_hash"] != request_hash
+                or self._record_request_payload(record) != request_payload
+            ):
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSUPPORTED: private submission is not retryable"
+                )
+            current = binding_from_submission_record(record)
+            if current.attempt_number == 2:
+                if record["schema_version"] != "1.3.0":
+                    raise AdapterUnavailable(
+                        "WORKER_RETRY_UNSUPPORTED: attempt 2 has another retry lineage"
+                    )
+                stored = self._validate_retry_authorization_document(
+                    record.get("retry_authorization"),
+                    expected_failure_kind="worker_exit",
+                )
+                if stored != token:
+                    raise AdapterIdempotencyConflict(
+                        "ADAPTER_RETRY_CONFLICT: retry authorization changed"
+                    )
+                if record["launch_state"] == "launched":
+                    return self._handle_from_record(record)
+                if record["launch_state"] in {"preparing", "launching"}:
+                    live = self.validate(
+                        project_id=project_id,
+                        principal_id=principal_id,
+                        algorithm=algorithm,
+                        dataset=dataset,
+                        task_type=task_type,
+                        parameters=parameters,
+                        resources=resources,
+                    )
+                    return self._resume_staged_submission(
+                        index_path=index_path, record=record, validated=live
+                    )
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_EXHAUSTED: second attempt is terminal"
+                )
+            if (
+                current.attempt_number != 1
+                or record["schema_version"] not in {"1.1.0", "1.2.0"}
+                or record["launch_state"] != "launched"
+                or record.get("attempt_history", []) != []
+                or "retry_authorization" in record
+                or token["previous_attempt_id"] != current.attempt_id
+            ):
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSAFE: authorization does not bind attempt 1"
+                )
+            old_job_dir = self._run_root / record["job_id"]
+            try:
+                attempt = read_worker_attempt_evidence(
+                    self._run_root, old_job_dir, current
+                )
+                exit_evidence = read_worker_exit_evidence(
+                    self._run_root, old_job_dir, current
+                )
+                status = _read_json_file(
+                    old_job_dir / "status.json", code="ADAPTER_STATUS_INVALID"
+                )
+            except (FileNotFoundError, WorkerControlError) as error:
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSAFE: stopped proof no longer matches"
+                ) from error
+            if (
+                attempt is None
+                or attempt.ticket_state != "spawned"
+                or not attempt.ready
+                or attempt.heartbeat_state != "running"
+                or status.get("status") != "failed"
+                or status.get("stage") != "worker_exit"
+                or _sha256_document(status) != exit_evidence.post_status_hash
+                or token["private_proof_hash"] != exit_evidence.record_hash
+            ):
+                raise AdapterUnavailable(
+                    "WORKER_RETRY_UNSAFE: stopped proof no longer matches"
+                )
+            live = self.validate(
+                project_id=project_id,
+                principal_id=principal_id,
+                algorithm=algorithm,
+                dataset=dataset,
+                task_type=task_type,
+                parameters=parameters,
+                resources=resources,
+            )
+            if live.normalized_config_hash != validated.normalized_config_hash:
+                raise AdapterUnavailable(
+                    "ADAPTER_VALIDATION_DRIFT: live validation changed retry identity"
+                )
+            created_at = token["authorized_at"]
+            job_id = self._retry_job_id(
+                submission_id, created_at, token["private_proof_hash"]
+            )
+            attempt_material = _stable_json_bytes(
+                {
+                    "submission_id": submission_id,
+                    "attempt_number": 2,
+                    "private_proof_hash": token["private_proof_hash"],
+                }
+            )
+            retry_binding = LaunchAttemptBinding(
+                submission_id=submission_id,
+                attempt_id="attempt-"
+                + hashlib.sha256(attempt_material).hexdigest()[:32],
+                attempt_number=2,
+                job_id=job_id,
+                request_hash=request_hash,
+                created_at=created_at,
+            )
+            expected_ticket_payload = {
+                **retry_binding.payload(),
+                "binding_hash": retry_binding.binding_hash,
+                "state": "staged",
+                "capacity_slot": None,
+                "capacity_generation": None,
+                "worker_pid": None,
+                "updated_at": created_at,
+            }
+            expected_ticket = {
+                **expected_ticket_payload,
+                "record_hash": _sha256_document(expected_ticket_payload),
+            }
+            expected_config = {"job_id": job_id, **live.worker_config}
+            expected_status = {
+                "job_id": job_id,
+                "status": "queued",
+                "stage": "queued",
+                "iteration": 0,
+                "total_iterations": live.parameters["iterations"],
+                "message": "FWI Adapter job queued",
+                "updated_at": created_at,
+            }
+            retry_job_dir = self._run_root / job_id
+            try:
+                with hold_idle_execution_fence(self._run_root, current):
+                    try:
+                        retry_job_dir = _create_private_directory(retry_job_dir)
+                    except FileExistsError:
+                        retry_job_dir = _require_private_directory(
+                            retry_job_dir, parent=self._run_root
+                        )
+                        descriptor = _open_directory_fd(retry_job_dir)
+                        try:
+                            unexpected = set(os.listdir(descriptor)) - {
+                                ".worker-launch.json",
+                                "config.original.json",
+                                "status.json",
+                            }
+                        finally:
+                            os.close(descriptor)
+                        if unexpected:
+                            raise AdapterHandleError(
+                                "ADAPTER_SUBMISSION_INVALID: retry directory is not staged"
+                            )
+                        for name, expected, private in (
+                            (".worker-launch.json", expected_ticket, True),
+                            ("config.original.json", expected_config, False),
+                            ("status.json", expected_status, False),
+                        ):
+                            path = retry_job_dir / name
+                            if path.exists() or path.is_symlink():
+                                existing = _read_json_file(
+                                    path,
+                                    code="ADAPTER_SUBMISSION_INVALID",
+                                    private=private,
+                                )
+                                if existing != expected:
+                                    raise AdapterHandleError(
+                                        "ADAPTER_SUBMISSION_INVALID: retry staging changed"
+                                    )
+                    stage_launch_attempt(
+                        self._run_root, retry_job_dir, retry_binding
+                    )
+                    _atomic_write_json(
+                        retry_job_dir / "config.original.json", expected_config
+                    )
+                    _atomic_write_json(
+                        retry_job_dir / "status.json", expected_status
+                    )
+                    record["schema_version"] = "1.3.0"
+                    record["attempt_history"] = [
+                        {
+                            "submission_id": record["submission_id"],
+                            "job_id": record["job_id"],
+                            "request_hash": record["request_hash"],
+                            "created_at": record["created_at"],
+                            "launch_attempt": copy.deepcopy(record["launch_attempt"]),
+                            "worker_exit": exit_evidence.as_dict(),
                             "retired_at": created_at,
                         }
                     ]
@@ -3890,7 +4544,7 @@ class DeepwaveAdapter:
         """Resume only a complete, exact, pre-Popen managed attempt."""
 
         if (
-            record["schema_version"] not in {"1.1.0", "1.2.0"}
+            record["schema_version"] not in {"1.1.0", "1.2.0", "1.3.0"}
             or record["adapter_version"] != ADAPTER_VERSION
             or record["algorithm"] != validated.algorithm
             or record["launch_state"] not in {"preparing", "launching"}
@@ -4231,6 +4885,24 @@ class DeepwaveAdapter:
     ) -> AdapterStatus:
         job_dir = self._job_directory(record)
         value = _read_json_file(job_dir / "status.json", code="ADAPTER_STATUS_INVALID")
+        exit_receipt_path = job_dir / WORKER_EXIT_NAME
+        if (
+            value.get("status") in {"queued", "running"}
+            and _is_supported_managed_record(record)
+            and not cancellation_fence_held
+            and not timeout_fence_held
+            and (exit_receipt_path.exists() or exit_receipt_path.is_symlink())
+        ):
+            try:
+                binding = binding_from_submission_record(record)
+                read_worker_exit_evidence(self._run_root, job_dir, binding)
+                value = _read_json_file(
+                    job_dir / "status.json", code="ADAPTER_STATUS_INVALID"
+                )
+            except (FileNotFoundError, WorkerControlError) as error:
+                raise AdapterStatusError(
+                    "ADAPTER_STATUS_INVALID: Worker exit receipt is invalid"
+                ) from error
         if value.get("job_id") != record["job_id"]:
             raise AdapterStatusError(
                 "ADAPTER_STATUS_INVALID: status identity does not match the handle"
@@ -4583,6 +5255,7 @@ class DeepwaveAdapter:
             resources=resources,
         )
         proof_evidence = proof["evidence"]
+        worker_exit_lineage = proof["schema_version"] == "1.1.0"
         if (
             proof_evidence.get("submission_id") != submission_id
             or proof_evidence.get("request_hash") != request_hash
@@ -4600,7 +5273,8 @@ class DeepwaveAdapter:
                 )
             record = self._read_submission(index_path)
             if (
-                record["schema_version"] != "1.2.0"
+                record["schema_version"]
+                != ("1.3.0" if worker_exit_lineage else "1.2.0")
                 or record["adapter_version"] != ADAPTER_VERSION
                 or record["algorithm"] != validated.algorithm
                 or record["submission_id"] != submission_id
@@ -4618,7 +5292,12 @@ class DeepwaveAdapter:
             current = binding_from_submission_record(record)
             history = record.get("attempt_history")
             authorization = self._validate_retry_authorization_document(
-                record.get("retry_authorization")
+                record.get("retry_authorization"),
+                expected_failure_kind=(
+                    "worker_exit"
+                    if worker_exit_lineage
+                    else "pre_running_launch_failure"
+                ),
             )
             if not isinstance(history, list) or len(history) != 1:
                 raise AdapterPurgeError(
@@ -4649,17 +5328,26 @@ class DeepwaveAdapter:
                 or authorization["private_proof_hash"]
                 != proof["previous_private_proof_hash"]
                 or authorization["authorized_at"] != proof["retry_reserved_at"]
-                or prior_record["launch_failure"]["proof_hash"]
-                != proof["previous_private_proof_hash"]
+                or (
+                    prior_record[
+                        "worker_exit" if worker_exit_lineage else "launch_failure"
+                    ]["record_hash" if worker_exit_lineage else "proof_hash"]
+                    != proof["previous_private_proof_hash"]
+                )
                 or record.get("launch_failure", {}).get("proof_hash")
                 != proof["private_proof_hash"]
             ):
                 raise AdapterPurgeError(
                     "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: retry lineage changed"
                 )
-            self._validate_failure_document(
-                prior_record.get("launch_failure"), prior
-            )
+            if worker_exit_lineage:
+                self._validate_worker_exit_document(
+                    prior_record.get("worker_exit"), prior
+                )
+            else:
+                self._validate_failure_document(
+                    prior_record.get("launch_failure"), prior
+                )
             self._validate_failure_document(record.get("launch_failure"), current)
 
             launch_state = record["launch_state"]
@@ -4709,15 +5397,52 @@ class DeepwaveAdapter:
                     )
                 return evidence
 
+            def read_exact_worker_exit(
+                attempt_record: Mapping[str, Any],
+                binding: LaunchAttemptBinding,
+            ) -> WorkerExitEvidence:
+                job_dir = self._run_root / binding.job_id
+                if not job_dir.exists() and not job_dir.is_symlink():
+                    raise AdapterPurgeError(
+                        "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: stopped attempt is missing"
+                    )
+                try:
+                    evidence = read_worker_exit_evidence(
+                        self._run_root, job_dir, binding
+                    )
+                except (FileNotFoundError, WorkerControlError) as error:
+                    raise AdapterPurgeError(
+                        "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: Worker-exit proof is unavailable"
+                    ) from error
+                expected_exit = attempt_record.get("worker_exit")
+                if (
+                    evidence.as_dict() != expected_exit
+                    or evidence.record_hash
+                    != proof["previous_private_proof_hash"]
+                ):
+                    raise AdapterPurgeError(
+                        "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: Worker-exit proof changed"
+                    )
+                return evidence
+
             try:
                 # Both attempts share one stable submission execution lock.
                 # The first transition checks both complete proofs before its
                 # tombstone or any delete.  Once that same-purge tombstone is
                 # durable, replay trusts the already-validated immutable
                 # record/token and may finish partially deleted directories.
+                prior_exit = (
+                    read_exact_worker_exit(prior_record, prior)
+                    if launch_state == "failed" and worker_exit_lineage
+                    else None
+                )
                 with hold_idle_execution_fence(self._run_root, current):
                     if launch_state == "failed":
-                        prior_evidence = read_exact_failure(prior_record, prior)
+                        prior_evidence = (
+                            None
+                            if worker_exit_lineage
+                            else read_exact_failure(prior_record, prior)
+                        )
                         current_evidence = read_exact_failure(record, current)
                         if (
                             current_evidence.as_dict() != proof_evidence
@@ -4727,9 +5452,17 @@ class DeepwaveAdapter:
                             raise AdapterPurgeError(
                                 "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: SQLite evidence differs from private state"
                             )
-                        if self._failure_proof(prior_record, prior_evidence)[
-                            "proof_hash"
-                        ] != proof["previous_private_proof_hash"]:
+                        if (
+                            prior_exit is not None
+                            and prior_exit.record_hash
+                            != proof["previous_private_proof_hash"]
+                        ) or (
+                            prior_evidence is not None
+                            and self._failure_proof(prior_record, prior_evidence)[
+                                "proof_hash"
+                            ]
+                            != proof["previous_private_proof_hash"]
+                        ):
                             raise AdapterPurgeError(
                                 "WORKER_RETRY_EXHAUSTION_PURGE_INVALID: prior private proof changed"
                             )
@@ -4801,7 +5534,7 @@ class DeepwaveAdapter:
             try:
                 fence = contextlib.nullcontext()
                 managed_bindings: list[LaunchAttemptBinding] = []
-                if record["schema_version"] in {"1.1.0", "1.2.0"}:
+                if record["schema_version"] in {"1.1.0", "1.2.0", "1.3.0"}:
                     binding = binding_from_submission_record(record)
                     managed_bindings = [
                         *(
@@ -5070,7 +5803,7 @@ class DeepwaveAdapter:
         lock_path = locks / (index_name + ".lock")
         with self._lock_submission(lock_path, timeout_seconds=5.0):
             record = self._record_for_handle(handle)
-            if record["schema_version"] not in {"1.1.0", "1.2.0"}:
+            if record["schema_version"] not in {"1.1.0", "1.2.0", "1.3.0"}:
                 return _managed_cancel_proof(
                     task_id=handle.task_id,
                     cancel_id=cancel_id,
@@ -5458,7 +6191,7 @@ class DeepwaveAdapter:
         lock_path = locks / (index_name + ".lock")
         with self._lock_submission(lock_path, timeout_seconds=5.0):
             record = self._record_for_handle(handle)
-            if record["schema_version"] not in {"1.1.0", "1.2.0"}:
+            if record["schema_version"] not in {"1.1.0", "1.2.0", "1.3.0"}:
                 return _managed_timeout_proof(
                     task_id=handle.task_id,
                     timeout_id=timeout_id,

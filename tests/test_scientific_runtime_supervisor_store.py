@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -10,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
+from scientific_runtime import task_store as task_store_module
 from scientific_runtime.fwi_registry import load_deepwave_manifest
 from scientific_runtime.registry_service import RegistryService
 from scientific_runtime.task_service import (
@@ -35,6 +37,7 @@ from tests.test_scientific_runtime_task_service import (
     NOW,
     PRINCIPAL_ID,
     PROJECT_ID,
+    WorkerExitRetryFakeDispatcher,
     executable_approval_decision,
     managed_worker_evidence,
 )
@@ -167,6 +170,37 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
 
     @staticmethod
     def _drop_retry_schema(connection: sqlite3.Connection) -> None:
+        connection.execute("DROP VIEW effective_dispatched_intents")
+        for trigger in (
+            "worker_exit_retry_reservation_requires_exact_case",
+            "worker_exit_retry_reservation_requires_active_term",
+            "worker_exit_retry_timeout_retirement_requires_exact_window",
+            "worker_exit_retry_reservation_retires_timeout",
+            "supervised_worker_exit_retry_attempt_requires_active_term",
+            "worker_launch_attempt_requires_retry_reservation",
+            "worker_exit_retry_replacement_requires_exact_case",
+            "worker_exit_retry_replacement_requires_active_term",
+            "worker_exit_retry_exhaustion_requires_exact_case",
+            "worker_exit_retry_reservations_are_immutable",
+            "worker_exit_retry_reservations_cannot_be_deleted",
+            "supervised_worker_exit_retry_attempts_are_immutable",
+            "supervised_worker_exit_retry_attempts_cannot_be_deleted",
+            "worker_exit_retry_timeout_retirements_are_immutable",
+            "worker_exit_retry_timeout_retirements_cannot_be_deleted",
+            "worker_exit_retry_dispatch_replacements_are_immutable",
+            "worker_exit_retry_dispatch_replacements_cannot_be_deleted",
+            "worker_exit_retry_exhaustions_are_immutable",
+            "worker_exit_retry_exhaustions_cannot_be_deleted",
+            "task_cancel_request_requires_exact_running_attempt",
+            "worker_attempt_timeout_window_requires_exact_start",
+            "supervised_timeout_attempt_requires_due_window",
+        ):
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        connection.execute("DROP TABLE worker_exit_retry_exhaustions")
+        connection.execute("DROP TABLE worker_exit_retry_dispatch_replacements")
+        connection.execute("DROP TABLE worker_exit_retry_timeout_retirements")
+        connection.execute("DROP TABLE supervised_worker_exit_retry_attempts")
+        connection.execute("DROP TABLE worker_exit_retry_reservations")
         for trigger in (
             "approvals_initialize_retry_budget",
             "approval_retry_budgets_are_immutable",
@@ -184,7 +218,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "worker_retry_exhaustions_are_immutable",
             "worker_retry_exhaustions_cannot_be_deleted",
         ):
-            connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         connection.execute("DROP TABLE worker_retry_exhaustions")
         connection.execute("DROP TABLE supervised_retry_attempts")
         connection.execute("DROP TABLE worker_retry_reservations")
@@ -211,6 +245,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         deferred: bool = False,
         wall_time_seconds: int | None = None,
         algorithm_version: str = "1.5.0",
+        dispatcher: FakeDispatcher | None = None,
     ):
         token = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         draft = optimizer_task_draft(algorithm_version=algorithm_version)
@@ -250,11 +285,14 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             **self.scope,
         )
 
-        dispatcher = FakeDispatcher(
-            self.store,
-            failure_code=("ADAPTER_CONCURRENCY_LIMIT" if deferred else None),
-            adapter_version=algorithm_version,
-        )
+        if dispatcher is None:
+            dispatcher = FakeDispatcher(
+                self.store,
+                failure_code=(
+                    "ADAPTER_CONCURRENCY_LIMIT" if deferred else None
+                ),
+                adapter_version=algorithm_version,
+            )
         dispatcher.defer_dispatch = deferred
         runtime = TaskService(
             self.store,
@@ -782,8 +820,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             },
         }
 
-    def test_fresh_v14_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 14)
+    def test_fresh_v15_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 15)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -805,6 +843,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "approval_retry_budgets",
             "worker_retry_reservations",
             "supervised_retry_attempts",
+            "worker_exit_retry_reservations",
+            "supervised_worker_exit_retry_attempts",
+            "worker_exit_retry_timeout_retirements",
+            "worker_exit_retry_dispatch_replacements",
+            "worker_exit_retry_exhaustions",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -889,6 +932,24 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "worker_retry_reservations_cannot_be_deleted",
             "supervised_retry_attempts_are_immutable",
             "supervised_retry_attempts_cannot_be_deleted",
+            "worker_exit_retry_reservation_requires_exact_case",
+            "worker_exit_retry_reservation_requires_active_term",
+            "worker_exit_retry_timeout_retirement_requires_exact_window",
+            "worker_exit_retry_reservation_retires_timeout",
+            "supervised_worker_exit_retry_attempt_requires_active_term",
+            "worker_exit_retry_replacement_requires_exact_case",
+            "worker_exit_retry_replacement_requires_active_term",
+            "worker_exit_retry_exhaustion_requires_exact_case",
+            "worker_exit_retry_reservations_are_immutable",
+            "worker_exit_retry_reservations_cannot_be_deleted",
+            "supervised_worker_exit_retry_attempts_are_immutable",
+            "supervised_worker_exit_retry_attempts_cannot_be_deleted",
+            "worker_exit_retry_timeout_retirements_are_immutable",
+            "worker_exit_retry_timeout_retirements_cannot_be_deleted",
+            "worker_exit_retry_dispatch_replacements_are_immutable",
+            "worker_exit_retry_dispatch_replacements_cannot_be_deleted",
+            "worker_exit_retry_exhaustions_are_immutable",
+            "worker_exit_retry_exhaustions_cannot_be_deleted",
         }
         expected_indexes = {
             "idx_worker_attempt_timeout_windows_scope_deadline",
@@ -896,6 +957,10 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "idx_supervised_timeout_attempts_term",
             "idx_supervised_dispatch_reconciliation_attempts_term",
             "idx_dispatch_reconciliation_resolutions_scope",
+            "idx_worker_exit_retry_reservations_scope",
+            "idx_supervised_worker_exit_retry_attempts_term",
+            "idx_worker_exit_retry_replacements_scope",
+            "idx_worker_exit_retry_exhaustions_scope",
         }
         connection = self._connection()
         try:
@@ -968,6 +1033,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 "SELECT name FROM schema_migrations WHERE version = 14"
             ).fetchone()
             self.assertEqual(retry_migration["name"], "0014_task_retry.sql")
+            worker_exit_retry_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 15"
+            ).fetchone()
+            self.assertEqual(
+                worker_exit_retry_migration["name"],
+                "0015_worker_exit_retry.sql",
+            )
         finally:
             connection.close()
 
@@ -1011,6 +1083,619 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.rollback()
             connection.close()
+
+    def test_v15_worker_exit_retry_columns_are_a_stable_store_interface(
+        self,
+    ) -> None:
+        expected_columns = {
+            "worker_exit_retry_reservations": [
+                "intent_id",
+                "attempt_number",
+                "task_id",
+                "project_id",
+                "principal_id",
+                "approval_id",
+                "previous_attempt_id",
+                "previous_observation_sequence",
+                "evidence_hash",
+                "private_schema_version",
+                "private_proof_hash",
+                "failure_kind",
+                "source_outcome_document_hash",
+                "source_handle_hash",
+                "retry_event_sequence",
+                "retry_event_hash",
+                "first_fencing_token",
+                "reserved_at",
+                "reserved_at_us",
+            ],
+            "supervised_worker_exit_retry_attempts": [
+                "intent_id",
+                "attempt_number",
+                "project_id",
+                "principal_id",
+                "fencing_token",
+                "authorized_at",
+                "authorized_at_us",
+            ],
+            "worker_exit_retry_timeout_retirements": [
+                "timeout_id",
+                "intent_id",
+                "attempt_number",
+                "attempt_id",
+                "timeout_window_hash",
+                "project_id",
+                "principal_id",
+                "fencing_token",
+                "retired_at",
+                "retired_at_us",
+            ],
+            "worker_exit_retry_dispatch_replacements": [
+                "intent_id",
+                "attempt_number",
+                "task_id",
+                "project_id",
+                "principal_id",
+                "approval_id",
+                "source_outcome_document_hash",
+                "source_handle_hash",
+                "attempt_id",
+                "observation_sequence",
+                "evidence_hash",
+                "handle_json",
+                "handle_hash",
+                "effective_outcome_json",
+                "effective_outcome_hash",
+                "fencing_token",
+                "replaced_at",
+                "replaced_at_us",
+            ],
+            "worker_exit_retry_exhaustions": [
+                "intent_id",
+                "attempt_number",
+                "task_id",
+                "project_id",
+                "principal_id",
+                "approval_id",
+                "attempt_id",
+                "observation_sequence",
+                "evidence_hash",
+                "private_schema_version",
+                "private_proof_hash",
+                "failure_kind",
+                "max_attempts",
+                "terminal_event_sequence",
+                "terminal_event_hash",
+                "fencing_token",
+                "exhausted_at",
+                "exhausted_at_us",
+            ],
+        }
+        connection = self._connection()
+        try:
+            for table, columns in expected_columns.items():
+                actual = [
+                    row["name"]
+                    for row in connection.execute(
+                        f"PRAGMA table_info({table})"
+                    ).fetchall()
+                ]
+                self.assertEqual(actual, columns, table)
+        finally:
+            connection.close()
+
+    def test_v14_database_upgrades_in_place_to_v15(self) -> None:
+        legacy_migrations = Path(self.temporary.name) / "v14-migrations"
+        legacy_migrations.mkdir(mode=0o700)
+        for migration in sorted(
+            task_store_module.MIGRATIONS_DIRECTORY.glob("[0-9][0-9][0-9][0-9]_*.sql")
+        ):
+            if int(migration.name.split("_", 1)[0]) <= 14:
+                shutil.copy2(migration, legacy_migrations / migration.name)
+
+        legacy_database = Path(self.temporary.name) / "legacy-v14.sqlite3"
+        with mock.patch.object(
+            task_store_module,
+            "MIGRATIONS_DIRECTORY",
+            legacy_migrations,
+        ):
+            legacy = SQLiteTaskStore(legacy_database)
+            self.assertEqual(legacy.migration_version(), 14)
+
+        upgraded = SQLiteTaskStore(legacy_database)
+        self.assertEqual(upgraded.migration_version(), 15)
+        connection = sqlite3.connect(legacy_database)
+        try:
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0], 15
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT name FROM schema_migrations WHERE version = 15"
+                ).fetchone()[0],
+                "0015_worker_exit_retry.sql",
+            )
+        finally:
+            connection.close()
+
+    def test_v15_effective_receipt_replacement_and_rows_are_immutable(
+        self,
+    ) -> None:
+        task_id, _, _ = self._submitted_runtime(key="v15-replacement-view")
+        intent = self.store.get_dispatch_intent(task_id)
+        self.assertIsNotNone(intent)
+        assert intent is not None and intent.handle is not None
+        _, source_handle_hash = encode_document(intent.handle)
+        replacement_handle = copy.deepcopy(intent.handle)
+        replacement_handle["job_id"] = "job-worker-exit-retry-2"
+        replacement_handle_json, replacement_handle_hash = encode_document(
+            replacement_handle
+        )
+        replacement_outcome = {
+            "status": "dispatched",
+            "handle": replacement_handle,
+            "recorded_at": T_PLUS_1,
+        }
+        replacement_outcome_json, replacement_outcome_hash = encode_document(
+            replacement_outcome
+        )
+        digest = "sha256:" + "a" * 64
+
+        connection = self._connection()
+        try:
+            source = connection.execute(
+                "SELECT * FROM effective_dispatched_intents WHERE intent_id = ?",
+                (intent.intent_id,),
+            ).fetchone()
+            self.assertIsNotNone(source)
+            assert source is not None
+            source_outcome_hash = source["outcome_document_hash"]
+            self.assertEqual(source["source"], "direct")
+
+            connection.execute("PRAGMA foreign_keys = OFF")
+            for trigger in (
+                "worker_exit_retry_reservation_requires_exact_case",
+                "worker_exit_retry_reservation_requires_active_term",
+                "worker_exit_retry_reservation_retires_timeout",
+                "supervised_worker_exit_retry_attempt_requires_active_term",
+                "worker_exit_retry_timeout_retirement_requires_exact_window",
+                "worker_exit_retry_replacement_requires_exact_case",
+                "worker_exit_retry_replacement_requires_active_term",
+                "worker_exit_retry_exhaustion_requires_exact_case",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+
+            connection.execute(
+                """
+                INSERT INTO worker_exit_retry_reservations(
+                    intent_id, attempt_number, task_id, project_id,
+                    principal_id, approval_id, previous_attempt_id,
+                    previous_observation_sequence, evidence_hash,
+                    private_schema_version, private_proof_hash, failure_kind,
+                    source_outcome_document_hash, source_handle_hash,
+                    retry_event_sequence, retry_event_hash,
+                    first_fencing_token, reserved_at, reserved_at_us
+                ) VALUES (?, 2, ?, ?, ?, ?, ?, 1, ?, '1.1.0', ?,
+                          'worker_exit', ?, ?, 1, ?, 1, ?, 1)
+                """,
+                (
+                    intent.intent_id,
+                    task_id,
+                    PROJECT_ID,
+                    PRINCIPAL_ID,
+                    intent.approval_id,
+                    "attempt-worker-exit-source",
+                    digest,
+                    digest,
+                    source_outcome_hash,
+                    source_handle_hash,
+                    digest,
+                    T_PLUS_1,
+                ),
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM effective_dispatched_intents WHERE intent_id = ?",
+                    (intent.intent_id,),
+                ).fetchone()
+            )
+
+            connection.execute(
+                """
+                INSERT INTO supervised_worker_exit_retry_attempts(
+                    intent_id, attempt_number, project_id, principal_id,
+                    fencing_token, authorized_at, authorized_at_us
+                ) VALUES (?, 2, ?, ?, 1, ?, 1)
+                """,
+                (intent.intent_id, PROJECT_ID, PRINCIPAL_ID, T_PLUS_1),
+            )
+            connection.execute(
+                """
+                INSERT INTO worker_exit_retry_timeout_retirements(
+                    timeout_id, intent_id, attempt_number, attempt_id,
+                    timeout_window_hash, project_id, principal_id,
+                    fencing_token, retired_at, retired_at_us
+                ) VALUES (?, ?, 2, ?, ?, ?, ?, 1, ?, 1)
+                """,
+                (
+                    "timeout-worker-exit-source",
+                    intent.intent_id,
+                    "attempt-worker-exit-source",
+                    digest,
+                    PROJECT_ID,
+                    PRINCIPAL_ID,
+                    T_PLUS_1,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO worker_exit_retry_dispatch_replacements(
+                    intent_id, attempt_number, task_id, project_id,
+                    principal_id, approval_id, source_outcome_document_hash,
+                    source_handle_hash, attempt_id, observation_sequence,
+                    evidence_hash, handle_json, handle_hash,
+                    effective_outcome_json, effective_outcome_hash,
+                    fencing_token, replaced_at, replaced_at_us
+                ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 1, ?, 1)
+                """,
+                (
+                    intent.intent_id,
+                    task_id,
+                    PROJECT_ID,
+                    PRINCIPAL_ID,
+                    intent.approval_id,
+                    source_outcome_hash,
+                    source_handle_hash,
+                    "attempt-worker-exit-retry-2",
+                    digest,
+                    replacement_handle_json,
+                    replacement_handle_hash,
+                    replacement_outcome_json,
+                    replacement_outcome_hash,
+                    T_PLUS_1,
+                ),
+            )
+            effective = connection.execute(
+                "SELECT * FROM effective_dispatched_intents WHERE intent_id = ?",
+                (intent.intent_id,),
+            ).fetchone()
+            self.assertIsNotNone(effective)
+            assert effective is not None
+            self.assertEqual(effective["source"], "worker_exit_retry_replacement")
+            self.assertEqual(
+                effective["outcome_document_hash"], replacement_outcome_hash
+            )
+            self.assertEqual(
+                effective["outcome_document_json"], replacement_outcome_json
+            )
+
+            connection.execute(
+                """
+                INSERT INTO worker_exit_retry_exhaustions(
+                    intent_id, attempt_number, task_id, project_id,
+                    principal_id, approval_id, attempt_id,
+                    observation_sequence, evidence_hash,
+                    private_schema_version, private_proof_hash, failure_kind,
+                    max_attempts, terminal_event_sequence,
+                    terminal_event_hash, fencing_token, exhausted_at,
+                    exhausted_at_us
+                ) VALUES (?, 2, ?, ?, ?, ?, ?, 1, ?, '1.3.0', ?,
+                          'worker_exit', 2, 2, ?, 1, ?, 2)
+                """,
+                (
+                    intent.intent_id,
+                    task_id,
+                    PROJECT_ID,
+                    PRINCIPAL_ID,
+                    intent.approval_id,
+                    "attempt-worker-exit-retry-2",
+                    digest,
+                    digest,
+                    digest,
+                    T_PLUS_1,
+                ),
+            )
+            connection.commit()
+
+            tables = (
+                "worker_exit_retry_reservations",
+                "supervised_worker_exit_retry_attempts",
+                "worker_exit_retry_timeout_retirements",
+                "worker_exit_retry_dispatch_replacements",
+                "worker_exit_retry_exhaustions",
+            )
+            for table in tables:
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                    connection.execute(
+                        f"UPDATE {table} SET project_id = 'tampered'"
+                    )
+                connection.rollback()
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                    connection.execute(f"DELETE FROM {table}")
+                connection.rollback()
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_v15_reservation_retires_an_armed_attempt_one_timeout(
+        self,
+    ) -> None:
+        (
+            task_id,
+            _,
+            _,
+            intent,
+            lease,
+            armed,
+            _,
+        ) = self._timeout_runtime(key="v15-timeout-retirement")
+        _, source_handle_hash = encode_document(intent.handle)
+
+        connection = self._connection()
+        try:
+            source = connection.execute(
+                """
+                SELECT outcome_document_hash
+                FROM effective_dispatched_intents WHERE intent_id = ?
+                """,
+                (intent.intent_id,),
+            ).fetchone()
+            observation = connection.execute(
+                """
+                SELECT observation.observation_sequence,
+                       observation.document_hash
+                FROM worker_attempt_timeout_windows AS timeout
+                JOIN worker_attempt_observations AS observation
+                  ON observation.attempt_id = timeout.attempt_id
+                 AND observation.observation_sequence
+                     = timeout.start_observation_sequence
+                WHERE timeout.timeout_id = ?
+                """,
+                (armed.timeout.timeout_id,),
+            ).fetchone()
+            self.assertIsNotNone(source)
+            self.assertIsNotNone(observation)
+            assert source is not None and observation is not None
+
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                "DROP TRIGGER worker_exit_retry_reservation_requires_exact_case"
+            )
+            connection.execute(
+                "DROP TRIGGER worker_exit_retry_reservation_requires_active_term"
+            )
+            digest = "sha256:" + "b" * 64
+            connection.execute(
+                """
+                INSERT INTO worker_exit_retry_reservations(
+                    intent_id, attempt_number, task_id, project_id,
+                    principal_id, approval_id, previous_attempt_id,
+                    previous_observation_sequence, evidence_hash,
+                    private_schema_version, private_proof_hash, failure_kind,
+                    source_outcome_document_hash, source_handle_hash,
+                    retry_event_sequence, retry_event_hash,
+                    first_fencing_token, reserved_at, reserved_at_us
+                ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, '1.1.0', ?,
+                          'worker_exit', ?, ?, 1, ?, ?, ?, 1)
+                """,
+                (
+                    intent.intent_id,
+                    task_id,
+                    PROJECT_ID,
+                    PRINCIPAL_ID,
+                    intent.approval_id,
+                    armed.timeout.attempt_id,
+                    observation["observation_sequence"],
+                    observation["document_hash"],
+                    digest,
+                    source["outcome_document_hash"],
+                    source_handle_hash,
+                    digest,
+                    lease.fencing_token,
+                    T_PLUS_1,
+                ),
+            )
+            retirement = connection.execute(
+                """
+                SELECT * FROM worker_exit_retry_timeout_retirements
+                WHERE timeout_id = ?
+                """,
+                (armed.timeout.timeout_id,),
+            ).fetchone()
+            self.assertIsNotNone(retirement)
+            assert retirement is not None
+            self.assertEqual(retirement["attempt_id"], armed.timeout.attempt_id)
+            self.assertEqual(
+                retirement["timeout_window_hash"],
+                connection.execute(
+                    """
+                    SELECT document_hash FROM worker_attempt_timeout_windows
+                    WHERE timeout_id = ?
+                    """,
+                    (armed.timeout.timeout_id,),
+                ).fetchone()[0],
+            )
+            deadline_at_us = connection.execute(
+                """
+                SELECT deadline_at_us FROM worker_attempt_timeout_windows
+                WHERE timeout_id = ?
+                """,
+                (armed.timeout.timeout_id,),
+            ).fetchone()[0]
+            connection.commit()
+
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "due pending window",
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO supervised_timeout_attempts(
+                        timeout_id, project_id, principal_id, intent_id,
+                        attempt_id, fencing_token, action,
+                        authorized_at, authorized_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?,
+                              'deliver_exact_attempt_timeout', ?, ?)
+                    """,
+                    (
+                        armed.timeout.timeout_id,
+                        PROJECT_ID,
+                        PRINCIPAL_ID,
+                        intent.intent_id,
+                        armed.timeout.attempt_id,
+                        lease.fencing_token,
+                        T_PLUS_10,
+                        deadline_at_us + 1,
+                    ),
+                )
+            connection.rollback()
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM worker_attempt_timeout_windows AS timeout
+                    WHERE timeout.task_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM worker_exit_retry_timeout_retirements AS retirement
+                          WHERE retirement.timeout_id = timeout.timeout_id
+                      )
+                    """,
+                    (task_id,),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_v15_mixed_worker_exit_exhaustion_projects_purge_cleanup_token(
+        self,
+    ) -> None:
+        dispatcher = WorkerExitRetryFakeDispatcher(
+            self.store,
+            second_attempt_outcome="pre_running_failure",
+        )
+        task_id, dispatcher, runtime, _ = self._pending_runtime(
+            key="v15-mixed-exhaustion-purge-proof",
+            dispatcher=dispatcher,
+        )
+        lease = self._acquire(
+            "v15-mixed-exhaustion-owner",
+            lease_seconds=30,
+        ).lease
+        scheduled = runtime.schedule_runtime_dispatch(
+            task_id,
+            **self.scope,
+            supervisor_lease=lease,
+        )
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        dispatcher.adapter_status = {
+            "status": "Failed",
+            "stage": "worker_exit",
+            "completed": 0,
+            "total": scheduled.intent.request["parameters"]["iterations"],
+            "message": "FWI Worker exited after ready",
+            "updated_at": NOW,
+            "terminal": True,
+        }
+        retrying = runtime.process_runtime_retry(
+            task_id,
+            **self.scope,
+            supervisor_lease=lease,
+        )
+        self.assertEqual(retrying.state, "retrying")
+        exhausted = runtime.process_runtime_retry(
+            task_id,
+            **self.scope,
+            supervisor_lease=lease,
+        )
+        self.assertEqual(exhausted.state, "exhausted")
+        self.assertEqual(exhausted.snapshot.status, "Failed")
+        self.assertEqual(exhausted.intent.state, "retry_exhausted")
+        self.assertIsNone(exhausted.intent.handle)
+
+        self.now[0] = T_PLUS_10
+        trashed = runtime.trash_task(
+            task_id=task_id,
+            expected_visibility_revision=0,
+            idempotency_key="trash-v15-mixed-exhaustion",
+            **self.scope,
+        )
+        self.assertEqual(trashed.snapshot.visibility_revision, 1)
+        _, purge_request_hash = encode_document(
+            {
+                "task_id": task_id,
+                "project_id": PROJECT_ID,
+                "principal_id": PRINCIPAL_ID,
+                "action": "purge_task",
+                "expected_visibility_revision": 1,
+            }
+        )
+        purge = self.store.reserve_task_purge(
+            task_id=task_id,
+            expected_visibility_revision=1,
+            idempotency_key="purge-v15-mixed-exhaustion",
+            request_hash=purge_request_hash,
+            now=T_PLUS_10,
+            **self.scope,
+        )
+        proof = self.store.get_retry_exhaustion_cleanup_proof(
+            purge_id=purge.purge_id,
+            task_id=task_id,
+            **self.scope,
+        )
+        self.assertIsNotNone(proof)
+        assert proof is not None
+        self.assertEqual(proof.private_schema_version, "1.3.0")
+        self.assertEqual(proof.failure_kind, "pre_running_launch_failure")
+        self.assertEqual(proof.previous_failure_kind, "worker_exit")
+        self.assertEqual(proof.previous_private_schema_version, "1.1.0")
+        token = proof.adapter_token()
+        expected_keys = {
+            "schema_version",
+            "purge_id",
+            "intent_id",
+            "task_id",
+            "project_id",
+            "principal_id",
+            "approval_id",
+            "attempt_id",
+            "attempt_number",
+            "observation_sequence",
+            "evidence",
+            "evidence_hash",
+            "private_schema_version",
+            "private_proof_hash",
+            "failure_kind",
+            "previous_attempt_id",
+            "previous_observation_sequence",
+            "previous_private_proof_hash",
+            "previous_failure_kind",
+            "previous_private_schema_version",
+            "retry_reserved_at",
+            "terminal_event_sequence",
+            "terminal_event_hash",
+            "exhausted_at",
+            "proof_hash",
+        }
+        self.assertEqual(set(token), expected_keys)
+        self.assertEqual(token["schema_version"], "1.1.0")
+        self.assertEqual(token["previous_failure_kind"], "worker_exit")
+        self.assertEqual(token["previous_private_schema_version"], "1.1.0")
+        payload = {key: value for key, value in token.items() if key != "proof_hash"}
+        self.assertEqual(token["proof_hash"], encode_document(payload)[1])
+        replay = self.store.get_retry_exhaustion_cleanup_proof(
+            purge_id=purge.purge_id,
+            task_id=task_id,
+            **self.scope,
+        )
+        self.assertIsNotNone(replay)
+        assert replay is not None
+        self.assertEqual(replay.adapter_token(), token)
 
     def test_retry_reservation_is_single_use_and_replays_across_terms(self) -> None:
         task_id, _, _, pending = self._pending_runtime(
@@ -1165,14 +1850,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v14(self) -> None:
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v15(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
             self._drop_retry_schema(connection)
-            connection.execute("DROP VIEW effective_dispatched_intents")
             connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
             connection.execute(
                 "DROP TABLE supervised_dispatch_reconciliation_attempts"
@@ -1201,7 +1885,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 14)
+        self.assertEqual(reopened.migration_version(), 15)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -1240,14 +1924,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v14(self) -> None:
+    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v15(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v12")
         acquired = self._acquire("upgrade-v12-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
         connection = self._connection()
         try:
             self._drop_retry_schema(connection)
-            connection.execute("DROP VIEW effective_dispatched_intents")
             connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
             connection.execute(
                 "DROP TABLE supervised_dispatch_reconciliation_attempts"
@@ -1271,7 +1954,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 14)
+        self.assertEqual(reopened.migration_version(), 15)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)

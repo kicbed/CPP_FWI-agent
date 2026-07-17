@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,22 +24,26 @@ from worker_launch_control import (
     CANCELLED_WORKER_EXIT_CODE,
     CONTROL_DIRECTORY,
     WALL_TIME_EXCEEDED_WORKER_EXIT_CODE,
+    WORKER_EXIT_NAME,
     WORKER_HEARTBEAT_NAME,
     WORKER_READY_NAME,
     LaunchAttemptBinding,
     ParentLaunchLease,
     WorkerCancellationRequested,
     WorkerControlError,
+    WorkerExitEvidence,
     WorkerHeartbeat,
     WorkerWallTimeExceeded,
     execution_fence_is_held,
     mark_launch_failed,
+    read_worker_exit_evidence,
     read_pre_running_attempt_evidence,
     read_worker_cancel_evidence,
     read_worker_stop_evidence,
     read_worker_attempt_evidence,
     request_worker_cancel,
     request_worker_stop,
+    record_worker_exit,
     stage_launch_attempt,
     worker_attempt_started,
 )
@@ -158,6 +164,628 @@ class WorkerLaunchControlTest(unittest.TestCase):
         )
         stage_launch_attempt(self.root, run_dir, binding)
         return binding, run_dir
+
+    def abrupt_running_attempt(
+        self, index: int
+    ) -> tuple[LaunchAttemptBinding, Path]:
+        """Leave exact ready/running sidecars while releasing both leases."""
+
+        binding, run_dir = self.binding(index)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=10.0,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        heartbeat._stop.set()
+        assert heartbeat._thread is not None
+        heartbeat._thread.join(2.0)
+        self.assertFalse(heartbeat._thread.is_alive())
+        self.assertIsNone(heartbeat._failure)
+        # Model an abrupt process exit: kernel leases close without a terminal
+        # heartbeat write, leaving the last exact state at ``running``.
+        heartbeat._close_descriptors()
+        self.assertFalse(execution_fence_is_held(self.root, binding))
+        return binding, run_dir
+
+    def worker_exit_statuses(
+        self, binding: LaunchAttemptBinding
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        pre: dict[str, object] = {
+            "job_id": binding.job_id,
+            "status": "running",
+            "stage": "invert",
+            "iteration": 1,
+            "total_iterations": 2,
+            "message": "FWI inversion running",
+            "updated_at": NOW,
+        }
+        post = {
+            **pre,
+            "status": "failed",
+            "stage": "worker_exit",
+            "message": "FWI worker exited with code -9",
+            "updated_at": "2026-07-16T08:00:01Z",
+        }
+        return pre, post
+
+    @staticmethod
+    def write_status(run_dir: Path, value: dict[str, object]) -> None:
+        path = run_dir / "status.json"
+        path.write_text(
+            json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+
+    def test_worker_exit_receipt_is_append_only_and_revalidated(self) -> None:
+        binding, run_dir = self.abrupt_running_attempt(40)
+        pre, post = self.worker_exit_statuses(binding)
+        self.write_status(run_dir, pre)
+
+        evidence = record_worker_exit(
+            self.root,
+            run_dir,
+            binding,
+            return_code=-9,
+            pre_status=pre,
+            post_status=post,
+            observed_at=post["updated_at"],
+        )
+        self.assertIsInstance(evidence, WorkerExitEvidence)
+        self.assertEqual(evidence.return_code, -9)
+        self.assertEqual(evidence.heartbeat_state, "running")
+        self.assertEqual(
+            json.loads((run_dir / "status.json").read_text(encoding="utf-8")),
+            post,
+        )
+        self.assertEqual(
+            read_worker_exit_evidence(self.root, run_dir, binding), evidence
+        )
+        receipt_path = run_dir / WORKER_EXIT_NAME
+        inode = receipt_path.stat().st_ino
+
+        replay = record_worker_exit(
+            self.root,
+            run_dir,
+            binding,
+            return_code=-9,
+            pre_status=pre,
+            post_status=post,
+        )
+        self.assertEqual(replay, evidence)
+        self.assertEqual(receipt_path.stat().st_ino, inode)
+
+        # Readers continue to re-prove the immutable attempt sidecars and the
+        # exact finalized status document.
+        self.assertEqual(
+            read_worker_exit_evidence(self.root, run_dir, binding), evidence
+        )
+        self.assertEqual(
+            record_worker_exit(
+                self.root,
+                run_dir,
+                binding,
+                return_code=-9,
+                pre_status=pre,
+                post_status=post,
+            ),
+            evidence,
+        )
+        conflicting_post = {
+            **post,
+            "message": "FWI worker exited with code -6",
+        }
+        with self.assertRaisesRegex(WorkerControlError, "WORKER_EXIT_CONFLICT"):
+            record_worker_exit(
+                self.root,
+                run_dir,
+                binding,
+                return_code=-6,
+                pre_status=pre,
+                post_status=conflicting_post,
+            )
+
+    def test_worker_exit_reader_recovers_receipt_first_status_gap(self) -> None:
+        binding, run_dir = self.abrupt_running_attempt(56)
+        pre, post = self.worker_exit_statuses(binding)
+        self.write_status(run_dir, pre)
+        original_write = worker_control._atomic_write_private_json
+
+        def interrupt_after_receipt(
+            path: Path, value: dict[str, object]
+        ) -> None:
+            if path.name == "status.json" and (run_dir / WORKER_EXIT_NAME).exists():
+                raise WorkerControlError(
+                    "WORKER_CONTROL_UNAVAILABLE: injected reaper crash"
+                )
+            original_write(path, value)
+
+        with patch.object(
+            worker_control,
+            "_atomic_write_private_json",
+            side_effect=interrupt_after_receipt,
+        ), self.assertRaisesRegex(WorkerControlError, "injected reaper crash"):
+            record_worker_exit(
+                self.root,
+                run_dir,
+                binding,
+                return_code=-9,
+                pre_status=pre,
+                post_status=post,
+            )
+        self.assertTrue((run_dir / WORKER_EXIT_NAME).is_file())
+        self.assertEqual(
+            json.loads((run_dir / "status.json").read_text(encoding="utf-8")),
+            pre,
+        )
+
+        # A later Supervisor process needs only durable files.  The reader
+        # reconstructs one candidate and writes it only after its hash exactly
+        # matches the receipt's bound post hash.
+        evidence = read_worker_exit_evidence(self.root, run_dir, binding)
+        self.assertEqual(evidence.return_code, -9)
+        self.assertEqual(
+            json.loads((run_dir / "status.json").read_text(encoding="utf-8")),
+            post,
+        )
+
+    def test_worker_exit_and_stop_request_share_terminal_arbitration(self) -> None:
+        binding, run_dir = self.abrupt_running_attempt(57)
+        pre, post = self.worker_exit_statuses(binding)
+        self.write_status(run_dir, pre)
+        writer_inside = threading.Event()
+        release_writer = threading.Event()
+        writer_result: list[object] = []
+        stop_result: list[object] = []
+        original_create = worker_control._create_private_json
+
+        def pause_receipt_create(path: Path, value: dict[str, object]) -> None:
+            if path.name == WORKER_EXIT_NAME:
+                writer_inside.set()
+                release_writer.wait(2.0)
+            original_create(path, value)
+
+        def write_exit() -> None:
+            try:
+                writer_result.append(
+                    record_worker_exit(
+                        self.root,
+                        run_dir,
+                        binding,
+                        return_code=-9,
+                        pre_status=pre,
+                        post_status=post,
+                    )
+                )
+            except BaseException as error:
+                writer_result.append(error)
+
+        def request_stop() -> None:
+            try:
+                stop_result.append(
+                    request_worker_stop(
+                        self.root,
+                        binding,
+                        request_id="racing-stop-57",
+                        reason="user_requested",
+                        requested_at=NOW,
+                    )
+                )
+            except BaseException as error:
+                stop_result.append(error)
+
+        with patch.object(
+            worker_control,
+            "_create_private_json",
+            side_effect=pause_receipt_create,
+        ):
+            writer = threading.Thread(target=write_exit)
+            requester = threading.Thread(target=request_stop)
+            try:
+                writer.start()
+                self.assertTrue(writer_inside.wait(2.0))
+                requester.start()
+                time.sleep(0.05)
+                self.assertTrue(requester.is_alive())
+            finally:
+                release_writer.set()
+                writer.join(2.0)
+                if requester.ident is not None:
+                    requester.join(2.0)
+
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(requester.is_alive())
+        self.assertEqual(len(writer_result), 1)
+        self.assertIsInstance(writer_result[0], WorkerExitEvidence)
+        self.assertEqual(len(stop_result), 1)
+        self.assertIsInstance(stop_result[0], WorkerControlError)
+        assert isinstance(stop_result[0], WorkerControlError)
+        self.assertEqual(stop_result[0].code, "WORKER_STOP_CONFLICT")
+        self.assertFalse(
+            read_worker_stop_evidence(self.root, binding).requested
+        )
+
+    def test_worker_exit_rejects_reserved_and_success_return_codes(self) -> None:
+        for index, return_code in enumerate(
+            (
+                0,
+                CANCELLED_WORKER_EXIT_CODE,
+                WALL_TIME_EXCEEDED_WORKER_EXIT_CODE,
+            ),
+            start=41,
+        ):
+            with self.subTest(return_code=return_code):
+                binding, run_dir = self.abrupt_running_attempt(index)
+                pre, post = self.worker_exit_statuses(binding)
+                self.write_status(run_dir, pre)
+                with self.assertRaisesRegex(
+                    WorkerControlError, "WORKER_EXIT_INVALID"
+                ):
+                    record_worker_exit(
+                        self.root,
+                        run_dir,
+                        binding,
+                        return_code=return_code,
+                        pre_status=pre,
+                        post_status=post,
+                    )
+                self.assertFalse((run_dir / WORKER_EXIT_NAME).exists())
+
+    def test_worker_exit_rejects_terminal_heartbeat_states(self) -> None:
+        for index, state in enumerate(
+            ("succeeded", "failed", "stopped"), start=44
+        ):
+            with self.subTest(state=state):
+                binding, run_dir = self.binding(index)
+                lease = ParentLaunchLease.acquire(
+                    self.root, run_dir, max_active=1
+                )
+                lease.mark_spawned(os.getpid())
+                heartbeat = WorkerHeartbeat(
+                    run_root=self.root,
+                    run_dir=run_dir,
+                    attempt_id=binding.attempt_id,
+                    attempt_fd=os.dup(lease.attempt_fd),
+                    capacity_fd=os.dup(lease.capacity_fd),
+                    interval_seconds=10.0,
+                )
+                lease.close_parent()
+                heartbeat.start()
+                heartbeat.stop(state)
+                pre, post = self.worker_exit_statuses(binding)
+                self.write_status(run_dir, pre)
+                with self.assertRaisesRegex(
+                    WorkerControlError, "WORKER_EXIT_UNSAFE"
+                ):
+                    record_worker_exit(
+                        self.root,
+                        run_dir,
+                        binding,
+                        return_code=-9,
+                        pre_status=pre,
+                        post_status=post,
+                    )
+
+    def test_worker_exit_never_relabels_terminal_status(self) -> None:
+        binding, run_dir = self.abrupt_running_attempt(58)
+        base, _ = self.worker_exit_statuses(binding)
+        for terminal_status, stage in (
+            ("succeeded", "complete"),
+            ("failed", "failed"),
+            ("cancelled", "cancelled"),
+        ):
+            with self.subTest(status=terminal_status):
+                terminal = {
+                    **base,
+                    "status": terminal_status,
+                    "stage": stage,
+                }
+                post = {
+                    **terminal,
+                    "status": "failed",
+                    "stage": "worker_exit",
+                    "message": "FWI worker exited with code -9",
+                    "updated_at": "2026-07-16T08:00:01Z",
+                }
+                self.write_status(run_dir, terminal)
+                with self.assertRaisesRegex(
+                    WorkerControlError, "terminal Worker status"
+                ):
+                    record_worker_exit(
+                        self.root,
+                        run_dir,
+                        binding,
+                        return_code=-9,
+                        pre_status=terminal,
+                        post_status=post,
+                    )
+        self.assertFalse((run_dir / WORKER_EXIT_NAME).exists())
+
+    def test_worker_exit_rejects_active_execution_fence(self) -> None:
+        binding, run_dir = self.binding(47)
+        lease = ParentLaunchLease.acquire(self.root, run_dir, max_active=1)
+        lease.mark_spawned(os.getpid())
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            interval_seconds=10.0,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        pre, post = self.worker_exit_statuses(binding)
+        self.write_status(run_dir, pre)
+        try:
+            with self.assertRaisesRegex(
+                WorkerControlError, "WORKER_ATTEMPT_BUSY"
+            ):
+                record_worker_exit(
+                    self.root,
+                    run_dir,
+                    binding,
+                    return_code=-9,
+                    pre_status=pre,
+                    post_status=post,
+                )
+            self.assertFalse((run_dir / WORKER_EXIT_NAME).exists())
+        finally:
+            heartbeat.stop("failed")
+
+    def test_worker_exit_rejects_v2_user_and_timeout_requests(self) -> None:
+        for index, reason in ((48, "user_requested"), (49, "wall_time_exceeded")):
+            with self.subTest(reason=reason):
+                binding, run_dir = self.abrupt_running_attempt(index)
+                attempt = read_worker_attempt_evidence(
+                    self.root, run_dir, binding
+                )
+                assert attempt is not None
+                if reason == "user_requested":
+                    request_worker_stop(
+                        self.root,
+                        binding,
+                        request_id=f"stop-{index}",
+                        reason=reason,
+                        requested_at=NOW,
+                    )
+                else:
+                    assert attempt.ready_started_at is not None
+                    started = datetime.fromisoformat(
+                        attempt.ready_started_at[:-1] + "+00:00"
+                    )
+                    deadline = started + timedelta(seconds=86_400)
+                    deadline_at = deadline.astimezone(timezone.utc).isoformat(
+                        timespec="microseconds"
+                    ).replace("+00:00", "Z")
+                    request_worker_stop(
+                        self.root,
+                        binding,
+                        request_id=f"stop-{index}",
+                        reason=reason,
+                        requested_at=deadline_at,
+                        wall_time_seconds=86_400,
+                        started_at=attempt.ready_started_at,
+                        deadline_at=deadline_at,
+                        ready_record_hash=attempt.ready_record_hash,
+                    )
+                pre, post = self.worker_exit_statuses(binding)
+                self.write_status(run_dir, pre)
+                with self.assertRaisesRegex(
+                    WorkerControlError, "WORKER_EXIT_UNSAFE.*stop request"
+                ):
+                    record_worker_exit(
+                        self.root,
+                        run_dir,
+                        binding,
+                        return_code=-9,
+                        pre_status=pre,
+                        post_status=post,
+                    )
+
+    def test_worker_exit_rejects_legacy_cancel_request(self) -> None:
+        binding, run_dir = self.abrupt_running_attempt(50)
+        attempt = read_worker_attempt_evidence(self.root, run_dir, binding)
+        assert attempt is not None
+        assert attempt.ticket_worker_pid is not None
+        assert attempt.capacity_slot is not None
+        assert attempt.capacity_generation is not None
+        worker_control.ensure_worker_cancel_capability(
+            self.root,
+            binding,
+            worker_pid=attempt.ticket_worker_pid,
+            capacity_slot=attempt.capacity_slot,
+            capacity_generation=attempt.capacity_generation,
+        )
+        worker_control._request_legacy_worker_cancel(
+            self.root,
+            binding,
+            cancel_id="legacy-stop-50",
+            reason="user_requested",
+            requested_at=NOW,
+        )
+        pre, post = self.worker_exit_statuses(binding)
+        self.write_status(run_dir, pre)
+        with self.assertRaisesRegex(
+            WorkerControlError, "WORKER_EXIT_UNSAFE.*legacy"
+        ):
+            record_worker_exit(
+                self.root,
+                run_dir,
+                binding,
+                return_code=-9,
+                pre_status=pre,
+                post_status=post,
+            )
+
+    def test_worker_exit_reader_rejects_a_late_stop_request(self) -> None:
+        binding, run_dir = self.abrupt_running_attempt(55)
+        pre, post = self.worker_exit_statuses(binding)
+        self.write_status(run_dir, pre)
+        record_worker_exit(
+            self.root,
+            run_dir,
+            binding,
+            return_code=-9,
+            pre_status=pre,
+            post_status=post,
+        )
+        with self.assertRaisesRegex(
+            WorkerControlError, "WORKER_STOP_CONFLICT.*terminal arbitration"
+        ):
+            request_worker_stop(
+                self.root,
+                binding,
+                request_id="late-stop-55",
+                reason="user_requested",
+                requested_at=NOW,
+            )
+        self.assertFalse(
+            read_worker_stop_evidence(self.root, binding).requested
+        )
+        self.assertEqual(
+            read_worker_exit_evidence(self.root, run_dir, binding).return_code,
+            -9,
+        )
+
+    def test_worker_exit_reader_rejects_tamper_status_drift_and_busy_fence(
+        self,
+    ) -> None:
+        binding, run_dir = self.abrupt_running_attempt(51)
+        pre, post = self.worker_exit_statuses(binding)
+        self.write_status(run_dir, pre)
+        record_worker_exit(
+            self.root,
+            run_dir,
+            binding,
+            return_code=-9,
+            pre_status=pre,
+            post_status=post,
+        )
+
+        lock_path = (
+            self.root
+            / CONTROL_DIRECTORY
+            / "worker-capacity"
+            / "attempts"
+            / f"{binding.submission_id}.lock"
+        )
+        descriptor = os.open(lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(
+                WorkerControlError, "WORKER_ATTEMPT_BUSY"
+            ):
+                read_worker_exit_evidence(self.root, run_dir, binding)
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+        drifted = {**pre, "message": "unbound status mutation"}
+        self.write_status(run_dir, drifted)
+        with self.assertRaisesRegex(
+            WorkerControlError, "outside the bound transition"
+        ):
+            read_worker_exit_evidence(self.root, run_dir, binding)
+
+    def test_worker_exit_reader_rejects_later_heartbeat_sidecar(self) -> None:
+        binding, run_dir = self.abrupt_running_attempt(59)
+        pre, post = self.worker_exit_statuses(binding)
+        self.write_status(run_dir, pre)
+        record_worker_exit(
+            self.root,
+            run_dir,
+            binding,
+            return_code=-9,
+            pre_status=pre,
+            post_status=post,
+        )
+        heartbeat_path = run_dir / WORKER_HEARTBEAT_NAME
+        heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        heartbeat["sequence"] += 1
+        heartbeat["updated_at"] = "2026-07-16T08:00:02Z"
+        heartbeat.pop("record_hash")
+        heartbeat = worker_control._record_with_hash(heartbeat)
+        worker_control._atomic_write_private_json(heartbeat_path, heartbeat)
+        with self.assertRaisesRegex(
+            WorkerControlError, "sidecar evidence changed"
+        ):
+            read_worker_exit_evidence(self.root, run_dir, binding)
+
+        self.write_status(run_dir, pre)
+        receipt_path = run_dir / WORKER_EXIT_NAME
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["return_code"] = -6
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        receipt_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            WorkerControlError, "integrity check failed"
+        ):
+            read_worker_exit_evidence(self.root, run_dir, binding)
+
+    def test_worker_exit_requires_complete_exact_evidence_and_status(self) -> None:
+        binding, run_dir = self.abrupt_running_attempt(52)
+        pre, post = self.worker_exit_statuses(binding)
+        self.write_status(run_dir, pre)
+        with self.assertRaisesRegex(WorkerControlError, "WORKER_EXIT_MISSING"):
+            read_worker_exit_evidence(self.root, run_dir, binding)
+        (run_dir / WORKER_READY_NAME).unlink()
+        with self.assertRaisesRegex(WorkerControlError, "WORKER_EXIT_UNSAFE"):
+            record_worker_exit(
+                self.root,
+                run_dir,
+                binding,
+                return_code=-9,
+                pre_status=pre,
+                post_status=post,
+            )
+
+        other_binding, other_dir = self.abrupt_running_attempt(53)
+        other_pre, other_post = self.worker_exit_statuses(other_binding)
+        # Missing status.json is never invented by the receipt writer.
+        with self.assertRaisesRegex(
+            WorkerControlError, "status evidence is missing"
+        ):
+            record_worker_exit(
+                self.root,
+                other_dir,
+                other_binding,
+                return_code=-9,
+                pre_status=other_pre,
+                post_status=other_post,
+            )
+        self.assertFalse((other_dir / WORKER_EXIT_NAME).exists())
+
+        capability_binding, capability_dir = self.abrupt_running_attempt(54)
+        capability_pre, capability_post = self.worker_exit_statuses(
+            capability_binding
+        )
+        self.write_status(capability_dir, capability_pre)
+        (
+            self.root
+            / CONTROL_DIRECTORY
+            / "worker-stop"
+            / f"{capability_binding.attempt_id}.capability.json"
+        ).unlink()
+        with self.assertRaisesRegex(
+            WorkerControlError, "has no v2 stop capability"
+        ):
+            record_worker_exit(
+                self.root,
+                capability_dir,
+                capability_binding,
+                return_code=-9,
+                pre_status=capability_pre,
+                post_status=capability_post,
+            )
+        self.assertFalse((capability_dir / WORKER_EXIT_NAME).exists())
 
     def test_worker_inherits_cross_process_submission_and_capacity_fences(self) -> None:
         binding, run_dir = self.binding(1)

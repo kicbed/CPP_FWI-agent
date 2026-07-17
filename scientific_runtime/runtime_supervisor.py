@@ -128,6 +128,16 @@ class RuntimeSupervisorTaskService(Protocol):
     ) -> Any:
         ...
 
+    def process_runtime_retry(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: Any,
+    ) -> Any:
+        ...
+
 
 @dataclass(frozen=True)
 class RuntimeSupervisorCycleResult:
@@ -147,6 +157,9 @@ class RuntimeSupervisorCycleResult:
     timeout_processed_task_ids: tuple[str, ...] = ()
     timeout_resolved_task_ids: tuple[str, ...] = ()
     reconciled_task_ids: tuple[str, ...] = ()
+    retry_processed_task_ids: tuple[str, ...] = ()
+    retry_dispatched_task_ids: tuple[str, ...] = ()
+    retry_exhausted_task_ids: tuple[str, ...] = ()
 
 
 class _SupervisorFailure(RuntimeError):
@@ -612,6 +625,50 @@ class RuntimeSupervisor:
             raise _SupervisorFailure(FATAL)
         return result
 
+    def _process_task_retry(self, task_id: str, lease: Any) -> Any:
+        """Run and strictly validate one finite automatic-retry pass."""
+
+        processor = getattr(self._task_service, "process_runtime_retry", None)
+        if not callable(processor):
+            return None
+        result = processor(
+            task_id,
+            project_id=self._project_id,
+            principal_id=self._principal_id,
+            supervisor_lease=lease,
+        )
+        state = getattr(result, "state", None)
+        snapshot = getattr(result, "snapshot", None)
+        intent = getattr(result, "intent", None)
+        deferred_code = getattr(result, "deferred_code", None)
+        boolean_fields = (
+            getattr(result, "authorized", None),
+            getattr(result, "authorization_replayed", None),
+            getattr(result, "dispatch_attempted", None),
+            getattr(result, "projected", None),
+            getattr(result, "adopted", None),
+            getattr(result, "timeout_armed", None),
+        )
+        if (
+            getattr(snapshot, "task_id", None) != task_id
+            or getattr(intent, "task_id", None) != task_id
+            or state not in {"none", "retrying", "dispatched", "exhausted"}
+            or any(type(value) is not bool for value in boolean_fields)
+            or (
+                deferred_code is not None
+                and (
+                    not isinstance(deferred_code, str)
+                    or _STABLE_CODE.fullmatch(deferred_code) is None
+                )
+            )
+            or (state == "retrying" and getattr(snapshot, "status", None) != "Retrying")
+            or (state == "retrying" and getattr(intent, "state", None) != "retrying")
+            or (state == "dispatched" and getattr(intent, "state", None) != "dispatched")
+            or (state == "exhausted" and getattr(snapshot, "status", None) != "Failed")
+        ):
+            raise _SupervisorFailure(FATAL)
+        return result
+
     def _observe_tasks(
         self, snapshots: list[Any], lease: Any, next_heartbeat: float
     ) -> tuple[RuntimeSupervisorCycleResult, Any, float]:
@@ -627,6 +684,9 @@ class RuntimeSupervisor:
         timeout_processed: list[str] = []
         timeout_resolved: list[str] = []
         reconciled: list[str] = []
+        retry_processed: list[str] = []
+        retry_dispatched: list[str] = []
+        retry_exhausted: list[str] = []
         deferred: list[tuple[str, str]] = []
         failures: list[tuple[str, str]] = []
         reconciliation_probe_used = False
@@ -634,7 +694,7 @@ class RuntimeSupervisor:
             if self._stop_event.is_set():
                 break
             status = getattr(snapshot, "status", None)
-            if status not in {"Queued", "Running"}:
+            if status not in {"Queued", "Running", "Retrying"}:
                 continue
             task_id = snapshot.task_id
             scanned.append(task_id)
@@ -747,6 +807,59 @@ class RuntimeSupervisor:
                 deferred.append((task_id, "DISPATCH_INTENT_MISSING"))
                 continue
             intent_state = getattr(intent, "state", None)
+            if intent_state == "retrying":
+                try:
+                    retry_result = self._process_task_retry(task_id, lease)
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "WORKER_RETRY_PROCESS_FAILED"
+                            ),
+                        )
+                    )
+                    continue
+                if retry_result is None:
+                    deferred.append((task_id, "WORKER_RETRY_UNSUPPORTED"))
+                    continue
+                retry_processed.append(task_id)
+                retry_state = getattr(retry_result, "state", None)
+                retry_code = getattr(retry_result, "deferred_code", None)
+                if getattr(retry_result, "timeout_armed", False):
+                    timeout_armed.append(task_id)
+                if retry_state == "retrying":
+                    deferred.append(
+                        (task_id, retry_code or "WORKER_EXIT_RETRY_IN_PROGRESS")
+                    )
+                    continue
+                if retry_state == "exhausted":
+                    retry_exhausted.append(task_id)
+                    continue
+                if retry_state != "dispatched":
+                    raise _SupervisorFailure(FATAL)
+                retry_dispatched.append(task_id)
+                try:
+                    self._task_service.refresh_runtime_status(
+                        task_id,
+                        project_id=self._project_id,
+                        principal_id=self._principal_id,
+                        supervisor_lease=lease,
+                    )
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "STATUS_REFRESH_FAILED"
+                            ),
+                        )
+                    )
+                else:
+                    refreshed.append(task_id)
+                continue
             schedule_projected = False
             force_reconciliation_projection = False
             if intent_state == "reconciliation_required":
@@ -1065,6 +1178,43 @@ class RuntimeSupervisor:
                 timeout_resolved.append(task_id)
                 continue
             try:
+                retry_result = self._process_task_retry(task_id, lease)
+            except Exception as error:
+                self._raise_if_fatal_task_error(error)
+                failures.append(
+                    (
+                        task_id,
+                        self._stable_error_code(
+                            error, "WORKER_RETRY_PROCESS_FAILED"
+                        ),
+                    )
+                )
+                continue
+            if retry_result is not None:
+                retry_state = getattr(retry_result, "state", None)
+                retry_code = getattr(retry_result, "deferred_code", None)
+                if retry_state != "none":
+                    retry_processed.append(task_id)
+                if getattr(retry_result, "timeout_armed", False):
+                    timeout_armed.append(task_id)
+                if retry_state == "retrying":
+                    deferred.append(
+                        (
+                            task_id,
+                            getattr(retry_result, "deferred_code", None)
+                            or "WORKER_EXIT_RETRY_IN_PROGRESS",
+                        )
+                    )
+                    continue
+                if retry_state == "exhausted":
+                    retry_exhausted.append(task_id)
+                    continue
+                if retry_state == "dispatched":
+                    retry_dispatched.append(task_id)
+                if retry_state == "none" and retry_code is not None:
+                    deferred.append((task_id, retry_code))
+                    continue
+            try:
                 self._task_service.refresh_runtime_status(
                     task_id,
                     project_id=self._project_id,
@@ -1100,6 +1250,9 @@ class RuntimeSupervisor:
                 timeout_processed_task_ids=tuple(timeout_processed),
                 timeout_resolved_task_ids=tuple(timeout_resolved),
                 reconciled_task_ids=tuple(reconciled),
+                retry_processed_task_ids=tuple(retry_processed),
+                retry_dispatched_task_ids=tuple(retry_dispatched),
+                retry_exhausted_task_ids=tuple(retry_exhausted),
             ),
             lease,
             next_heartbeat,

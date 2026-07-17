@@ -8,8 +8,8 @@
   本地结果永久删除、P2.4 启动 receipt 收养/状态追赶、P2.5A 控制面 fenced lease/持续状态泵与
   P2.5B 固定 Adapter 托管 Worker launch fence、P2.5C fenced Worker 证据投影/late adoption、
   P2.6 可恢复 fenced scheduler/受监督首次派发、P2.7 exact-attempt user cancellation 与 P2.8
-  exact-attempt wall-time timeout 与 P2.9A 有界 positive receipt resolution/adoption 均为
-  有界 Verified；完整 P2 仍 Pending**
+  exact-attempt wall-time timeout、P2.9A 有界 positive receipt resolution/adoption 与 P2.9B1/B2
+  finite retry 均为有界 Verified；完整 P2 仍 Pending**
 - 用户确认日期：2026-07-15
 - 实现分支：`feature/scientific-agent-runtime`
 - 基线分支：`feature/fwi-deepwave-2d-acoustic`
@@ -224,8 +224,8 @@ manifest 还必须描述参数与结果 Schema、输入输出类型/shape/dtype/
 中等、纵向、可独立验证的切片：共享同一状态机、接口和出口测试的相邻工作合并；只有出现明确
 并发/崩溃窗口、独立安全边界、文件所有权冲突或无法共同验证的风险时才拆分并记录理由。不得为
 单个 migration、字段、receipt/sidecar 或一项测试分别创建产品路线切片，也不得为了减少编号把
-高风险工作压成不可审阅的大提交。当前约十余个剩余中等切片只是估算，允许基于证据合理浮动，
-未经说明不得膨胀成几十个路线切片。
+高风险工作压成不可审阅的大提交。“约十余个”是从当前到整个 D-003 项目完成（含完整 P2、
+P3、P4、P5）的粗估，不是一个 P 级别内的配额；每阶段仍按现场边界收敛并记录拆分理由。
 
 测试按影响分级：内部变更先跑受影响单元测试；切片出口跑相关集成测试；阶段出口跑完整回归
 及适用的真实 CPU/CUDA/E2E。只有数值 Worker、依赖、数据或规范化配置变化时才重复对应耗时
@@ -463,9 +463,10 @@ current Adapter 下 legacy-private schema `1.0` 的 exact launched receipt。
 也不启动 launcher、negative reset、refund、retry，或根据 reconciliation 负向推断/合成 Task
 terminal；已证明的 terminal receipt 只沿既有 exact status bridge 追赶。Workbench/API 只允许
 有界只读 `action_required`/`resolved`，不暴露
-handle/hash/PID/path 且无浏览器 mutation；session 只声明
-`positive_receipt_reconciliation=true`，继续保持 `automatic_reconciliation=false` 与 `retry=false`，
-不得宣称 full/automatic reconciliation。SQLite v13 以 append-only resolution/effective dispatch
+handle/hash/PID/path 且无浏览器 mutation；session 声明
+`positive_receipt_reconciliation=true`，继续保持 `automatic_reconciliation=false`；`retry=false`
+表示没有浏览器手工 retry mutation，有限自动 retry 另有严格能力字段。不得宣称 full/automatic
+reconciliation。SQLite v13 以 append-only resolution/effective dispatch
 保留原 outcome；Supervisor 每周期最多 probe 一个 action-required task，managed running 同周期
 arm timeout，terminal receipt 同周期 status catch-up。
 
@@ -492,7 +493,22 @@ P2.9B1 已于 2026-07-17 **Verified**：SQLite v14 与 Approval 1.1 为 current 
 Trash/Purge 以 Store cleanup proof、同一 idle fence 和先墓碑后删除支持崩溃重放。Workbench/API/UI
 只暴露有界终态且无 retry mutation。attempt 2 成功后的 effective status/artifact/cancel/timeout 读取
 统一消费 latest current `1.5.0` handle，并按 attempt 1/private 1.1、attempt 2/private 1.2 验证；这只
-关闭 B1 lineage，P2.9B2 继续 Pending，不能从 B1 推断 post-ready replacement retry 已完成。
+关闭 B1 lineage。
+
+P2.9B2 已于 2026-07-17 **Verified**：SQLite v15 与 receipt-first Worker terminal arbitration 只在
+exact spawned+ready+running、idle execution fence、无 cancel/timeout ownership、非 `0/75/76`
+exit code及 append-only worker-exit receipt 全部一致时允许 active Supervisor 追加 retry reservation。
+reservation 立即隐藏旧 effective handle 并退役旧 timeout；Adapter 用 private 1.3 追加 attempt 2，
+ready 后 Store 原子发布 replacement handle/`node_started`，status、artifact、cancel、timeout 全部只
+消费 replacement。普通 status bridge 不能提交任何 `worker_exit`，因此同周期退出竞态必须回到下一
+次 fenced retry decision。attempt 2 的 B1/private 1.2 与 B2/private 1.3 exit 都只会 exact
+terminalize，绝不创建 attempt 3；B2 pre-running exhaustion 的 mixed-lineage Trash/Purge 由兼容的
+Store proof 绑定两次 attempt。公开 UI 只有有限自动 retry 的只读能力/状态，没有 retry mutation 或
+私有 proof 泄漏。
+
+按 D-011，仅就 P2，B2 完成后剩余工作压缩为两个不降低出口质量的交付切片：一个完整关闭负向/不确定
+reconciliation 矩阵，另一个合并 SSE 与完整 P2 故障、代表性 CPU/CUDA 阶段出口。出现新的具体
+安全边界时仍可记录后拆分；该估算不是配额。
 
 完成标准：重复请求不重复建任务；控制面重启后恢复或明确终结任务；取消能到达 Worker；
 已提交任务不依赖浏览器连接存活。
@@ -588,9 +604,12 @@ PlanGraph、批准和资源边界控制。
 
 ## 9. 计划变更控制
 
-- 本计划已经获批，后续 Codex 不得静默改变核心方向。
+- 本计划已经获批，后续 Codex 不得修改或重新解释其范围、阶段顺序、依赖、安全边界或退出标准；
+  任何变化都必须先获得用户明确同意。
 - 新建议先说明证据、收益、成本、风险和兼容性，得到用户明确批准后才更新 D-003 和本文。
 - 仅执行进度、测试结果和阻塞变化时更新 `docs/PROJECT_PROGRESS.md`，不重写已批准目标。
+- 所有数量、工期和剩余切片估算都必须标明全项目/阶段/子切片范围、包含阶段，以及粗估或承诺
+  性质；不得用当前阶段子集替换整个项目估算。
 - 当前对话中的最新明确指示始终优先。
 
 ## 10. 变更记录
@@ -614,3 +633,6 @@ PlanGraph、批准和资源边界控制。
 | 2026-07-16 | 实现并验证 P2.9A：SQLite v13 append-only authorization/adoption/resolution 与 effective dispatch、managed/private exact positive probe、每周期最多一次、同周期 timeout/status catch-up，以及六字段只读 Workbench 投影；整体验证同时关闭 same-key approve/submit late-replay race | Runtime 319/319、固定 venv Worker 32/32、launch-control 25/25、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node/治理与真实 Adapter 文件/锁专项 PASS；replacement launcher 零调用，并发用例 10 进程重复 PASS，未运行 CUDA；finite retry 仍待用户确认 |
 | 2026-07-17 | 接受 D-012 并开始 P2.9B finite retry：最多 2 次、显式最坏预算、只重试 exact stopped 的 pre-running launch failure 与 post-ready `worker_exit`；B1/B2 以 effective handle/产物/取消/超时目标迁移安全边界拆分 | 用户明确要求按建议继续；旧 Approval 保持一次，普通 worker failure、timeout、cancel、损坏/分歧/不确定 reconciliation 不重试，且不增加浏览器 retry mutation |
 | 2026-07-17 | 实现并验证 P2.9B1 pre-running launch failure retry：SQLite v14/Approval 1.1 两次串行预算、active-term retry reservation/delivery、Adapter 1.5 append-only attempt 2、retry exhaustion、无 handle 双 attempt Trash/Purge 与 bounded public projection | Runtime 343/343、固定 venv Worker 32/32、launch-control 26/26、Web 47/47、Embedding 6/6、CTest 39/39、MCP 1/1、Node/治理和独立最终审计 PASS；未重复数值 FWI/CUDA。B2、剩余 reconciliation、SSE 和完整 P2 出口仍 Pending |
+| 2026-07-17 | 实现并验证 P2.9B2 post-ready worker-exit retry：SQLite v15 exact receipt/reservation/replacement/exhaustion、receipt-first terminal arbitration、private 1.3 attempt 2、effective handle/status/artifact/cancel/timeout 共同迁移、旧 timeout retirement、mixed-lineage Trash/Purge、只读 Web 与禁止 attempt 3 | Runtime 360/360、固定 venv Worker 32/32、launch-control 39/39、Web 47/47、Embedding 6/6、CTest 39/39、MCP 1/1、Node/治理与三轮独立审计 PASS；未重复数值 FWI/CUDA。P2 剩余交付压缩为完整 reconciliation 矩阵与 SSE + P2 阶段出口两个切片 |
+| 2026-07-17 | 澄清 D-011 “约十余个”估算覆盖从当前到整个 D-003 完成（完整 P2 及 P3–P5），不是一个 P 级别；P2 当前两个剩余切片只是其子集 | 用户明确确认估算范围；阶段顺序、依赖和出口质量门均不变 |
+| 2026-07-17 | 接受 D-013 估算范围标注与计划变更控制：全项目/阶段/子切片及粗估/承诺必须显式区分；Accepted 计划未经用户明确同意不得修改或重释 | 用户要求固定为后续新窗口自动遵守的治理规则 |

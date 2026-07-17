@@ -55,6 +55,7 @@ from worker_launch_control import (
     WorkerHeartbeat,
     WorkerWallTimeExceeded,
     binding_from_submission_record,
+    record_worker_exit,
     read_worker_cancel_evidence,
     read_worker_attempt_evidence,
     read_worker_stop_evidence,
@@ -2081,6 +2082,65 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             adapter._write_submission(record_path, original_record)
         self.assertEqual(private_snapshot(), before_exact_probe)
 
+    def test_pre_running_retry_attempt_two_worker_exit_has_exact_proof(
+        self,
+    ) -> None:
+        launcher = StoppedThenSuccessfulSafeLauncher()
+        adapter = self.make_adapter(launcher=launcher)
+        request = self.submit_kwargs(
+            task_id="task-b1-attempt-two-worker-exit",
+            idempotency_key="task-b1-attempt-two-worker-exit:invert:0001",
+        )
+        with self.assertRaises(AdapterUnavailable):
+            adapter.submit(**copy.deepcopy(request))
+        first = adapter.probe_pre_running_retry(**copy.deepcopy(request))
+        authorization = {
+            "schema_version": "1.0.0",
+            "intent_id": "intent-b1-attempt-two-worker-exit",
+            "previous_attempt_id": first.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "failure_kind": "pre_running_launch_failure",
+            "private_proof_hash": first.private_proof_hash,
+            "next_attempt_number": 2,
+            "authorized_at": "2026-07-15T06:00:01Z",
+        }
+        handle = adapter.retry_pre_running(
+            **copy.deepcopy(request), authorization=authorization
+        )
+        run_dir = self.run_root / handle.job_id
+        binding, heartbeat = self.start_exact_worker(handle, run_dir)
+        heartbeat._stop.set()
+        assert heartbeat._thread is not None
+        heartbeat._thread.join(2.0)
+        self.assertFalse(heartbeat._thread.is_alive())
+        heartbeat._close_descriptors()
+        pre_status = json.loads(
+            (run_dir / "status.json").read_text(encoding="utf-8")
+        )
+        post_status = {
+            **pre_status,
+            "status": "failed",
+            "stage": "worker_exit",
+            "message": "FWI worker exited with code -9",
+            "updated_at": "2026-07-15T06:00:02Z",
+        }
+        exit_evidence = record_worker_exit(
+            self.run_root,
+            run_dir,
+            binding,
+            return_code=-9,
+            pre_status=pre_status,
+            post_status=post_status,
+        )
+
+        exhausted = adapter.probe_worker_exit_retry_exhaustion(
+            **copy.deepcopy(request)
+        )
+        self.assertEqual(exhausted.previous_attempt_number, 2)
+        self.assertEqual(exhausted.private_schema_version, "1.2.0")
+        self.assertEqual(exhausted.private_proof_hash, exit_evidence.record_hash)
+        self.assertEqual(exhausted.exit_evidence, exit_evidence.as_dict())
+
     def test_retry_exhaustion_purge_deletes_both_attempts_and_replays(self) -> None:
         adapter, request, token, record_path = (
             self.stopped_retry_exhaustion_fixture(
@@ -2130,6 +2190,121 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                 purge_id=conflicting["purge_id"],
                 exhaustion=conflicting,
             )
+
+    def test_worker_exit_then_pre_running_exhaustion_purges_exact_chain(
+        self,
+    ) -> None:
+        task_id = "task-worker-exit-mixed-exhaustion-purge"
+        request = self.submit_kwargs(
+            task_id=task_id,
+            idempotency_key=f"{task_id}:invert:0001",
+        )
+        first_adapter = self.make_adapter()
+        first_handle = first_adapter.submit(**copy.deepcopy(request))
+        first_dir = self.launcher.calls[-1]["run_dir"]
+        first_binding, heartbeat = self.start_exact_worker(
+            first_handle, first_dir
+        )
+        heartbeat._stop.set()
+        assert heartbeat._thread is not None
+        heartbeat._thread.join(2.0)
+        self.assertFalse(heartbeat._thread.is_alive())
+        self.assertIsNone(heartbeat._failure)
+        heartbeat._close_descriptors()
+
+        pre_status = json.loads(
+            (first_dir / "status.json").read_text(encoding="utf-8")
+        )
+        post_status = {
+            **pre_status,
+            "status": "failed",
+            "stage": "worker_exit",
+            "message": "FWI worker exited with code -9",
+            "updated_at": "2026-07-15T06:00:01Z",
+        }
+        exit_evidence = record_worker_exit(
+            self.run_root,
+            first_dir,
+            first_binding,
+            return_code=-9,
+            pre_status=pre_status,
+            post_status=post_status,
+        )
+
+        stopped_launcher = StoppedTwiceSafeLauncher()
+        adapter = self.make_adapter(launcher=stopped_launcher)
+        first = adapter.probe_worker_exit_retry(**copy.deepcopy(request))
+        self.assertEqual(first.private_proof_hash, exit_evidence.record_hash)
+        authorization = {
+            "schema_version": "1.0.0",
+            "intent_id": f"intent-{task_id}",
+            "previous_attempt_id": first.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "failure_kind": "worker_exit",
+            "private_proof_hash": first.private_proof_hash,
+            "next_attempt_number": 2,
+            "authorized_at": "2026-07-15T06:00:02Z",
+        }
+        with self.assertRaises(AdapterUnavailable) as second_stopped:
+            adapter.retry_worker_exit(
+                **copy.deepcopy(request), authorization=authorization
+            )
+        self.assertEqual(second_stopped.exception.code, "WORKER_LAUNCH_FAILED")
+        second = adapter.probe_pre_running_retry_exhaustion(
+            **copy.deepcopy(request)
+        )
+        self.assertEqual(second.private_schema_version, "1.3.0")
+
+        payload = {
+            "schema_version": "1.1.0",
+            "purge_id": f"purge-{task_id}",
+            "intent_id": authorization["intent_id"],
+            "task_id": task_id,
+            "project_id": "project-1",
+            "principal_id": "user-1",
+            "approval_id": f"approval-{task_id}",
+            "attempt_id": second.previous_attempt_id,
+            "attempt_number": 2,
+            "observation_sequence": 2,
+            "evidence": copy.deepcopy(second.evidence),
+            "evidence_hash": fwi_adapter_module._sha256_document(
+                second.evidence
+            ),
+            "private_schema_version": "1.3.0",
+            "private_proof_hash": second.private_proof_hash,
+            "failure_kind": "pre_running_launch_failure",
+            "previous_attempt_id": first.previous_attempt_id,
+            "previous_observation_sequence": 1,
+            "previous_private_proof_hash": first.private_proof_hash,
+            "previous_failure_kind": "worker_exit",
+            "previous_private_schema_version": first.private_schema_version,
+            "retry_reserved_at": authorization["authorized_at"],
+            "terminal_event_sequence": 2,
+            "terminal_event_hash": "sha256:" + "f" * 64,
+            "exhausted_at": "2026-07-15T06:00:03Z",
+        }
+        token = {
+            **payload,
+            "proof_hash": fwi_adapter_module._sha256_document(payload),
+        }
+        record_path = self.submission_record_path(first_handle)
+        record = adapter._read_submission(record_path)
+        job_dirs = [
+            self.run_root / record["attempt_history"][0]["job_id"],
+            self.run_root / record["job_id"],
+        ]
+
+        result = adapter.purge_retry_exhausted(
+            **copy.deepcopy(request),
+            purge_id=token["purge_id"],
+            exhaustion=copy.deepcopy(token),
+        ).as_dict()
+        self.assertEqual(result["local_run_state"], "deleted")
+        self.assertFalse(result["replayed"])
+        self.assertTrue(all(not path.exists() for path in job_dirs))
+        self.assertEqual(
+            adapter._read_submission(record_path)["launch_state"], "purged"
+        )
 
     def test_dispatcher_consumes_only_store_typed_retry_exhaustion_proof(
         self,
@@ -3930,12 +4105,14 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         stage_launch_attempt(launcher_root, run_dir, launch_binding)
 
         allow_exit = threading.Event()
+        reaped = threading.Event()
 
         class SyntheticProcess:
             pid = 4321
 
             def wait(self) -> int:
                 allow_exit.wait(1.0)
+                reaped.set()
                 return 0
 
             def poll(self) -> None:
@@ -4001,14 +4178,13 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             self.assertEqual(options["env"]["CUDA_VISIBLE_DEVICES"], "0")
             self.assertEqual(started.call_count, 1)
             allow_exit.set()
-            for _ in range(100):
-                current = json.loads(
-                    (run_dir / "status.json").read_text(encoding="utf-8")
-                )
-                if current.get("stage") == "worker_exit":
-                    break
-                time.sleep(0.005)
-        self.assertEqual(current.get("stage"), "worker_exit")
+            self.assertTrue(reaped.wait(1.0))
+            current = json.loads(
+                (run_dir / "status.json").read_text(encoding="utf-8")
+            )
+        # Exit code zero without a terminal Worker document is ambiguous, not
+        # an exact retryable worker_exit failure.
+        self.assertEqual(current.get("stage"), "queued")
         current.update(
             {
                 "status": "succeeded",

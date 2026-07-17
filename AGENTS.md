@@ -85,6 +85,14 @@ simulate real-time context.
 - Never silently replace an accepted decision. Mark the old entry superseded
   and link it to the replacement so later sessions can reconstruct why it
   changed.
+- Do not alter or reinterpret an Accepted plan's scope, phase order,
+  dependencies, safety boundaries, or exit criteria without the user's
+  explicit approval. Progress/evidence updates may change only
+  Accepted/Implemented/Verified/Pending status, not the accepted direction.
+- Every estimate of remaining slices, time, or quantity must label its scope
+  (whole project, phase, or sub-slice), included phases, and whether it is a
+  rough estimate or a commitment. Keep whole-project and current-phase
+  estimates visibly separate in bootstrap summaries and progress ledgers.
 - Keep **Accepted direction**, **Implemented**, and **Verified** separate. A
   design can be accepted but still pending implementation.
 - Update the continuity document in the same change when an approved decision,

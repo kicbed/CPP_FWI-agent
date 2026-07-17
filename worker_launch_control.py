@@ -37,8 +37,10 @@ CONTROL_DIRECTORY = ".scientific-runtime-adapter-v1"
 LAUNCH_TICKET_NAME = ".worker-launch.json"
 WORKER_READY_NAME = ".worker-ready.json"
 WORKER_HEARTBEAT_NAME = ".worker-heartbeat.json"
+WORKER_EXIT_NAME = ".worker-exit.json"
 WORKER_CANCEL_DIRECTORY = "worker-cancel"
 WORKER_STOP_DIRECTORY = "worker-stop"
+WORKER_TERMINAL_ARBITRATION_DIRECTORY = "worker-terminal-arbitration"
 CONTROL_SCHEMA_VERSION = "1.0.0"
 STOP_PROTOCOL_VERSION = "2.0.0"
 MAX_CONTROL_JSON_BYTES = 64 * 1024
@@ -721,6 +723,126 @@ class WorkerAttemptEvidence:
         }
 
 
+@dataclass(frozen=True)
+class WorkerExitEvidence:
+    """Append-only proof that one exact ready Worker exited unexpectedly.
+
+    The receipt is path-free and does not by itself authorize retry.  A reader
+    re-proves the stable idle execution fence, the exact started-attempt
+    sidecars, absence of either stop request protocol, and the bound pre/post
+    status document before returning it.
+    """
+
+    submission_id: str
+    attempt_id: str
+    attempt_number: int
+    job_id: str
+    request_hash: str
+    binding_hash: str
+    created_at: str
+    ticket_record_hash: str
+    ready_record_hash: str
+    heartbeat_sequence: int
+    heartbeat_state: str
+    heartbeat_record_hash: str
+    pre_status_hash: str
+    post_status_hash: str
+    return_code: int
+    observed_at: str
+    record_hash: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": CONTROL_SCHEMA_VERSION,
+            "submission_id": self.submission_id,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "job_id": self.job_id,
+            "request_hash": self.request_hash,
+            "binding_hash": self.binding_hash,
+            "created_at": self.created_at,
+            "ticket_record_hash": self.ticket_record_hash,
+            "ready_record_hash": self.ready_record_hash,
+            "heartbeat_sequence": self.heartbeat_sequence,
+            "heartbeat_state": self.heartbeat_state,
+            "heartbeat_record_hash": self.heartbeat_record_hash,
+            "pre_status_hash": self.pre_status_hash,
+            "post_status_hash": self.post_status_hash,
+            "return_code": self.return_code,
+            "observed_at": self.observed_at,
+            "record_hash": self.record_hash,
+        }
+
+
+@contextlib.contextmanager
+def _hold_worker_terminal_arbitration(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> Iterator[Path]:
+    """Serialize durable stop-request and unexpected-exit publication.
+
+    This lock is distinct from the execution fence because a stop request must
+    be publishable while the Worker still owns that fence.  It is stable per
+    submission, so all serial attempts share one non-replaceable arbitration
+    inode without accumulating one lock per attempt.
+    """
+
+    root = Path(run_root)
+    if not root.is_absolute() or root.is_symlink():
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise WorkerControlError(
+            "WORKER_CONTROL_UNAVAILABLE: run root is unavailable"
+        ) from error
+    if resolved != root:
+        raise WorkerControlError(
+            "WORKER_CONTROL_INVALID: run root is not canonical"
+        )
+    _require_protected_directory(root)
+    control = _ensure_private_directory(root / CONTROL_DIRECTORY)
+    arbitration = _ensure_private_directory(
+        control / WORKER_TERMINAL_ARBITRATION_DIRECTORY
+    )
+    lock_path = arbitration / f"{binding.submission_id}.lock"
+    descriptor = _open_private_lock(lock_path, blocking=True)
+    if descriptor is None:
+        raise WorkerControlError(
+            "WORKER_CONTROL_UNAVAILABLE: terminal arbitration lock failed"
+        )
+    try:
+        _validate_or_record_lock_identity(lock_path, descriptor)
+        yield root
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _reject_worker_exit_receipt_for_stop(
+    run_root: Path,
+    binding: LaunchAttemptBinding,
+    *,
+    conflict_code: str,
+) -> None:
+    """Fail closed when an exact exit receipt already won arbitration."""
+
+    _, job_dir = _validate_root_and_run(
+        run_root, run_root / binding.job_id
+    )
+    try:
+        value = _read_private_json(job_dir / WORKER_EXIT_NAME)
+    except FileNotFoundError:
+        return
+    _validate_worker_exit_receipt(value, binding)
+    raise WorkerControlError(
+        f"{conflict_code}: worker-exit receipt already won terminal arbitration"
+    )
+
+
 def _cancel_control_paths(
     run_root: Path | str,
     binding: LaunchAttemptBinding,
@@ -971,7 +1093,7 @@ def _validate_cancel_acknowledgement(
     return copy.deepcopy(dict(value))
 
 
-def _request_legacy_worker_cancel(
+def _request_legacy_worker_cancel_unlocked(
     run_root: Path | str,
     binding: LaunchAttemptBinding,
     *,
@@ -1018,6 +1140,27 @@ def _request_legacy_worker_cancel(
             "WORKER_CANCEL_CONFLICT: attempt is bound to another cancellation request"
         )
     return _read_legacy_worker_cancel_evidence(run_root, binding), replayed
+
+
+def _request_legacy_worker_cancel(
+    run_root: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    cancel_id: str,
+    reason: str,
+    requested_at: str,
+) -> tuple[WorkerCancelEvidence, bool]:
+    with _hold_worker_terminal_arbitration(run_root, binding) as root:
+        _reject_worker_exit_receipt_for_stop(
+            root, binding, conflict_code="WORKER_CANCEL_CONFLICT"
+        )
+        return _request_legacy_worker_cancel_unlocked(
+            root,
+            binding,
+            cancel_id=cancel_id,
+            reason=reason,
+            requested_at=requested_at,
+        )
 
 
 def _read_legacy_worker_cancel_evidence(
@@ -1461,7 +1604,7 @@ def _validate_stop_acknowledgement(
     return copy.deepcopy(dict(value))
 
 
-def request_worker_stop(
+def _request_worker_stop_unlocked(
     run_root: Path | str,
     binding: LaunchAttemptBinding,
     *,
@@ -1537,6 +1680,37 @@ def request_worker_stop(
             "WORKER_STOP_CONFLICT: attempt timeout window changed"
         )
     return read_worker_stop_evidence(run_root, binding), replayed
+
+
+def request_worker_stop(
+    run_root: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    request_id: str,
+    reason: str,
+    requested_at: str,
+    wall_time_seconds: int | None = None,
+    started_at: str | None = None,
+    deadline_at: str | None = None,
+    ready_record_hash: str | None = None,
+) -> tuple[WorkerStopEvidence, bool]:
+    """Arbitrate and publish one exact v2 stop request."""
+
+    with _hold_worker_terminal_arbitration(run_root, binding) as root:
+        _reject_worker_exit_receipt_for_stop(
+            root, binding, conflict_code="WORKER_STOP_CONFLICT"
+        )
+        return _request_worker_stop_unlocked(
+            root,
+            binding,
+            request_id=request_id,
+            reason=reason,
+            requested_at=requested_at,
+            wall_time_seconds=wall_time_seconds,
+            started_at=started_at,
+            deadline_at=deadline_at,
+            ready_record_hash=ready_record_hash,
+        )
 
 
 def read_worker_stop_evidence(
@@ -2977,6 +3151,449 @@ def read_pre_running_attempt_evidence(
     return evidence
 
 
+_WORKER_EXIT_STATUS_MUTATIONS = frozenset(
+    {"status", "stage", "message", "updated_at"}
+)
+
+
+def _worker_exit_status_hashes(
+    binding: LaunchAttemptBinding,
+    pre_status: Mapping[str, Any],
+    post_status: Mapping[str, Any],
+    return_code: int,
+) -> tuple[str, str]:
+    """Validate and hash the reaper's exact nonterminal-to-exit transition."""
+
+    if not isinstance(pre_status, Mapping) or not isinstance(post_status, Mapping):
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: status evidence must be JSON objects"
+        )
+    pre = copy.deepcopy(dict(pre_status))
+    post = copy.deepcopy(dict(post_status))
+    if set(pre) != set(post):
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit status fields changed"
+        )
+    if pre.get("job_id") != binding.job_id or post.get("job_id") != binding.job_id:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit status job changed"
+        )
+    if pre.get("status") not in {"queued", "running"}:
+        raise WorkerControlError(
+            "WORKER_EXIT_UNSAFE: terminal Worker status cannot become worker_exit"
+        )
+    if (
+        post.get("status") != "failed"
+        or post.get("stage") != "worker_exit"
+        or post.get("failure_code") is not None
+        or post.get("message")
+        != f"FWI worker exited with code {return_code}"
+    ):
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: post status is not an ordinary worker_exit"
+        )
+    if not isinstance(pre.get("stage"), str) or not isinstance(
+        post.get("message"), str
+    ):
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit status text is invalid"
+        )
+    _parse_timestamp(pre.get("updated_at"))
+    if _parse_timestamp(post.get("updated_at")) < _parse_timestamp(
+        pre.get("updated_at")
+    ):
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit status time moved backwards"
+        )
+    for key in set(pre) - _WORKER_EXIT_STATUS_MUTATIONS:
+        if pre[key] != post[key]:
+            raise WorkerControlError(
+                "WORKER_EXIT_INVALID: worker-exit changed scientific status data"
+            )
+    pre_hash = _sha256_document(pre)
+    post_hash = _sha256_document(post)
+    if pre_hash == post_hash:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit status transition is empty"
+        )
+    return pre_hash, post_hash
+
+
+def _require_no_worker_exit_stop(
+    run_root: Path | str, binding: LaunchAttemptBinding
+) -> None:
+    """Reject every requested v2 or legacy stop channel, including corruption."""
+
+    capability = read_worker_stop_capability(run_root, binding)
+    if capability is None:
+        raise WorkerControlError(
+            "WORKER_EXIT_UNSAFE: exact Worker has no v2 stop capability"
+        )
+    stop = read_worker_stop_evidence(run_root, binding)
+    if stop.requested or stop.acknowledged:
+        raise WorkerControlError(
+            "WORKER_EXIT_UNSAFE: Worker has a stop request"
+        )
+    legacy_capability = _read_legacy_worker_cancel_capability(
+        run_root, binding
+    )
+    if legacy_capability is not None:
+        legacy = _read_legacy_worker_cancel_evidence(run_root, binding)
+        if legacy.requested or legacy.acknowledged:
+            raise WorkerControlError(
+                "WORKER_EXIT_UNSAFE: Worker has a legacy cancellation request"
+            )
+
+
+def _validate_worker_exit_receipt(
+    value: Mapping[str, Any], binding: LaunchAttemptBinding
+) -> WorkerExitEvidence:
+    required = {
+        *binding.payload().keys(),
+        "binding_hash",
+        "ticket_record_hash",
+        "ready_record_hash",
+        "heartbeat_sequence",
+        "heartbeat_state",
+        "heartbeat_record_hash",
+        "pre_status_hash",
+        "post_status_hash",
+        "return_code",
+        "observed_at",
+        "record_hash",
+    }
+    if set(value) != required:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit receipt fields are invalid"
+        )
+    _validate_record_hash(value)
+    if any(
+        value.get(key) != expected
+        for key, expected in {
+            **binding.payload(),
+            "binding_hash": binding.binding_hash,
+        }.items()
+    ):
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit receipt binding changed"
+        )
+    if any(
+        SHA256.fullmatch(value.get(field, "")) is None
+        for field in (
+            "ticket_record_hash",
+            "ready_record_hash",
+            "heartbeat_record_hash",
+            "pre_status_hash",
+            "post_status_hash",
+        )
+    ):
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit evidence hash is invalid"
+        )
+    if (
+        type(value.get("heartbeat_sequence")) is not int
+        or value["heartbeat_sequence"] < 1
+        or value.get("heartbeat_state") != "running"
+        or type(value.get("return_code")) is not int
+        or value["return_code"]
+        in {
+            0,
+            CANCELLED_WORKER_EXIT_CODE,
+            WALL_TIME_EXCEEDED_WORKER_EXIT_CODE,
+        }
+        or value["pre_status_hash"] == value["post_status_hash"]
+    ):
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit outcome is invalid"
+        )
+    _parse_timestamp(value.get("observed_at"))
+    return WorkerExitEvidence(
+        submission_id=value["submission_id"],
+        attempt_id=value["attempt_id"],
+        attempt_number=value["attempt_number"],
+        job_id=value["job_id"],
+        request_hash=value["request_hash"],
+        binding_hash=value["binding_hash"],
+        created_at=value["created_at"],
+        ticket_record_hash=value["ticket_record_hash"],
+        ready_record_hash=value["ready_record_hash"],
+        heartbeat_sequence=value["heartbeat_sequence"],
+        heartbeat_state=value["heartbeat_state"],
+        heartbeat_record_hash=value["heartbeat_record_hash"],
+        pre_status_hash=value["pre_status_hash"],
+        post_status_hash=value["post_status_hash"],
+        return_code=value["return_code"],
+        observed_at=value["observed_at"],
+        record_hash=value["record_hash"],
+    )
+
+
+def _read_worker_exit_context(
+    run_root: Path | str,
+    run_dir: Path,
+    binding: LaunchAttemptBinding,
+) -> tuple[WorkerAttemptEvidence, dict[str, Any], str]:
+    attempt = read_worker_attempt_evidence(run_root, run_dir, binding)
+    if (
+        attempt is None
+        or attempt.ticket_state != "spawned"
+        or not attempt.ready
+        or not attempt.started
+        or attempt.heartbeat_state != "running"
+        or attempt.ready_record_hash is None
+        or attempt.heartbeat_sequence is None
+        or attempt.heartbeat_record_hash is None
+    ):
+        raise WorkerControlError(
+            "WORKER_EXIT_UNSAFE: exact ready Worker has no running exit evidence"
+        )
+    _require_no_worker_exit_stop(run_root, binding)
+    try:
+        status = _read_private_json(run_dir / "status.json")
+    except FileNotFoundError as error:
+        raise WorkerControlError(
+            "WORKER_EXIT_UNSAFE: Worker status evidence is missing"
+        ) from error
+    return attempt, status, _sha256_document(status)
+
+
+def _validate_live_worker_exit(
+    evidence: WorkerExitEvidence,
+    attempt: WorkerAttemptEvidence,
+    status: Mapping[str, Any],
+    status_hash: str,
+) -> None:
+    if (
+        evidence.ticket_record_hash != attempt.ticket_record_hash
+        or evidence.ready_record_hash != attempt.ready_record_hash
+        or evidence.heartbeat_sequence != attempt.heartbeat_sequence
+        or evidence.heartbeat_state != attempt.heartbeat_state
+        or evidence.heartbeat_record_hash != attempt.heartbeat_record_hash
+    ):
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: worker-exit sidecar evidence changed"
+        )
+    if status_hash == evidence.pre_status_hash:
+        if status.get("job_id") != evidence.job_id or status.get("status") not in {
+            "queued",
+            "running",
+        }:
+            raise WorkerControlError(
+                "WORKER_EXIT_INVALID: pre-exit status no longer matches"
+            )
+    elif status_hash == evidence.post_status_hash:
+        if (
+            status.get("job_id") != evidence.job_id
+            or status.get("status") != "failed"
+            or status.get("stage") != "worker_exit"
+            or status.get("failure_code") is not None
+        ):
+            raise WorkerControlError(
+                "WORKER_EXIT_INVALID: post-exit status no longer matches"
+            )
+    else:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: Worker status is outside the bound transition"
+        )
+
+
+def _finalize_worker_exit_status(
+    evidence: WorkerExitEvidence,
+    run_dir: Path,
+    status: Mapping[str, Any],
+    status_hash: str,
+    *,
+    post_status: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Install only the exact post document bound by an existing receipt."""
+
+    if status_hash == evidence.post_status_hash:
+        return copy.deepcopy(dict(status)), status_hash
+    if status_hash != evidence.pre_status_hash:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: Worker status is outside the bound transition"
+        )
+    candidate = (
+        copy.deepcopy(dict(post_status))
+        if post_status is not None
+        else {
+            **copy.deepcopy(dict(status)),
+            "status": "failed",
+            "stage": "worker_exit",
+            "message": f"FWI worker exited with code {evidence.return_code}",
+            "updated_at": evidence.observed_at,
+        }
+    )
+    if _sha256_document(candidate) != evidence.post_status_hash:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: bound post status cannot be reconstructed"
+        )
+    status_path = run_dir / "status.json"
+    # Re-check immediately before replacement.  Legitimate terminal writers
+    # share the arbitration lock; an uncoordinated drift remains visible and
+    # is never overwritten deliberately.
+    current = _read_private_json(status_path)
+    current_hash = _sha256_document(current)
+    if current_hash == evidence.post_status_hash:
+        return current, current_hash
+    if current_hash != evidence.pre_status_hash:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: Worker status changed before finalization"
+        )
+    _atomic_write_private_json(status_path, candidate)
+    written = _read_private_json(status_path)
+    written_hash = _sha256_document(written)
+    if written_hash != evidence.post_status_hash:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: Worker exit finalization changed"
+        )
+    return written, written_hash
+
+
+def record_worker_exit(
+    run_root: Path | str,
+    run_dir: Path | str,
+    binding: LaunchAttemptBinding,
+    *,
+    return_code: int,
+    pre_status: Mapping[str, Any],
+    post_status: Mapping[str, Any],
+    observed_at: str | None = None,
+) -> WorkerExitEvidence:
+    """Append one exact post-ready unexpected-exit receipt.
+
+    The caller must have synchronously reaped the exact process.  This method
+    independently proves that the inherited execution fence is idle.  It
+    publishes the receipt first, then atomically installs only the already-
+    bound ``post_status`` document.  A reader can finish that exact transition
+    after a crash between those two durable writes.
+    """
+
+    if type(return_code) is not int or return_code in {
+        0,
+        CANCELLED_WORKER_EXIT_CODE,
+        WALL_TIME_EXCEEDED_WORKER_EXIT_CODE,
+    }:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: return code is not an unexpected failure"
+        )
+    pre_hash, post_hash = _worker_exit_status_hashes(
+        binding, pre_status, post_status, return_code
+    )
+    status_observed_at = post_status.get("updated_at")
+    if observed_at is None:
+        observed_at = status_observed_at
+    if observed_at != status_observed_at:
+        raise WorkerControlError(
+            "WORKER_EXIT_INVALID: observation time differs from post status"
+        )
+    _parse_timestamp(observed_at)
+    root, job_dir = _validate_root_and_run(run_root, run_dir)
+    receipt_path = job_dir / WORKER_EXIT_NAME
+    with _hold_worker_terminal_arbitration(root, binding):
+        with hold_idle_execution_fence(root, binding):
+            attempt, status, status_hash = _read_worker_exit_context(
+                root, job_dir, binding
+            )
+            try:
+                existing_value = _read_private_json(receipt_path)
+            except FileNotFoundError:
+                existing_value = None
+            if existing_value is None:
+                if status_hash != pre_hash:
+                    raise WorkerControlError(
+                        "WORKER_EXIT_UNSAFE: initial receipt requires the "
+                        "pre-exit status"
+                    )
+                candidate = _record_with_hash(
+                    {
+                        **binding.payload(),
+                        "binding_hash": binding.binding_hash,
+                        "ticket_record_hash": attempt.ticket_record_hash,
+                        "ready_record_hash": attempt.ready_record_hash,
+                        "heartbeat_sequence": attempt.heartbeat_sequence,
+                        "heartbeat_state": attempt.heartbeat_state,
+                        "heartbeat_record_hash": attempt.heartbeat_record_hash,
+                        "pre_status_hash": pre_hash,
+                        "post_status_hash": post_hash,
+                        "return_code": return_code,
+                        "observed_at": observed_at,
+                    }
+                )
+                try:
+                    _create_private_json(receipt_path, candidate)
+                    existing_value = candidate
+                except FileExistsError:
+                    existing_value = _read_private_json(receipt_path)
+            evidence = _validate_worker_exit_receipt(existing_value, binding)
+            expected = {
+                "ticket_record_hash": attempt.ticket_record_hash,
+                "ready_record_hash": attempt.ready_record_hash,
+                "heartbeat_sequence": attempt.heartbeat_sequence,
+                "heartbeat_state": "running",
+                "heartbeat_record_hash": attempt.heartbeat_record_hash,
+                "pre_status_hash": pre_hash,
+                "post_status_hash": post_hash,
+                "return_code": return_code,
+            }
+            if any(
+                getattr(evidence, key) != value
+                for key, value in expected.items()
+            ):
+                raise WorkerControlError(
+                    "WORKER_EXIT_CONFLICT: attempt has another worker-exit receipt"
+                )
+            if evidence.observed_at != observed_at:
+                raise WorkerControlError(
+                    "WORKER_EXIT_CONFLICT: worker-exit observation time changed"
+                )
+            # Re-read after append-only publication so concurrent stop/status
+            # evidence cannot make a successful return look stronger than it is.
+            attempt, status, status_hash = _read_worker_exit_context(
+                root, job_dir, binding
+            )
+            _validate_live_worker_exit(evidence, attempt, status, status_hash)
+            status, status_hash = _finalize_worker_exit_status(
+                evidence,
+                job_dir,
+                status,
+                status_hash,
+                post_status=post_status,
+            )
+            _validate_live_worker_exit(evidence, attempt, status, status_hash)
+            _require_no_worker_exit_stop(root, binding)
+            return evidence
+
+
+def read_worker_exit_evidence(
+    run_root: Path | str,
+    run_dir: Path | str,
+    binding: LaunchAttemptBinding,
+) -> WorkerExitEvidence:
+    """Re-prove and return one exact append-only unexpected-exit receipt."""
+
+    root, job_dir = _validate_root_and_run(run_root, run_dir)
+    with _hold_worker_terminal_arbitration(root, binding):
+        with hold_idle_execution_fence(root, binding):
+            try:
+                value = _read_private_json(job_dir / WORKER_EXIT_NAME)
+            except FileNotFoundError as error:
+                raise WorkerControlError(
+                    "WORKER_EXIT_MISSING: worker-exit receipt is missing"
+                ) from error
+            evidence = _validate_worker_exit_receipt(value, binding)
+            attempt, status, status_hash = _read_worker_exit_context(
+                root, job_dir, binding
+            )
+            _validate_live_worker_exit(evidence, attempt, status, status_hash)
+            status, status_hash = _finalize_worker_exit_status(
+                evidence, job_dir, status, status_hash
+            )
+            _validate_live_worker_exit(evidence, attempt, status, status_hash)
+            _require_no_worker_exit_stop(root, binding)
+            return evidence
+
+
 def worker_attempt_started(
     run_root: Path | str,
     run_dir: Path | str,
@@ -2994,12 +3611,14 @@ __all__ = [
     "STOP_PROTOCOL_VERSION",
     "SUPPORTED_STOP_REASONS",
     "WALL_TIME_EXCEEDED_WORKER_EXIT_CODE",
+    "WORKER_EXIT_NAME",
     "LaunchAttemptBinding",
     "ParentLaunchLease",
     "WorkerAttemptEvidence",
     "WorkerCancelEvidence",
     "WorkerCancellationRequested",
     "WorkerControlError",
+    "WorkerExitEvidence",
     "WorkerHeartbeat",
     "WorkerStopEvidence",
     "WorkerWallTimeExceeded",
@@ -3011,6 +3630,7 @@ __all__ = [
     "mark_launch_failed",
     "purge_worker_cancel_control",
     "purge_worker_stop_control",
+    "read_worker_exit_evidence",
     "read_pre_running_attempt_evidence",
     "read_worker_cancel_capability",
     "read_worker_cancel_evidence",
@@ -3019,6 +3639,7 @@ __all__ = [
     "read_worker_attempt_evidence",
     "request_worker_cancel",
     "request_worker_stop",
+    "record_worker_exit",
     "stage_launch_attempt",
     "worker_attempt_started",
 ]

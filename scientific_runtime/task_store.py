@@ -68,7 +68,7 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
         {"NeedsInput", "Draft", "AwaitingApproval", "Cancelled"}
     ),
     "AwaitingApproval": frozenset({"AwaitingApproval", "Queued", "Cancelled"}),
-    "Queued": frozenset({"Running", "Failed", "Cancelled"}),
+    "Queued": frozenset({"Running", "Retrying", "Failed", "Cancelled"}),
     "Running": frozenset(
         {"Running", "Waiting", "Retrying", "Succeeded", "Failed", "Cancelled"}
     ),
@@ -319,12 +319,27 @@ class RetryExhaustionCleanupProof:
     terminal_event_sequence: int
     terminal_event_hash: str
     exhausted_at: str
+    previous_failure_kind: str = "pre_running_launch_failure"
+    previous_private_schema_version: str | None = None
 
     def adapter_token(self) -> dict[str, Any]:
         """Return a canonical purge-bound token for the private state check."""
 
+        worker_exit_lineage = self.previous_failure_kind == "worker_exit"
+        if worker_exit_lineage:
+            if self.previous_private_schema_version not in {"1.1.0", "1.2.0"}:
+                raise TaskStoreCorruption(
+                    "worker-exit cleanup proof has an invalid private lineage"
+                )
+        elif (
+            self.previous_failure_kind != "pre_running_launch_failure"
+            or self.previous_private_schema_version is not None
+        ):
+            raise TaskStoreCorruption(
+                "pre-running cleanup proof has an invalid private lineage"
+            )
         payload = {
-            "schema_version": "1.0.0",
+            "schema_version": "1.1.0" if worker_exit_lineage else "1.0.0",
             "purge_id": self.purge_id,
             "intent_id": self.intent_id,
             "task_id": self.task_id,
@@ -347,6 +362,15 @@ class RetryExhaustionCleanupProof:
             "terminal_event_hash": self.terminal_event_hash,
             "exhausted_at": self.exhausted_at,
         }
+        if worker_exit_lineage:
+            payload.update(
+                {
+                    "previous_failure_kind": self.previous_failure_kind,
+                    "previous_private_schema_version": (
+                        self.previous_private_schema_version
+                    ),
+                }
+            )
         return {**payload, "proof_hash": encode_document(payload)[1]}
 
 
@@ -399,6 +423,12 @@ class SupervisedRetryAuthorization:
     authorized_at: str
     reservation_replayed: bool
     authorization_replayed: bool
+    private_schema_version: str | None = None
+    source_outcome_document_hash: str | None = None
+    source_handle_hash: str | None = None
+    source_handle: dict[str, Any] | None = None
+    retry_event_sequence: int | None = None
+    retry_event_hash: str | None = None
 
     def adapter_token(self) -> dict[str, Any]:
         """Return the stable, path-free authorization consumed by Adapter."""
@@ -413,6 +443,24 @@ class SupervisedRetryAuthorization:
             "next_attempt_number": self.attempt_number,
             "authorized_at": self.reserved_at,
         }
+
+
+@dataclass(frozen=True)
+class SupervisedWorkerExitRetryExhaustion:
+    """Atomic terminalization of attempt 2 after a B2 reservation."""
+
+    snapshot: TaskSnapshot
+    intent: DispatchIntentSnapshot
+    attempt_id: str
+    observation_sequence: int
+    evidence_hash: str
+    private_proof_hash: str
+    private_schema_version: str
+    failure_kind: str
+    terminal_event_sequence: int
+    fencing_token: int
+    exhausted_at: str
+    replayed: bool
 
 
 @dataclass(frozen=True)
@@ -851,6 +899,46 @@ class TaskStore(Protocol):
     ) -> SupervisedRetryAuthorization:
         ...
 
+    def authorize_supervised_worker_exit_retry(
+        self,
+        *,
+        intent_id: str,
+        previous_attempt_id: str,
+        previous_observation_sequence: int,
+        failure_kind: str,
+        private_schema_version: str,
+        private_proof_hash: str,
+        retry_event: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedRetryAuthorization:
+        ...
+
+    def resume_supervised_worker_exit_retry(
+        self,
+        *,
+        intent_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedRetryAuthorization:
+        ...
+
+    def finalize_supervised_worker_exit_retry_exhaustion(
+        self,
+        *,
+        intent_id: str,
+        attempt_id: str,
+        observation_sequence: int,
+        evidence: Mapping[str, Any],
+        private_schema_version: str,
+        private_proof_hash: str,
+        failure_kind: str,
+        terminal_event: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedWorkerExitRetryExhaustion:
+        ...
+
     def finalize_supervised_retry_exhaustion(
         self,
         *,
@@ -895,6 +983,7 @@ class TaskStore(Protocol):
         intent_id: str,
         evidence: Mapping[str, Any],
         handle: Mapping[str, Any] | None,
+        replacement_event: Mapping[str, Any] | None = None,
         supervisor_lease: RuntimeSupervisorLease,
         supervisor_clock: Callable[[], str],
     ) -> WorkerAttemptProjection:
@@ -2188,12 +2277,25 @@ class SQLiteTaskStore:
                 raise TaskStoreConflict(
                     "timeout window requires the latest exact Worker attempt"
                 )
+            worker_exit_retry_attempt = connection.execute(
+                """
+                SELECT 1 FROM worker_exit_retry_reservations
+                WHERE intent_id = ? AND attempt_number = ?
+                """,
+                (intent_id, int(attempt["attempt_number"])),
+            ).fetchone() is not None
             proof = _validate_timeout_capability_proof(
                 capability_proof,
                 attempt_id=attempt_id,
                 binding_hash=attempt["binding_hash"],
                 private_schema_version=(
-                    "1.2.0" if int(attempt["attempt_number"]) == 2 else "1.1.0"
+                    "1.3.0"
+                    if worker_exit_retry_attempt
+                    else (
+                        "1.2.0"
+                        if int(attempt["attempt_number"]) == 2
+                        else "1.1.0"
+                    )
                 ),
             )
             proof_json, proof_document_hash = encode_document(proof)
@@ -2364,6 +2466,980 @@ class SQLiteTaskStore:
                 ) from error
             raise TaskStoreConflict(
                 "Worker timeout window conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finalize_supervised_worker_exit_retry_exhaustion(
+        self,
+        *,
+        intent_id: str,
+        attempt_id: str,
+        observation_sequence: int,
+        evidence: Mapping[str, Any],
+        private_schema_version: str,
+        private_proof_hash: str,
+        failure_kind: str,
+        terminal_event: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedWorkerExitRetryExhaustion:
+        """Atomically close attempt 2 without ever authorizing attempt 3."""
+
+        if (
+            not isinstance(intent_id, str)
+            or not intent_id
+            or WORKER_ATTEMPT_ID.fullmatch(str(attempt_id)) is None
+            or type(observation_sequence) is not int
+            or observation_sequence < 1
+            or private_schema_version != "1.3.0"
+            or not _is_sha256(private_proof_hash)
+            or failure_kind not in {"pre_running_launch_failure", "worker_exit"}
+            or not isinstance(terminal_event, Mapping)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("Worker-exit retry exhaustion is invalid")
+        normalized = _validated_worker_evidence(evidence)
+        evidence_json, evidence_hash = encode_document(normalized)
+        event = copy.deepcopy(dict(terminal_event))
+        event_json, event_hash = encode_document(event)
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            exhausted_at, exhausted_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            reservation = connection.execute(
+                """
+                SELECT * FROM worker_exit_retry_reservations
+                WHERE intent_id = ? AND attempt_number = 2
+                """,
+                (intent_id,),
+            ).fetchone()
+            if reservation is None:
+                raise TaskStoreConflict("Worker-exit retry reservation is absent")
+            task_id = reservation["task_id"]
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("retry target task cannot be read")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=exhausted_at_us,
+                action="Worker-exit retry exhaustion",
+            )
+            existing = connection.execute(
+                """
+                SELECT * FROM worker_exit_retry_exhaustions
+                WHERE intent_id = ? AND attempt_number = 2
+                """,
+                (intent_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["attempt_id"] != attempt_id
+                    or existing["observation_sequence"] != observation_sequence
+                    or existing["evidence_hash"] != evidence_hash
+                    or existing["private_schema_version"]
+                    != private_schema_version
+                    or existing["private_proof_hash"] != private_proof_hash
+                    or existing["failure_kind"] != failure_kind
+                    or existing["terminal_event_hash"] != event_hash
+                ):
+                    raise TaskStoreConflict(
+                        "Worker-exit retry exhaustion conflicts with durable state"
+                    )
+                snapshot = self._load_snapshot(connection, task_id)
+                intent = self._load_dispatch_intent(connection, task_id=task_id)
+                if snapshot is None or intent is None or snapshot.status != "Failed":
+                    raise TaskStoreCorruption(
+                        "Worker-exit retry exhaustion cannot be read"
+                    )
+                connection.commit()
+                return SupervisedWorkerExitRetryExhaustion(
+                    snapshot=snapshot,
+                    intent=intent,
+                    attempt_id=attempt_id,
+                    observation_sequence=observation_sequence,
+                    evidence_hash=evidence_hash,
+                    private_proof_hash=private_proof_hash,
+                    private_schema_version=private_schema_version,
+                    failure_kind=failure_kind,
+                    terminal_event_sequence=existing[
+                        "terminal_event_sequence"
+                    ],
+                    fencing_token=existing["fencing_token"],
+                    exhausted_at=existing["exhausted_at"],
+                    replayed=True,
+                )
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            attempt = connection.execute(
+                """
+                SELECT * FROM worker_launch_attempts
+                WHERE intent_id = ? ORDER BY attempt_number DESC LIMIT 1
+                """,
+                (intent_id,),
+            ).fetchone()
+            observation = connection.execute(
+                """
+                SELECT * FROM worker_attempt_observations
+                WHERE attempt_id = ? AND observation_sequence = ?
+                """,
+                (attempt_id, observation_sequence),
+            ).fetchone()
+            latest_observation = connection.execute(
+                """
+                SELECT MAX(observation_sequence)
+                FROM worker_attempt_observations WHERE attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()[0]
+            replacement = connection.execute(
+                """
+                SELECT * FROM worker_exit_retry_dispatch_replacements
+                WHERE intent_id = ? AND attempt_number = 2
+                """,
+                (intent_id,),
+            ).fetchone()
+            pre_running = failure_kind == "pre_running_launch_failure"
+            ticket = normalized["ticket"]
+            if (
+                attempt is None
+                or attempt["attempt_id"] != attempt_id
+                or int(attempt["attempt_number"]) != 2
+                or attempt["intent_id"] != intent_id
+                or observation is None
+                or observation["document_hash"] != evidence_hash
+                or int(latest_observation) != observation_sequence
+                or normalized["attempt_id"] != attempt_id
+                or normalized["attempt_number"] != 2
+                or (
+                    pre_running
+                    and (
+                        task["status"] != "Retrying"
+                        or intent.state != "retrying"
+                        or replacement is not None
+                        or ticket["state"] != "failed"
+                        or ticket["worker_pid"] is not None
+                        or normalized["ready"] is not None
+                        or normalized["heartbeat"] is not None
+                    )
+                )
+                or (
+                    not pre_running
+                    and (
+                        task["status"] != "Running"
+                        or intent.state != "dispatched"
+                        or replacement is None
+                        or replacement["attempt_id"] != attempt_id
+                        or ticket["state"] != "spawned"
+                        or normalized["ready"] is None
+                        or normalized["heartbeat"] is None
+                        or normalized["heartbeat"]["state"] != "running"
+                    )
+                )
+            ):
+                raise TaskStoreConflict(
+                    "retry exhaustion requires exact current attempt 2 evidence"
+                )
+            if connection.execute(
+                "SELECT 1 FROM task_cancel_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict("cancellation owns the terminal race")
+            if connection.execute(
+                "SELECT 1 FROM task_timeout_outcomes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict("timeout owns the terminal race")
+            if connection.execute(
+                """
+                SELECT 1
+                FROM worker_attempt_timeout_windows AS timeout
+                JOIN supervised_timeout_attempts AS delivery
+                  ON delivery.timeout_id = timeout.timeout_id
+                WHERE timeout.attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict("timeout delivery owns the terminal race")
+            next_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_events "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            extension = event.get("extensions", {}).get(
+                "org.agent_rpc.retry_exhaustion"
+            )
+            expected_extension = {
+                "intent_id": intent_id,
+                "attempt_id": attempt_id,
+                "attempt_number": 2,
+                "observation_sequence": observation_sequence,
+                "evidence_hash": evidence_hash,
+                "private_schema_version": "1.3.0",
+                "private_proof_hash": private_proof_hash,
+                "failure_kind": failure_kind,
+                "max_attempts": 2,
+            }
+            if (
+                event.get("sequence") != next_sequence
+                or event.get("task_id") != task_id
+                or event.get("node_id") != intent.node_id
+                or event.get("event_type") != "node_failed"
+                or event.get("task_status") != "Failed"
+                or event.get("error", {}).get("code") != "retry_exhausted"
+                or event.get("error", {}).get("retryable") is not False
+                or event.get("fingerprint") != intent.queue_fingerprint
+                or extension != expected_extension
+                or (
+                    pre_running
+                    and event.get("occurred_at") != ticket["updated_at"]
+                )
+            ):
+                raise TaskStoreConflict("retry exhaustion event is invalid")
+            _, fingerprint_hash = encode_document(event["fingerprint"])
+            connection.execute(
+                """
+                INSERT INTO run_events(
+                    task_id, sequence, event_id, event_type, task_status,
+                    node_id, fingerprint_hash, document_json, document_hash,
+                    occurred_at, recorded_at
+                ) VALUES (?, ?, ?, 'node_failed', 'Failed', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    next_sequence,
+                    event["event_id"],
+                    intent.node_id,
+                    fingerprint_hash,
+                    event_json,
+                    event_hash,
+                    event["occurred_at"],
+                    exhausted_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO supervised_run_event_commits(
+                    task_id, sequence, project_id, principal_id,
+                    fencing_token, recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    next_sequence,
+                    task["project_id"],
+                    task["principal_id"],
+                    supervisor_lease.fencing_token,
+                    exhausted_at,
+                    exhausted_at_us,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Failed', updated_at = ? "
+                "WHERE task_id = ?",
+                (exhausted_at, task_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO worker_exit_retry_exhaustions(
+                    intent_id, attempt_number, task_id, project_id,
+                    principal_id, approval_id, attempt_id,
+                    observation_sequence, evidence_hash,
+                    private_schema_version, private_proof_hash, failure_kind,
+                    max_attempts, terminal_event_sequence,
+                    terminal_event_hash, fencing_token,
+                    exhausted_at, exhausted_at_us
+                ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, '1.3.0', ?, ?, 2,
+                          ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    task_id,
+                    task["project_id"],
+                    task["principal_id"],
+                    intent.approval_id,
+                    attempt_id,
+                    observation_sequence,
+                    evidence_hash,
+                    private_proof_hash,
+                    failure_kind,
+                    next_sequence,
+                    event_hash,
+                    supervisor_lease.fencing_token,
+                    exhausted_at,
+                    exhausted_at_us,
+                ),
+            )
+            snapshot = self._load_snapshot(connection, task_id)
+            stored_intent = self._load_dispatch_intent(
+                connection, task_id=task_id
+            )
+            if snapshot is None or stored_intent is None or snapshot.status != "Failed":
+                raise TaskStoreCorruption(
+                    "Worker-exit retry exhaustion cannot be read"
+                )
+            connection.commit()
+            return SupervisedWorkerExitRetryExhaustion(
+                snapshot=snapshot,
+                intent=stored_intent,
+                attempt_id=attempt_id,
+                observation_sequence=observation_sequence,
+                evidence_hash=evidence_hash,
+                private_proof_hash=private_proof_hash,
+                private_schema_version=private_schema_version,
+                failure_kind=failure_kind,
+                terminal_event_sequence=next_sequence,
+                fencing_token=supervisor_lease.fencing_token,
+                exhausted_at=exhausted_at,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "retry exhaustion lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "retry exhaustion conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _load_worker_exit_retry_source_handle(
+        connection: sqlite3.Connection, reservation: sqlite3.Row
+    ) -> dict[str, Any]:
+        rows = connection.execute(
+            """
+            SELECT document_json, document_hash FROM (
+                SELECT outcome.document_json, outcome.document_hash
+                FROM dispatch_outcomes AS outcome
+                WHERE outcome.intent_id = ? AND outcome.outcome = 'dispatched'
+                UNION ALL
+                SELECT resolution.effective_outcome_json AS document_json,
+                       resolution.effective_outcome_hash AS document_hash
+                FROM dispatch_reconciliation_resolutions AS resolution
+                WHERE resolution.intent_id = ?
+                  AND resolution.result = 'dispatched'
+            ) WHERE document_hash = ?
+            """,
+            (
+                reservation["intent_id"],
+                reservation["intent_id"],
+                reservation["source_outcome_document_hash"],
+            ),
+        ).fetchall()
+        if len(rows) != 1:
+            raise TaskStoreCorruption(
+                "worker-exit retry source outcome cannot be reconstructed"
+            )
+        outcome = _decode_hashed_document(
+            rows[0], label="worker-exit retry source outcome"
+        )
+        handle = outcome.get("handle") if isinstance(outcome, dict) else None
+        try:
+            _, handle_hash = encode_document(handle)
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "worker-exit retry source handle is invalid"
+            ) from error
+        if (
+            outcome.get("status") != "dispatched"
+            or not isinstance(handle, dict)
+            or handle_hash != reservation["source_handle_hash"]
+        ):
+            raise TaskStoreCorruption(
+                "worker-exit retry source handle changed"
+            )
+        return copy.deepcopy(handle)
+
+    def authorize_supervised_worker_exit_retry(
+        self,
+        *,
+        intent_id: str,
+        previous_attempt_id: str,
+        previous_observation_sequence: int,
+        failure_kind: str,
+        private_schema_version: str,
+        private_proof_hash: str,
+        retry_event: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedRetryAuthorization:
+        """Atomically retire attempt 1 and reserve the only B2 replacement."""
+
+        if (
+            not isinstance(intent_id, str)
+            or not intent_id
+            or WORKER_ATTEMPT_ID.fullmatch(str(previous_attempt_id)) is None
+            or type(previous_observation_sequence) is not int
+            or previous_observation_sequence < 1
+            or failure_kind != "worker_exit"
+            or private_schema_version not in {"1.1.0", "1.2.0"}
+            or not _is_sha256(private_proof_hash)
+            or not isinstance(retry_event, Mapping)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("supervised Worker-exit retry is invalid")
+        event = copy.deepcopy(dict(retry_event))
+        event_json, event_hash = encode_document(event)
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authorized_at, authorized_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("retry target task cannot be read")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=authorized_at_us,
+                action="supervised Worker-exit retry",
+            )
+
+            existing = connection.execute(
+                """
+                SELECT * FROM worker_exit_retry_reservations
+                WHERE intent_id = ? AND attempt_number = 2
+                """,
+                (intent_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["previous_attempt_id"] != previous_attempt_id
+                    or existing["previous_observation_sequence"]
+                    != previous_observation_sequence
+                    or existing["failure_kind"] != failure_kind
+                    or existing["private_schema_version"]
+                    != private_schema_version
+                    or existing["private_proof_hash"] != private_proof_hash
+                    or existing["retry_event_hash"] != event_hash
+                ):
+                    raise TaskStoreConflict(
+                        "Worker-exit retry reservation conflicts with durable state"
+                    )
+                source_handle = self._load_worker_exit_retry_source_handle(
+                    connection, existing
+                )
+                delivery = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO supervised_worker_exit_retry_attempts(
+                        intent_id, attempt_number, project_id, principal_id,
+                        fencing_token, authorized_at, authorized_at_us
+                    ) VALUES (?, 2, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        task["project_id"],
+                        task["principal_id"],
+                        supervisor_lease.fencing_token,
+                        authorized_at,
+                        authorized_at_us,
+                    ),
+                )
+                intent = self._load_dispatch_intent(connection, task_id=task_id)
+                if intent is None or intent.state != "retrying":
+                    raise TaskStoreConflict(
+                        "Worker-exit retry is no longer awaiting delivery"
+                    )
+                connection.commit()
+                return SupervisedRetryAuthorization(
+                    intent=intent,
+                    attempt_number=2,
+                    previous_attempt_id=previous_attempt_id,
+                    previous_observation_sequence=previous_observation_sequence,
+                    evidence_hash=existing["evidence_hash"],
+                    private_proof_hash=private_proof_hash,
+                    failure_kind="worker_exit",
+                    fencing_token=supervisor_lease.fencing_token,
+                    reserved_at=existing["reserved_at"],
+                    authorized_at=authorized_at,
+                    reservation_replayed=True,
+                    authorization_replayed=delivery.rowcount == 0,
+                    private_schema_version=private_schema_version,
+                    source_outcome_document_hash=existing[
+                        "source_outcome_document_hash"
+                    ],
+                    source_handle_hash=existing["source_handle_hash"],
+                    source_handle=source_handle,
+                    retry_event_sequence=existing["retry_event_sequence"],
+                    retry_event_hash=existing["retry_event_hash"],
+                )
+
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if (
+                intent is None
+                or intent.state != "dispatched"
+                or intent.handle is None
+                or task["status"] not in {"Queued", "Running"}
+                or intent.adapter_id != "fwi.deepwave_adapter"
+                or intent.adapter_version != "1.5.0"
+                or intent.request.get("algorithm")
+                != {"id": "deepwave.acoustic_fwi", "version": "1.5.0"}
+            ):
+                raise TaskStoreConflict(
+                    "retry requires a current post-ready managed dispatch"
+                )
+            budget = connection.execute(
+                """
+                SELECT * FROM approval_retry_budgets
+                WHERE task_id = ? AND approval_id = ?
+                """,
+                (task_id, intent.approval_id),
+            ).fetchone()
+            if (
+                budget is None
+                or int(budget["max_attempts"]) != 2
+                or int(budget["max_concurrent_attempts"]) != 1
+                or budget["retryable_failure_classes_json"]
+                != '["pre_running_launch_failure","worker_exit"]'
+            ):
+                raise TaskStoreConflict("approval does not authorize finite retry")
+            attempt = connection.execute(
+                """
+                SELECT * FROM worker_launch_attempts
+                WHERE intent_id = ? ORDER BY attempt_number DESC LIMIT 1
+                """,
+                (intent_id,),
+            ).fetchone()
+            observation = connection.execute(
+                """
+                SELECT * FROM worker_attempt_observations
+                WHERE attempt_id = ? AND observation_sequence = ?
+                """,
+                (previous_attempt_id, previous_observation_sequence),
+            ).fetchone()
+            latest_sequence = connection.execute(
+                """
+                SELECT MAX(observation_sequence)
+                FROM worker_attempt_observations WHERE attempt_id = ?
+                """,
+                (previous_attempt_id,),
+            ).fetchone()[0]
+            if (
+                attempt is None
+                or attempt["attempt_id"] != previous_attempt_id
+                or int(attempt["attempt_number"]) != 1
+                or observation is None
+                or observation["ticket_state"] != "spawned"
+                or observation["ticket_worker_pid"] is None
+                or observation["ready_record_hash"] is None
+                or observation["heartbeat_state"] != "running"
+                or observation["heartbeat_record_hash"] is None
+                or int(latest_sequence) != previous_observation_sequence
+            ):
+                raise TaskStoreConflict(
+                    "retry requires exact post-ready attempt 1 evidence"
+                )
+            for table in (
+                "task_cancel_requests",
+                "task_purge_requests",
+                "task_timeout_outcomes",
+            ):
+                if connection.execute(
+                    f"SELECT 1 FROM {table} WHERE task_id = ?", (task_id,)
+                ).fetchone() is not None:
+                    raise TaskStoreConflict(
+                        "runtime control already owns the retry target"
+                    )
+            elapsed_or_authorized_timeout = connection.execute(
+                """
+                SELECT 1
+                FROM worker_attempt_timeout_windows AS timeout
+                LEFT JOIN supervised_timeout_attempts AS delivery
+                  ON delivery.timeout_id = timeout.timeout_id
+                WHERE timeout.attempt_id = ?
+                  AND (delivery.timeout_id IS NOT NULL
+                       OR timeout.deadline_at_us <= ?)
+                LIMIT 1
+                """,
+                (previous_attempt_id, authorized_at_us),
+            ).fetchone()
+            if elapsed_or_authorized_timeout is not None:
+                raise TaskStoreConflict("timeout owns the exact attempt stop race")
+
+            source = connection.execute(
+                """
+                SELECT outcome_document_json, outcome_document_hash
+                FROM effective_dispatched_intents WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if source is None:
+                raise TaskStoreConflict("effective dispatch receipt is unavailable")
+            source_outcome = _decode_hashed_document(
+                {
+                    "document_json": source["outcome_document_json"],
+                    "document_hash": source["outcome_document_hash"],
+                },
+                label="worker-exit retry source outcome",
+            )
+            source_handle = source_outcome.get("handle")
+            try:
+                _, source_handle_hash = encode_document(source_handle)
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "effective dispatch handle is invalid"
+                ) from error
+            if source_handle != intent.handle:
+                raise TaskStoreConflict("effective dispatch handle changed")
+
+            next_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_events "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            extension = event.get("extensions", {}).get(
+                "org.agent_rpc.worker_exit_retry"
+            )
+            expected_extension = {
+                "intent_id": intent_id,
+                "attempt_number": 2,
+                "previous_attempt_id": previous_attempt_id,
+                "previous_observation_sequence": previous_observation_sequence,
+                "evidence_hash": observation["document_hash"],
+                "private_schema_version": private_schema_version,
+                "private_proof_hash": private_proof_hash,
+                "failure_kind": "worker_exit",
+                "max_attempts": 2,
+                "source_outcome_document_hash": source[
+                    "outcome_document_hash"
+                ],
+                "source_handle_hash": source_handle_hash,
+            }
+            if (
+                event.get("task_id") != task_id
+                or event.get("sequence") != next_sequence
+                or event.get("event_type") != "node_retrying"
+                or event.get("task_status") != "Retrying"
+                or event.get("node_id") != intent.node_id
+                or event.get("fingerprint") != intent.queue_fingerprint
+                or extension != expected_extension
+            ):
+                raise TaskStoreConflict("Worker-exit retry event is invalid")
+            _, fingerprint_hash = encode_document(event["fingerprint"])
+            connection.execute(
+                """
+                INSERT INTO run_events(
+                    task_id, sequence, event_id, event_type, task_status,
+                    node_id, fingerprint_hash, document_json, document_hash,
+                    occurred_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    next_sequence,
+                    event["event_id"],
+                    "node_retrying",
+                    "Retrying",
+                    intent.node_id,
+                    fingerprint_hash,
+                    event_json,
+                    event_hash,
+                    event["occurred_at"],
+                    authorized_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO supervised_run_event_commits(
+                    task_id, sequence, project_id, principal_id,
+                    fencing_token, recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    next_sequence,
+                    task["project_id"],
+                    task["principal_id"],
+                    supervisor_lease.fencing_token,
+                    authorized_at,
+                    authorized_at_us,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Retrying', updated_at = ? "
+                "WHERE task_id = ?",
+                (authorized_at, task_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO worker_exit_retry_reservations(
+                    intent_id, attempt_number, task_id, project_id,
+                    principal_id, approval_id, previous_attempt_id,
+                    previous_observation_sequence, evidence_hash,
+                    private_schema_version, private_proof_hash, failure_kind,
+                    source_outcome_document_hash, source_handle_hash,
+                    retry_event_sequence, retry_event_hash,
+                    first_fencing_token, reserved_at, reserved_at_us
+                ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'worker_exit',
+                          ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    task_id,
+                    task["project_id"],
+                    task["principal_id"],
+                    intent.approval_id,
+                    previous_attempt_id,
+                    previous_observation_sequence,
+                    observation["document_hash"],
+                    private_schema_version,
+                    private_proof_hash,
+                    source["outcome_document_hash"],
+                    source_handle_hash,
+                    next_sequence,
+                    event_hash,
+                    supervisor_lease.fencing_token,
+                    authorized_at,
+                    authorized_at_us,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO supervised_worker_exit_retry_attempts(
+                    intent_id, attempt_number, project_id, principal_id,
+                    fencing_token, authorized_at, authorized_at_us
+                ) VALUES (?, 2, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    task["project_id"],
+                    task["principal_id"],
+                    supervisor_lease.fencing_token,
+                    authorized_at,
+                    authorized_at_us,
+                ),
+            )
+            stored_intent = self._load_dispatch_intent(
+                connection, task_id=task_id
+            )
+            if stored_intent is None or stored_intent.state != "retrying":
+                raise TaskStoreCorruption(
+                    "Worker-exit retry reservation cannot be read"
+                )
+            connection.commit()
+            return SupervisedRetryAuthorization(
+                intent=stored_intent,
+                attempt_number=2,
+                previous_attempt_id=previous_attempt_id,
+                previous_observation_sequence=previous_observation_sequence,
+                evidence_hash=observation["document_hash"],
+                private_proof_hash=private_proof_hash,
+                failure_kind="worker_exit",
+                fencing_token=supervisor_lease.fencing_token,
+                reserved_at=authorized_at,
+                authorized_at=authorized_at,
+                reservation_replayed=False,
+                authorization_replayed=False,
+                private_schema_version=private_schema_version,
+                source_outcome_document_hash=source["outcome_document_hash"],
+                source_handle_hash=source_handle_hash,
+                source_handle=copy.deepcopy(source_handle),
+                retry_event_sequence=next_sequence,
+                retry_event_hash=event_hash,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "Worker-exit retry lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "Worker-exit retry conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def resume_supervised_worker_exit_retry(
+        self,
+        *,
+        intent_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> SupervisedRetryAuthorization:
+        """Redeliver the immutable B2 token after a Supervisor restart."""
+
+        if (
+            not isinstance(intent_id, str)
+            or not intent_id
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("supervised Worker-exit retry is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authorized_at, authorized_at_us = _runtime_timestamp(
+                supervisor_clock()
+            )
+            reservation = connection.execute(
+                """
+                SELECT * FROM worker_exit_retry_reservations
+                WHERE intent_id = ? AND attempt_number = 2
+                """,
+                (intent_id,),
+            ).fetchone()
+            if reservation is None:
+                raise TaskStoreConflict("Worker-exit retry reservation is absent")
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (reservation["task_id"],),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("retry target task cannot be read")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=authorized_at_us,
+                action="supervised Worker-exit retry",
+            )
+            intent = self._load_dispatch_intent(
+                connection, task_id=reservation["task_id"]
+            )
+            if (
+                intent is None
+                or intent.state != "retrying"
+                or task["status"] != "Retrying"
+                or connection.execute(
+                    "SELECT 1 FROM worker_exit_retry_exhaustions "
+                    "WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise TaskStoreConflict(
+                    "Worker-exit retry is no longer awaiting delivery"
+                )
+            source_handle = self._load_worker_exit_retry_source_handle(
+                connection, reservation
+            )
+            delivery = connection.execute(
+                """
+                INSERT OR IGNORE INTO supervised_worker_exit_retry_attempts(
+                    intent_id, attempt_number, project_id, principal_id,
+                    fencing_token, authorized_at, authorized_at_us
+                ) VALUES (?, 2, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    task["project_id"],
+                    task["principal_id"],
+                    supervisor_lease.fencing_token,
+                    authorized_at,
+                    authorized_at_us,
+                ),
+            )
+            connection.commit()
+            return SupervisedRetryAuthorization(
+                intent=intent,
+                attempt_number=2,
+                previous_attempt_id=reservation["previous_attempt_id"],
+                previous_observation_sequence=reservation[
+                    "previous_observation_sequence"
+                ],
+                evidence_hash=reservation["evidence_hash"],
+                private_proof_hash=reservation["private_proof_hash"],
+                failure_kind="worker_exit",
+                fencing_token=supervisor_lease.fencing_token,
+                reserved_at=reservation["reserved_at"],
+                authorized_at=authorized_at,
+                reservation_replayed=True,
+                authorization_replayed=delivery.rowcount == 0,
+                private_schema_version=reservation["private_schema_version"],
+                source_outcome_document_hash=reservation[
+                    "source_outcome_document_hash"
+                ],
+                source_handle_hash=reservation["source_handle_hash"],
+                source_handle=source_handle,
+                retry_event_sequence=reservation["retry_event_sequence"],
+                retry_event_hash=reservation["retry_event_hash"],
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "Worker-exit retry lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "Worker-exit retry delivery conflicts with durable state"
             ) from error
         except Exception:
             if connection.in_transaction:
@@ -6107,7 +7183,13 @@ class SQLiteTaskStore:
                    EXISTS(
                        SELECT 1 FROM task_cancel_requests AS cancel
                        WHERE cancel.task_id = timeout.task_id
-                   ) AS has_cancel_request
+                   ) AS has_cancel_request,
+                   EXISTS(
+                       SELECT 1
+                       FROM worker_exit_retry_reservations AS retry
+                       WHERE retry.intent_id = timeout.intent_id
+                         AND retry.attempt_number = attempt.attempt_number
+                   ) AS is_worker_exit_retry
             FROM worker_attempt_timeout_windows AS timeout
             JOIN worker_launch_attempts AS attempt
               ON attempt.attempt_id = timeout.attempt_id
@@ -6117,6 +7199,11 @@ class SQLiteTaskStore:
               ON outcome_delivery.timeout_id = outcome.timeout_id
              AND outcome_delivery.fencing_token = outcome.fencing_token
             WHERE timeout.task_id = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM worker_exit_retry_timeout_retirements AS retirement
+                  WHERE retirement.timeout_id = timeout.timeout_id
+              )
             ORDER BY attempt.attempt_number DESC
             LIMIT 1
             """,
@@ -6134,7 +7221,13 @@ class SQLiteTaskStore:
                 attempt_id=row["attempt_id"],
                 binding_hash=row["binding_hash"],
                 private_schema_version=(
-                    "1.2.0" if int(row["attempt_number"]) == 2 else "1.1.0"
+                    "1.3.0"
+                    if bool(row["is_worker_exit_retry"])
+                    else (
+                        "1.2.0"
+                        if int(row["attempt_number"]) == 2
+                        else "1.1.0"
+                    )
                 ),
             )
             _, capability_proof_hash = encode_document(capability_proof)
@@ -7469,6 +8562,253 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption(
                     "unresolved reconciliation has a dangling adoption"
                 )
+
+        source_handle = None if handle is None else copy.deepcopy(handle)
+        source_outcome_hash = (
+            row["effective_outcome_hash"]
+            if row["reconciliation_result"] is not None
+            else row["outcome_hash"]
+        )
+        worker_exit_retry = connection.execute(
+            """
+            SELECT retry.*,
+                   replacement.attempt_id AS replacement_attempt_id,
+                   replacement.observation_sequence
+                       AS replacement_observation_sequence,
+                   replacement.evidence_hash AS replacement_evidence_hash,
+                   replacement.handle_json AS replacement_handle_json,
+                   replacement.handle_hash AS replacement_handle_hash,
+                   replacement.effective_outcome_json
+                       AS replacement_outcome_json,
+                   replacement.effective_outcome_hash
+                       AS replacement_outcome_hash,
+                   replacement.fencing_token AS replacement_fencing_token,
+                   replacement.replaced_at,
+                   replacement.replaced_at_us,
+                   exhausted.attempt_id AS exhausted_attempt_id,
+                   exhausted.observation_sequence
+                       AS exhausted_observation_sequence,
+                   exhausted.evidence_hash AS exhausted_evidence_hash,
+                   exhausted.private_schema_version
+                       AS exhausted_private_schema_version,
+                   exhausted.private_proof_hash
+                       AS exhausted_private_proof_hash,
+                   exhausted.failure_kind AS exhausted_failure_kind,
+                   exhausted.terminal_event_sequence,
+                   exhausted.terminal_event_hash,
+                   exhausted.fencing_token AS exhausted_fencing_token,
+                   exhausted.exhausted_at,
+                   exhausted.exhausted_at_us
+            FROM worker_exit_retry_reservations AS retry
+            LEFT JOIN worker_exit_retry_dispatch_replacements AS replacement
+              ON replacement.intent_id = retry.intent_id
+             AND replacement.attempt_number = retry.attempt_number
+            LEFT JOIN worker_exit_retry_exhaustions AS exhausted
+              ON exhausted.intent_id = retry.intent_id
+             AND exhausted.attempt_number = retry.attempt_number
+            WHERE retry.intent_id = ? AND retry.attempt_number = 2
+            """,
+            (row["intent_id"],),
+        ).fetchone()
+        if worker_exit_retry is not None:
+            retry_event_row = connection.execute(
+                """
+                SELECT document_json, document_hash, event_type, task_status,
+                       node_id, fingerprint_hash, recorded_at
+                FROM run_events WHERE task_id = ? AND sequence = ?
+                """,
+                (
+                    row["task_id"],
+                    worker_exit_retry["retry_event_sequence"],
+                ),
+            ).fetchone()
+            if retry_event_row is None:
+                raise TaskStoreCorruption(
+                    "worker-exit retry reservation lacks its transition event"
+                )
+            retry_event = _decode_hashed_document(
+                retry_event_row, label="worker-exit retry event"
+            )
+            retry_extension = retry_event.get("extensions", {}).get(
+                "org.agent_rpc.worker_exit_retry"
+            )
+            try:
+                _, source_handle_hash = encode_document(source_handle)
+                reserved_at, reserved_at_us = _runtime_timestamp(
+                    worker_exit_retry["reserved_at"]
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "worker-exit retry source identity is invalid"
+                ) from error
+            expected_retry_extension = {
+                "intent_id": row["intent_id"],
+                "attempt_number": 2,
+                "previous_attempt_id": worker_exit_retry[
+                    "previous_attempt_id"
+                ],
+                "previous_observation_sequence": worker_exit_retry[
+                    "previous_observation_sequence"
+                ],
+                "evidence_hash": worker_exit_retry["evidence_hash"],
+                "private_schema_version": worker_exit_retry[
+                    "private_schema_version"
+                ],
+                "private_proof_hash": worker_exit_retry[
+                    "private_proof_hash"
+                ],
+                "failure_kind": "worker_exit",
+                "max_attempts": 2,
+                "source_outcome_document_hash": worker_exit_retry[
+                    "source_outcome_document_hash"
+                ],
+                "source_handle_hash": worker_exit_retry["source_handle_hash"],
+            }
+            if (
+                state != "dispatched"
+                or source_handle is None
+                or worker_exit_retry["task_id"] != row["task_id"]
+                or worker_exit_retry["approval_id"] != row["approval_id"]
+                or worker_exit_retry["project_id"]
+                != task_identity["project_id"]
+                or worker_exit_retry["principal_id"]
+                != task_identity["principal_id"]
+                or worker_exit_retry["failure_kind"] != "worker_exit"
+                or worker_exit_retry["private_schema_version"]
+                not in {"1.1.0", "1.2.0"}
+                or source_outcome_hash
+                != worker_exit_retry["source_outcome_document_hash"]
+                or source_handle_hash != worker_exit_retry["source_handle_hash"]
+                or retry_event_row["document_hash"]
+                != worker_exit_retry["retry_event_hash"]
+                or retry_event_row["event_type"] != "node_retrying"
+                or retry_event_row["task_status"] != "Retrying"
+                or retry_event_row["node_id"] != row["node_id"]
+                or retry_event_row["fingerprint_hash"] != row["fingerprint_hash"]
+                or retry_event_row["recorded_at"] != reserved_at
+                or reserved_at != worker_exit_retry["reserved_at"]
+                or reserved_at_us != worker_exit_retry["reserved_at_us"]
+                or retry_extension != expected_retry_extension
+            ):
+                raise TaskStoreCorruption(
+                    "worker-exit retry reservation differs from its source"
+                )
+
+            state = "retrying"
+            handle = None
+            failure_code = None
+            outcome_recorded_at = reserved_at
+            if worker_exit_retry["replacement_attempt_id"] is not None:
+                replacement_handle = _decode_document(
+                    worker_exit_retry["replacement_handle_json"],
+                    label="worker-exit retry replacement handle",
+                )
+                try:
+                    _, replacement_handle_hash = encode_document(
+                        replacement_handle
+                    )
+                    replaced_at, replaced_at_us = _runtime_timestamp(
+                        worker_exit_retry["replaced_at"]
+                    )
+                except TaskStoreConflict as error:
+                    raise TaskStoreCorruption(
+                        "worker-exit retry replacement is invalid"
+                    ) from error
+                replacement_outcome = _decode_hashed_document(
+                    {
+                        "document_json": worker_exit_retry[
+                            "replacement_outcome_json"
+                        ],
+                        "document_hash": worker_exit_retry[
+                            "replacement_outcome_hash"
+                        ],
+                    },
+                    label="worker-exit retry replacement outcome",
+                )
+                replacement_attempt = connection.execute(
+                    "SELECT * FROM worker_launch_attempts WHERE attempt_id = ?",
+                    (worker_exit_retry["replacement_attempt_id"],),
+                ).fetchone()
+                replacement_observation = connection.execute(
+                    """
+                    SELECT document_hash FROM worker_attempt_observations
+                    WHERE attempt_id = ? AND observation_sequence = ?
+                    """,
+                    (
+                        worker_exit_retry["replacement_attempt_id"],
+                        worker_exit_retry["replacement_observation_sequence"],
+                    ),
+                ).fetchone()
+                if (
+                    not isinstance(replacement_handle, dict)
+                    or replacement_handle_hash
+                    != worker_exit_retry["replacement_handle_hash"]
+                    or replacement_outcome
+                    != {
+                        "status": "dispatched",
+                        "handle": replacement_handle,
+                        "recorded_at": replaced_at,
+                    }
+                    or replaced_at != worker_exit_retry["replaced_at"]
+                    or replaced_at_us != worker_exit_retry["replaced_at_us"]
+                    or replacement_attempt is None
+                    or int(replacement_attempt["attempt_number"]) != 2
+                    or replacement_attempt["intent_id"] != row["intent_id"]
+                    or replacement_attempt["submission_id"]
+                    != replacement_handle.get("submission_id")
+                    or replacement_attempt["job_id"]
+                    != replacement_handle.get("job_id")
+                    or replacement_attempt["adapter_request_hash"]
+                    != replacement_handle.get("request_hash")
+                    or replacement_observation is None
+                    or replacement_observation["document_hash"]
+                    != worker_exit_retry["replacement_evidence_hash"]
+                ):
+                    raise TaskStoreCorruption(
+                        "worker-exit retry replacement differs from attempt 2"
+                    )
+                state = "dispatched"
+                handle = replacement_handle
+                outcome_recorded_at = replaced_at
+
+            if worker_exit_retry["exhausted_attempt_id"] is not None:
+                exhaustion_event = connection.execute(
+                    """
+                    SELECT event_type, task_status, document_hash
+                    FROM run_events WHERE task_id = ? AND sequence = ?
+                    """,
+                    (
+                        row["task_id"],
+                        worker_exit_retry["terminal_event_sequence"],
+                    ),
+                ).fetchone()
+                if (
+                    worker_exit_retry["exhausted_private_schema_version"]
+                    != "1.3.0"
+                    or worker_exit_retry["exhausted_failure_kind"]
+                    not in {"pre_running_launch_failure", "worker_exit"}
+                    or exhaustion_event is None
+                    or exhaustion_event["event_type"] != "node_failed"
+                    or exhaustion_event["task_status"] != "Failed"
+                    or exhaustion_event["document_hash"]
+                    != worker_exit_retry["terminal_event_hash"]
+                    or task_identity["status"] != "Failed"
+                ):
+                    raise TaskStoreCorruption(
+                        "worker-exit retry exhaustion is inconsistent"
+                    )
+                if worker_exit_retry["exhausted_failure_kind"] == "pre_running_launch_failure":
+                    if handle is not None:
+                        raise TaskStoreCorruption(
+                            "pre-running B2 exhaustion retained a handle"
+                        )
+                    state = "retry_exhausted"
+                    failure_code = "WORKER_RETRY_EXHAUSTED"
+                    outcome_recorded_at = worker_exit_retry["exhausted_at"]
+                elif handle is None:
+                    raise TaskStoreCorruption(
+                        "post-ready B2 exhaustion lacks its replacement handle"
+                    )
         if row["exhaustion_attempt_number"] is not None:
             exhaustion_event = connection.execute(
                 """
@@ -8582,9 +9922,35 @@ class SQLiteTaskStore:
                               AND terminal.task_status = 'Failed'
                               AND terminal.document_hash =
                                   exhaustion.terminal_event_hash
-                        ) AS has_retry_exhaustion
+                        ) AS has_retry_exhaustion,
+                        EXISTS(
+                            SELECT 1
+                            FROM dispatch_intents AS intent
+                            JOIN worker_exit_retry_exhaustions AS exhaustion
+                              ON exhaustion.intent_id = intent.intent_id
+                             AND exhaustion.attempt_number = 2
+                            JOIN run_events AS terminal
+                              ON terminal.task_id = exhaustion.task_id
+                             AND terminal.sequence =
+                                 exhaustion.terminal_event_sequence
+                            WHERE intent.task_id = ?
+                              AND exhaustion.task_id = intent.task_id
+                              AND exhaustion.failure_kind =
+                                  'pre_running_launch_failure'
+                              AND terminal.event_type = 'node_failed'
+                              AND terminal.task_status = 'Failed'
+                              AND terminal.document_hash =
+                                  exhaustion.terminal_event_hash
+                        ) AS has_worker_exit_retry_exhaustion
                     """,
-                    (task_id, task_id, task_id, task_id, task_id),
+                    (
+                        task_id,
+                        task_id,
+                        task_id,
+                        task_id,
+                        task_id,
+                        task_id,
+                    ),
                 ).fetchone()
                 pre_runtime_abandonment = (
                     task["status"] == "Cancelled"
@@ -8598,7 +9964,13 @@ class SQLiteTaskStore:
                         evidence["has_effective_dispatch"] == 1
                         or (
                             task["status"] == "Failed"
-                            and evidence["has_retry_exhaustion"] == 1
+                            and (
+                                evidence["has_retry_exhaustion"] == 1
+                                or evidence[
+                                    "has_worker_exit_retry_exhaustion"
+                                ]
+                                == 1
+                            )
                         )
                     )
                 )
@@ -8986,6 +10358,379 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    def _load_worker_exit_retry_exhaustion_cleanup_proof(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        purge_id: str,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        purge_requested_at: str,
+        intent: DispatchIntentSnapshot,
+    ) -> RetryExhaustionCleanupProof:
+        """Authenticate the no-handle B2 mixed-lineage purge proof."""
+
+        exhaustion = connection.execute(
+            """
+            SELECT * FROM worker_exit_retry_exhaustions
+            WHERE intent_id = ? AND attempt_number = 2
+            """,
+            (intent.intent_id,),
+        ).fetchone()
+        reservation = connection.execute(
+            """
+            SELECT * FROM worker_exit_retry_reservations
+            WHERE intent_id = ? AND attempt_number = 2
+            """,
+            (intent.intent_id,),
+        ).fetchone()
+        conflicting_lineage = connection.execute(
+            """
+            SELECT EXISTS(
+                       SELECT 1 FROM worker_retry_exhaustions
+                       WHERE intent_id = ? AND attempt_number = 2
+                   )
+                   OR EXISTS(
+                       SELECT 1 FROM worker_retry_reservations
+                       WHERE intent_id = ? AND attempt_number = 2
+                   )
+            """,
+            (intent.intent_id, intent.intent_id),
+        ).fetchone()[0]
+        replacement = connection.execute(
+            """
+            SELECT 1 FROM worker_exit_retry_dispatch_replacements
+            WHERE intent_id = ? AND attempt_number = 2
+            """,
+            (intent.intent_id,),
+        ).fetchone()
+        attempts = connection.execute(
+            """
+            SELECT * FROM worker_launch_attempts
+            WHERE intent_id = ? ORDER BY attempt_number
+            """,
+            (intent.intent_id,),
+        ).fetchall()
+        if (
+            exhaustion is None
+            or reservation is None
+            or bool(conflicting_lineage)
+            or replacement is not None
+            or len(attempts) != 2
+        ):
+            raise TaskStoreCorruption(
+                "worker-exit retry cleanup lineage is incomplete"
+            )
+        previous_attempt, current_attempt = attempts
+        observation = connection.execute(
+            """
+            SELECT * FROM worker_attempt_observations
+            WHERE attempt_id = ? AND observation_sequence = ?
+            """,
+            (
+                exhaustion["attempt_id"],
+                exhaustion["observation_sequence"],
+            ),
+        ).fetchone()
+        previous_observation = connection.execute(
+            """
+            SELECT * FROM worker_attempt_observations
+            WHERE attempt_id = ? AND observation_sequence = ?
+            """,
+            (
+                reservation["previous_attempt_id"],
+                reservation["previous_observation_sequence"],
+            ),
+        ).fetchone()
+        if observation is None or previous_observation is None:
+            raise TaskStoreCorruption(
+                "worker-exit retry cleanup observations are incomplete"
+            )
+        evidence = _decode_worker_observation_row(observation)
+        previous_evidence = _decode_worker_observation_row(
+            previous_observation
+        )
+        _require_worker_attempt_observation_binding(
+            current_attempt,
+            evidence,
+            intent_id=intent.intent_id,
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+        )
+        _require_worker_attempt_observation_binding(
+            previous_attempt,
+            previous_evidence,
+            intent_id=intent.intent_id,
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+        )
+        latest_current = connection.execute(
+            """
+            SELECT MAX(observation_sequence)
+            FROM worker_attempt_observations WHERE attempt_id = ?
+            """,
+            (exhaustion["attempt_id"],),
+        ).fetchone()[0]
+        latest_previous = connection.execute(
+            """
+            SELECT MAX(observation_sequence)
+            FROM worker_attempt_observations WHERE attempt_id = ?
+            """,
+            (reservation["previous_attempt_id"],),
+        ).fetchone()[0]
+
+        retry_event_row = connection.execute(
+            """
+            SELECT * FROM run_events
+            WHERE task_id = ? AND sequence = ?
+            """,
+            (task_id, reservation["retry_event_sequence"]),
+        ).fetchone()
+        retry_commit = connection.execute(
+            """
+            SELECT * FROM supervised_run_event_commits
+            WHERE task_id = ? AND sequence = ?
+            """,
+            (task_id, reservation["retry_event_sequence"]),
+        ).fetchone()
+        terminal_event_row = connection.execute(
+            """
+            SELECT * FROM run_events
+            WHERE task_id = ? AND sequence = ?
+            """,
+            (task_id, exhaustion["terminal_event_sequence"]),
+        ).fetchone()
+        terminal_commit = connection.execute(
+            """
+            SELECT * FROM supervised_run_event_commits
+            WHERE task_id = ? AND sequence = ?
+            """,
+            (task_id, exhaustion["terminal_event_sequence"]),
+        ).fetchone()
+        if any(
+            row is None
+            for row in (
+                retry_event_row,
+                retry_commit,
+                terminal_event_row,
+                terminal_commit,
+            )
+        ):
+            raise TaskStoreCorruption(
+                "worker-exit retry cleanup event chain is incomplete"
+            )
+        assert retry_event_row is not None
+        assert retry_commit is not None
+        assert terminal_event_row is not None
+        assert terminal_commit is not None
+        retry_event = _decode_run_event_row(
+            retry_event_row, label="worker-exit retry transition event"
+        )
+        terminal_event = _decode_run_event_row(
+            terminal_event_row,
+            label="worker-exit retry exhaustion terminal event",
+        )
+        retry_extension = retry_event.get("extensions", {}).get(
+            "org.agent_rpc.worker_exit_retry"
+        )
+        terminal_extension = terminal_event.get("extensions", {}).get(
+            "org.agent_rpc.retry_exhaustion"
+        )
+        expected_retry_extension = {
+            "intent_id": intent.intent_id,
+            "attempt_number": 2,
+            "previous_attempt_id": reservation["previous_attempt_id"],
+            "previous_observation_sequence": reservation[
+                "previous_observation_sequence"
+            ],
+            "evidence_hash": reservation["evidence_hash"],
+            "private_schema_version": reservation["private_schema_version"],
+            "private_proof_hash": reservation["private_proof_hash"],
+            "failure_kind": "worker_exit",
+            "max_attempts": 2,
+            "source_outcome_document_hash": reservation[
+                "source_outcome_document_hash"
+            ],
+            "source_handle_hash": reservation["source_handle_hash"],
+        }
+        expected_terminal_extension = {
+            "intent_id": intent.intent_id,
+            "attempt_id": exhaustion["attempt_id"],
+            "attempt_number": 2,
+            "observation_sequence": exhaustion["observation_sequence"],
+            "evidence_hash": exhaustion["evidence_hash"],
+            "private_schema_version": "1.3.0",
+            "private_proof_hash": exhaustion["private_proof_hash"],
+            "failure_kind": "pre_running_launch_failure",
+            "max_attempts": 2,
+        }
+        current_failure_payload = {
+            "schema_version": "1.0.0",
+            "failure_kind": "pre_running_launch_failure",
+            "submission_id": evidence["submission_id"],
+            "attempt_id": evidence["attempt_id"],
+            "attempt_number": evidence["attempt_number"],
+            "job_id": evidence["job_id"],
+            "request_hash": evidence["request_hash"],
+            "binding_hash": evidence["binding_hash"],
+            "ticket_record_hash": evidence["ticket"]["record_hash"],
+        }
+        source_handle = self._load_worker_exit_retry_source_handle(
+            connection, reservation
+        )
+        control_conflict = connection.execute(
+            """
+            SELECT EXISTS(
+                       SELECT 1 FROM task_cancel_requests
+                       WHERE task_id = ?
+                   )
+                   OR EXISTS(
+                       SELECT 1 FROM task_timeout_outcomes
+                       WHERE task_id = ?
+                   )
+                   OR EXISTS(
+                       SELECT 1
+                       FROM worker_attempt_timeout_windows AS timeout
+                       JOIN supervised_timeout_attempts AS delivery
+                         ON delivery.timeout_id = timeout.timeout_id
+                       WHERE timeout.attempt_id = ?
+                   )
+            """,
+            (task_id, task_id, exhaustion["attempt_id"]),
+        ).fetchone()[0]
+        if (
+            exhaustion["task_id"] != task_id
+            or exhaustion["project_id"] != project_id
+            or exhaustion["principal_id"] != principal_id
+            or exhaustion["approval_id"] != intent.approval_id
+            or exhaustion["attempt_number"] != 2
+            or exhaustion["max_attempts"] != 2
+            or exhaustion["private_schema_version"] != "1.3.0"
+            or exhaustion["failure_kind"] != "pre_running_launch_failure"
+            or observation["document_hash"] != exhaustion["evidence_hash"]
+            or observation["observation_sequence"] != latest_current
+            or evidence["attempt_number"] != 2
+            or evidence["ticket"]["state"] != "failed"
+            or evidence["ticket"]["worker_pid"] is not None
+            or evidence["ready"] is not None
+            or evidence["heartbeat"] is not None
+            or encode_document(current_failure_payload)[1]
+            != exhaustion["private_proof_hash"]
+            or reservation["task_id"] != task_id
+            or reservation["project_id"] != project_id
+            or reservation["principal_id"] != principal_id
+            or reservation["approval_id"] != intent.approval_id
+            or reservation["failure_kind"] != "worker_exit"
+            or reservation["private_schema_version"] not in {"1.1.0", "1.2.0"}
+            or not _is_sha256(reservation["private_proof_hash"])
+            or previous_observation["document_hash"]
+            != reservation["evidence_hash"]
+            or previous_observation["observation_sequence"] != latest_previous
+            or previous_evidence["attempt_number"] != 1
+            or previous_evidence["ticket"]["state"] != "spawned"
+            or previous_evidence["ticket"]["worker_pid"] is None
+            or previous_evidence["ready"] is None
+            or previous_evidence["heartbeat"] is None
+            or previous_evidence["heartbeat"]["state"] != "running"
+            or previous_attempt["attempt_number"] != 1
+            or current_attempt["attempt_number"] != 2
+            or previous_attempt["attempt_id"]
+            != reservation["previous_attempt_id"]
+            or current_attempt["attempt_id"] != exhaustion["attempt_id"]
+            or current_attempt["submission_id"]
+            != previous_attempt["submission_id"]
+            or current_attempt["adapter_request_hash"]
+            != previous_attempt["adapter_request_hash"]
+            or current_attempt["created_at"] != reservation["reserved_at"]
+            or current_attempt["job_id"] == previous_attempt["job_id"]
+            or source_handle.get("submission_id")
+            != previous_attempt["submission_id"]
+            or source_handle.get("job_id") != previous_attempt["job_id"]
+            or source_handle.get("request_hash")
+            != previous_attempt["adapter_request_hash"]
+            or retry_event_row["document_hash"] != reservation["retry_event_hash"]
+            or retry_event.get("event_type") != "node_retrying"
+            or retry_event.get("task_status") != "Retrying"
+            or retry_event.get("node_id") != intent.node_id
+            or retry_event.get("fingerprint") != intent.queue_fingerprint
+            or retry_extension != expected_retry_extension
+            or retry_event_row["recorded_at"] != reservation["reserved_at"]
+            or retry_commit["project_id"] != project_id
+            or retry_commit["principal_id"] != principal_id
+            or retry_commit["fencing_token"] != reservation["first_fencing_token"]
+            or retry_commit["recorded_at"] != reservation["reserved_at"]
+            or retry_commit["recorded_at_us"] != reservation["reserved_at_us"]
+            or terminal_event_row["document_hash"]
+            != exhaustion["terminal_event_hash"]
+            or terminal_event.get("event_type") != "node_failed"
+            or terminal_event.get("task_status") != "Failed"
+            or terminal_event.get("error")
+            != {
+                "code": "retry_exhausted",
+                "message": "FWI Worker exhausted its approved attempts",
+                "retryable": False,
+            }
+            or terminal_extension != expected_terminal_extension
+            or terminal_event_row["recorded_at"] != exhaustion["exhausted_at"]
+            or terminal_commit["project_id"] != project_id
+            or terminal_commit["principal_id"] != principal_id
+            or terminal_commit["fencing_token"] != exhaustion["fencing_token"]
+            or terminal_commit["recorded_at"] != exhaustion["exhausted_at"]
+            or terminal_commit["recorded_at_us"] != exhaustion["exhausted_at_us"]
+            or bool(control_conflict)
+        ):
+            raise TaskStoreCorruption(
+                "worker-exit retry cleanup proof is inconsistent"
+            )
+        try:
+            _, requested_at_us = _runtime_timestamp(purge_requested_at)
+            _, exhausted_at_us = _runtime_timestamp(exhaustion["exhausted_at"])
+            _, reserved_at_us = _runtime_timestamp(reservation["reserved_at"])
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "worker-exit retry cleanup time is invalid"
+            ) from error
+        if (
+            exhausted_at_us != exhaustion["exhausted_at_us"]
+            or reserved_at_us != reservation["reserved_at_us"]
+            or exhausted_at_us < reserved_at_us
+            or requested_at_us < exhausted_at_us
+        ):
+            raise TaskStoreCorruption(
+                "worker-exit retry cleanup violates causal order"
+            )
+        return RetryExhaustionCleanupProof(
+            purge_id=purge_id,
+            intent_id=intent.intent_id,
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            approval_id=intent.approval_id,
+            attempt_id=exhaustion["attempt_id"],
+            observation_sequence=int(exhaustion["observation_sequence"]),
+            evidence=copy.deepcopy(evidence),
+            evidence_hash=exhaustion["evidence_hash"],
+            private_schema_version=exhaustion["private_schema_version"],
+            private_proof_hash=exhaustion["private_proof_hash"],
+            failure_kind=exhaustion["failure_kind"],
+            previous_attempt_id=reservation["previous_attempt_id"],
+            previous_observation_sequence=int(
+                reservation["previous_observation_sequence"]
+            ),
+            previous_private_proof_hash=reservation["private_proof_hash"],
+            retry_reserved_at=reservation["reserved_at"],
+            terminal_event_sequence=int(exhaustion["terminal_event_sequence"]),
+            terminal_event_hash=exhaustion["terminal_event_hash"],
+            exhausted_at=exhaustion["exhausted_at"],
+            previous_failure_kind="worker_exit",
+            previous_private_schema_version=reservation[
+                "private_schema_version"
+            ],
+        )
+
     def get_retry_exhaustion_cleanup_proof(
         self,
         *,
@@ -9062,6 +10807,29 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption(
                     "retry exhaustion cleanup intent is inconsistent"
                 )
+
+            worker_exit_exhaustion = connection.execute(
+                """
+                SELECT 1 FROM worker_exit_retry_exhaustions
+                WHERE intent_id = ? AND attempt_number = 2
+                  AND failure_kind = 'pre_running_launch_failure'
+                """,
+                (intent.intent_id,),
+            ).fetchone()
+            if worker_exit_exhaustion is not None:
+                result = (
+                    self._load_worker_exit_retry_exhaustion_cleanup_proof(
+                        connection,
+                        purge_id=purge_id,
+                        task_id=task_id,
+                        project_id=project_id,
+                        principal_id=principal_id,
+                        purge_requested_at=purge["requested_at"],
+                        intent=intent,
+                    )
+                )
+                connection.commit()
+                return result
 
             exhaustion = connection.execute(
                 """
@@ -11607,6 +13375,7 @@ class SQLiteTaskStore:
         intent_id: str,
         evidence: Mapping[str, Any],
         handle: Mapping[str, Any] | None,
+        replacement_event: Mapping[str, Any] | None = None,
         supervisor_lease: RuntimeSupervisorLease,
         supervisor_clock: Callable[[], str],
     ) -> WorkerAttemptProjection:
@@ -11619,6 +13388,11 @@ class SQLiteTaskStore:
         normalized = _validated_worker_evidence(evidence)
         document_json, document_hash = encode_document(normalized)
         normalized_handle = None if handle is None else dict(handle)
+        normalized_replacement_event = (
+            None
+            if replacement_event is None
+            else copy.deepcopy(dict(replacement_event))
+        )
         ticket = normalized["ticket"]
         ready = normalized["ready"]
         heartbeat = normalized["heartbeat"]
@@ -11635,7 +13409,8 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
                 """
-                SELECT project_id, principal_id FROM tasks WHERE task_id = ?
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
                 """,
                 (task_id,),
             ).fetchone()
@@ -11667,7 +13442,7 @@ class SQLiteTaskStore:
                 and intent.reconciliation is not None
                 and intent.reconciliation.state == "required"
             )
-            if intent.state not in {"dispatching", "dispatched"} and not (
+            if intent.state not in {"dispatching", "dispatched", "retrying"} and not (
                 reconciliation_pending
             ):
                 raise TaskStoreConflict("dispatch intent cannot accept Worker evidence")
@@ -11678,6 +13453,10 @@ class SQLiteTaskStore:
             ):
                 raise TaskStoreConflict(
                     "dispatch reconciliation used a private receipt"
+                )
+            if intent.state != "retrying" and normalized_replacement_event is not None:
+                raise TaskStoreConflict(
+                    "dispatch replacement event has no retry reservation"
                 )
             if reconciliation_pending and (
                 normalized_handle is None
@@ -11726,13 +13505,25 @@ class SQLiteTaskStore:
                         "Worker attempt number is not the next durable attempt"
                     )
                 if normalized["attempt_number"] == 2:
-                    reservation = connection.execute(
+                    pre_running_reservation = connection.execute(
                         """
                         SELECT * FROM worker_retry_reservations
                         WHERE intent_id = ? AND attempt_number = 2
                         """,
                         (intent_id,),
                     ).fetchone()
+                    worker_exit_reservation = connection.execute(
+                        """
+                        SELECT * FROM worker_exit_retry_reservations
+                        WHERE intent_id = ? AND attempt_number = 2
+                        """,
+                        (intent_id,),
+                    ).fetchone()
+                    reservation = (
+                        pre_running_reservation
+                        if pre_running_reservation is not None
+                        else worker_exit_reservation
+                    )
                     prior_attempt = connection.execute(
                         """
                         SELECT * FROM worker_launch_attempts
@@ -11742,6 +13533,10 @@ class SQLiteTaskStore:
                     ).fetchone()
                     if (
                         reservation is None
+                        or (
+                            pre_running_reservation is not None
+                            and worker_exit_reservation is not None
+                        )
                         or reservation["task_id"] != task_id
                         or reservation["project_id"] != task["project_id"]
                         or reservation["principal_id"] != task["principal_id"]
@@ -12000,6 +13795,144 @@ class SQLiteTaskStore:
                         raise TaskStoreConflict(
                             "Worker adoption differs from the dispatch outcome"
                         )
+                elif intent.state == "retrying":
+                    if (
+                        normalized["attempt_number"] != 2
+                        or task["status"] != "Retrying"
+                        or normalized_replacement_event is None
+                    ):
+                        raise TaskStoreConflict(
+                            "dispatch replacement requires exact retry state"
+                        )
+                    reservation = connection.execute(
+                        """
+                        SELECT * FROM worker_exit_retry_reservations
+                        WHERE intent_id = ? AND attempt_number = 2
+                        """,
+                        (intent_id,),
+                    ).fetchone()
+                    if reservation is None:
+                        raise TaskStoreCorruption(
+                            "dispatch replacement lacks its retry reservation"
+                        )
+                    handle_json, handle_hash = encode_document(normalized_handle)
+                    effective_outcome = {
+                        "status": "dispatched",
+                        "handle": normalized_handle,
+                        "recorded_at": observed_at,
+                    }
+                    effective_json, effective_hash = encode_document(
+                        effective_outcome
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO worker_exit_retry_dispatch_replacements(
+                            intent_id, attempt_number, task_id, project_id,
+                            principal_id, approval_id,
+                            source_outcome_document_hash, source_handle_hash,
+                            attempt_id, observation_sequence, evidence_hash,
+                            handle_json, handle_hash, effective_outcome_json,
+                            effective_outcome_hash, fencing_token,
+                            replaced_at, replaced_at_us
+                        ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  ?, ?, ?, ?)
+                        """,
+                        (
+                            intent_id,
+                            task_id,
+                            task["project_id"],
+                            task["principal_id"],
+                            intent.approval_id,
+                            reservation["source_outcome_document_hash"],
+                            reservation["source_handle_hash"],
+                            normalized["attempt_id"],
+                            observation_sequence,
+                            document_hash,
+                            handle_json,
+                            handle_hash,
+                            effective_json,
+                            effective_hash,
+                            supervisor_lease.fencing_token,
+                            observed_at,
+                            observed_at_us,
+                        ),
+                    )
+                    event_json, event_hash = encode_document(
+                        normalized_replacement_event
+                    )
+                    next_event_sequence = int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(sequence), 0) + 1 "
+                            "FROM run_events WHERE task_id = ?",
+                            (task_id,),
+                        ).fetchone()[0]
+                    )
+                    event_fingerprint = normalized_replacement_event.get(
+                        "fingerprint"
+                    )
+                    _, event_fingerprint_hash = encode_document(
+                        event_fingerprint
+                    )
+                    if (
+                        normalized_replacement_event.get("task_id") != task_id
+                        or normalized_replacement_event.get("sequence")
+                        != next_event_sequence
+                        or normalized_replacement_event.get("event_type")
+                        != "node_started"
+                        or normalized_replacement_event.get("task_status")
+                        != "Running"
+                        or normalized_replacement_event.get("node_id")
+                        != intent.node_id
+                        or event_fingerprint != intent.queue_fingerprint
+                    ):
+                        raise TaskStoreConflict(
+                            "dispatch replacement transition is invalid"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO run_events(
+                            task_id, sequence, event_id, event_type,
+                            task_status, node_id, fingerprint_hash,
+                            document_json, document_hash, occurred_at,
+                            recorded_at
+                        ) VALUES (?, ?, ?, 'node_started', 'Running', ?, ?,
+                                  ?, ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            next_event_sequence,
+                            normalized_replacement_event["event_id"],
+                            intent.node_id,
+                            event_fingerprint_hash,
+                            event_json,
+                            event_hash,
+                            normalized_replacement_event["occurred_at"],
+                            observed_at,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO supervised_run_event_commits(
+                            task_id, sequence, project_id, principal_id,
+                            fencing_token, recorded_at, recorded_at_us
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            next_event_sequence,
+                            task["project_id"],
+                            task["principal_id"],
+                            supervisor_lease.fencing_token,
+                            observed_at,
+                            observed_at_us,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE tasks SET status = 'Running', updated_at = ? "
+                        "WHERE task_id = ?",
+                        (observed_at, task_id),
+                    )
+                    adopted = True
                 elif reconciliation_pending:
                     source_outcome = connection.execute(
                         """
@@ -12086,6 +14019,10 @@ class SQLiteTaskStore:
                         ),
                     )
                     adopted = True
+            elif normalized_replacement_event is not None:
+                raise TaskStoreConflict(
+                    "dispatch replacement event requires a ready handle"
+                )
 
             stored_intent = self._load_dispatch_intent(
                 connection, task_id=task_id

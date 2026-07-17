@@ -318,7 +318,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                     "max_attempts": 2,
                     "max_concurrent_attempts": 1,
                     "pre_running_launch_failure": True,
-                    "worker_exit": False,
+                    "worker_exit": True,
                 },
                 "sse": False,
                 "startup_dispatch_recovery": False,
@@ -1277,6 +1277,117 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                 },
             )
 
+    def test_worker_exit_retrying_projection_is_bounded_and_path_free(self) -> None:
+        created = self.workbench.create_task(
+            guided_form(), "create-worker-exit-retrying-projection"
+        )
+        self.workbench.approve_and_submit(
+            created["task_id"],
+            created["plan"]["plan_hash"],
+            "approve-worker-exit-retrying-projection",
+        )
+        snapshot = replace(
+            self.store.get_task(created["task_id"]),
+            status="Running",
+        )
+        base_intent = self.store.get_dispatch_intent(created["task_id"])
+        self.assertIsNotNone(base_intent)
+        assert base_intent is not None
+        recorded_at = "2026-07-17T12:00:00.000000Z"
+        resolved_at = "2026-07-17T12:00:01.000000Z"
+        retrying_at = "2026-07-17T12:00:02.000000Z"
+        private_values = {
+            "intent_id": "intent-private-worker-exit",
+            "attempt_id": "attempt-private-worker-exit",
+            "previous_attempt_id": "attempt-private-previous",
+            "evidence_hash": "sha256:" + "a" * 64,
+            "handle": {"job_id": "fwi-private-worker-exit-job"},
+            "pid": 4242,
+            "relative_path": "/root/private/worker-exit",
+            "private_proof": {"stopped": True},
+        }
+        original_can_cancel = self.tasks.can_cancel_task
+        self.tasks.can_cancel_task = lambda *_args, **_kwargs: False
+        try:
+            projected = self.workbench._project(
+                snapshot,
+                intent={
+                    "state": "retrying",
+                    "failure_code": None,
+                    "created_at": base_intent.created_at,
+                    "dispatch_claimed_at": base_intent.created_at,
+                    "outcome_recorded_at": retrying_at,
+                    "reconciliation": {
+                        "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                        "recorded_at": recorded_at,
+                        "state": "resolved",
+                        "result": "dispatched",
+                        "evidence_kind": "managed_worker_receipt",
+                        "resolved_at": resolved_at,
+                        "attempt_id": "attempt-private-reconciliation",
+                        "evidence_hash": "sha256:" + "b" * 64,
+                    },
+                    **private_values,
+                },
+            )
+        finally:
+            self.tasks.can_cancel_task = original_can_cancel
+
+        self.assertEqual(projected["status"], "Running")
+        self.assertEqual(
+            projected["dispatch"],
+            {
+                "state": "retrying",
+                "failure_code": None,
+                "created_at": base_intent.created_at,
+                "dispatch_claimed_at": base_intent.created_at,
+                "outcome_recorded_at": retrying_at,
+                "reconciliation": {
+                    "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                    "recorded_at": recorded_at,
+                    "state": "resolved",
+                    "result": "dispatched",
+                    "evidence_kind": "managed_worker_receipt",
+                    "resolved_at": resolved_at,
+                },
+            },
+        )
+        self.assertFalse(projected["can_cancel"])
+        serialized = repr(projected["dispatch"])
+        for private_value in (
+            *private_values,
+            *private_values.values(),
+            "attempt-private-reconciliation",
+            "sha256:" + "b" * 64,
+            "job_id",
+            "4242",
+        ):
+            self.assertNotIn(str(private_value), serialized)
+
+        for invalid_intent in (
+            {
+                "state": "retrying",
+                "failure_code": "WORKER_EXIT",
+                "reconciliation": None,
+            },
+            {
+                "state": "retrying",
+                "failure_code": None,
+                "reconciliation": {
+                    "failure_code": "DISPATCH_RECEIPT_UNKNOWN",
+                    "recorded_at": recorded_at,
+                    "state": "required",
+                    "result": None,
+                    "evidence_kind": None,
+                    "resolved_at": None,
+                },
+            },
+        ):
+            with self.subTest(invalid_intent=invalid_intent):
+                with self.assertRaises(WorkbenchRuntimeError) as caught:
+                    self.workbench._project(snapshot, intent=invalid_intent)
+                self.assertEqual(caught.exception.code, "SERVICE_RESPONSE_INVALID")
+
     def test_retry_exhaustion_projection_is_bounded_and_path_free(self) -> None:
         created = self.workbench.create_task(
             guided_form(), "create-retry-exhaustion-projection"
@@ -1735,6 +1846,21 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             "max_attempts": 2,
             "private_path": "/root/private/retry-attempt",
         }
+        worker_exit_extension = {
+            "intent_id": "intent-private-worker-exit",
+            "attempt_number": 2,
+            "previous_attempt_id": "attempt-private-worker-exit",
+            "previous_observation_sequence": 4,
+            "evidence_hash": "sha256:" + "a" * 64,
+            "private_schema_version": "1.1.0",
+            "private_proof_hash": "sha256:" + "b" * 64,
+            "failure_kind": "worker_exit",
+            "max_attempts": 2,
+            "source_outcome_document_hash": "sha256:" + "c" * 64,
+            "source_handle_hash": "sha256:" + "d" * 64,
+            "pid": 4242,
+            "private_path": "/root/private/worker-exit-retry",
+        }
         canonical = {
             "schema_version": "1.0.0",
             "event_id": "event-retry-exhausted-public",
@@ -1752,6 +1878,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             "fingerprint": {},
             "extensions": {
                 "org.agent_rpc.retry_exhaustion": private_extension,
+                "org.agent_rpc.worker_exit_retry": worker_exit_extension,
                 "org.agent_rpc.adapter_status": {
                     "stage": "submit",
                     "job_id": "fwi-private-retry-job",
@@ -1775,6 +1902,9 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertNotIn(
             "org.agent_rpc.retry_exhaustion", projected[0]["extensions"]
         )
+        self.assertNotIn(
+            "org.agent_rpc.worker_exit_retry", projected[0]["extensions"]
+        )
         self.assertEqual(
             projected[0]["extensions"]["org.agent_rpc.adapter_status"],
             {"stage": "submit"},
@@ -1785,6 +1915,10 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             canonical["extensions"]["org.agent_rpc.retry_exhaustion"],
             private_extension,
         )
+        self.assertEqual(
+            canonical["extensions"]["org.agent_rpc.worker_exit_retry"],
+            worker_exit_extension,
+        )
         serialized = repr(projected)
         for private in (
             private_extension["intent_id"],
@@ -1793,11 +1927,22 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             private_extension["private_proof_hash"],
             private_extension["private_schema_version"],
             private_extension["private_path"],
+            worker_exit_extension["intent_id"],
+            worker_exit_extension["previous_attempt_id"],
+            worker_exit_extension["evidence_hash"],
+            worker_exit_extension["private_proof_hash"],
+            worker_exit_extension["source_outcome_document_hash"],
+            worker_exit_extension["source_handle_hash"],
+            worker_exit_extension["private_path"],
             "intent_id",
             "attempt_id",
+            "previous_attempt_id",
             "evidence_hash",
             "private_proof_hash",
             "private_schema_version",
+            "source_outcome_document_hash",
+            "source_handle_hash",
+            "4242",
             "fwi-private-retry-job",
         ):
             self.assertNotIn(private, serialized)

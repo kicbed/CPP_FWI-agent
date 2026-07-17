@@ -11,13 +11,13 @@
   P2-005B 固定 Adapter 托管 Worker launch fence、P2-005C fenced Worker 证据投影/late adoption、
   P2-006 可恢复 fenced scheduler/受监督首次派发、P2-007 exact-attempt user cancellation 与
   P2-008 exact-attempt wall-time timeout 与 P2-009A 有界 positive receipt resolution/adoption
-  及 P2-009B1 pre-running launch failure retry 均为有界 Verified；完整 P2 Pending**
-- 当前阶段：**P2-009B1 pre-running launch failure 重试 Verified；P2-009B2 post-ready `worker_exit` Pending；完整 P2 继续进行**
-- 下一动作：以 effective handle/产物/取消/超时目标共同迁移为出口推进 B2；随后关闭剩余负向/
-  不确定 reconciliation、SSE，并执行完整 P2 故障与代表性 CPU/CUDA 阶段出口。按 D-011 当前为
-  3 个实现工作流加 1 次阶段出口的弹性估算，不是固定配额
-- 交付粒度：D-011 采用弹性中等切片，约十余个只是估算；保留逐切片验证和阶段质量门，不为
-  migration/字段/单项测试单独制造路线切片，确有安全/验证证据时允许合理增加并记录原因
+  及 P2-009B1/B2 finite retry 均为有界 Verified；完整 P2 Pending**
+- 当前阶段：**P2-009B1 pre-running launch failure 与 P2-009B2 post-ready `worker_exit` retry 均已 Verified；完整 P2 继续进行**
+- 下一动作：仅就 P2，将剩余交付压缩为两个中等切片：先一次关闭负向/不确定 reconciliation
+  矩阵，再合并 SSE 与完整 P2 故障、代表性 CPU/CUDA 阶段出口。质量门、依赖和安全边界不变；
+  这仍是弹性估算，不是固定配额
+- 交付粒度：D-011 的“约十余个”是整个 D-003 完成（完整 P2、P3、P4、P5）的粗估；上述两个
+  仅是 P2 子集。逐切片验证和阶段质量门不变，确有安全/验证证据时才拆分并记录原因
 - 当前阻塞：无
 - 完整计划：`docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md`
 
@@ -32,7 +32,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | 准备 | Verified | D-003 计划/进度、D-004、D-005 提案、安全门和真实新会话冷启动 reconciliation | branch/diff/ancestor/helper/live tests + launcher/continuity/runtime-secret：PASS | —（阶段完成） |
 | P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 31/31；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
 | P1 最小持久垂直切片 | Verified | 既有 P1 Task Store/Registry/Adapter/atomic submit/Guided Web 全闭环及 D-006/D-007；D-008/P1-008 增加 Conversation/Task 可选引用、无级联本地对话删除和当前 Algorithm/Adapter 1.4 的 2 数值 + 6 PNG 结果画廊 | Runtime 165/165、Worker 28/28、Web 29/29、Embedding 6/6、CTest 39/39、MCP 1/1 及 UI/治理 PASS；fresh v6 CUDA 10 events、8 artifacts/6 PNG、数值更新和重启不变性 PASS | —（P1 及当前维护切片完成） |
-| P2 持久可靠性加固 | In progress（P2-001–P2-009A 有界切片 Verified；P2-009B1 Verified；P2-009B2 Pending；完整 P2 Pending） | SQLite v14 + Approval 1.1 两次串行/累计 2W 预算；current Deepwave 1.5 exact stopped attempt 2、第二次失败终结、无 handle 双 attempt Trash/Purge 和有界公开投影 | Runtime 343/343、固定 venv Worker 32/32、launch-control 26/26、Web 47/47、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理与独立最终审计 PASS；未重复数值 FWI/CUDA | 推进 B2 effective handle/status/artifact/cancel/timeout 共同迁移；再完成剩余 reconciliation、SSE 与完整 P2 出口 |
+| P2 持久可靠性加固 | In progress（P2-001–P2-009A 与 P2-009B1/B2 有界切片 Verified；完整 P2 Pending） | SQLite v15；两次串行/累计 2W；pre-running 与 exact post-ready `worker_exit` 各只允许一次自动 retry；private 1.3 replacement/effective handle、timeout retirement、attempt2 exhaustion、混合 lineage Trash/Purge 和有界公开投影 | Runtime 360/360、固定 venv Worker 32/32、launch-control 39/39、Web 47/47、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理与三轮独立审计 PASS；未重复数值 FWI/CUDA | 一个切片关闭剩余 reconciliation 矩阵；再合并 SSE 与完整 P2 故障/代表性 CPU-CUDA 出口 |
 | P3 确定性 DAG | Pending | 无 | 无 | 依赖、并行、资源锁和 checkpoint 通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
 | P5 算法 SDK | Pending | 无 | 无 | 受控数据可匹配多个独立算法；新增真实插件无需 Orchestrator 关键词且 conformance 通过 |
@@ -54,8 +54,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   Worker 执行和同机容量仍由 P2-005B inherited `flock` 围栏；SQLite v10/v11 不是 Worker lease。
   P2-007 已提供有界 exact-attempt user cancel；P2-008 已提供有界 exact-attempt timeout；P2-009A
   已验证严格正向 receipt 证明下的有界 resolution/adoption；P2-009B1 已验证 exact stopped
-  pre-running failure 的一次自动重试。当前仍无 DAG、post-ready `worker_exit` retry、完整
-  reconciliation 或 SSE。
+  pre-running failure 的一次自动重试，P2-009B2 已验证 exact post-ready `worker_exit` 的一次自动
+  重试与 current effective target 替换。当前仍无 DAG、完整 reconciliation 或 SSE。
 - D-006/P1-006 已把固定 FWI 的显式整数上限扩展为 10000；该 checkpoint 使用
   Algorithm/Adapter `1.1.0`。D-007 的 `1.2.0` 是不可变六参数历史快照，`1.3.0` 是已验证
   checkpoint；D-008 当时的新提交使用 `1.4.0`，D-012/B1 当前新提交推进为 `1.5.0`；旧
@@ -131,8 +131,10 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   是弹性估算而非固定 12。多算法表示多个独立可选工具，自动串联完整处理流程不作为当前出口。
 - D-012 已批准：每个新批准 Task 最多两个 append-only Worker attempt；Approval 显式绑定最坏
   资源预算，只对 exact stopped 的 pre-running launch failure 与 post-ready `worker_exit` 自动重试。
-  普通数值失败、timeout、cancel、成功、损坏/分歧/不确定 reconciliation 不重试。B1 已 Verified；
-  B2 因 effective handle、artifact、cancel、timeout 必须共同迁移而后置到独立安全出口。
+  普通数值失败、timeout、cancel、成功、损坏/分歧/不确定 reconciliation 不重试。B1/B2 均已
+  Verified；effective handle、artifact、cancel、timeout 已在 B2 同一安全出口内共同迁移。
+- D-013 已批准并完成治理落地：所有数量/工期/切片估算显式区分全项目、阶段和子切片范围，
+  并注明粗估或承诺；Accepted 计划的范围、顺序、依赖、安全边界和出口未经用户明确同意不变。
 - 2026-07-15 用户的风险评估已收紧顺序：最小 FWI Schema 先行，最小 SQLite TaskService
   提前到首个垂直切片，Redis 不作为任务事实源，P4 Agent Planner 后置。
 - Git 动态快照（截至 2026-07-15）：当前实现分支基于 `ffeb5bc`；本地 `main`
@@ -145,8 +147,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 - P1.1c 历史 checkpoint 已实现后端 submit 幂等、预算消费、durable intent 与 Queued；P2-006
   当前 submit 已改为 enqueue-only，current 1.5 pending/no-record 首派由 active Supervisor term
   负责。P2-009A 只在上述两类 exact positive receipt 下推进 immutable
-  `reconciliation_required` 的有界 resolution/adoption；B1 只关闭 pre-running retry，负向/不确定
-  reconciliation、退款和 post-ready `worker_exit` retry 仍未解决；
+  `reconciliation_required` 的有界 resolution/adoption；B1/B2 已关闭两类有限 retry，负向/不确定
+  reconciliation 与退款仍未解决；
 - Deepwave Adapter 只覆盖固定 `acoustic_fwi_2d` 单节点，尚未成为通用 Algorithm SDK；旧
   forward 因输出语义不匹配而未接入标准 Adapter；
 - P2-006 已让 Web 进程在 scope-level fenced term 下调度并持续更新 task，不依赖浏览器 GET；
@@ -154,7 +156,8 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
   声称所有 runtime write 都由唯一 Supervisor 独占。kernel `flock` 仍是执行/容量权威，heartbeat
   不是 lease 或 takeover 信号；standalone CLI/C++ MCP 不在该投影/容量边界，升级前或首次扫描前
   已终态的 task 不保证 evidence backfill。不完整 staging、确定性 Adapter/receipt 错误仍需未来
-  reconciliation；finite retry 策略已由 D-012 接受且 P2-009B1 已 Verified，但 B2 仍 Pending；完整 reconciliation/SSE、P3 DAG 和 P4 Agent
+  reconciliation；finite retry 策略已由 D-012 接受且 P2-009B1/B2 已 Verified；完整
+  reconciliation/SSE、P3 DAG 和 P4 Agent
   Planner 仍未实现。P2-007/P2-008 不支持 pending/staged、legacy private schema 1.0 或公共 Adapter
   1.0–1.3；P2-009A 只额外覆盖 current Adapter 下 legacy-private schema 1.0 的 exact launched receipt，
   不把公共 Adapter 1.0–1.3 纳入；
@@ -713,7 +716,7 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
 
 ### P2-009B / D-012 有限自动重试（2026-07-17）
 
-- 状态：**Accepted / In progress；B1 Implemented → Verified，B2 Pending；完整 P2 仍 Pending**。
+- 状态：**Accepted / Implemented；B1/B2 均 Implemented → Verified；完整 P2 仍 Pending**。
 - 固定策略为最多 2 个 append-only attempt；新 Approval 显式绑定 `max_attempts=2`、每次资源上限
   和两次顺序执行的最坏 wall/resource budget，旧 Approval 保持一次。只允许 exact stopped 的
   pre-running launch failure 与 post-ready `worker_exit`；普通数值失败、timeout、cancel、成功、
@@ -737,13 +740,29 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
   将 pending purge、两次 observation/private proof、reservation 与 terminal event/commit 绑定。Adapter
   在同一 idle fence 下先写同 purge 墓碑再 FD-relative 删除两个 attempt；不同 purge 拒绝，目录间和
   目录内部分删除均可幂等续作，旁系目录不删除。
-- 最终分级回归：Runtime 343/343；固定 venv Worker 32/32；launch-control 26/26；Web 47/47；
+- **P2-009B2 已 Verified**：SQLite v15 只接受 current effective dispatched handle、latest exact
+  spawned+ready+running observation、idle execution fence、无 stop/cancel ownership、非
+  `0/75/76` exit code 与 append-only private worker-exit receipt。active Supervisor 原子追加
+  `node_retrying`/reservation 并立即隐藏旧 handle；Adapter 在 submission lock 下复核后用 private
+  1.3 追加 attempt 2。ready 后 Store 原子发布 replacement handle 与 `node_started`，所有 status、
+  artifact、cancel、timeout 消费者随后只解析 replacement；旧 attempt timeout window 随 reservation
+  退役，新的 timeout window 绑定 attempt 2。
+- cancel、到期 timeout、自然成功/失败、普通数值失败、证据损坏/分歧/模糊均不能抢占成 retry。
+  普通 status bridge 对任何 `worker_exit` 都只读，必须等 fenced retry pass 决策，关闭了
+  “retry 检查后、同周期 refresh 前退出”的竞态。attempt 2 的 private 1.2（B1 lineage）与 1.3
+  （B2 lineage）exit 都只会 exact terminalize，不会创建 attempt 3。
+- attempt 2 pre-running failure 原子进入 no-handle `retry_exhausted`；Store cleanup proof 以兼容的
+  schema 1.1 token 额外绑定 prior `worker_exit` private schema/hash，并在 Adapter 同一 idle fence 下
+  精确清理两条 mixed lineage。attempt 2 post-ready exit 保留 replacement handle，以普通 receipt-bound
+  purge 处理。公开 Workbench/API/UI 仅增加 `finite_automatic_retry.worker_exit=true` 和有界
+  Retrying/terminal 投影；`retry=false` 继续表示没有浏览器手工 retry mutation，内部 proof/handle/
+  hash/PID/path 均不外泄。
+- B2 最终分级回归：Runtime 360/360；TaskService 106/106；Supervisor Store 62/62；Runtime
+  Supervisor 27/27；Adapter 60/60；固定 venv Worker 32/32；launch-control 39/39；Web 47/47；
   Embedding 6/6；根 CTest 39/39；MCP 1/1；Node UI、launcher、continuity、runtime-secret、helper、
-  py_compile/diff 及两轮独立边界审计 PASS。本切片使用 production-class pre-Popen/文件锁故障注入，
-  未重复数值 FWI/CUDA。
-- **P2-009B2** 单独 Pending：post-ready `worker_exit` 启动 attempt 2 前，必须把 status、artifact、
-  cancel 与 timeout 的 current target 一起绑定到同一个 effective handle。该边界涉及已经公开的
-  dispatched receipt 与结果所有权，不能复用 B1 的“尚无句柄”假设。
+  py_compile/diff 和三轮独立边界审计 PASS。使用 production-class receipt/fence、真实 SQLite
+  v14→v15、跨 term replay、direct/resolved source、两类 attempt2 exhaustion 和同周期竞态注入；
+  按 D-011 未在非阶段出口重复数值 FWI/CUDA。
 - 不增加浏览器 retry mutation；第 2 次仍失败后的人工再次运行必须创建新 Task/Plan/Approval。
 
 ### 完整 P2 仍 Pending
@@ -757,8 +776,10 @@ receipt resolution/adoption 均已 Verified。P2-006
 已关闭 current managed pending/no-record 首派和 exact staged 同 attempt 恢复；P2-007 只关闭上述
 exact current managed attempt 的用户取消，P2-008 只关闭具备 v2 exact-stop capability 的上述
 managed attempt 自动 wall-time enforcement。除 P2-009A 的上述正向 exact receipt 窗口外，
-P2-009B finite retry 的 B1 已 Verified、B2 仍 Pending；负向/不确定
-`reconciliation_required` resolution 与 SSE 仍未实现。服务器 transcript
+P2-009B finite retry 的 B1/B2 均已 Verified；负向/不确定
+`reconciliation_required` resolution 与 SSE 仍未实现。按 D-011，P2 剩余实现压缩为一个完整
+reconciliation 矩阵切片，以及一个合并 SSE 与完整 P2 故障/代表性 CPU-CUDA 出口的阶段切片。
+服务器 transcript
 永久删除、SQLite 审计历史硬
 删除和备份/外部副本清理仍 Pending。
 D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
@@ -819,6 +840,8 @@ D-005 仍未获批，没有迁移或删除旧 prompt-like 文件。
 | 2026-07-16 | P2-009A | In progress → Implemented → Verified；完整 P2 仍 Pending | SQLite v13 append-only authorization/adoption/resolution 与 effective dispatch；managed/private exact positive probe；每周期最多一次、同周期 timeout/status；六字段只读 Web 投影且无 mutation；整体验证同时关闭 same-key approve/submit late-replay race | Runtime 319/319、固定 venv Worker 32/32、launch-control 25/25、Web 46/46、Embedding 6/6、CTest 39/39、MCP 1/1、Node UI/治理 PASS；真实 Adapter 文件/锁 probe 中 replacement launcher 零调用；并发用例 10 进程重复 PASS；未运行 CUDA | 先请用户确认 finite retry 次数/预算/失败边界，再推进 P2-009B；负向 reconciliation 与 SSE 后置 |
 | 2026-07-17 | P2-009B / D-012 | Pending → Accepted / In progress；完整 P2 仍 Pending | 最多 2 个 attempt、显式最坏预算、仅 exact stopped pre-running launch failure / post-ready `worker_exit`；因 effective handle/产物/取消/超时目标迁移边界拆为 B1/B2，当前先实现 B1 | 策略与安全出口已核对；尚无实现/测试通过证据 | 完成 B1 SQLite/Adapter/Supervisor/Workbench 与竞态回归；B2 仍 Pending |
 | 2026-07-17 | P2-009B1 / D-012 | Accepted / In progress → Implemented → Verified；完整 P2 仍 Pending | SQLite v14 + Approval 1.1 两次串行/累计 2W、current Deepwave 1.5 exact stopped proof、active-term reservation/delivery、append-only attempt 2、exhaustion 终态、无 handle 双 attempt Trash/Purge、有界公开投影且无 retry mutation | Runtime 343/343、固定 venv Worker 32/32、launch-control 26/26、Web 47/47、Embedding 6/6、CTest 39/39、MCP 1/1、Node/治理与独立最终审计 PASS；未重复数值 FWI/CUDA | 推进 B2 post-ready `worker_exit` 的 effective handle/status/artifact/cancel/timeout 共同迁移；再完成剩余 reconciliation、SSE 与完整 P2 出口 |
+| 2026-07-17 | P2-009B2 / D-012 | In progress → Implemented → Verified；完整 P2 仍 Pending | SQLite v15 exact worker-exit reservation/replacement/exhaustion、receipt-first terminal arbitration、private 1.3 attempt2、effective handle/status/artifact/cancel/timeout 共同迁移、旧 timeout retirement、mixed-lineage purge、只读 Web 与无 attempt3 | Runtime 360/360、TaskService 106/106、Supervisor Store 62/62、Runtime Supervisor 27/27、Adapter 60/60、Worker 32/32、launch-control 39/39、Web 47/47、Embedding 6/6、CTest 39/39、MCP 1/1、Node/治理与三轮独立审计 PASS；未重复数值 FWI/CUDA | P2 压缩为两个剩余交付切片：完整 reconciliation 矩阵；SSE + 完整 P2 故障/代表性 CPU-CUDA 出口。整个 D-003 的“约十余个”估算还包括 P3–P5 |
+| 2026-07-17 | D-013 | Accepted → Implemented → Verified（governance）；运行时阶段不变 | 估算必须标明 whole-project/phase/sub-slice 范围、包含阶段及粗估/承诺性质；Accepted 计划的范围、顺序、依赖、安全边界、出口未经用户明确同意不得修改或重释 | AGENTS 自动入口、四份连续性真源、continuity contract、launcher、Node UI 与 diff check PASS | 后续状态更新只改 Implemented/Verified/Pending 和证据；任何计划变更先说明证据/收益/成本/风险/兼容性并取得用户明确批准 |
 
 记录规则：
 

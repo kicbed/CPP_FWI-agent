@@ -506,7 +506,7 @@ class GuidedWorkbench:
                     "max_attempts": 2,
                     "max_concurrent_attempts": 1,
                     "pre_running_launch_failure": True,
-                    "worker_exit": False,
+                    "worker_exit": True,
                 },
                 "sse": False,
                 "startup_dispatch_recovery": False,
@@ -1412,10 +1412,23 @@ class GuidedWorkbench:
         approval = snapshot.approval
         dispatch = None
         if intent is not None:
+            dispatch_state = _value(intent, "state")
+            dispatch_failure_code = _value(intent, "failure_code")
             reconciliation = _value(intent, "reconciliation")
+            if dispatch_state == "retrying" and (
+                dispatch_failure_code is not None
+                or (
+                    reconciliation is not None
+                    and _value(reconciliation, "state") != "resolved"
+                )
+            ):
+                raise WorkbenchRuntimeError(
+                    "SERVICE_RESPONSE_INVALID",
+                    ["worker-exit retry projection is invalid"],
+                )
             dispatch = {
-                "state": _value(intent, "state"),
-                "failure_code": _value(intent, "failure_code"),
+                "state": dispatch_state,
+                "failure_code": dispatch_failure_code,
                 "created_at": _value(intent, "created_at"),
                 "dispatch_claimed_at": _value(intent, "dispatch_claimed_at"),
                 "outcome_recorded_at": _value(intent, "outcome_recorded_at"),
@@ -1757,11 +1770,14 @@ class GuidedWorkbench:
             value = copy.deepcopy(event)
             extensions = value.get("extensions")
             if isinstance(extensions, dict):
-                # The canonical exhaustion audit binds internal intent,
-                # attempt, observation, and private Adapter proof identities.
-                # Browser/API consumers need only the public retry_exhausted
-                # error code; never project that internal proof extension.
-                extensions.pop("org.agent_rpc.retry_exhaustion", None)
+                # Retry audits bind internal intent, attempt, observation, and
+                # private Adapter proof identities.  Browser/API consumers need
+                # only the public event/state; never project either proof.
+                for internal_retry_extension in (
+                    "org.agent_rpc.retry_exhaustion",
+                    "org.agent_rpc.worker_exit_retry",
+                ):
+                    extensions.pop(internal_retry_extension, None)
                 adapter_detail = extensions.get("org.agent_rpc.adapter_status")
                 if isinstance(adapter_detail, dict):
                     adapter_detail.pop("job_id", None)

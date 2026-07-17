@@ -62,15 +62,17 @@ RUN_EVENT_STATUS = {
     # lifecycle semantics are deferred to the P3 scheduler.
     "node_succeeded": frozenset({"Succeeded"}),
     "node_failed": frozenset({"Failed"}),
+    "node_retrying": frozenset({"Retrying"}),
     "cancel_requested": frozenset({"Queued", "Running"}),
     "task_cancelled": frozenset({"Cancelled"}),
 }
 
 RUN_EVENT_EXPECTED_STATUS = {
-    "node_started": frozenset({"Queued"}),
+    "node_started": frozenset({"Queued", "Retrying"}),
     "node_progress": frozenset({"Running"}),
     "node_succeeded": frozenset({"Running"}),
     "node_failed": frozenset({"Queued", "Running"}),
+    "node_retrying": frozenset({"Queued", "Running"}),
     "cancel_requested": frozenset({"Queued", "Running"}),
     "task_cancelled": frozenset({"Queued", "Running"}),
 }
@@ -79,7 +81,6 @@ P2_EVENT_TYPES = frozenset(
     {
         "checkpoint_created",
         "node_waiting",
-        "node_retrying",
     }
 )
 
@@ -193,6 +194,22 @@ class TaskScheduleResult:
     """One Supervisor-owned pass through the first-dispatch state machine."""
 
     intent: DispatchIntentSnapshot
+    authorized: bool
+    authorization_replayed: bool
+    dispatch_attempted: bool
+    projected: bool
+    adopted: bool
+    deferred_code: str | None = None
+    timeout_armed: bool = False
+
+
+@dataclass(frozen=True)
+class TaskRetryProcessResult:
+    """One Supervisor-owned pass through post-ready finite retry."""
+
+    snapshot: TaskSnapshot
+    intent: DispatchIntentSnapshot
+    state: str
     authorized: bool
     authorization_replayed: bool
     dispatch_attempted: bool
@@ -3684,7 +3701,7 @@ class TaskService:
         intent = self._store.get_dispatch_intent(task_id)
         if intent is None:
             raise TaskConflict("runtime task has no dispatch intent")
-        if intent.state not in {"dispatching", "dispatched"}:
+        if intent.state not in {"dispatching", "dispatched", "retrying"}:
             return TaskWorkerProjectionResult(
                 intent=intent,
                 evidence=None,
@@ -3740,13 +3757,63 @@ class TaskService:
                 raise TaskDispatchError("DISPATCH_RECEIPT_INVALID") from error
         if intent.state == "dispatched" and validated_handle != intent.handle:
             raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
+        replacement_event: dict[str, Any] | None = None
+        if intent.state == "retrying" and validated_handle is not None:
+            ready = evidence.get("ready")
+            heartbeat = evidence.get("heartbeat")
+            if (
+                evidence.get("attempt_number") != 2
+                or not isinstance(ready, Mapping)
+                or not isinstance(heartbeat, Mapping)
+                or heartbeat.get("state")
+                not in {"running", "succeeded", "failed"}
+            ):
+                raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
+            sequence = self._store.latest_run_event_sequence(task_id) + 1
+            _, identity_hash = encode_document(
+                {
+                    "intent_id": intent.intent_id,
+                    "attempt_id": evidence.get("attempt_id"),
+                    "job_id": validated_handle.get("job_id"),
+                    "ready_record_hash": ready.get("record_hash"),
+                    "event_type": "node_started",
+                    "sequence": sequence,
+                }
+            )
+            replacement_event = {
+                "schema_version": "1.0.0",
+                "event_id": "event-"
+                + identity_hash.removeprefix("sha256:")[:32],
+                "sequence": sequence,
+                "task_id": task_id,
+                "node_id": intent.node_id,
+                "event_type": "node_started",
+                "task_status": "Running",
+                "occurred_at": ready.get("started_at"),
+                "fingerprint": copy.deepcopy(intent.queue_fingerprint),
+                "extensions": {
+                    "org.agent_rpc.adapter_status": {
+                        "job_id": validated_handle["job_id"],
+                        "stage": "running",
+                        "worker_updated_at": ready.get("started_at"),
+                    }
+                },
+            }
+            self._validate_schema("run-event.schema.json", replacement_event)
+            _validate_run_event_semantics(replacement_event)
+            _validate_run_event_binding(snapshot, replacement_event)
         try:
+            projection_arguments: dict[str, Any] = {
+                "intent_id": intent.intent_id,
+                "evidence": evidence,
+                "handle": validated_handle,
+                "supervisor_lease": supervisor_lease,
+                "supervisor_clock": self._runtime_supervisor_clock,
+            }
+            if replacement_event is not None:
+                projection_arguments["replacement_event"] = replacement_event
             projection = self._store.record_supervised_worker_observation(
-                intent_id=intent.intent_id,
-                evidence=evidence,
-                handle=validated_handle,
-                supervisor_lease=supervisor_lease,
-                supervisor_clock=self._runtime_supervisor_clock,
+                **projection_arguments
             )
         except RuntimeSupervisorLeaseLost as error:
             raise TaskSupervisorLeaseLost() from error
@@ -4722,6 +4789,711 @@ class TaskService:
             replayed=completed.replayed,
         )
 
+    @staticmethod
+    def _approved_finite_retry(snapshot: TaskSnapshot) -> bool:
+        approval = snapshot.approval
+        retry_policy = (
+            approval.get("scope", {}).get("retry_policy")
+            if isinstance(approval, Mapping)
+            and isinstance(approval.get("scope"), Mapping)
+            else None
+        )
+        retryable = (
+            retry_policy.get("retryable_failure_classes")
+            if isinstance(retry_policy, Mapping)
+            else None
+        )
+        return bool(
+            isinstance(approval, Mapping)
+            and approval.get("schema_version") == "1.1.0"
+            and isinstance(retry_policy, Mapping)
+            and retry_policy.get("max_attempts") == 2
+            and retry_policy.get("max_concurrent_attempts") == 1
+            and isinstance(retryable, list)
+            and len(retryable) == 2
+            and all(isinstance(item, str) for item in retryable)
+            and set(retryable) == RETRYABLE_FAILURE_CLASSES
+        )
+
+    def process_runtime_retry(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskRetryProcessResult:
+        """Run the sole post-ready retry decision before generic status."""
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        intent = self._store.get_dispatch_intent(task_id)
+        if intent is None:
+            raise TaskConflict("runtime task has no dispatch intent")
+
+        def result(
+            state: str,
+            *,
+            current_snapshot: TaskSnapshot = snapshot,
+            current_intent: DispatchIntentSnapshot = intent,
+            authorized: bool = False,
+            authorization_replayed: bool = False,
+            dispatch_attempted: bool = False,
+            projected: bool = False,
+            adopted: bool = False,
+            deferred_code: str | None = None,
+            timeout_armed: bool = False,
+        ) -> TaskRetryProcessResult:
+            return TaskRetryProcessResult(
+                snapshot=current_snapshot,
+                intent=current_intent,
+                state=state,
+                authorized=authorized,
+                authorization_replayed=authorization_replayed,
+                dispatch_attempted=dispatch_attempted,
+                projected=projected,
+                adopted=adopted,
+                deferred_code=deferred_code,
+                timeout_armed=timeout_armed,
+            )
+
+        if (
+            snapshot.status not in {"Queued", "Running", "Retrying"}
+            or not self._approved_finite_retry(snapshot)
+        ):
+            return result("none")
+        if snapshot.cancellation is not None:
+            return result("none", deferred_code="CANCEL_CONTROL_PENDING")
+        timeout = getattr(snapshot, "timeout", None)
+        if timeout is not None and getattr(timeout, "state", None) == "requested":
+            return result("none", deferred_code="TIMEOUT_CONTROL_PENDING")
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+
+        if intent.state == "retrying":
+            try:
+                authorization = self._store.resume_supervised_worker_exit_retry(
+                    intent_id=intent.intent_id,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+            except RuntimeSupervisorLeaseLost as error:
+                raise TaskSupervisorLeaseLost() from error
+            except TaskStoreConflict:
+                current_intent = self._store.get_dispatch_intent(task_id) or intent
+                current_snapshot = self.get_task(
+                    task_id, project_id=project_id, principal_id=principal_id
+                )
+                if current_intent.state == "dispatched":
+                    return result(
+                        "dispatched",
+                        current_snapshot=current_snapshot,
+                        current_intent=current_intent,
+                        projected=True,
+                        adopted=True,
+                    )
+                return result(
+                    "retrying",
+                    current_snapshot=current_snapshot,
+                    current_intent=current_intent,
+                    deferred_code="WORKER_EXIT_RETRY_RESUME_CONFLICT",
+                )
+            if (
+                authorization.intent.intent_id != intent.intent_id
+                or authorization.intent.state != "retrying"
+                or authorization.attempt_number != 2
+                or authorization.failure_kind != "worker_exit"
+                or authorization.private_schema_version
+                not in {"1.1.0", "1.2.0"}
+                or type(authorization.authorization_replayed) is not bool
+            ):
+                raise TaskDispatchError("WORKER_RETRY_AUTHORIZATION_INVALID")
+            return self._deliver_authorized_worker_exit_retry(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                snapshot=snapshot,
+                intent=authorization.intent,
+                authorization=authorization,
+                supervisor_lease=supervisor_lease,
+            )
+
+        if intent.state != "dispatched" or intent.handle is None:
+            return result("none")
+        try:
+            adapter_status = self._validated_adapter_status(
+                intent, self._dispatcher.status(intent)
+            )
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except TaskDispatchError:
+            raise
+        except Exception as error:
+            raise TaskDispatchError("ADAPTER_STATUS_UNAVAILABLE") from error
+        if (
+            adapter_status["status"] != "Failed"
+            or adapter_status["stage"] != "worker_exit"
+        ):
+            return result("none")
+
+        projection = self.project_worker_attempt(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            supervisor_lease=supervisor_lease,
+        )
+        evidence = projection.evidence
+        if not isinstance(evidence, Mapping):
+            return result(
+                "none",
+                current_intent=projection.intent,
+                deferred_code=projection.deferred_code
+                or "WORKER_EXIT_PROJECTION_UNAVAILABLE",
+            )
+        attempt_number = evidence.get("attempt_number")
+        if attempt_number == 2:
+            try:
+                proof = self._dispatcher.probe_worker_exit_retry_exhaustion(
+                    projection.intent
+                )
+            except (DispatchDeferred, DispatchError) as error:
+                # Status alone never authorizes terminalization.  Corrupt,
+                # incomplete, or otherwise ambiguous exit proof remains for
+                # a later fenced decision instead of falling through to the
+                # ordinary status bridge.
+                return result(
+                    "none",
+                    current_intent=projection.intent,
+                    projected=True,
+                    deferred_code=error.code,
+                )
+            if proof.private_schema_version == "1.2.0":
+                return self._finalize_pre_running_retry_worker_exit_exhaustion(
+                    task_id=task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    intent=projection.intent,
+                    projection=projection,
+                    proof=proof,
+                    adapter_status=adapter_status,
+                    supervisor_lease=supervisor_lease,
+                )
+            return self._finalize_worker_exit_retry_exhaustion(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                snapshot=snapshot,
+                intent=projection.intent,
+                projection=projection,
+                proof=proof,
+                supervisor_lease=supervisor_lease,
+            )
+        if attempt_number != 1:
+            raise TaskDispatchError("WORKER_EXIT_PROJECTION_INVALID")
+        try:
+            proof = self._dispatcher.probe_worker_exit_retry(intent)
+        except (DispatchDeferred, DispatchError) as error:
+            return result(
+                "none",
+                current_intent=projection.intent,
+                projected=True,
+                deferred_code=error.code,
+            )
+        if (
+            proof.failure_kind != "worker_exit"
+            or proof.previous_attempt_id != projection.attempt_id
+            or proof.previous_attempt_number != 1
+            or proof.private_schema_version not in {"1.1.0", "1.2.0"}
+            or proof.evidence != evidence
+            or not isinstance(proof.private_evidence, Mapping)
+            or type(projection.observation_sequence) is not int
+            or projection.observation_sequence < 1
+            or not isinstance(projection.document_hash, str)
+        ):
+            raise TaskDispatchError("WORKER_EXIT_PROOF_INVALID")
+        try:
+            _, evidence_hash = encode_document(dict(evidence))
+            source_outcome = {
+                "status": "dispatched",
+                "handle": copy.deepcopy(intent.handle),
+                "recorded_at": intent.outcome_recorded_at,
+            }
+            _, source_outcome_hash = encode_document(source_outcome)
+            _, source_handle_hash = encode_document(intent.handle)
+        except TaskStoreConflict as error:
+            raise TaskDispatchError("WORKER_EXIT_PROOF_INVALID") from error
+        if (
+            evidence_hash != projection.document_hash
+            or intent.outcome_recorded_at is None
+        ):
+            raise TaskDispatchError("WORKER_EXIT_PROOF_INVALID")
+        sequence = self._store.latest_run_event_sequence(task_id) + 1
+        extension = {
+            "intent_id": intent.intent_id,
+            "attempt_number": 2,
+            "previous_attempt_id": projection.attempt_id,
+            "previous_observation_sequence": projection.observation_sequence,
+            "evidence_hash": projection.document_hash,
+            "private_schema_version": proof.private_schema_version,
+            "private_proof_hash": proof.private_proof_hash,
+            "failure_kind": "worker_exit",
+            "max_attempts": 2,
+            "source_outcome_document_hash": source_outcome_hash,
+            "source_handle_hash": source_handle_hash,
+        }
+        _, event_identity = encode_document(
+            {
+                **extension,
+                "event_type": "node_retrying",
+                "sequence": sequence,
+            }
+        )
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-"
+            + event_identity.removeprefix("sha256:")[:32],
+            "sequence": sequence,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_retrying",
+            "task_status": "Retrying",
+            "occurred_at": adapter_status["updated_at"],
+            # This atomic retry transition is bound to the approved/preflight
+            # queue fingerprint.  The Adapter handle carries a later runtime
+            # fingerprint and may legitimately differ.
+            "fingerprint": copy.deepcopy(intent.queue_fingerprint),
+            "extensions": {
+                "org.agent_rpc.worker_exit_retry": extension,
+            },
+        }
+        self._validate_schema("run-event.schema.json", event)
+        _validate_run_event_semantics(event)
+        _validate_run_event_binding(snapshot, event)
+        try:
+            authorization = self._store.authorize_supervised_worker_exit_retry(
+                intent_id=intent.intent_id,
+                previous_attempt_id=projection.attempt_id,
+                previous_observation_sequence=projection.observation_sequence,
+                failure_kind="worker_exit",
+                private_schema_version=proof.private_schema_version,
+                private_proof_hash=proof.private_proof_hash,
+                retry_event=event,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            current_intent = self._store.get_dispatch_intent(task_id) or intent
+            current_snapshot = self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            return result(
+                "retrying"
+                if current_intent.state == "retrying"
+                else "none",
+                current_snapshot=current_snapshot,
+                current_intent=current_intent,
+                projected=True,
+                deferred_code="WORKER_EXIT_RETRY_AUTHORIZATION_CONFLICT",
+            )
+        if (
+            authorization.intent.state != "retrying"
+            or authorization.failure_kind != "worker_exit"
+            or authorization.previous_attempt_id != projection.attempt_id
+            or authorization.previous_observation_sequence
+            != projection.observation_sequence
+            or authorization.evidence_hash != projection.document_hash
+            or authorization.private_proof_hash != proof.private_proof_hash
+            or authorization.source_outcome_document_hash
+            != source_outcome_hash
+            or authorization.source_handle_hash != source_handle_hash
+        ):
+            raise TaskDispatchError("WORKER_RETRY_AUTHORIZATION_INVALID")
+        return self._deliver_authorized_worker_exit_retry(
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            snapshot=self.get_task(
+                task_id, project_id=project_id, principal_id=principal_id
+            ),
+            intent=authorization.intent,
+            authorization=authorization,
+            supervisor_lease=supervisor_lease,
+        )
+
+    def _deliver_authorized_worker_exit_retry(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        authorization: Any,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskRetryProcessResult:
+        try:
+            token = authorization.adapter_token()
+        except Exception as error:
+            raise TaskDispatchError("WORKER_RETRY_AUTHORIZATION_INVALID") from error
+        if (
+            not isinstance(token, Mapping)
+            or token.get("intent_id") != intent.intent_id
+            or token.get("failure_kind") != "worker_exit"
+            or token.get("next_attempt_number") != 2
+        ):
+            raise TaskDispatchError("WORKER_RETRY_AUTHORIZATION_INVALID")
+        deferred_code: str | None = None
+        handle: dict[str, Any] | None = None
+        try:
+            handle = self._dispatcher.retry_worker_exit(
+                intent, authorization=token
+            )
+        except (DispatchDeferred, DispatchError) as error:
+            deferred_code = error.code
+        except Exception:
+            deferred_code = "WORKER_RETRY_UNAVAILABLE"
+
+        validated_handle: dict[str, Any] | None = None
+        if handle is not None:
+            try:
+                validated_handle = self._validate_dispatch_receipt(
+                    snapshot=snapshot,
+                    intent=intent,
+                    handle=handle,
+                )
+            except TaskValidationError:
+                deferred_code = "DISPATCH_RECEIPT_INVALID"
+        try:
+            projection = self.project_worker_attempt(
+                task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                supervisor_lease=supervisor_lease,
+            )
+        except (TaskConflict, TaskDispatchError):
+            projection = None
+        current_snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        current_intent = self._store.get_dispatch_intent(task_id) or intent
+        if projection is not None:
+            current_intent = projection.intent
+            if (
+                current_intent.state == "dispatched"
+                and (
+                    validated_handle is None
+                    or current_intent.handle == validated_handle
+                )
+            ):
+                return TaskRetryProcessResult(
+                    snapshot=current_snapshot,
+                    intent=current_intent,
+                    state="dispatched",
+                    authorized=True,
+                    authorization_replayed=authorization.authorization_replayed,
+                    dispatch_attempted=True,
+                    projected=projection.projected,
+                    adopted=projection.adopted,
+                    timeout_armed=projection.timeout_armed,
+                )
+            evidence = projection.evidence
+            ticket = (
+                evidence.get("ticket")
+                if isinstance(evidence, Mapping)
+                else None
+            )
+            if (
+                isinstance(evidence, Mapping)
+                and evidence.get("attempt_number") == 2
+                and isinstance(ticket, Mapping)
+                and ticket.get("state") == "failed"
+                and ticket.get("worker_pid") is None
+                and evidence.get("ready") is None
+                and evidence.get("heartbeat") is None
+            ):
+                try:
+                    proof = self._dispatcher.probe_pre_running_retry_exhaustion(
+                        current_intent
+                    )
+                except DispatchError:
+                    pass
+                else:
+                    return self._finalize_worker_exit_retry_exhaustion(
+                        task_id=task_id,
+                        project_id=project_id,
+                        principal_id=principal_id,
+                        snapshot=current_snapshot,
+                        intent=current_intent,
+                        projection=projection,
+                        proof=proof,
+                        supervisor_lease=supervisor_lease,
+                    )
+        return TaskRetryProcessResult(
+            snapshot=current_snapshot,
+            intent=current_intent,
+            state="retrying",
+            authorized=True,
+            authorization_replayed=authorization.authorization_replayed,
+            dispatch_attempted=True,
+            projected=projection is not None and projection.projected,
+            adopted=False,
+            deferred_code=deferred_code or "WORKER_EXIT_RETRY_IN_PROGRESS",
+        )
+
+    def _finalize_pre_running_retry_worker_exit_exhaustion(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        intent: DispatchIntentSnapshot,
+        projection: TaskWorkerProjectionResult,
+        proof: DispatchRetryProof,
+        adapter_status: Mapping[str, Any],
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskRetryProcessResult:
+        """Close a B1 attempt-2 exit without ever authorizing attempt 3."""
+
+        evidence = projection.evidence
+        private_evidence = proof.private_evidence
+        if (
+            intent.state != "dispatched"
+            or not isinstance(intent.handle, Mapping)
+            or not isinstance(evidence, Mapping)
+            or evidence.get("attempt_number") != 2
+            or proof.failure_kind != "worker_exit"
+            or proof.previous_attempt_number != 2
+            or proof.previous_attempt_id != projection.attempt_id
+            or proof.private_schema_version != "1.2.0"
+            or proof.evidence != evidence
+            or not isinstance(private_evidence, Mapping)
+            or private_evidence.get("record_hash") != proof.private_proof_hash
+            or private_evidence.get("observed_at")
+            != adapter_status.get("updated_at")
+            or adapter_status.get("status") != "Failed"
+            or adapter_status.get("stage") != "worker_exit"
+            or adapter_status.get("job_id") != intent.handle.get("job_id")
+            or type(projection.observation_sequence) is not int
+            or projection.observation_sequence < 1
+            or not isinstance(projection.document_hash, str)
+        ):
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_PROOF_INVALID")
+        try:
+            _, evidence_hash = encode_document(dict(evidence))
+        except TaskStoreConflict as error:
+            raise TaskDispatchError(
+                "WORKER_RETRY_EXHAUSTION_PROOF_INVALID"
+            ) from error
+        if evidence_hash != projection.document_hash:
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_PROOF_INVALID")
+
+        current = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if current.status not in {"Queued", "Running"}:
+            raise TaskConflict("retry exhaustion task state changed")
+        sequence = self._store.latest_run_event_sequence(task_id) + 1
+        extension = {
+            "intent_id": intent.intent_id,
+            "attempt_id": projection.attempt_id,
+            "attempt_number": 2,
+            "observation_sequence": projection.observation_sequence,
+            "evidence_hash": projection.document_hash,
+            "private_schema_version": "1.2.0",
+            "private_proof_hash": proof.private_proof_hash,
+            "failure_kind": "worker_exit",
+            "max_attempts": 2,
+        }
+        _, identity_hash = encode_document(
+            {**extension, "event_type": "node_failed", "sequence": sequence}
+        )
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-" + identity_hash.removeprefix("sha256:")[:32],
+            "sequence": sequence,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "retry_exhausted",
+                "message": "FWI Worker exhausted its approved attempts",
+                "retryable": False,
+            },
+            "occurred_at": adapter_status["updated_at"],
+            "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+            "extensions": {
+                "org.agent_rpc.retry_exhaustion": extension,
+                "org.agent_rpc.adapter_status": {
+                    "job_id": adapter_status["job_id"],
+                    "stage": "worker_exit",
+                    "worker_updated_at": adapter_status["updated_at"],
+                },
+            },
+        }
+        self._validate_schema("run-event.schema.json", event)
+        _validate_run_event_semantics(event)
+        _validate_run_event_binding(current, event)
+        try:
+            completed = self._store.commit_runtime_transition(
+                task_id=task_id,
+                expected_status=current.status,
+                event=event,
+                now=None,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        return TaskRetryProcessResult(
+            snapshot=completed,
+            intent=intent,
+            state="exhausted",
+            authorized=False,
+            authorization_replayed=False,
+            dispatch_attempted=False,
+            projected=True,
+            adopted=False,
+            deferred_code="WORKER_RETRY_EXHAUSTED",
+        )
+
+    def _finalize_worker_exit_retry_exhaustion(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        projection: TaskWorkerProjectionResult,
+        proof: DispatchRetryProof,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskRetryProcessResult:
+        evidence = projection.evidence
+        if (
+            not isinstance(evidence, Mapping)
+            or evidence.get("attempt_number") != 2
+            or proof.previous_attempt_number != 2
+            or proof.previous_attempt_id != projection.attempt_id
+            or proof.private_schema_version != "1.3.0"
+            or proof.failure_kind
+            not in {"pre_running_launch_failure", "worker_exit"}
+            or proof.evidence != evidence
+            or type(projection.observation_sequence) is not int
+            or projection.observation_sequence < 1
+            or not isinstance(projection.document_hash, str)
+        ):
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_PROOF_INVALID")
+        try:
+            _, evidence_hash = encode_document(dict(evidence))
+        except TaskStoreConflict as error:
+            raise TaskDispatchError(
+                "WORKER_RETRY_EXHAUSTION_PROOF_INVALID"
+            ) from error
+        if evidence_hash != projection.document_hash:
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_PROOF_INVALID")
+        ticket = evidence.get("ticket")
+        private_evidence = proof.private_evidence
+        occurred_at = (
+            private_evidence.get("observed_at")
+            if proof.failure_kind == "worker_exit"
+            and isinstance(private_evidence, Mapping)
+            else ticket.get("updated_at")
+            if isinstance(ticket, Mapping)
+            else None
+        )
+        if not isinstance(occurred_at, str):
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_PROOF_INVALID")
+        sequence = self._store.latest_run_event_sequence(task_id) + 1
+        extension = {
+            "intent_id": intent.intent_id,
+            "attempt_id": projection.attempt_id,
+            "attempt_number": 2,
+            "observation_sequence": projection.observation_sequence,
+            "evidence_hash": projection.document_hash,
+            "private_schema_version": "1.3.0",
+            "private_proof_hash": proof.private_proof_hash,
+            "failure_kind": proof.failure_kind,
+            "max_attempts": 2,
+        }
+        _, identity_hash = encode_document(
+            {**extension, "event_type": "node_failed", "sequence": sequence}
+        )
+        event = {
+            "schema_version": "1.0.0",
+            "event_id": "event-" + identity_hash.removeprefix("sha256:")[:32],
+            "sequence": sequence,
+            "task_id": task_id,
+            "node_id": intent.node_id,
+            "event_type": "node_failed",
+            "task_status": "Failed",
+            "error": {
+                "code": "retry_exhausted",
+                "message": "FWI Worker exhausted its approved attempts",
+                "retryable": False,
+            },
+            "occurred_at": occurred_at,
+            "fingerprint": copy.deepcopy(intent.queue_fingerprint),
+            "extensions": {
+                "org.agent_rpc.retry_exhaustion": extension,
+            },
+        }
+        self._validate_schema("run-event.schema.json", event)
+        _validate_run_event_semantics(event)
+        _validate_run_event_binding(snapshot, event)
+        try:
+            exhausted = (
+                self._store.finalize_supervised_worker_exit_retry_exhaustion(
+                    intent_id=intent.intent_id,
+                    attempt_id=projection.attempt_id,
+                    observation_sequence=projection.observation_sequence,
+                    evidence=evidence,
+                    private_schema_version="1.3.0",
+                    private_proof_hash=proof.private_proof_hash,
+                    failure_kind=proof.failure_kind,
+                    terminal_event=event,
+                    supervisor_lease=supervisor_lease,
+                    supervisor_clock=self._runtime_supervisor_clock,
+                )
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        if (
+            exhausted.snapshot.status != "Failed"
+            or exhausted.attempt_id != projection.attempt_id
+            or exhausted.observation_sequence != projection.observation_sequence
+            or exhausted.private_schema_version != "1.3.0"
+            or exhausted.failure_kind != proof.failure_kind
+        ):
+            raise TaskDispatchError("WORKER_RETRY_EXHAUSTION_OUTCOME_INVALID")
+        return TaskRetryProcessResult(
+            snapshot=exhausted.snapshot,
+            intent=exhausted.intent,
+            state="exhausted",
+            authorized=False,
+            authorization_replayed=exhausted.replayed,
+            dispatch_attempted=False,
+            projected=True,
+            adopted=False,
+            deferred_code="WORKER_RETRY_EXHAUSTED",
+        )
+
     def refresh_runtime_status(
         self,
         task_id: str,
@@ -4776,6 +5548,12 @@ class TaskService:
             raise TaskDispatchError("ADAPTER_STATUS_UNAVAILABLE") from error
         adapter_status = self._validated_adapter_status(intent, observed)
         target = adapter_status["status"]
+        if target == "Failed" and adapter_status["stage"] == "worker_exit":
+            # Neither browser reads nor the ordinary active-term status pass
+            # own this decision.  The fenced retry processor must first prove
+            # the exact exit and either reserve attempt 2 or consume the
+            # already-spent budget.
+            return TaskRuntimeResult(snapshot, intent, adapter_status)
 
         for _ in range(8):
             snapshot = self.get_task(
@@ -4816,8 +5594,13 @@ class TaskService:
                     adapter_observation = event.get("extensions", {}).get(
                         "org.agent_rpc.adapter_status"
                     )
-                    if isinstance(adapter_observation, Mapping) and isinstance(
-                        adapter_observation.get("worker_updated_at"), str
+                    current_job_id = intent.handle.get("job_id")
+                    if (
+                        isinstance(adapter_observation, Mapping)
+                        and adapter_observation.get("job_id") == current_job_id
+                        and isinstance(
+                            adapter_observation.get("worker_updated_at"), str
+                        )
                     ):
                         previous_worker_time = adapter_observation[
                             "worker_updated_at"
@@ -4825,6 +5608,8 @@ class TaskService:
                     if (
                         event.get("event_type") == "node_progress"
                         and event.get("node_id") == intent.node_id
+                        and isinstance(adapter_observation, Mapping)
+                        and adapter_observation.get("job_id") == current_job_id
                     ):
                         progress = event.get("progress")
                         if isinstance(progress, Mapping) and type(

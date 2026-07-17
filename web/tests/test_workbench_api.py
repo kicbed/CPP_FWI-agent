@@ -620,6 +620,21 @@ class WorkbenchAPITest(unittest.TestCase):
             "max_attempts": 2,
             "private_path": "/root/private/http-retry",
         }
+        worker_exit_extension = {
+            "intent_id": "intent-http-private-worker-exit",
+            "attempt_number": 2,
+            "previous_attempt_id": "attempt-http-private-worker-exit",
+            "previous_observation_sequence": 5,
+            "evidence_hash": "sha256:" + "d" * 64,
+            "private_schema_version": "1.1.0",
+            "private_proof_hash": "sha256:" + "e" * 64,
+            "failure_kind": "worker_exit",
+            "max_attempts": 2,
+            "source_outcome_document_hash": "sha256:" + "f" * 64,
+            "source_handle_hash": "sha256:" + "0" * 64,
+            "pid": 4242,
+            "private_path": "/root/private/http-worker-exit",
+        }
         canonical = {
             "schema_version": "1.0.0",
             "event_id": "event-http-retry-exhausted",
@@ -637,6 +652,7 @@ class WorkbenchAPITest(unittest.TestCase):
             "fingerprint": {},
             "extensions": {
                 "org.agent_rpc.retry_exhaustion": private_extension,
+                "org.agent_rpc.worker_exit_retry": worker_exit_extension,
             },
         }
 
@@ -667,6 +683,7 @@ class WorkbenchAPITest(unittest.TestCase):
         event = payload["data"]["events"][0]
         self.assertEqual(event["error"]["code"], "retry_exhausted")
         self.assertNotIn("org.agent_rpc.retry_exhaustion", event["extensions"])
+        self.assertNotIn("org.agent_rpc.worker_exit_retry", event["extensions"])
         serialized = response.body.decode("utf-8")
         for private in (
             private_extension["intent_id"],
@@ -675,11 +692,22 @@ class WorkbenchAPITest(unittest.TestCase):
             private_extension["private_proof_hash"],
             private_extension["private_schema_version"],
             private_extension["private_path"],
+            worker_exit_extension["intent_id"],
+            worker_exit_extension["previous_attempt_id"],
+            worker_exit_extension["evidence_hash"],
+            worker_exit_extension["private_proof_hash"],
+            worker_exit_extension["source_outcome_document_hash"],
+            worker_exit_extension["source_handle_hash"],
+            worker_exit_extension["private_path"],
             "intent_id",
             "attempt_id",
+            "previous_attempt_id",
             "evidence_hash",
             "private_proof_hash",
             "private_schema_version",
+            "source_outcome_document_hash",
+            "source_handle_hash",
+            "4242",
             "/root/",
         ):
             self.assertNotIn(private, serialized)
