@@ -12,8 +12,14 @@
 4. 只有阶段/范围变化、决策冲突、账本 reconciliation、安全/发布审计或维护持续记录本身时，
    才完整读取对应长文档；
 5. 获取经过过滤的本机服务与 FWI 任务状态，或执行等价的安全只读检查；
-6. 用现场 Git、交付物和重跑测试核对摘要，冲突时以现场证据为准并修正短入口和真源；
+6. 用现场 Git、交付物和受影响测试核对摘要，冲突时以现场证据为准并修正拥有该事实的真源；
 7. 区分 Accepted、Implemented、Verified 和 Pending，再处理用户刚刚提出的问题。
+
+用户只说“继续 D-003”时，默认执行一个有界工作轮次：先声明一个主要目标、一个风险边界、
+预计触及面、验证层级和停止点，再实现并只跑受影响/失败测试。未到路线切片出口时以真实
+`In progress` 安全交接；到切片出口才在候选最终 tree 上跑一次相关 aggregate；到阶段出口才
+跑完整回归和代表性 CPU/CUDA/E2E。默认一次综合审阅，第三轮及以后独立审计须先获用户明确
+批准。工作轮次不是新路线切片，不改变滚动余量。
 
 官方行为说明见 [Codex 的 AGENTS.md 文档](https://learn.chatgpt.com/docs/agent-configuration/agents-md)。
 项目级说明会从仓库根目录到当前工作目录逐级生效，因此在本仓库或其子目录中打开会话
@@ -26,10 +32,11 @@
 
 跨会话记录分为四层，避免把决策、计划和短期进度混在一起：
 
-- `docs/PROJECT_CURRENT_STATE.md` 保存有界当前摘要、读取路由和不可破坏边界；
+- `docs/PROJECT_CURRENT_STATE.md` 保存不超过 80 行/8192 字节的读取路由、当前增量和不可破坏边界；
 - `docs/PROJECT_CONTINUITY.md` 保存经用户明确同意的长期方向与安全边界；
 - `docs/architecture/SCIENTIFIC_AGENT_RUNTIME_PLAN.md` 保存 D-003 的完整阶段、交付物和验收标准；
-- `docs/PROJECT_PROGRESS.md` 保存已验证 checkpoint、当前阶段和下一个安全动作。
+- `docs/PROJECT_PROGRESS.md` 是执行状态、验证证据、已验证 checkpoint、当前阶段、滚动余量和
+  下一个安全动作的唯一真源。
 
 `docs/PROJECT_CONTINUITY.md` 中的持久结论包括：
 
@@ -78,8 +85,10 @@ Codex 直接做等价检查并继续，不能要求用户代为执行。
 或 pending-sync 的文件，以及未索引的 Markdown、Shell、SQL，仍直接定向读取；Git、测试、
 运行状态和安全结论始终来自真实命令。CodeGraph 不可用时自动回退，不把初始化工作交给用户。
 
-开发中优先运行当前切片的聚焦测试并限制输出；只有形成 Verified checkpoint 时才运行约定的
-完整回归。这样减少重复日志，不降低最终验收标准。
+工作轮次内只运行受影响/失败测试并限制输出；路线切片出口只运行一次相关 aggregate，阶段出口
+才运行完整回归和适用的代表性 CPU/CUDA/E2E。aggregate 只报告一次，已包含子集不重复相加；
+数值 Worker、依赖、数据和规范化配置身份不变时复用绑定证据。这样减少重复执行与日志，不降低
+阶段验收标准。
 
 该程序的状态收集遵守以下边界：
 
