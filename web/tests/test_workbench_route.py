@@ -444,7 +444,7 @@ class WorkbenchRouteTest(unittest.TestCase):
             serve, "TaskService", return_value=mock.sentinel.tasks
         ), mock.patch.object(
             serve, "GuidedWorkbench", return_value=application
-        ), mock.patch.object(
+        ) as guided_workbench, mock.patch.object(
             serve.secrets, "token_urlsafe", return_value="composition-csrf-token"
         ), mock.patch.object(
             serve, "WorkbenchAPI", side_effect=compose_api
@@ -454,6 +454,13 @@ class WorkbenchRouteTest(unittest.TestCase):
             result = serve.create_workbench_api()
 
         self.assertIs(result, composed_api)
+        guided_workbench.assert_called_once_with(
+            mock.sentinel.tasks,
+            mock.sentinel.registry,
+            project_id="local-workbench",
+            principal_id="local-user",
+            enable_fixed_recipe_dag=True,
+        )
         application.recover_runtime_on_startup.assert_called_once_with(
             max_tasks=10000
         )

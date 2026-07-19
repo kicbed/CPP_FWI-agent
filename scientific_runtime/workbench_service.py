@@ -22,6 +22,19 @@ from jsonschema import Draft7Validator
 
 from scientific_runtime_contracts import compute_plan_hash
 
+from .fixed_recipe import (
+    RECIPE_ADAPTER_ID,
+    RECIPE_ADAPTER_VERSION,
+    RECIPE_ALGORITHM_ID,
+    RECIPE_ALGORITHM_VERSION,
+    RECIPE_EXTENSION_KEY,
+    RECIPE_ID,
+    RECIPE_VERSION,
+    fixed_recipe_extension,
+    fixed_recipe_plan_inputs,
+    is_fixed_recipe_extension,
+    load_fixed_recipe_manifest,
+)
 from .fwi_registry import DEEPWAVE_ALGORITHM_ID, DEEPWAVE_ALGORITHM_VERSION
 from .registry_service import (
     RegistryConflict,
@@ -65,6 +78,8 @@ FORM_FIELDS = frozenset(
     }
 )
 LEGACY_FORM_FIELDS = FORM_FIELDS - {"optimizer", "learning_rate"}
+RECIPE_SELECTOR_FIELDS = frozenset({"recipe_id", "recipe_version"})
+RECIPE_FORM_FIELDS = FORM_FIELDS | RECIPE_SELECTOR_FIELDS
 LEGACY_ALGORITHM_VERSIONS = ("1.0.0", "1.1.0")
 HISTORICAL_OPTIMIZER_ALGORITHM_VERSIONS = ("1.2.0", "1.3.0")
 PRESETS = frozenset({"fwi_smoke", "fwi_demo"})
@@ -214,6 +229,19 @@ def _value(value: Any, field: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(field, default)
     return getattr(value, field, default)
+
+
+def _fixed_recipe_from_document(document: Mapping[str, Any] | None) -> bool:
+    """Recognize only the exact hash-bound packaged Recipe extension."""
+
+    if not isinstance(document, Mapping):
+        return False
+    extensions = document.get("extensions")
+    return (
+        isinstance(extensions, Mapping)
+        and set(extensions) == {RECIPE_EXTENSION_KEY}
+        and is_fixed_recipe_extension(extensions.get(RECIPE_EXTENSION_KEY))
+    )
 
 
 def _as_mapping(value: Any) -> dict[str, Any] | None:
@@ -391,6 +419,33 @@ def _public_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _public_recipe_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the packaged workflow without its internal command routing."""
+
+    stages: list[dict[str, Any]] = []
+    for stage in manifest["nodes"]:
+        stages.append(
+            {
+                "node_id": stage["node_id"],
+                "label": stage.get("label", stage["node_id"]),
+                "description": stage.get("description", ""),
+                "dependencies": copy.deepcopy(stage["dependencies"]),
+                "outputs": copy.deepcopy(stage["outputs"]),
+                "risk": copy.deepcopy(stage.get("risk")),
+            }
+        )
+    return {
+        "id": manifest["id"],
+        "version": manifest["version"],
+        "label": manifest.get("label", manifest["id"]),
+        "description": manifest.get("description", ""),
+        "algorithm": copy.deepcopy(manifest["algorithm"]),
+        "adapter": copy.deepcopy(manifest["adapter"]),
+        "task_type": manifest["task_type"],
+        "stages": stages,
+    }
+
+
 def _public_node(node: Mapping[str, Any]) -> dict[str, Any]:
     # Node mutation keys are an internal Adapter boundary, not browser state.
     return {
@@ -441,6 +496,7 @@ class GuidedWorkbench:
         *,
         project_id: str,
         principal_id: str,
+        enable_fixed_recipe_dag: bool = False,
         clock: Callable[[], str] = _utc_now,
     ) -> None:
         if not isinstance(project_id, str) or OPAQUE_ID.fullmatch(project_id) is None:
@@ -451,10 +507,16 @@ class GuidedWorkbench:
             raise WorkbenchValidationError(
                 "INVALID_SESSION_SCOPE", ["principal_id must be a v1 opaque identifier"]
             )
+        if type(enable_fixed_recipe_dag) is not bool:
+            raise WorkbenchValidationError(
+                "INVALID_PRODUCTION_CAPABILITY",
+                ["enable_fixed_recipe_dag must be an explicit boolean"],
+            )
         self._tasks = task_service
         self._registry = registry_service
         self._project_id = project_id
         self._principal_id = principal_id
+        self._fixed_recipe_dag_enabled = enable_fixed_recipe_dag
         self._clock = clock
 
     @property
@@ -506,6 +568,7 @@ class GuidedWorkbench:
             raise WorkbenchRuntimeError("TASK_STORE_UNAVAILABLE", [str(error)]) from error
 
     def session_capabilities(self) -> dict[str, Any]:
+        recipe = _public_recipe_manifest(load_fixed_recipe_manifest())
         return {
             "mode": "guided",
             "scope": {
@@ -515,8 +578,14 @@ class GuidedWorkbench:
             "task_type": TASK_TYPE,
             "dataset": {"id": DATASET_ID, "version": DATASET_VERSION},
             "algorithm": {"id": ALGORITHM_ID, "version": ALGORITHM_VERSION},
+            "recipes": [recipe] if self._fixed_recipe_dag_enabled else [],
             "form": {
                 "fields": sorted(FORM_FIELDS),
+                "recipe_selector_fields": (
+                    sorted(RECIPE_SELECTOR_FIELDS)
+                    if self._fixed_recipe_dag_enabled
+                    else []
+                ),
                 "presets": sorted(PRESETS),
                 "devices": sorted(DEVICES),
                 "iterations": {"minimum": 1, "maximum": MAX_FWI_ITERATIONS},
@@ -586,7 +655,7 @@ class GuidedWorkbench:
                 "positive_receipt_reconciliation": True,
                 "exact_negative_reconciliation": True,
                 "automatic_reconciliation": False,
-                "dag": False,
+                "dag": self._fixed_recipe_dag_enabled,
             },
         }
 
@@ -633,6 +702,11 @@ class GuidedWorkbench:
                 and TASK_TYPE in manifest.get("task_types", [])
                 and manifest.get("security", {}).get("allowlisted") is True
             ],
+            "recipes": (
+                [_public_recipe_manifest(load_fixed_recipe_manifest())]
+                if self._fixed_recipe_dag_enabled
+                else []
+            ),
         }
 
     def _validated_form(
@@ -644,9 +718,11 @@ class GuidedWorkbench:
             )
         keys = set(form)
         legacy_form = keys == LEGACY_FORM_FIELDS
-        unknown = sorted(str(key) for key in keys - FORM_FIELDS)
-        missing = sorted(FORM_FIELDS - keys)
-        if keys not in (FORM_FIELDS, LEGACY_FORM_FIELDS):
+        recipe_form = keys == RECIPE_FORM_FIELDS
+        accepted_fields = RECIPE_FORM_FIELDS if recipe_form else FORM_FIELDS
+        unknown = sorted(str(key) for key in keys - RECIPE_FORM_FIELDS)
+        missing = sorted(accepted_fields - keys)
+        if keys not in (FORM_FIELDS, LEGACY_FORM_FIELDS, RECIPE_FORM_FIELDS):
             errors = []
             if missing:
                 errors.append("missing fields: " + ", ".join(missing))
@@ -657,6 +733,19 @@ class GuidedWorkbench:
         expanded = {key: copy.deepcopy(value) for key, value in form.items()}
         if legacy_form:
             expanded.update(optimizer="adam", learning_rate="10")
+        if recipe_form and not self._fixed_recipe_dag_enabled:
+            raise WorkbenchRuntimeError(
+                "GUIDED_CAPABILITY_UNAVAILABLE",
+                ["the production DAG composition is not enabled"],
+            )
+        if recipe_form and (
+            expanded.get("recipe_id") != RECIPE_ID
+            or expanded.get("recipe_version") != RECIPE_VERSION
+        ):
+            raise WorkbenchValidationError(
+                "RECIPE_UNSUPPORTED",
+                [f"recipe must be {RECIPE_ID}@{RECIPE_VERSION}"],
+            )
 
         goal = expanded["goal"]
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
@@ -759,8 +848,10 @@ class GuidedWorkbench:
                 "GUIDED_CAPABILITY_UNAVAILABLE",
                 ["the fixed Dataset/Algorithm registration is not executable"],
             )
+        normalized_fields = RECIPE_FORM_FIELDS if recipe_form else FORM_FIELDS
         normalized = {
-            field: copy.deepcopy(expanded[field]) for field in sorted(FORM_FIELDS)
+            field: copy.deepcopy(expanded[field])
+            for field in sorted(normalized_fields)
         }
         normalized["learning_rate"] = format(learning_rate.normalize(), "f")
         normalized["learning_rate_milli"] = int(scaled)
@@ -825,6 +916,10 @@ class GuidedWorkbench:
         draft_id: str,
         revision: int,
     ) -> dict[str, Any]:
+        recipe_selected = (
+            form.get("recipe_id") == RECIPE_ID
+            and form.get("recipe_version") == RECIPE_VERSION
+        )
         return {
             "schema_version": "1.1.0",
             "draft_id": draft_id,
@@ -854,7 +949,11 @@ class GuidedWorkbench:
                     "and Registry snapshots."
                 ),
             },
-            "extensions": {},
+            "extensions": (
+                {RECIPE_EXTENSION_KEY: fixed_recipe_extension()}
+                if recipe_selected
+                else {}
+            ),
         }
 
     def _legacy_draft_candidates(
@@ -987,6 +1086,146 @@ class GuidedWorkbench:
             )
         return candidates
 
+    def _fixed_recipe_plan(
+        self,
+        *,
+        task_id: str,
+        draft: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        request_key: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        """Compose the one packaged P3 fan-out/fan-in workflow."""
+
+        recipe = load_fixed_recipe_manifest()
+        expected_dependencies = {
+            "data_check": [],
+            "forward": ["data_check"],
+            "quality_check": ["data_check"],
+            "fwi": ["forward", "quality_check"],
+            "result_check": ["fwi"],
+        }
+        stages = recipe.get("nodes")
+        if (
+            recipe.get("id") != RECIPE_ID
+            or recipe.get("version") != RECIPE_VERSION
+            or recipe.get("algorithm")
+            != {"id": RECIPE_ALGORITHM_ID, "version": RECIPE_ALGORITHM_VERSION}
+            or recipe.get("adapter")
+            != {"id": RECIPE_ADAPTER_ID, "version": RECIPE_ADAPTER_VERSION}
+            or not isinstance(stages, list)
+            or [stage.get("node_id") for stage in stages]
+            != list(expected_dependencies)
+            or any(
+                stage.get("dependencies")
+                != expected_dependencies[stage["node_id"]]
+                for stage in stages
+            )
+            or manifest.get("id") != RECIPE_ALGORITHM_ID
+            or manifest.get("version") != RECIPE_ALGORITHM_VERSION
+            or manifest.get("adapter", {}).get("version")
+            != RECIPE_ADAPTER_VERSION
+        ):
+            raise WorkbenchRuntimeError(
+                "GUIDED_CAPABILITY_UNAVAILABLE",
+                ["the packaged Recipe identity or runtime binding is invalid"],
+            )
+        revision = draft["revision"]
+        plan_id = _stable_id(
+            "plan",
+            self._project_id,
+            self._principal_id,
+            task_id,
+            revision,
+            request_key,
+        )
+        dataset = draft["datasets"][0]
+        risk_by_node = {
+            "data_check": ("input_integrity", "low"),
+            "forward": ("synthetic_forward", "medium"),
+            "quality_check": ("bounded_quality_check", "low"),
+            "fwi": ("synthetic_baseline", "medium"),
+            "result_check": ("bounded_result_check", "low"),
+        }
+        nodes: list[dict[str, Any]] = []
+        for stage in stages:
+            node_id = stage["node_id"]
+            risk_code, severity = risk_by_node[node_id]
+            plan_inputs = fixed_recipe_plan_inputs(node_id, _identity(dataset))
+            if plan_inputs is None:
+                raise WorkbenchRuntimeError(
+                    "GUIDED_CAPABILITY_UNAVAILABLE",
+                    ["the packaged Recipe input graph is invalid"],
+                )
+            nodes.append(
+                {
+                    "node_id": node_id,
+                    "algorithm": copy.deepcopy(draft["algorithm"]),
+                    "inputs": plan_inputs,
+                    # Algorithm 1.6 is immutable: every node declares and the
+                    # Adapter verifies all eight registered outputs.  The
+                    # Recipe catalog separately highlights the subset used by
+                    # each fixed stage without inventing a new Algorithm.
+                    "outputs": copy.deepcopy(manifest["outputs"]),
+                    "dependencies": copy.deepcopy(stage["dependencies"]),
+                    "parameters": copy.deepcopy(draft["parameters"]),
+                    "resources": copy.deepcopy(draft["resources"]),
+                    "side_effects": copy.deepcopy(
+                        manifest["security"]["side_effects"]
+                    ),
+                    "idempotency_key": _stable_id(
+                        "node",
+                        self._project_id,
+                        self._principal_id,
+                        task_id,
+                        revision,
+                        request_key,
+                        node_id,
+                        draft["parameters"],
+                        draft["resources"],
+                    ),
+                    "risks": [
+                        copy.deepcopy(
+                            stage.get(
+                                "risk",
+                                {
+                                    "code": risk_code,
+                                    "severity": severity,
+                                    "mitigation": (
+                                        "Use only the fixed immutable dataset, pinned "
+                                        "Algorithm/Adapter, bounded resources, and "
+                                        "validated finite artifacts."
+                                    ),
+                                },
+                            )
+                        )
+                    ],
+                    "acceptance_criteria": [
+                        {
+                            "id": "validated_artifacts",
+                            "description": (
+                                "The fixed Adapter validates hashes, finite "
+                                "values, and lineage for every returned artifact."
+                            ),
+                            "required": True,
+                        }
+                    ],
+                }
+            )
+        plan = {
+            "schema_version": "1.2.0",
+            "plan_id": plan_id,
+            "draft": {"draft_id": draft["draft_id"], "revision": revision},
+            "task_type": TASK_TYPE,
+            "nodes": nodes,
+            "missing_fields": [],
+            "plan_hash": "sha256:" + "0" * 64,
+            "created_at": created_at,
+            "extensions": {RECIPE_EXTENSION_KEY: fixed_recipe_extension()},
+        }
+        plan["plan_hash"] = compute_plan_hash(plan)
+        return plan
+
     def _plan(
         self,
         *,
@@ -996,6 +1235,14 @@ class GuidedWorkbench:
         request_key: str,
         created_at: str,
     ) -> dict[str, Any]:
+        if _fixed_recipe_from_document(draft):
+            return self._fixed_recipe_plan(
+                task_id=task_id,
+                draft=draft,
+                manifest=manifest,
+                request_key=request_key,
+                created_at=created_at,
+            )
         revision = draft["revision"]
         plan_id = _stable_id(
             "plan",
@@ -1108,6 +1355,10 @@ class GuidedWorkbench:
 
     def create_task(self, form: Mapping[str, Any], key: str) -> dict[str, Any]:
         normalized, dataset, manifest, legacy_form = self._validated_form(form)
+        recipe_selected = (
+            normalized.get("recipe_id") == RECIPE_ID
+            and normalized.get("recipe_version") == RECIPE_VERSION
+        )
         create_key = self._mutation_key("create", key)
         draft_id = _stable_id(
             "draft",
@@ -1124,11 +1375,15 @@ class GuidedWorkbench:
             revision=1,
         )
         compatible_manifests = {manifest["version"]: manifest}
-        historical_candidates = self._historical_optimizer_draft_candidates(
-            form=normalized,
-            dataset=dataset,
-            draft_id=draft_id,
-            revision=1,
+        historical_candidates = (
+            []
+            if recipe_selected
+            else self._historical_optimizer_draft_candidates(
+                form=normalized,
+                dataset=dataset,
+                draft_id=draft_id,
+                revision=1,
+            )
         )
         compatible_candidates = historical_candidates
         if legacy_form:
@@ -1217,6 +1472,10 @@ class GuidedWorkbench:
                 "INVALID_REVISION", ["expected_revision must be a positive integer"]
             )
         normalized, dataset, manifest, legacy_form = self._validated_form(form)
+        recipe_selected = (
+            normalized.get("recipe_id") == RECIPE_ID
+            and normalized.get("recipe_version") == RECIPE_VERSION
+        )
         current = self._call(self._tasks.get_task, task_id, **self._scope)
         current_revision = current.draft["revision"]
         target_revision = expected_revision + 1
@@ -1231,11 +1490,15 @@ class GuidedWorkbench:
         revised = None
         compatible_replayed = False
         compatible_manifests = {manifest["version"]: manifest}
-        historical_candidates = self._historical_optimizer_draft_candidates(
-            form=normalized,
-            dataset=dataset,
-            draft_id=current.draft["draft_id"],
-            revision=target_revision,
+        historical_candidates = (
+            []
+            if recipe_selected
+            else self._historical_optimizer_draft_candidates(
+                form=normalized,
+                dataset=dataset,
+                draft_id=current.draft["draft_id"],
+                revision=target_revision,
+            )
         )
         compatible_candidates = historical_candidates
         if legacy_form:
@@ -1305,7 +1568,20 @@ class GuidedWorkbench:
         decided = _timestamp(decided_at, field="clock")
         dataset = snapshot.draft["datasets"][0]
         resources = copy.deepcopy(snapshot.draft["resources"])
-        return {
+        recipe_selected = _fixed_recipe_from_document(snapshot.plan)
+        algorithms: list[dict[str, Any]] = []
+        for node in snapshot.plan["nodes"]:
+            identity = copy.deepcopy(node["algorithm"])
+            if identity not in algorithms:
+                algorithms.append(identity)
+        side_effects = sorted(
+            {
+                effect
+                for node in snapshot.plan["nodes"]
+                for effect in node["side_effects"]
+            }
+        )
+        value = {
             "schema_version": "1.1.0",
             "approval_id": _stable_id(
                 "approval",
@@ -1322,11 +1598,9 @@ class GuidedWorkbench:
             "actor": {"type": "user", "id": self._principal_id},
             "scope": {
                 "datasets": [_identity(dataset)],
-                "algorithms": [copy.deepcopy(snapshot.draft["algorithm"])],
+                "algorithms": algorithms,
                 "resource_limits": resources,
-                "side_effects": copy.deepcopy(
-                    snapshot.plan["nodes"][0]["side_effects"]
-                ),
+                "side_effects": side_effects,
                 "max_tasks": 1,
                 "retry_policy": {
                     "max_attempts": 2,
@@ -1341,8 +1615,19 @@ class GuidedWorkbench:
             },
             "decided_at": _format_timestamp(decided),
             "expires_at": _format_timestamp(decided + timedelta(hours=1)),
-            "extensions": {},
+            "extensions": (
+                {RECIPE_EXTENSION_KEY: fixed_recipe_extension()}
+                if recipe_selected
+                else {}
+            ),
         }
+        if recipe_selected:
+            # P3 DAG nodes are intentionally single-attempt.  Approval 1.0 is
+            # the existing no-retry contract; do not silently grant the P2
+            # two-attempt policy to five independent nodes.
+            value["schema_version"] = "1.0.0"
+            value["scope"].pop("retry_policy")
+        return value
 
     def approve_and_submit(
         self, task_id: str, plan_hash: str, key: str
@@ -1414,6 +1699,19 @@ class GuidedWorkbench:
                 **self._scope,
             )
         approved_snapshot = _value(approved, "snapshot", approved)
+        if _fixed_recipe_from_document(approved_snapshot.plan):
+            # Multi-node execution starts only inside the fenced production
+            # RuntimeSupervisor.  The browser approves the exact same PlanGraph
+            # and never dispatches or advances a node itself.
+            result = self._project(approved_snapshot)
+            result.update(
+                {
+                    "submitted": True,
+                    "replayed": bool(_value(approved, "replayed", False)),
+                    "dispatch_attempted": False,
+                }
+            )
+            return result
         submitted = self._call(
             self._tasks.submit_task,
             task_id=task_id,
@@ -1454,6 +1752,12 @@ class GuidedWorkbench:
             raise WorkbenchValidationError(
                 "INVALID_CANCEL_REASON", ["reason must be user_requested"]
             )
+        current = self._call(self._tasks.get_task, task_id, **self._scope)
+        if _fixed_recipe_from_document(current.plan):
+            raise WorkbenchConflict(
+                "RECIPE_CANCEL_UNAVAILABLE",
+                ["task-wide cancellation is unavailable for the fixed P3 Recipe"],
+            )
         result = self._call(
             self._tasks.cancel_task,
             task_id=task_id,
@@ -1468,6 +1772,346 @@ class GuidedWorkbench:
         response = self._project(snapshot, intent=intent)
         response["replayed"] = bool(_value(result, "replayed", False))
         return response
+
+    def _project_plan_node(
+        self, node: Mapping[str, Any], *, recipe_stage: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        projected = _public_node(node)
+        manifest = self._call(
+            self._registry.get_algorithm,
+            algorithm_id=node["algorithm"]["id"],
+            version=node["algorithm"]["version"],
+            require_allowlisted=True,
+        )
+        projected["adapter"] = (
+            {
+                "id": RECIPE_ADAPTER_ID,
+                "version": manifest["adapter"]["version"],
+            }
+            if recipe_stage is not None
+            else {
+                "protocol": manifest["adapter"]["protocol"],
+                "version": manifest["adapter"]["version"],
+            }
+        )
+        if recipe_stage is not None:
+            projected["label"] = recipe_stage.get("label", node["node_id"])
+            projected["description"] = recipe_stage.get("description", "")
+            projected["highlighted_outputs"] = copy.deepcopy(
+                recipe_stage.get("outputs", [])
+            )
+        return projected
+
+    @staticmethod
+    def _runtime_cache_projection(value: Any) -> dict[str, Any]:
+        source = value if isinstance(value, Mapping) else {}
+        state = source.get("state")
+        if state not in {"hit", "miss", "not_evaluated"}:
+            state = "not_evaluated"
+        result: dict[str, Any] = {"state": state}
+        for key in ("key_hash", "cache_key_hash", "entry_hash"):
+            item = source.get(key)
+            if isinstance(item, str) and SHA256.fullmatch(item) is not None:
+                result["key_hash" if key != "entry_hash" else "entry_hash"] = item
+        source_node = source.get("source_node_id")
+        if isinstance(source_node, str) and OPAQUE_ID.fullmatch(source_node) is not None:
+            result["source_node_id"] = source_node
+        return result
+
+    @staticmethod
+    def _runtime_checkpoint_projection(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID", ["Recipe checkpoint fact is invalid"]
+            )
+        allowed = (
+            "state",
+            "checkpoint_index",
+            "completed_updates",
+            "created_at",
+            "resume_requested_at",
+            "resumed_at",
+            "same_attempt",
+            "capacity_released_while_waiting",
+        )
+        result = {
+            key: copy.deepcopy(value[key])
+            for key in allowed
+            if key in value
+        }
+        if "resume_acknowledged_at" in value:
+            result["resumed_at"] = copy.deepcopy(value["resume_acknowledged_at"])
+        result.setdefault("same_attempt", True)
+        result.setdefault("capacity_released_while_waiting", False)
+        return result
+
+    @staticmethod
+    def _runtime_failure_projection(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID", ["Recipe failure fact is invalid"]
+            )
+        result: dict[str, Any] = {}
+        code = value.get("code") or value.get("failure_code")
+        if isinstance(code, str) and re.fullmatch(r"[A-Z0-9_]{1,128}", code):
+            result["code"] = code
+        message = value.get("message") or value.get("reason")
+        if isinstance(message, str) and 0 < len(message) <= 500:
+            result["message"] = message
+        blockers = (
+            value.get("blocked_by")
+            or value.get("dependency_blockers")
+            or value.get("blocked_by_node_ids")
+        )
+        if isinstance(blockers, (list, tuple)) and all(
+            isinstance(item, str) and OPAQUE_ID.fullmatch(item) is not None
+            for item in blockers
+        ):
+            result["blocked_by"] = list(blockers)
+        adapter_status = value.get("adapter_status")
+        if isinstance(adapter_status, Mapping):
+            adapter_message = adapter_status.get("message")
+            if (
+                "message" not in result
+                and isinstance(adapter_message, str)
+                and 0 < len(adapter_message) <= 500
+            ):
+                result["message"] = adapter_message
+        return result or None
+
+    @staticmethod
+    def _runtime_outputs_projection(value: Any) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple)):
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID", ["Recipe output facts are invalid"]
+            )
+        result: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                raise WorkbenchRuntimeError(
+                    "SERVICE_RESPONSE_INVALID", ["Recipe output fact is invalid"]
+                )
+            manifest = item.get("logical_manifest")
+            if not isinstance(manifest, Mapping):
+                manifest = item.get("artifact_manifest")
+            if not isinstance(manifest, Mapping):
+                manifest = item.get("logical_artifact_manifest")
+            if not isinstance(manifest, Mapping):
+                manifest = item
+            output: dict[str, Any] = {}
+            for source_key, public_key in (
+                ("artifact_id", "artifact_id"),
+                ("output_port", "output_port"),
+                ("port", "output_port"),
+                ("data_type", "data_type"),
+                ("media_type", "media_type"),
+                ("size_bytes", "size_bytes"),
+                ("content_hash", "content_hash"),
+            ):
+                candidate = manifest.get(source_key, item.get(source_key))
+                if candidate is not None and public_key not in output:
+                    output[public_key] = copy.deepcopy(candidate)
+            document_hash = item.get("logical_manifest_hash") or item.get(
+                "artifact_manifest_hash"
+            )
+            if isinstance(document_hash, str) and SHA256.fullmatch(document_hash):
+                output["manifest_hash"] = document_hash
+            if output:
+                result.append(output)
+        return result
+
+    @staticmethod
+    def _runtime_lineage_projection(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID", ["Recipe lineage fact is invalid"]
+            )
+        result: dict[str, Any] = {}
+        lineage_hash = value.get("document_hash") or value.get("lineage_hash")
+        if isinstance(lineage_hash, str) and SHA256.fullmatch(lineage_hash):
+            result["document_hash"] = lineage_hash
+        roots = value.get("dataset_roots")
+        if isinstance(roots, (list, tuple)):
+            public_roots = []
+            for root in roots:
+                if not isinstance(root, Mapping):
+                    continue
+                public_roots.append(
+                    {
+                        key: copy.deepcopy(root[key])
+                        for key in ("id", "version", "content_hash", "data_type")
+                        if key in root
+                    }
+                )
+            result["dataset_roots"] = public_roots
+        hashes = (
+            value.get("direct_artifact_hashes")
+            or value.get("artifact_hashes")
+            or value.get("direct_input_hashes")
+        )
+        if isinstance(hashes, (list, tuple)) and all(
+            isinstance(item, str) and SHA256.fullmatch(item) is not None
+            for item in hashes
+        ):
+            result["direct_artifact_hashes"] = list(hashes)
+        return result or None
+
+    def _project_runtime_nodes(
+        self,
+        snapshot: TaskSnapshot,
+        *,
+        recipe_stages: Mapping[str, Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        plan = snapshot.plan
+        if not isinstance(plan, Mapping):
+            return []
+        reader = getattr(self._tasks, "get_dag_runtime_node_facts", None)
+        raw = (
+            self._call(reader, snapshot.task_id, **self._scope)
+            if callable(reader)
+            else None
+        )
+        raw_by_id: dict[str, Mapping[str, Any]] = {}
+        initialized = False
+        if raw is not None:
+            if (
+                not isinstance(raw, Mapping)
+                or set(raw)
+                != {
+                    "schema_version",
+                    "task_id",
+                    "plan_id",
+                    "plan_hash",
+                    "runtime_initialized",
+                    "nodes",
+                }
+                or raw.get("task_id") != snapshot.task_id
+                or raw.get("plan_id") != plan.get("plan_id")
+                or raw.get("plan_hash") != plan.get("plan_hash")
+                or type(raw.get("runtime_initialized")) is not bool
+                or not isinstance(raw.get("nodes"), list)
+            ):
+                raise WorkbenchRuntimeError(
+                    "SERVICE_RESPONSE_INVALID", ["Recipe runtime facts are invalid"]
+                )
+            initialized = raw["runtime_initialized"]
+            raw_by_id = {
+                value.get("node_id"): value
+                for value in raw["nodes"]
+                if isinstance(value, Mapping)
+            }
+            if len(raw_by_id) != len(raw["nodes"]):
+                raise WorkbenchRuntimeError(
+                    "SERVICE_RESPONSE_INVALID", ["Recipe runtime nodes are invalid"]
+                )
+        result: list[dict[str, Any]] = []
+        plan_states = {
+            node_id: value.get("state")
+            for node_id, value in raw_by_id.items()
+        }
+        allowed_states = {
+            "Pending",
+            "Queued",
+            "Running",
+            "Waiting",
+            "Retrying",
+            "Succeeded",
+            "Failed",
+            "Blocked",
+            "Cancelled",
+        }
+        for node in plan["nodes"]:
+            node_id = node["node_id"]
+            fact = raw_by_id.get(node_id)
+            state = (
+                fact.get("state")
+                if fact is not None and fact.get("state") is not None
+                else "Pending"
+            )
+            if state not in allowed_states:
+                raise WorkbenchRuntimeError(
+                    "SERVICE_RESPONSE_INVALID", ["Recipe node state is invalid"]
+                )
+            dependencies = node["dependencies"]
+            if fact is not None and fact.get("dependencies") != dependencies:
+                raise WorkbenchRuntimeError(
+                    "SERVICE_RESPONSE_INVALID", ["Recipe node dependencies drifted"]
+                )
+            wait_reason: str | None = None
+            if snapshot.approval is None:
+                wait_reason = "approval_required"
+            elif state == "Pending":
+                waiting = [
+                    dependency
+                    for dependency in dependencies
+                    if plan_states.get(dependency) != "Succeeded"
+                ]
+                wait_reason = (
+                    "dependencies: " + ", ".join(waiting)
+                    if waiting
+                    else ("scheduler" if initialized else "runtime_initialization")
+                )
+            elif state == "Queued":
+                wait_reason = "dispatch_or_resource_capacity"
+            elif state == "Waiting":
+                wait_reason = "checkpoint_resume"
+            elif state == "Blocked":
+                wait_reason = "dependency_failure"
+            runtime_outputs = self._runtime_outputs_projection(
+                fact.get("outputs") if fact is not None else None
+            )
+            highlighted_ports = {
+                value.get("port")
+                for value in recipe_stages[node_id].get("outputs", [])
+                if isinstance(value, Mapping)
+            }
+            runtime_outputs = [
+                value
+                for value in runtime_outputs
+                if value.get("output_port") in highlighted_ports
+            ]
+            result.append(
+                {
+                    "node_id": node_id,
+                    "label": recipe_stages[node_id].get("label", node_id),
+                    "status": state,
+                    "dependencies": copy.deepcopy(dependencies),
+                    "algorithm": copy.deepcopy(node["algorithm"]),
+                    "adapter": {
+                        "id": RECIPE_ADAPTER_ID,
+                        "version": RECIPE_ADAPTER_VERSION,
+                    },
+                    "parameters": copy.deepcopy(node["parameters"]),
+                    "resources": copy.deepcopy(node["resources"]),
+                    "wait_reason": wait_reason,
+                    "cache": self._runtime_cache_projection(
+                        fact.get("cache") if fact is not None else None
+                    ),
+                    "checkpoint": self._runtime_checkpoint_projection(
+                        fact.get("checkpoint") if fact is not None else None
+                    ),
+                    "failure": self._runtime_failure_projection(
+                        fact.get("failure") if fact is not None else None
+                    ),
+                    "lineage": self._runtime_lineage_projection(
+                        fact.get("lineage") if fact is not None else None
+                    ),
+                    "outputs": runtime_outputs,
+                }
+            )
+        if raw_by_id and set(raw_by_id) != {node["node_id"] for node in plan["nodes"]}:
+            raise WorkbenchRuntimeError(
+                "SERVICE_RESPONSE_INVALID", ["Recipe runtime node set drifted"]
+            )
+        return result
 
     def _project(
         self,
@@ -1577,10 +2221,27 @@ class GuidedWorkbench:
         checkpoint_projection = _public_checkpoint(
             getattr(snapshot, "checkpoint", None), task_status=snapshot.status
         )
+        recipe_selected = _fixed_recipe_from_document(plan)
+        recipe_manifest = load_fixed_recipe_manifest() if recipe_selected else None
+        recipe_stages = (
+            {
+                stage["node_id"]: stage
+                for stage in recipe_manifest["nodes"]
+            }
+            if recipe_manifest is not None
+            else {}
+        )
+        runtime_nodes = (
+            self._project_runtime_nodes(snapshot, recipe_stages=recipe_stages)
+            if recipe_selected
+            else []
+        )
         can_cancel = False
         can_cancel_task = getattr(self._tasks, "can_cancel_task", None)
         timeout_allows_cancel = timeout is None or timeout.state == "armed"
         if (
+            not recipe_selected
+            and
             cancellation is None
             and timeout_allows_cancel
             and callable(can_cancel_task)
@@ -1608,6 +2269,11 @@ class GuidedWorkbench:
                 "missing_fields": copy.deepcopy(draft["missing_fields"]),
                 "suggestions": copy.deepcopy(draft["suggestions"]),
             },
+            "recipe": (
+                _public_recipe_manifest(recipe_manifest)
+                if recipe_manifest is not None
+                else None
+            ),
             "plan": (
                 None
                 if plan is None
@@ -1616,7 +2282,13 @@ class GuidedWorkbench:
                     "plan_hash": plan["plan_hash"],
                     "draft": copy.deepcopy(plan["draft"]),
                     "task_type": plan["task_type"],
-                    "nodes": [_public_node(node) for node in plan["nodes"]],
+                    "nodes": [
+                        self._project_plan_node(
+                            node,
+                            recipe_stage=recipe_stages.get(node["node_id"]),
+                        )
+                        for node in plan["nodes"]
+                    ],
                     "created_at": plan["created_at"],
                 }
             ),
@@ -1634,6 +2306,7 @@ class GuidedWorkbench:
             ),
             "dispatch": dispatch,
             "runtime_status": status,
+            "runtime_nodes": runtime_nodes,
             "can_cancel": can_cancel,
             "cancellation": cancellation_projection,
             "timeout": timeout_projection,
@@ -1649,6 +2322,11 @@ class GuidedWorkbench:
             raise WorkbenchValidationError(
                 "INVALID_REFRESH", ["refresh must be a boolean"]
             )
+        current = self._call(self._tasks.get_task, task_id, **self._scope)
+        if _fixed_recipe_from_document(current.plan):
+            # Recipe truth is pumped only by the fenced Supervisor.  GET/SSE,
+            # browser refresh, and reconnect are strictly read-only.
+            return self._project(current)
         if refresh:
             result = self._call(
                 self._tasks.refresh_runtime_status, task_id=task_id, **self._scope
@@ -1658,7 +2336,7 @@ class GuidedWorkbench:
                 intent=_value(result, "intent"),
                 adapter_status=_value(result, "adapter_status"),
             )
-        snapshot = self._call(self._tasks.get_task, task_id, **self._scope)
+        snapshot = current
         intent = self._call(
             self._tasks.get_dispatch_intent, task_id, **self._scope
         )
@@ -1718,6 +2396,11 @@ class GuidedWorkbench:
                     "seed": parameters.get("seed"),
                     "optimizer": parameters.get("optimizer"),
                     "learning_rate_milli": parameters.get("learning_rate_milli"),
+                    "recipe": (
+                        fixed_recipe_extension()
+                        if _fixed_recipe_from_document(snapshot.plan)
+                        else None
+                    ),
                     "wall_time_seconds": draft.get("resources", {}).get(
                         "wall_time_seconds"
                     ),
@@ -1888,17 +2571,42 @@ class GuidedWorkbench:
             value.pop("checkpoint", None)
             extensions = value.get("extensions")
             if isinstance(extensions, dict):
-                # Retry audits bind internal intent, attempt, observation, and
-                # private Adapter proof identities.  Browser/API consumers need
-                # only the public event/state; never project either proof.
+                # Retry and DAG-failure audits bind internal intent, attempt,
+                # observation, and private Adapter proof identities.
+                # Browser/API consumers need only the public event/state.
                 for internal_extension in (
                     "org.agent_rpc.retry_exhaustion",
                     "org.agent_rpc.worker_exit_retry",
+                    "org.agent_rpc.dag_no_retry",
                     "org.agent_rpc.dispatch_reconciliation",
                     "org.agent_rpc.checkpoint_wait",
                     "org.agent_rpc.checkpoint_resume",
                 ):
                     extensions.pop(internal_extension, None)
+                cache_detail = extensions.get("org.agent_rpc.node_cache")
+                if cache_detail is not None:
+                    cache_key_hash = (
+                        cache_detail.get("cache_key_hash")
+                        if isinstance(cache_detail, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(cache_detail, dict)
+                        and cache_detail.get("state") == "hit"
+                        and isinstance(cache_key_hash, str)
+                        and SHA256.fullmatch(cache_key_hash) is not None
+                        and cache_detail.get("worker_runtime_started") is False
+                    ):
+                        # Cache source task/intent/receipt identities are
+                        # append-only verification evidence.  The public event
+                        # exposes only the bounded cache outcome and key.
+                        extensions["org.agent_rpc.node_cache"] = {
+                            "state": "hit",
+                            "cache_key_hash": cache_key_hash,
+                            "worker_runtime_started": False,
+                        }
+                    else:
+                        extensions.pop("org.agent_rpc.node_cache", None)
                 adapter_detail = extensions.get("org.agent_rpc.adapter_status")
                 if isinstance(adapter_detail, dict):
                     adapter_detail.pop("job_id", None)

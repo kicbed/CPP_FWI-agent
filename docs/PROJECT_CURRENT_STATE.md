@@ -2,7 +2,7 @@
 
 <!-- project-current-state: v1 -->
 
-更新日期：2026-07-19
+更新日期：2026-07-20
 
 这是新会话的有界路由摘要，不替代进度账本、阶段计划或现场证据。冲突时以 Git、代码、
 受影响测试和任务现场为准；普通实现与验证证据只写入 `docs/PROJECT_PROGRESS.md`。
@@ -10,17 +10,14 @@
 ## 当前路由
 
 - 活跃分支：`feature/scientific-agent-runtime`；基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`。
-- Accepted：D-003 固定 P0→P1→P2→P3→P4→P5→P6；历史入口“P3–P6 仍按固定顺序 Pending”已推进至 P3；只有 P6 出口通过才算全项目完成。
-- Verified：P0、P1、P2。P2-001～P2-009B2、reconciliation 矩阵、checkpoint / Waiting /
-  same-live-attempt resume 及只读 SSE 均已实现；完整故障回归和代表性 CPU/CUDA HTTP/SSE E2E
-  阶段出口通过，P2 已结束。
-- In progress：P3 readiness、v18–v21 DAG runtime 及 SQLite v22 scope-local node cache / trusted lineage 均已验证；严格 cache hit 是无 Worker 的 append-only durable fact，控制面重启不
-  重跑已完成节点，DAG checkpoint 只复用 P2 same-live Worker/process/attempt。Recipe 未实现；
-  `dag` 仍关闭，P4–P6 Pending。
-- 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 8 个，当前约 4 个，P2 为 0、
-  P3–P6 暂估约 4；这是弹性估算，不是配额。
-- 当前阻塞：无；下一安全动作是单独推进 P3 固定 Recipe/Guided 工作包，不混入公开 DAG API/UI
-  扩张或 P3 阶段出口。
+- Accepted：D-003 固定 P0→P1→P2→P3→P4→P5→P6；P4–P6 仍按固定顺序 Pending；只有 P6 出口通过才算全项目完成。
+- Verified：P0、P1、P2、P3。P2 已结束；P3 已完成 v18–v23 deterministic DAG、typed artifact binding、
+  node cache / trusted lineage / same-live checkpoint，以及显式固定 Recipe 的 Guided API/UI/SSE；
+  完整回归和 fresh CPU/CUDA HTTP/SSE 阶段出口通过。
+- Pending：P4 Agent Planner、P5 Algorithm SDK、P6 评测与加固；本窗口停止在 P4 之前。
+- 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 9 个，当前约 3 个，P2/P3 为 0、
+  P4–P6 暂估约 3；这是弹性估算，不是配额。
+- 当前阻塞：无；下一安全动作只在用户后续明确要求时进入 P4，不把 P5/P6 提前混入。
 - D-005 仍为 Proposed，不迁移或删除现有 runtime prompt-like 文件。
 - **最高优先级 D 锁**：D-001～D-012 及 D-LOCK 只可按单目标精确 diff/hash 和用户随后单独
   原样复制的一次性 `D-AUTH` 句修改；普通“继续/同意/固定/记录”无效。
@@ -58,10 +55,10 @@
   scope-bound RunEvent，并以有限重连后 GET polling 回退，不成为新的事实源或 mutation 入口。
 - reconciliation 的精确负向证明只终结为 Failed，不退款、不重试；transient/uncertain 保持
   action_required。该负向证明可进入 Trash，但无授权清理协议时 purge 必须 fail closed。
-- P3 内部 SQLite v22 在 v21 exact admission/资源锁上增加 scope-bound canonical cache key、
-  Succeeded receipt/artifact 重验、path-free hit fact 与递归 Dataset lineage；公开 `dag=false`。
-  DAG 恢复、node cache、Worker checkpoint 相互独立；多算法默认独立可选。
-  P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
+- P3 SQLite v22 提供 scope-local cache/trusted lineage，v23 只为 exact 固定 Recipe 放行 B/C
+  并行并要求 terminal Worker 证据；`dag=true` 仅完整 `web/serve.py` 生产组合发布。Recipe 只有
+  显式选择才生成五节点 PlanGraph，普通 Guided/multi-algorithm 仍单节点。上游 artifact 是真实
+  校验的控制面/cache/lineage 输入，不是 P5 动态 Algorithm 参数；P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
 - 不读取、打印或提交 `.env`、密钥、凭证、私有 prompt、模型、运行 artifact、数据库、日志、
   构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开；科学结论只限实际实验边界。

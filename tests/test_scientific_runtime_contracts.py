@@ -14,6 +14,7 @@ from scientific_runtime_contracts import (
     schema_errors,
 )
 from scientific_runtime.fwi_registry import load_deepwave_manifest
+from scientific_runtime.fixed_recipe import fixed_recipe_plan_inputs
 
 
 HASH_A = "sha256:" + "a" * 64
@@ -790,6 +791,82 @@ class ScientificRuntimeExecutionGateTest(unittest.TestCase):
 
     def test_valid_guided_fwi_plan_opens_the_gate(self) -> None:
         self.assertEqual(self.evaluate(), [])
+
+    def test_claimed_fixed_recipe_requires_exact_versioned_graph(self) -> None:
+        extension = {"id": "forward_qc_fwi", "version": "1.0.0"}
+        draft = optimizer_task_draft(algorithm_version="1.6.0")
+        draft["extensions"] = {"org.agent_rpc.recipe": copy.deepcopy(extension)}
+        plan = optimizer_plan_graph(algorithm_version="1.6.0")
+        plan["schema_version"] = "1.2.0"
+        plan["extensions"] = {"org.agent_rpc.recipe": copy.deepcopy(extension)}
+        template = plan["nodes"][0]
+        template["outputs"] = copy.deepcopy(load_deepwave_manifest()["outputs"])
+        plan["nodes"] = []
+        for node_id, dependencies in (
+            ("data_check", []),
+            ("forward", ["data_check"]),
+            ("quality_check", ["data_check"]),
+            ("fwi", ["forward", "quality_check"]),
+            ("result_check", ["fwi"]),
+        ):
+            node = copy.deepcopy(template)
+            node["node_id"] = node_id
+            node["dependencies"] = dependencies
+            node["idempotency_key"] = f"task-001:{node_id}:0001"
+            node["inputs"] = fixed_recipe_plan_inputs(
+                node_id, template["inputs"][0]["dataset"]
+            )
+            plan["nodes"].append(node)
+        rehash(plan)
+        approval = approval_decision(plan)
+        approval["scope"]["algorithms"] = [
+            {"id": "deepwave.acoustic_fwi", "version": "1.6.0"}
+        ]
+        datasets, _ = registry_inputs()
+        manifest = load_deepwave_manifest()
+        algorithms = {(manifest["id"], manifest["version"]): manifest}
+        self.assertEqual(
+            self.evaluate(
+                draft=draft,
+                plan=plan,
+                approval=approval,
+                datasets=datasets,
+                algorithms=algorithms,
+            ),
+            [],
+        )
+
+        forged = copy.deepcopy(plan)
+        forged["extensions"]["org.agent_rpc.recipe"]["version"] = "9.9.9"
+        rehash(forged)
+        forged_approval = copy.deepcopy(approval)
+        rehash(forged, forged_approval)
+        self.assert_has_code(
+            self.evaluate(
+                draft=draft,
+                plan=forged,
+                approval=forged_approval,
+                datasets=datasets,
+                algorithms=algorithms,
+            ),
+            "FIXED_RECIPE_INVALID",
+        )
+
+        missing_edge = copy.deepcopy(plan)
+        missing_edge["nodes"][3]["inputs"].pop()
+        rehash(missing_edge)
+        missing_edge_approval = copy.deepcopy(approval)
+        rehash(missing_edge, missing_edge_approval)
+        self.assert_has_code(
+            self.evaluate(
+                draft=draft,
+                plan=missing_edge,
+                approval=missing_edge_approval,
+                datasets=datasets,
+                algorithms=algorithms,
+            ),
+            "FIXED_RECIPE_PLAN_INVALID",
+        )
 
     def test_unregistered_or_unpinned_algorithm_is_rejected(self) -> None:
         self.assert_has_code(self.evaluate(algorithms={}), "ALGORITHM_NOT_REGISTERED")

@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Protocol
+from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 
 from jsonschema import Draft7Validator
 from PIL import Image
@@ -77,6 +77,10 @@ from .fwi_registry import (
     DEEPWAVE_ALGORITHM_ID,
     DEEPWAVE_ALGORITHM_VERSION,
     load_deepwave_manifest,
+)
+from .fixed_recipe import (
+    fixed_recipe_stage,
+    is_fixed_recipe_extension,
 )
 
 
@@ -338,6 +342,9 @@ class AdapterValidation:
     worker_config: dict[str, Any]
     normalized_config_hash: str
     device_details: dict[str, Any]
+    recipe: dict[str, str] | None
+    recipe_stage: str | None
+    recipe_input_hashes: list[str] | None
     fingerprint: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -355,6 +362,9 @@ class AdapterValidation:
                 "worker_config": self.worker_config,
                 "normalized_config_hash": self.normalized_config_hash,
                 "device_details": self.device_details,
+                "recipe": self.recipe,
+                "recipe_stage": self.recipe_stage,
+                "recipe_input_hashes": self.recipe_input_hashes,
                 "fingerprint": self.fingerprint,
             }
         )
@@ -1659,10 +1669,10 @@ class SafeSubprocessWorkerLauncher:
         checkpoint_capable: bool = False,
         resource_device: Literal["cpu", "cuda"] = "cpu",
     ) -> int:
-        if command != "invert":
+        if command not in {"forward", "invert"}:
             raise AdapterValidationError(
-                "TASK_TYPE_UNSUPPORTED_IN_P1",
-                ["the standard P1 Adapter launches only inversion"],
+                "WORKER_COMMAND_UNSUPPORTED",
+                ["the fixed Adapter launches only forward or inversion"],
             )
         if type(checkpoint_capable) is not bool:
             raise AdapterValidationError(
@@ -1715,7 +1725,7 @@ class SafeSubprocessWorkerLauncher:
                 "-m",
                 "worker_launch_bootstrap",
                 "--command",
-                "invert",
+                command,
                 "--config",
                 str(config_path),
                 "--run-dir",
@@ -1948,6 +1958,14 @@ def _default_device_validator(device: str) -> dict[str, Any]:
 
 
 def _git_source_evidence() -> dict[str, Any]:
+    """Return an exact clean Git identity or explicit incomplete evidence.
+
+    The cache contract accepts only a clean, complete source identity.  A
+    development checkout remains executable, but a dirty or unreadable Git
+    view is deliberately left non-reproducible and therefore cannot seed or
+    consume the semantic node cache.
+    """
+
     source: dict[str, Any] = {"identity_complete": False, "dirty": None}
     try:
         commit = subprocess.run(
@@ -1974,11 +1992,18 @@ def _git_source_evidence() -> dict[str, Any]:
             text=True,
             timeout=5,
         ).stdout
-        if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", commit):
+        commit_valid = (
+            re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", commit) is not None
+        )
+        tree_valid = (
+            re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", tree) is not None
+        )
+        if commit_valid:
             source["git_commit"] = commit
-        if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", tree):
+        if tree_valid:
             source["git_tree"] = tree
         source["dirty"] = bool(porcelain)
+        source["identity_complete"] = commit_valid and tree_valid and not porcelain
     except (OSError, subprocess.SubprocessError):
         pass
     return source
@@ -1992,6 +2017,7 @@ def _default_fingerprint_factory(
     seed: int,
     device: str,
     device_details: Mapping[str, Any],
+    reproducible: bool = False,
 ) -> dict[str, Any]:
     # The legacy child does not enable deterministic algorithms.  Never copy
     # a potentially different flag from the control process into its evidence.
@@ -2000,17 +2026,33 @@ def _default_fingerprint_factory(
     known = [
         "The legacy Worker records seed but does not consume it in the numerical path.",
         "Bitwise equality across library, driver, CPU, or GPU versions is not promised.",
-        "The environment hash is an installed-package snapshot, not a rebuildable lock.",
+        "The environment lock fingerprints the resolved Worker runtime, not a container image.",
     ]
+    source = _git_source_evidence()
+    clean_source = (
+        reproducible is True
+        and source.get("identity_complete") is True
+        and source.get("dirty") is False
+    )
+    if not clean_source:
+        # Preserve the long-standing P1/P2 development-mode shape.  Best-effort
+        # Git fields remain useful provenance, but never imply cacheability.
+        source["identity_complete"] = False
+    environment_lock_hash = device_details.get("environment_lock_hash")
+    if environment_lock_hash is None:
+        # Historical/custom device probes retain this key.  The fixed Worker
+        # probe now publishes the same resolved-runtime digest under the public
+        # environment-lock name as well.
+        environment_lock_hash = device_details[
+            "development_environment_snapshot_hash"
+        ]
     return {
-        "provenance_mode": "development",
+        "provenance_mode": "reproducible" if clean_source else "development",
         "algorithm": dict(algorithm),
         "adapter_version": ADAPTER_VERSION,
-        "source": _git_source_evidence(),
+        "source": source,
         "environment": {
-            "environment_lock_hash": device_details[
-                "development_environment_snapshot_hash"
-            ]
+            "environment_lock_hash": environment_lock_hash
         },
         "runtime": copy.deepcopy(device_details["runtime"]),
         "seed": seed,
@@ -2031,6 +2073,88 @@ def _default_fingerprint_factory(
             "known_nondeterminism": known,
         },
     }
+
+
+def _is_clean_reproducible_fingerprint(value: Mapping[str, Any]) -> bool:
+    """Recognize the exact cacheable source/environment provenance shape."""
+
+    source = value.get("source")
+    environment = value.get("environment")
+    return (
+        value.get("provenance_mode") == "reproducible"
+        and isinstance(source, Mapping)
+        and source.get("identity_complete") is True
+        and source.get("dirty") is False
+        and re.fullmatch(
+            r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+            str(source.get("git_commit", "")),
+        )
+        is not None
+        and re.fullmatch(
+            r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+            str(source.get("git_tree", "")),
+        )
+        is not None
+        and isinstance(environment, Mapping)
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(environment.get("environment_lock_hash", "")),
+        )
+        is not None
+    )
+
+
+def _validated_recipe_input_hashes(
+    *,
+    recipe: Mapping[str, Any] | None,
+    recipe_stage: str | None,
+    value: Sequence[str] | None,
+) -> list[str] | None:
+    """Validate the closed Recipe's non-Dataset input hash vector.
+
+    These hashes bind already verified durable node-output inputs to the
+    Adapter request/fingerprint.  They never become dynamic Worker arguments.
+    """
+
+    if recipe is None and recipe_stage is None:
+        if value is not None:
+            raise AdapterValidationError(
+                "FIXED_RECIPE_INVALID",
+                ["Recipe input hashes are unavailable outside the fixed Recipe"],
+            )
+        return None
+    stage = fixed_recipe_stage(recipe_stage)
+    if not is_fixed_recipe_extension(recipe) or stage is None:
+        raise AdapterValidationError(
+            "FIXED_RECIPE_INVALID",
+            ["Recipe identity and node stage must match the packaged workflow"],
+        )
+    if value is None:
+        hashes: list[Any] = []
+    elif isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        hashes = list(value)
+    else:
+        hashes = [value]
+    expected_count = len(stage["upstream_inputs"])
+    if (
+        len(hashes) != expected_count
+        or any(
+            not isinstance(item, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None
+            for item in hashes
+        )
+        or len(set(hashes)) != len(hashes)
+    ):
+        raise AdapterValidationError(
+            "FIXED_RECIPE_INVALID",
+            [
+                "Recipe input hashes must exactly match the packaged stage's "
+                "ordered upstream inputs"
+            ],
+        )
+    return hashes
 
 
 class DeepwaveAdapter:
@@ -2332,6 +2456,9 @@ class DeepwaveAdapter:
         resources: Mapping[str, Any],
         verify_runtime: bool,
         allow_historical_managed: bool = False,
+        recipe: Mapping[str, Any] | None = None,
+        recipe_stage: str | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterValidation:
         for name, value in (("project_id", project_id), ("principal_id", principal_id)):
             if not isinstance(value, str) or OPAQUE_ID.fullmatch(value) is None:
@@ -2341,6 +2468,37 @@ class DeepwaveAdapter:
         algorithm_value = self._validate_algorithm(
             algorithm,
             allow_historical_managed=allow_historical_managed,
+        )
+        recipe_value: dict[str, str] | None = None
+        stage_contract: dict[str, Any] | None = None
+        if recipe is None and recipe_stage is None:
+            pass
+        elif (
+            is_fixed_recipe_extension(recipe)
+            and isinstance(recipe_stage, str)
+            and (stage_contract := fixed_recipe_stage(recipe_stage)) is not None
+        ):
+            recipe_value = {
+                "id": str(recipe["id"]),
+                "version": str(recipe["version"]),
+            }
+        else:
+            raise AdapterValidationError(
+                "FIXED_RECIPE_INVALID",
+                ["Recipe identity and node stage must match the packaged workflow"],
+            )
+        if recipe_value is not None and algorithm_value != {
+            "id": ALGORITHM_ID,
+            "version": ADAPTER_VERSION,
+        }:
+            raise AdapterValidationError(
+                "FIXED_RECIPE_INVALID",
+                ["The packaged Recipe requires the exact current Algorithm/Adapter"],
+            )
+        recipe_hashes = _validated_recipe_input_hashes(
+            recipe=recipe,
+            recipe_stage=recipe_stage,
+            value=recipe_input_hashes,
         )
         if task_type != "acoustic_fwi_2d":
             raise AdapterValidationError(
@@ -2353,6 +2511,14 @@ class DeepwaveAdapter:
             principal_id=principal_id,
             verify_local=verify_runtime,
         )
+        if (
+            recipe_hashes is not None
+            and dataset_identity["content_hash"] in recipe_hashes
+        ):
+            raise AdapterValidationError(
+                "FIXED_RECIPE_INVALID",
+                ["Recipe Dataset and upstream artifact hashes must be distinct"],
+            )
         parameter_value = self._validate_parameters(parameters)
         resource_value = self._validate_resources(
             resources, device=parameter_value["device"]
@@ -2386,12 +2552,26 @@ class DeepwaveAdapter:
             "task_type": task_type,
             "parameters": parameter_value,
         }
+        if recipe_value is not None:
+            normalized_material["recipe"] = {
+                **recipe_value,
+                "stage": recipe_stage,
+                "command": stage_contract["command"],
+                "input_hashes": copy.deepcopy(recipe_hashes),
+            }
         normalized_hash = _sha256_document(normalized_material)
+        command = "invert" if stage_contract is None else stage_contract["command"]
+        worker_preset = (
+            parameter_value["preset"] if command == "invert" else "forward"
+        )
+        worker_iterations = (
+            parameter_value["iterations"] if command == "invert" else 0
+        )
         worker_config = {
             "model_id": MODEL_ID,
-            "preset": parameter_value["preset"],
+            "preset": worker_preset,
             "device": parameter_value["device"],
-            "iterations": parameter_value["iterations"],
+            "iterations": worker_iterations,
             "seed": parameter_value["seed"],
             "optimizer": parameter_value["optimizer"],
             "learning_rate": parameter_value["learning_rate_milli"] / 1000.0,
@@ -2406,10 +2586,13 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameter_value,
             resources=resource_value,
-            command="invert",
+            command=command,
             worker_config=worker_config,
             normalized_config_hash=normalized_hash,
             device_details=device_details,
+            recipe=recipe_value,
+            recipe_stage=recipe_stage,
+            recipe_input_hashes=recipe_hashes,
         )
 
     def validate(
@@ -2422,6 +2605,9 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_stage: str | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterValidation:
         validated = self._validate_request(
             project_id=project_id,
@@ -2432,15 +2618,26 @@ class DeepwaveAdapter:
             parameters=parameters,
             resources=resources,
             verify_runtime=True,
+            recipe=recipe,
+            recipe_stage=recipe_stage,
+            recipe_input_hashes=recipe_input_hashes,
         )
         fingerprint = self._validate_fingerprint(
             self._fingerprint_factory(
                 algorithm=validated.algorithm,
                 normalized_config_hash=validated.normalized_config_hash,
-                input_hashes=[validated.dataset["content_hash"]],
+                input_hashes=[
+                    validated.dataset["content_hash"],
+                    *(validated.recipe_input_hashes or []),
+                ],
                 seed=validated.parameters["seed"],
                 device=validated.parameters["device"],
                 device_details=validated.device_details,
+                # Only the explicitly selected, packaged P3 Recipe may use
+                # clean production provenance for semantic node caching.  The
+                # historical P1/P2 single-node path remains development-mode
+                # compatible and never changes cache behavior implicitly.
+                reproducible=validated.recipe is not None,
             ),
             validated=validated,
         )
@@ -2461,6 +2658,9 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_stage: str | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterValidation:
         """Revalidate a retained managed request without minting new identity."""
 
@@ -2474,6 +2674,9 @@ class DeepwaveAdapter:
             resources=resources,
             verify_runtime=True,
             allow_historical_managed=True,
+            recipe=recipe,
+            recipe_stage=recipe_stage,
+            recipe_input_hashes=recipe_input_hashes,
         )
 
     def estimate(self, **kwargs: Any) -> AdapterEstimate:
@@ -2611,7 +2814,7 @@ class DeepwaveAdapter:
         idempotency_key: str,
         validated: AdapterValidation,
     ) -> dict[str, Any]:
-        return {
+        value = {
             "submission_id": submission_id,
             "task_id": task_id,
             "node_id": node_id,
@@ -2627,10 +2830,16 @@ class DeepwaveAdapter:
             "resources": validated.resources,
             "normalized_config_hash": validated.normalized_config_hash,
         }
+        if validated.recipe is not None:
+            value["recipe"] = copy.deepcopy(validated.recipe)
+            value["recipe_input_hashes"] = copy.deepcopy(
+                validated.recipe_input_hashes
+            )
+        return value
 
     @staticmethod
     def _record_request_payload(record: Mapping[str, Any]) -> dict[str, Any]:
-        return {
+        value = {
             key: copy.deepcopy(record[key])
             for key in (
                 "submission_id",
@@ -2649,6 +2858,12 @@ class DeepwaveAdapter:
                 "normalized_config_hash",
             )
         }
+        if "recipe" in record:
+            value["recipe"] = copy.deepcopy(record["recipe"])
+            value["recipe_input_hashes"] = copy.deepcopy(
+                record["recipe_input_hashes"]
+            )
+        return value
 
     def _retry_request_material(
         self,
@@ -2664,6 +2879,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> tuple[
         AdapterValidation,
         str,
@@ -2688,6 +2905,9 @@ class DeepwaveAdapter:
             resources=resources,
             verify_runtime=False,
             allow_historical_managed=True,
+            recipe=recipe,
+            recipe_stage=node_id if recipe is not None else None,
+            recipe_input_hashes=recipe_input_hashes,
         )
         submission_id = self._submission_id(task_id, plan_hash, idempotency_key)
         request_payload = self._request_payload(
@@ -3057,6 +3277,8 @@ class DeepwaveAdapter:
         launch_state = value.get("launch_state")
         if launch_state in {"purging", "purged"}:
             required.add("purge_id")
+        if "recipe" in value or "recipe_input_hashes" in value:
+            required.update({"recipe", "recipe_input_hashes"})
         if set(value) != required:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private record fields are inconsistent"
@@ -3072,6 +3294,25 @@ class DeepwaveAdapter:
             raise AdapterHandleError(
                 "ADAPTER_SUBMISSION_INVALID: private record version is unsupported"
             )
+        if "recipe" in value:
+            try:
+                recipe_hashes = _validated_recipe_input_hashes(
+                    recipe=value["recipe"],
+                    recipe_stage=value.get("node_id"),
+                    value=value["recipe_input_hashes"],
+                )
+                if (
+                    isinstance(value.get("dataset"), Mapping)
+                    and value["dataset"].get("content_hash") in recipe_hashes
+                ):
+                    raise AdapterValidationError(
+                        "FIXED_RECIPE_INVALID",
+                        ["Recipe Dataset and upstream hashes overlap"],
+                    )
+            except AdapterValidationError as error:
+                raise AdapterHandleError(
+                    "ADAPTER_SUBMISSION_INVALID: private Recipe binding is invalid"
+                ) from error
         if schema_version in {"1.1.0", "1.2.0", "1.3.0"}:
             try:
                 binding = binding_from_submission_record(value)
@@ -3327,6 +3568,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Read one exact managed attempt without launching or scanning.
 
@@ -3351,6 +3594,9 @@ class DeepwaveAdapter:
             resources=resources,
             verify_runtime=False,
             allow_historical_managed=True,
+            recipe=recipe,
+            recipe_stage=node_id if recipe is not None else None,
+            recipe_input_hashes=recipe_input_hashes,
         )
         submission_id = self._submission_id(task_id, plan_hash, idempotency_key)
         request_payload = self._request_payload(
@@ -3435,8 +3681,11 @@ class DeepwaveAdapter:
                 )
             if (
                 evidence.heartbeat_state == "waiting"
-                and validated.algorithm
-                != {"id": ALGORITHM_ID, "version": "1.6.0"}
+                and (
+                    validated.algorithm
+                    != {"id": ALGORITHM_ID, "version": "1.6.0"}
+                    or validated.command != "invert"
+                )
             ):
                 raise AdapterHandleError(
                     "ADAPTER_SUBMISSION_INVALID: checkpoint Waiting is not supported by this receipt"
@@ -3474,6 +3723,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterPreRunningRetryProof:
         """Prove attempt 1 stopped before ready without mutating private state."""
 
@@ -3490,6 +3741,8 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameters,
             resources=resources,
+            recipe=recipe,
+            recipe_input_hashes=recipe_input_hashes,
         )
 
     def probe_pre_running_retry_exhaustion(
@@ -3506,6 +3759,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterPreRunningRetryProof:
         """Prove exact attempt 2 also stopped before ready, without mutation."""
 
@@ -3522,6 +3777,8 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameters,
             resources=resources,
+            recipe=recipe,
+            recipe_input_hashes=recipe_input_hashes,
         )
 
     def probe_worker_exit_retry(
@@ -3538,6 +3795,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterWorkerExitRetryProof:
         """Prove exact attempt 1 exited after ready without stop control."""
 
@@ -3554,6 +3813,8 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameters,
             resources=resources,
+            recipe=recipe,
+            recipe_input_hashes=recipe_input_hashes,
         )
 
     def probe_worker_exit_retry_exhaustion(
@@ -3570,6 +3831,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterWorkerExitRetryProof:
         """Prove exact attempt 2 also exited after ready, without attempt 3."""
 
@@ -3586,6 +3849,8 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameters,
             resources=resources,
+            recipe=recipe,
+            recipe_input_hashes=recipe_input_hashes,
         )
 
     def _probe_worker_exit_failure(
@@ -3603,6 +3868,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterWorkerExitRetryProof:
         """Read one receipt-first post-ready exit under the submission lock."""
 
@@ -3629,6 +3896,8 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameters,
             resources=resources,
+            recipe=recipe,
+            recipe_input_hashes=recipe_input_hashes,
         )
         with self._lock_submission(lock_path, create=False, timeout_seconds=5.0):
             record = self._read_submission(index_path)
@@ -3716,6 +3985,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterPreRunningRetryProof:
         """Read one current exact private failure under its idle fence."""
 
@@ -3743,6 +4014,8 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameters,
             resources=resources,
+            recipe=recipe,
+            recipe_input_hashes=recipe_input_hashes,
         )
         with self._lock_submission(lock_path, create=False, timeout_seconds=5.0):
             if not index_path.exists() and not index_path.is_symlink():
@@ -3843,6 +4116,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterHandle:
         """Append and launch deterministic attempt 2 after SQLite authorization."""
 
@@ -3866,6 +4141,8 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameters,
             resources=resources,
+            recipe=recipe,
+            recipe_input_hashes=recipe_input_hashes,
         )
         with self._lock_submission(lock_path, create=False, timeout_seconds=5.0):
             record = self._read_submission(index_path)
@@ -3900,6 +4177,9 @@ class DeepwaveAdapter:
                         task_type=task_type,
                         parameters=parameters,
                         resources=resources,
+                        recipe=recipe,
+                        recipe_stage=node_id if recipe is not None else None,
+                        recipe_input_hashes=recipe_input_hashes,
                     )
                     return self._resume_staged_submission(
                         index_path=index_path, record=record, validated=live
@@ -3941,6 +4221,9 @@ class DeepwaveAdapter:
                 task_type=task_type,
                 parameters=parameters,
                 resources=resources,
+                recipe=recipe,
+                recipe_stage=node_id if recipe is not None else None,
+                recipe_input_hashes=recipe_input_hashes,
             )
             if live.normalized_config_hash != validated.normalized_config_hash:
                 raise AdapterUnavailable(
@@ -4100,6 +4383,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterHandle:
         """Append and launch attempt 2 from one exact post-ready exit receipt."""
 
@@ -4125,6 +4410,8 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameters,
             resources=resources,
+            recipe=recipe,
+            recipe_input_hashes=recipe_input_hashes,
         )
         with self._lock_submission(lock_path, create=False, timeout_seconds=5.0):
             record = self._read_submission(index_path)
@@ -4163,6 +4450,9 @@ class DeepwaveAdapter:
                         task_type=task_type,
                         parameters=parameters,
                         resources=resources,
+                        recipe=recipe,
+                        recipe_stage=node_id if recipe is not None else None,
+                        recipe_input_hashes=recipe_input_hashes,
                     )
                     return self._resume_staged_submission(
                         index_path=index_path, record=record, validated=live
@@ -4217,6 +4507,9 @@ class DeepwaveAdapter:
                 task_type=task_type,
                 parameters=parameters,
                 resources=resources,
+                recipe=recipe,
+                recipe_stage=node_id if recipe is not None else None,
+                recipe_input_hashes=recipe_input_hashes,
             )
             if live.normalized_config_hash != validated.normalized_config_hash:
                 raise AdapterUnavailable(
@@ -4389,6 +4682,19 @@ class DeepwaveAdapter:
         dataset = record.get("dataset")
         parameters = record.get("parameters")
         resources = record.get("resources")
+        development_provenance = (
+            value.get("provenance_mode") == "development"
+            and isinstance(value.get("source"), Mapping)
+            and value["source"].get("identity_complete") is False
+        )
+        reproducible_recipe_provenance = (
+            is_fixed_recipe_extension(record.get("recipe"))
+            and fixed_recipe_stage(record.get("node_id")) is not None
+            and _is_clean_reproducible_fingerprint(value)
+        )
+        recipe_input_hashes = (
+            record.get("recipe_input_hashes") if "recipe" in record else []
+        )
         if (
             errors
             or not isinstance(dataset, Mapping)
@@ -4399,14 +4705,14 @@ class DeepwaveAdapter:
                 record.get("adapter_version"),
                 value,
             )
-            or value.get("provenance_mode") != "development"
-            or not isinstance(value.get("source"), Mapping)
-            or value["source"].get("identity_complete") is not False
+            or not (development_provenance or reproducible_recipe_provenance)
             or value.get("seed") != parameters.get("seed")
             or not isinstance(value.get("hardware"), Mapping)
             or value["hardware"].get("device") != resources.get("device")
             or value.get("normalized_config_hash") != normalized_config_hash
-            or value.get("input_hashes") != [dataset.get("content_hash")]
+            or not isinstance(recipe_input_hashes, list)
+            or value.get("input_hashes")
+            != [dataset.get("content_hash"), *recipe_input_hashes]
         ):
             raise AdapterHandleError(
                 "FINGERPRINT_INVALID: retained reconciliation fingerprint changed"
@@ -4427,6 +4733,8 @@ class DeepwaveAdapter:
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
         normalized_config_hash: str,
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterExistingDispatchReceiptProof | AdapterDispatchNotStartedProof:
         """Read one exact positive or exact pre-running negative result."""
 
@@ -4436,6 +4744,16 @@ class DeepwaveAdapter:
             plan_hash=plan_hash,
             idempotency_key=idempotency_key,
         )
+        try:
+            recipe_hashes = _validated_recipe_input_hashes(
+                recipe=recipe,
+                recipe_stage=node_id if recipe is not None else None,
+                value=recipe_input_hashes,
+            )
+        except AdapterValidationError as error:
+            raise AdapterUnavailable(
+                "DISPATCH_RECONCILIATION_UNSUPPORTED: immutable Recipe inputs are unsupported"
+            ) from error
         if (
             not isinstance(project_id, str)
             or OPAQUE_ID.fullmatch(project_id) is None
@@ -4451,6 +4769,13 @@ class DeepwaveAdapter:
             or not isinstance(resources, Mapping)
             or not isinstance(normalized_config_hash, str)
             or PLAN_HASH.fullmatch(normalized_config_hash) is None
+            or (
+                recipe is not None
+                and (
+                    not is_fixed_recipe_extension(recipe)
+                    or fixed_recipe_stage(node_id) is None
+                )
+            )
         ):
             raise AdapterUnavailable(
                 "DISPATCH_RECONCILIATION_UNSUPPORTED: immutable request is unsupported"
@@ -4480,6 +4805,11 @@ class DeepwaveAdapter:
             "resources": copy.deepcopy(dict(resources)),
             "normalized_config_hash": normalized_config_hash,
         }
+        if recipe is not None:
+            request_payload["recipe"] = copy.deepcopy(dict(recipe))
+            request_payload["recipe_input_hashes"] = copy.deepcopy(
+                recipe_hashes
+            )
         request_hash = _sha256_document(request_payload)
         index_name = submission_id.removeprefix("submission-") + ".json"
         control = self._run_root / CONTROL_DIRECTORY
@@ -4726,6 +5056,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
         allow_managed_promotion: bool,
     ) -> tuple[dict[str, Any], AdapterHandle]:
         """Read one exact current-version receipt under its submission lock.
@@ -4752,6 +5084,9 @@ class DeepwaveAdapter:
             resources=resources,
             verify_runtime=False,
             allow_historical_managed=True,
+            recipe=recipe,
+            recipe_stage=node_id if recipe is not None else None,
+            recipe_input_hashes=recipe_input_hashes,
         )
         submission_id = self._submission_id(
             task_id, plan_hash, idempotency_key
@@ -4900,10 +5235,18 @@ class DeepwaveAdapter:
                 "FINGERPRINT_INVALID: " + "; ".join(errors)
             )
         mismatches: list[str] = []
-        if value["provenance_mode"] != "development":
-            mismatches.append("P1.2a fingerprint must be development mode")
-        if value["source"]["identity_complete"] is not False:
-            mismatches.append("P1.2a source identity must remain explicitly incomplete")
+        development_provenance = (
+            value.get("provenance_mode") == "development"
+            and isinstance(value.get("source"), Mapping)
+            and value["source"].get("identity_complete") is False
+        )
+        reproducible_recipe_provenance = (
+            validated.recipe is not None
+            and validated.recipe_stage is not None
+            and _is_clean_reproducible_fingerprint(value)
+        )
+        if not (development_provenance or reproducible_recipe_provenance):
+            mismatches.append("source/environment provenance")
         if value["algorithm"] != validated.algorithm:
             mismatches.append("algorithm")
         expected_adapter_version = validated.algorithm["version"]
@@ -4922,7 +5265,10 @@ class DeepwaveAdapter:
             mismatches.append("device")
         if value["normalized_config_hash"] != validated.normalized_config_hash:
             mismatches.append("normalized_config_hash")
-        if value["input_hashes"] != [validated.dataset["content_hash"]]:
+        if value["input_hashes"] != [
+            validated.dataset["content_hash"],
+            *(validated.recipe_input_hashes or []),
+        ]:
             mismatches.append("input_hashes")
         if mismatches:
             raise AdapterUnavailable(
@@ -5008,7 +5354,7 @@ class DeepwaveAdapter:
                 "status": "failed",
                 "stage": "submit",
                 "iteration": 0,
-                "total_iterations": validated.parameters["iterations"],
+                "total_iterations": validated.worker_config["iterations"],
                 "message": "FWI worker could not be started",
                 "updated_at": self._clock(),
             },
@@ -5039,6 +5385,7 @@ class DeepwaveAdapter:
                     record.get("adapter_version") == "1.6.0"
                     and record.get("algorithm")
                     == {"id": ALGORITHM_ID, "version": "1.6.0"}
+                    and validated.command == "invert"
                 ),
                 resource_device=validated.resources["device"],
             )
@@ -5153,7 +5500,7 @@ class DeepwaveAdapter:
             "status": "queued",
             "stage": "queued",
             "iteration": 0,
-            "total_iterations": validated.parameters["iterations"],
+            "total_iterations": validated.worker_config["iterations"],
             "message": "FWI Adapter job queued",
             "updated_at": record["created_at"],
         }
@@ -5194,6 +5541,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterHandle:
         self._validate_submit_identity(
             task_id=task_id,
@@ -5210,6 +5559,9 @@ class DeepwaveAdapter:
             parameters=parameters,
             resources=resources,
             verify_runtime=False,
+            recipe=recipe,
+            recipe_stage=node_id if recipe is not None else None,
+            recipe_input_hashes=recipe_input_hashes,
         )
         # P0/SQLite scope node keys to an immutable plan, not globally and not
         # merely to a node label.  A changed node under the same plan/key is a
@@ -5238,6 +5590,9 @@ class DeepwaveAdapter:
                 task_type=task_type,
                 parameters=parameters,
                 resources=resources,
+                recipe=recipe,
+                recipe_stage=node_id if recipe is not None else None,
+                recipe_input_hashes=recipe_input_hashes,
             )
             if value.normalized_config_hash != normalized.normalized_config_hash:
                 raise AdapterUnavailable(
@@ -5343,7 +5698,7 @@ class DeepwaveAdapter:
                     "status": "queued",
                     "stage": "queued",
                     "iteration": 0,
-                    "total_iterations": validated.parameters["iterations"],
+                    "total_iterations": validated.worker_config["iterations"],
                     "message": "FWI Adapter job queued",
                     "updated_at": created_at,
                 },
@@ -5561,6 +5916,13 @@ class DeepwaveAdapter:
             == {"id": ALGORITHM_ID, "version": "1.6.0"}
             and record.get("adapter_version") == "1.6.0"
             and record.get("algorithm") == handle.algorithm
+            and (
+                "recipe" not in record
+                or (
+                    is_fixed_recipe_extension(record.get("recipe"))
+                    and record.get("node_id") == "fwi"
+                )
+            )
             and _is_supported_managed_control_record(handle, record)
         )
 
@@ -5831,6 +6193,7 @@ class DeepwaveAdapter:
             "running",
             "validate_model",
             "generate_observed",
+            "forward_initial",
             "gradient_check",
             "invert",
             "checkpoint_wait",
@@ -5856,7 +6219,7 @@ class DeepwaveAdapter:
             raise AdapterStatusError(
                 "ADAPTER_STATUS_INVALID: progress counters are invalid"
             )
-        if total != record["parameters"]["iterations"]:
+        if total != record["worker_config"]["iterations"]:
             raise AdapterStatusError(
                 "ADAPTER_STATUS_INVALID: total iterations differ from the request"
             )
@@ -5906,6 +6269,13 @@ class DeepwaveAdapter:
                 record.get("adapter_version") == "1.6.0"
                 and record.get("algorithm")
                 == {"id": ALGORITHM_ID, "version": "1.6.0"}
+                and (
+                    "recipe" not in record
+                    or (
+                        is_fixed_recipe_extension(record.get("recipe"))
+                        and record.get("node_id") == "fwi"
+                    )
+                )
             ):
                 raise AdapterStatusError(
                     "ADAPTER_STATUS_INVALID: Waiting is not supported by this receipt"
@@ -6156,6 +6526,8 @@ class DeepwaveAdapter:
         task_type: str,
         parameters: Mapping[str, Any],
         resources: Mapping[str, Any],
+        recipe: Mapping[str, Any] | None = None,
+        recipe_input_hashes: Sequence[str] | None = None,
     ) -> AdapterPurgeResult:
         """Delete an exact two-attempt stopped chain with no launched handle."""
 
@@ -6192,6 +6564,8 @@ class DeepwaveAdapter:
             task_type=task_type,
             parameters=parameters,
             resources=resources,
+            recipe=recipe,
+            recipe_input_hashes=recipe_input_hashes,
         )
         proof_evidence = proof["evidence"]
         worker_exit_lineage = proof["schema_version"] == "1.1.0"
@@ -8007,6 +8381,19 @@ class DeepwaveAdapter:
                 "worker_job_id": record["job_id"],
             }
         }
+        recipe = record.get("recipe")
+        if recipe is not None:
+            stage = fixed_recipe_stage(record.get("node_id"))
+            if not is_fixed_recipe_extension(recipe) or stage is None:
+                raise AdapterArtifactError(
+                    "ADAPTER_ARTIFACT_INVALID: Recipe stage binding is invalid"
+                )
+            extensions["org.agent_rpc.recipe_artifact"] = {
+                "id": recipe["id"],
+                "version": recipe["version"],
+                "stage": stage["node_id"],
+                "worker_command": stage["command"],
+            }
         if public_extensions is not None:
             for namespace, detail in public_extensions.items():
                 if namespace == "org.agent_rpc.adapter" or not isinstance(
@@ -8067,13 +8454,21 @@ class DeepwaveAdapter:
             )
         except AdapterStatusError as error:
             raise AdapterArtifactError(str(error)) from error
+        recipe_stage = (
+            fixed_recipe_stage(record.get("node_id"))
+            if is_fixed_recipe_extension(record.get("recipe"))
+            else None
+        )
+        expected_command = (
+            recipe_stage["command"] if recipe_stage is not None else "invert"
+        )
         if (
             config_document != {"job_id": record["job_id"], **record["worker_config"]}
             or legacy_manifest.get("schema_version") != "1"
             or legacy_manifest.get("type") != "fwi_result"
             or legacy_manifest.get("job_id") != record["job_id"]
             or legacy_manifest.get("status") != "succeeded"
-            or legacy_manifest.get("command") != "invert"
+            or legacy_manifest.get("command") != expected_command
             or legacy_manifest.get("model_id") != MODEL_ID
             or legacy_manifest.get("physics") != "2d_acoustic_constant_density"
             or legacy_manifest.get("parameter") != "vp"
@@ -8094,11 +8489,12 @@ class DeepwaveAdapter:
         self._validate_npy(inverted, shape=shape)
         losses = self._validate_loss_csv(
             loss,
-            iterations=record["parameters"]["iterations"],
+            iterations=record["worker_config"]["iterations"],
             expected_frequency_hz=8.0,
         )
         if (
-            record["parameters"]["preset"] == "fwi_demo"
+            expected_command == "invert"
+            and record["parameters"]["preset"] == "fwi_demo"
             and losses[-1] >= losses[0]
         ):
             raise AdapterArtifactError(
@@ -8108,19 +8504,23 @@ class DeepwaveAdapter:
         # receipts intentionally retain their four-field parameter document,
         # so collection must verify them against the historical worker
         # defaults without mutating their signed lineage.
-        optimizer = record["parameters"].get("optimizer", "adam")
-        learning_rate_milli = record["parameters"].get(
-            "learning_rate_milli", 10_000
-        )
+        optimizer = record["worker_config"].get("optimizer", "adam")
+        learning_rate = record["worker_config"].get("learning_rate", 10.0)
         metrics = self._scalar_metrics(
             metrics_document,
-            iterations=record["parameters"]["iterations"],
-            device=record["parameters"]["device"],
+            iterations=record["worker_config"]["iterations"],
+            device=record["worker_config"]["device"],
             optimizer=optimizer,
-            learning_rate=learning_rate_milli / 1000.0,
+            learning_rate=learning_rate,
             losses=losses,
             fingerprint=record["fingerprint"],
         )
+        if recipe_stage is not None:
+            metrics = {
+                **metrics,
+                "recipe_stage": recipe_stage["node_id"],
+                "worker_command": recipe_stage["command"],
+            }
         artifacts = [
             self._artifact_manifest(
                 record=record,

@@ -27,7 +27,10 @@ from worker_launch_control import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m worker_launch_bootstrap")
-    parser.add_argument("--command", choices=("invert",), required=True)
+    # P3's packaged Recipe reuses the same fenced managed Worker for its fixed
+    # forward/check stages.  Keep this closed to the two immutable Worker CLI
+    # operations; it is not a dynamic command or Algorithm-SDK surface.
+    parser.add_argument("--command", choices=("forward", "invert"), required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--run-root", required=True)

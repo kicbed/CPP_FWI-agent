@@ -4,6 +4,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -11,6 +12,13 @@ from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
+
+import scientific_runtime.task_store as task_store_module
+from scientific_runtime.fixed_recipe import (
+    fixed_recipe_plan_inputs,
+    load_fixed_recipe_manifest,
+)
 
 from scientific_runtime import (
     DispatchError,
@@ -18,13 +26,16 @@ from scientific_runtime import (
     SQLiteTaskStore,
     TaskConflict,
     TaskDispatchError,
+    TaskNotFound,
     TaskService,
     TaskStoreConflict,
     TaskStoreCorruption,
     TaskSupervisorLeaseLost,
+    TaskValidationError,
     load_deepwave_manifest,
 )
 from scientific_runtime_contracts import compute_plan_hash
+from scientific_runtime.task_store import encode_document, is_fixed_recipe_parallel_plan
 from tests import test_scientific_runtime_task_service as task_service_fixtures
 from tests.test_scientific_runtime_contracts import approval_decision, dataset_ref
 from tests.test_scientific_runtime_dag_execution_store import (
@@ -52,6 +63,8 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
         self.dispatch_counts: Counter[tuple[str, str]] = Counter()
         self._observations: dict[str, dict] = {}
         self._statuses: dict[str, dict] = {}
+        self._manifests_by_intent: dict[str, list[dict]] = {}
+        self._artifact_data_by_intent: dict[str, dict[str, bytes]] = {}
 
     @staticmethod
     def _attempt_id(intent) -> str:
@@ -68,6 +81,56 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
         observation = self._observations.get(intent.intent_id)
         if observation is not None:
             self.worker_observation = copy.deepcopy(observation)
+
+    def set_node_outputs(self, intent, manifests, artifact_data) -> None:
+        node_manifests = copy.deepcopy(manifests)
+        node_artifact_data: dict[str, bytes] = {}
+        for manifest in node_manifests:
+            physical_id = manifest["artifact_id"]
+            node_id = f"{physical_id}-{intent.node_id}"
+            manifest["artifact_id"] = node_id
+            node_artifact_data[node_id] = bytes(artifact_data[physical_id])
+        self._manifests_by_intent[intent.intent_id] = node_manifests
+        self._artifact_data_by_intent[intent.intent_id] = node_artifact_data
+        self._activate_outputs(intent)
+
+    def _activate_outputs(self, intent) -> None:
+        manifests = self._manifests_by_intent.get(intent.intent_id)
+        artifact_data = self._artifact_data_by_intent.get(intent.intent_id)
+        if manifests is not None and artifact_data is not None:
+            self.manifests = copy.deepcopy(manifests)
+            self.artifact_data = copy.deepcopy(artifact_data)
+
+    def prepare_node(self, snapshot, *, node_id, input_binding):
+        prepared = super().prepare_node(
+            snapshot, node_id=node_id, input_binding=input_binding
+        )
+        extensions = snapshot.plan.get("extensions")
+        if not isinstance(extensions, dict):
+            return prepared
+        recipe = extensions.get("org.agent_rpc.recipe")
+        if recipe is None:
+            return prepared
+        recipe_input_hashes = [
+            bound["binding"]["artifact"]["content_hash"]
+            for bound in input_binding.binding_document["inputs"]
+            if bound.get("kind") == "node_output"
+        ]
+        request = copy.deepcopy(prepared.request)
+        request["recipe"] = copy.deepcopy(recipe)
+        request["recipe_input_hashes"] = recipe_input_hashes
+        fingerprint = copy.deepcopy(prepared.queue_fingerprint)
+        fingerprint["input_hashes"] = [
+            input_binding.binding_document["inputs"][0]["dataset"][
+                "content_hash"
+            ],
+            *recipe_input_hashes,
+        ]
+        return replace(
+            prepared,
+            request=request,
+            queue_fingerprint=fingerprint,
+        )
 
     def dispatch(self, intent):
         # Keep the existing real P2 boundary, but permit successor nodes after
@@ -89,7 +152,7 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
             "job_id": job_id,
             "idempotency_key": intent.node_idempotency_key,
             "plan_hash": intent.plan_hash,
-            "request_hash": MANAGED_REQUEST_HASH,
+            "request_hash": intent.request_hash,
             "algorithm": copy.deepcopy(intent.request["algorithm"]),
             "fingerprint": copy.deepcopy(intent.queue_fingerprint),
             "adapter_version": intent.adapter_version,
@@ -98,6 +161,7 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
             "evidence": managed_worker_evidence(
                 attempt_id=attempt_id,
                 job_id=job_id,
+                request_hash=intent.request_hash,
             ),
             "handle": copy.deepcopy(handle),
         }
@@ -142,11 +206,21 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
 
     def set_status(self, intent, *, state: str, updated_at: str) -> None:
         terminal = state in {"Succeeded", "Failed", "Cancelled"}
+        recipe_forward = (
+            intent.request.get("recipe")
+            == {"id": "forward_qc_fwi", "version": "1.0.0"}
+            and intent.node_id != "fwi"
+        )
+        total = (
+            0
+            if recipe_forward
+            else int(intent.request["parameters"]["iterations"])
+        )
         self._statuses[intent.intent_id] = {
             "status": state,
             "stage": state.lower(),
-            "completed": 2 if state == "Succeeded" else 0,
-            "total": 2,
+            "completed": total if state == "Succeeded" else 0,
+            "total": total,
             "message": f"controlled {intent.node_id} {state.lower()}",
             "updated_at": updated_at,
             "terminal": terminal,
@@ -161,6 +235,7 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
                 attempt_id=prior["attempt_id"],
                 attempt_number=prior["attempt_number"],
                 job_id=prior["job_id"],
+                request_hash=prior["request_hash"],
                 heartbeat_sequence=sequence,
                 heartbeat_state=state,
             ),
@@ -172,8 +247,17 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
     @contextlib.contextmanager
     def verified_node_outputs(self, intent):
         self._activate(intent)
+        self._activate_outputs(intent)
         with super().verified_node_outputs(intent) as outputs:
             yield outputs
+
+    def collect(self, intent):
+        self._activate_outputs(intent)
+        return super().collect(intent)
+
+    def read_artifact(self, intent, artifact_id):
+        self._activate_outputs(intent)
+        return super().read_artifact(intent, artifact_id)
 
 
 class ReproducibleMultiNodeDagDispatcher(MultiNodeControlledDagDispatcher):
@@ -184,6 +268,9 @@ class ReproducibleMultiNodeDagDispatcher(MultiNodeControlledDagDispatcher):
             snapshot, node_id=node_id, input_binding=input_binding
         )
         fingerprint = executable_fingerprint(self.adapter_version)
+        fingerprint["input_hashes"] = copy.deepcopy(
+            prepared.queue_fingerprint["input_hashes"]
+        )
         request = copy.deepcopy(prepared.request)
         request["normalized_config_hash"] = fingerprint[
             "normalized_config_hash"
@@ -271,9 +358,25 @@ class ScientificRuntimeDagRuntimeSchedulerTest(unittest.TestCase):
             dispatcher=self.dispatcher,
         )
 
-    def _approved_dag(self, suffix: str) -> tuple[str, dict]:
+    def _approved_dag(
+        self,
+        suffix: str,
+        *,
+        fixed_recipe: bool = False,
+        fixed_recipe_version: str = "1.0.0",
+        include_result_check: bool = False,
+        iterations: int = 2,
+    ) -> tuple[str, dict]:
         draft = current_optimizer_task_draft()
         draft["draft_id"] = f"draft-dag-runtime-{suffix}"
+        draft["parameters"]["iterations"] = iterations
+        if fixed_recipe:
+            draft["extensions"] = {
+                "org.agent_rpc.recipe": {
+                    "id": "forward_qc_fwi",
+                    "version": fixed_recipe_version,
+                }
+            }
         created = self.service.create_task(
             draft=draft,
             idempotency_key=f"create-dag-runtime-{suffix}",
@@ -288,20 +391,48 @@ class ScientificRuntimeDagRuntimeSchedulerTest(unittest.TestCase):
             "revision": draft["revision"],
         }
         template = copy.deepcopy(plan["nodes"][0])
-        dependencies = {
-            "a": [],
-            "b": ["a"],
-            "c": ["a"],
-            "d": ["b", "c"],
-        }
+        dependencies = (
+            {
+                "data_check": [],
+                "forward": ["data_check"],
+                "quality_check": ["data_check"],
+                "fwi": ["forward", "quality_check"],
+                "result_check": ["fwi"],
+            }
+            if fixed_recipe
+            else {
+                "a": [],
+                "b": ["a"],
+                "c": ["a"],
+                "d": ["b", "c"],
+            }
+        )
+        if include_result_check and not fixed_recipe:
+            dependencies["e"] = ["d"]
         nodes = []
         for node_id, required in dependencies.items():
             node = copy.deepcopy(template)
             node["node_id"] = node_id
             node["dependencies"] = required
             node["idempotency_key"] = f"{task_id}:{node_id}:0001"
+            node["parameters"]["iterations"] = iterations
+            if fixed_recipe and fixed_recipe_version == "1.0.0":
+                node["inputs"] = fixed_recipe_plan_inputs(
+                    node_id, template["inputs"][0]["dataset"]
+                )
+                node["outputs"] = copy.deepcopy(
+                    load_fixed_recipe_manifest()["plan_outputs"]
+                )
             nodes.append(node)
         plan["nodes"] = nodes
+        if fixed_recipe:
+            plan["schema_version"] = "1.2.0"
+            plan["extensions"] = {
+                "org.agent_rpc.recipe": {
+                    "id": "forward_qc_fwi",
+                    "version": fixed_recipe_version,
+                }
+            }
         plan["plan_hash"] = compute_plan_hash(plan)
         self.service.persist_plan(task_id=task_id, plan=plan, **self.scope)
 
@@ -398,8 +529,12 @@ class ScientificRuntimeDagRuntimeSchedulerTest(unittest.TestCase):
                     self, task_id
                 )
             )
-            self.dispatcher.manifests = manifests
-            self.dispatcher.artifact_data = artifact_data
+            set_node_outputs = getattr(self.dispatcher, "set_node_outputs", None)
+            if callable(set_node_outputs):
+                set_node_outputs(intent, manifests, artifact_data)
+            else:
+                self.dispatcher.manifests = manifests
+                self.dispatcher.artifact_data = artifact_data
         self.dispatcher.set_terminal_heartbeat(
             intent, state=state.lower()
         )
@@ -657,6 +792,210 @@ class ScientificRuntimeDagRuntimeSchedulerTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_nonempty_v22_upgrades_in_place_preserving_active_cache_and_checkpoint_facts(
+        self,
+    ) -> None:
+        legacy_migrations = Path(self.temporary.name) / "v22-migrations"
+        legacy_migrations.mkdir(mode=0o700)
+        for migration in sorted(
+            task_store_module.MIGRATIONS_DIRECTORY.glob(
+                "[0-9][0-9][0-9][0-9]_*.sql"
+            )
+        ):
+            if int(migration.name.split("_", 1)[0]) <= 22:
+                shutil.copy2(migration, legacy_migrations / migration.name)
+
+        self.database_path = Path(self.temporary.name) / "nonempty-v22.sqlite3"
+        with mock.patch.object(
+            task_store_module,
+            "MIGRATIONS_DIRECTORY",
+            legacy_migrations,
+        ):
+            self.store = SQLiteTaskStore(self.database_path)
+        self.assertEqual(self.store.migration_version(), 22)
+        self.registry = RegistryService(self.store, clock=self._now)
+        self.registry.register_dataset(dataset=dataset_ref())
+        self.registry.register_algorithm(manifest=load_deepwave_manifest("1.6.0"))
+        self.dispatcher = ReproducibleMultiNodeDagDispatcher(self.store)
+        self.service = self._new_service(self.store)
+
+        source_task, cache_target, cache_lease = self._cacheable_source_and_target(
+            "v22-upgrade-cache"
+        )
+        cache_hit = self._advance(cache_target, cache_lease)
+        self.assertEqual(cache_hit.cache_hit_node_id, "a")
+        self.service.release_runtime_supervisor_lease(cache_lease)
+
+        active_task, _ = self._approved_dag("v22-upgrade-active", iterations=3)
+        active_lease = self._acquire("v22-upgrade-active")
+        active = self._advance(active_task, active_lease)
+        self.assertEqual(active.admitted_node_id, "a")
+        self.assertEqual(self._node_states(active_task)["a"], (2, "Queued"))
+        self.service.release_runtime_supervisor_lease(active_lease)
+
+        checkpoint_task, _ = self._approved_dag(
+            "v22-upgrade-checkpoint", iterations=4
+        )
+        checkpoint_lease = self._acquire("v22-upgrade-checkpoint")
+        self.assertEqual(
+            self._advance(checkpoint_task, checkpoint_lease).admitted_node_id,
+            "a",
+        )
+        self._start_active(checkpoint_task, checkpoint_lease, "a")
+        checkpoint_intent = self._active_intent(checkpoint_task)
+        observation = copy.deepcopy(
+            self.dispatcher._observations[checkpoint_intent.intent_id]
+        )
+        evidence = observation["evidence"]
+        waiting_evidence = managed_worker_evidence(
+            attempt_id=evidence["attempt_id"],
+            attempt_number=evidence["attempt_number"],
+            job_id=evidence["job_id"],
+            request_hash=evidence["request_hash"],
+            heartbeat_sequence=evidence["heartbeat"]["sequence"] + 1,
+            heartbeat_state="waiting",
+        )
+        waiting_observation = {
+            "evidence": waiting_evidence,
+            "handle": copy.deepcopy(observation["handle"]),
+        }
+        self.dispatcher._observations[checkpoint_intent.intent_id] = copy.deepcopy(
+            waiting_observation
+        )
+        self.dispatcher.worker_observation = copy.deepcopy(waiting_observation)
+        projected = self.service.project_worker_attempt(
+            checkpoint_task,
+            supervisor_lease=checkpoint_lease,
+            **self.scope,
+        )
+        self.assertTrue(projected.projected)
+        checkpoint_proof = task_service_fixtures.checkpoint_wait_proof(
+            checkpoint_task,
+            waiting_observation,
+            checkpoint_created_at="2026-07-15T03:00:10.000000Z",
+        )
+        checkpoint_proof["node_id"] = "a"
+        checkpoint_proof["proof_hash"] = encode_document(
+            {
+                key: value
+                for key, value in checkpoint_proof.items()
+                if key != "proof_hash"
+            }
+        )[1]
+        self.dispatcher.checkpoint_probe_result = copy.deepcopy(checkpoint_proof)
+        waiting = self.service.process_runtime_checkpoint(
+            checkpoint_task,
+            supervisor_lease=checkpoint_lease,
+            **self.scope,
+        )
+        self.assertEqual((waiting.state, waiting.snapshot.status), ("waiting", "Waiting"))
+
+        preserved_tables = (
+            "dag_node_execution_admissions",
+            "dag_node_cache_entries",
+            "dag_node_cache_hit_facts",
+            "worker_checkpoint_waits",
+        )
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            before = {
+                table: [
+                    dict(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table} ORDER BY rowid"
+                    ).fetchall()
+                ]
+                for table in preserved_tables
+            }
+            self.assertTrue(before["dag_node_execution_admissions"])
+            self.assertTrue(before["dag_node_cache_entries"])
+            self.assertEqual(len(before["dag_node_cache_hit_facts"]), 1)
+            self.assertEqual(len(before["worker_checkpoint_waits"]), 1)
+        finally:
+            connection.close()
+
+        upgraded = SQLiteTaskStore(self.database_path)
+        self.assertEqual(upgraded.migration_version(), 23)
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            after = {
+                table: [
+                    dict(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table} ORDER BY rowid"
+                    ).fetchall()
+                ]
+                for table in preserved_tables
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(
+                [row[0] for row in connection.execute("PRAGMA quick_check")],
+                ["ok"],
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            upgraded.get_dag_node_state_snapshot(
+                task_id=active_task,
+                **self.scope,
+            ).nodes[0].state,
+            "Queued",
+        )
+        self.assertEqual(upgraded.get_task(checkpoint_task).status, "Waiting")
+        self.assertEqual(
+            before["dag_node_cache_entries"][0]["source_task_id"],
+            source_task,
+        )
+
+    def test_parameter_change_is_a_cache_miss_and_starts_a_worker(self) -> None:
+        self.dispatcher = ReproducibleMultiNodeDagDispatcher(self.store)
+        self.service = self._new_service(self.store)
+        source_task, source_plan = self._approved_dag(
+            "cache-parameter-source",
+            iterations=2,
+        )
+        source_lease = self._acquire("cache-parameter-source")
+        self.assertEqual(
+            self._advance(source_task, source_lease).admitted_node_id, "a"
+        )
+        self._run_success(source_task, source_lease, "a")
+        self.service.release_runtime_supervisor_lease(source_lease)
+
+        target_task, target_plan = self._approved_dag(
+            "cache-parameter-target",
+            iterations=3,
+        )
+        self.assertNotEqual(source_plan["plan_hash"], target_plan["plan_hash"])
+        target_lease = self._acquire("cache-parameter-target")
+        dispatches_before = self.dispatcher.dispatch_calls
+
+        miss = self._advance(target_task, target_lease)
+
+        self.assertIsNone(miss.cache_hit_node_id)
+        self.assertEqual(miss.admitted_node_id, "a")
+        self.assertEqual(miss.active_intent.request["parameters"]["iterations"], 3)
+        self.assertEqual(self.dispatcher.dispatch_calls, dispatches_before)
+        self.assertEqual(self._dispatch_count(target_task, "a"), 0)
+
+        self._start_active(target_task, target_lease, "a")
+        self.assertEqual(self.dispatcher.dispatch_calls, dispatches_before + 1)
+        self.assertEqual(self._dispatch_count(target_task, "a"), 1)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dag_node_cache_hit_facts "
+                    "WHERE target_task_id = ?",
+                    (target_task,),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
     def test_cache_reverification_tampering_fails_closed_without_worker(self) -> None:
         _, target_task, target_lease = self._cacheable_source_and_target(
             "cache-reverify-tamper", tampering=True
@@ -817,6 +1156,912 @@ class ScientificRuntimeDagRuntimeSchedulerTest(unittest.TestCase):
         self.assertEqual(
             self._table_count("dag_node_terminal_facts", task_id), 4
         )
+
+    def test_dag_successor_can_wait_queued_while_task_is_running(self) -> None:
+        task_id, _ = self._approved_dag("successor-resource-wait")
+        lease = self._acquire("successor-resource-wait")
+        self.assertEqual(self._advance(task_id, lease).admitted_node_id, "a")
+        self._run_success(task_id, lease, "a")
+
+        successor = self._advance(task_id, lease)
+        self.assertEqual(successor.admitted_node_id, "b")
+        scheduled = self.service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+        self.assertEqual(
+            (scheduled.intent.node_id, scheduled.intent.state),
+            ("b", "dispatched"),
+        )
+
+        observed = self.service.refresh_runtime_status(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+
+        self.assertEqual(observed.snapshot.status, "Running")
+        self.assertEqual(observed.adapter_status["status"], "Queued")
+        self.assertEqual(self._node_states(task_id)["b"][1], "Queued")
+        self.assertEqual(self._dispatch_count(task_id, "b"), 1)
+
+    def test_fixed_recipe_fan_out_overlaps_and_restart_keeps_one_dispatch(
+        self,
+    ) -> None:
+        task_id, _ = self._approved_dag(
+            "fixed-recipe-parallel",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        lease = self._acquire("fixed-recipe-parallel-first")
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id, "data_check"
+        )
+        self._run_success(task_id, lease, "data_check")
+
+        admitted_b = self._advance(task_id, lease)
+        self.assertEqual(admitted_b.admitted_node_id, "forward")
+        self._start_active(task_id, lease, "forward")
+        admitted_c = self._advance(task_id, lease)
+        self.assertEqual(admitted_c.admitted_node_id, "quality_check")
+        self.assertEqual(
+            tuple(intent.node_id for intent in admitted_c.active_intents),
+            ("forward", "quality_check"),
+        )
+        self._start_active(task_id, lease, "quality_check")
+        self.assertEqual(
+            {node: state for node, (_revision, state) in self._node_states(task_id).items()},
+            {
+                "data_check": "Succeeded",
+                "forward": "Running",
+                "quality_check": "Running",
+                "fwi": "Pending",
+                "result_check": "Pending",
+            },
+        )
+        facts = self.service.get_dag_runtime_node_facts(task_id, **self.scope)
+        self.assertEqual(
+            set(facts),
+            {
+                "schema_version",
+                "task_id",
+                "plan_id",
+                "plan_hash",
+                "runtime_initialized",
+                "nodes",
+            },
+        )
+        facts_by_node = {node["node_id"]: node for node in facts["nodes"]}
+        data_check_hashes_before = tuple(
+            (
+                output["port"],
+                output["artifact_manifest"]["content_hash"],
+                output["artifact_manifest_hash"],
+            )
+            for output in facts_by_node["data_check"]["outputs"]
+        )
+        self.assertEqual(
+            (
+                facts_by_node["forward"]["state"],
+                facts_by_node["quality_check"]["state"],
+            ),
+            ("Running", "Running"),
+        )
+        self.assertNotEqual(
+            facts_by_node["forward"]["admission"]["intent_id"],
+            facts_by_node["quality_check"]["admission"]["intent_id"],
+        )
+        for intent in admitted_c.active_intents:
+            self.assertEqual(
+                intent.request["recipe"],
+                {"id": "forward_qc_fwi", "version": "1.0.0"},
+            )
+        self.assertTrue(facts_by_node["data_check"]["outputs"])
+        self.assertRegex(
+            facts_by_node["data_check"]["lineage"]["document_hash"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        with self.assertRaises(TaskNotFound):
+            self.service.get_dag_runtime_node_facts(
+                task_id,
+                project_id=PROJECT_ID,
+                principal_id="other-user",
+            )
+        counts_before = tuple(
+            self._dispatch_count(task_id, node)
+            for node in ("forward", "quality_check")
+        )
+
+        lease = self._crash_restart("fixed-recipe-parallel-successor")
+        recovered = self._advance(task_id, lease)
+        self.assertEqual(
+            tuple(intent.node_id for intent in recovered.active_intents),
+            ("forward", "quality_check"),
+        )
+        self.assertEqual(recovered.active_intent.node_id, "quality_check")
+        self.assertEqual(
+            recovered.active_intent.request["recipe"],
+            {"id": "forward_qc_fwi", "version": "1.0.0"},
+        )
+        restarted_facts = self.service.get_dag_runtime_node_facts(
+            task_id, **self.scope
+        )
+        restarted_data_check = next(
+            node
+            for node in restarted_facts["nodes"]
+            if node["node_id"] == "data_check"
+        )
+        self.assertEqual(
+            tuple(
+                (
+                    output["port"],
+                    output["artifact_manifest"]["content_hash"],
+                    output["artifact_manifest_hash"],
+                )
+                for output in restarted_data_check["outputs"]
+            ),
+            data_check_hashes_before,
+        )
+        self.assertEqual(self._dispatch_count(task_id, "data_check"), 1)
+        replay = self.service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(
+            (replay.intent.node_id, replay.intent.state),
+            ("quality_check", "dispatched"),
+        )
+        self.assertEqual(
+            tuple(
+                self._dispatch_count(task_id, node)
+                for node in ("forward", "quality_check")
+            ),
+            counts_before,
+        )
+
+        self._finish_active(task_id, lease, "quality_check", state="Failed")
+        blocked = self._advance(task_id, lease)
+        self.assertEqual(blocked.active_intent.node_id, "forward")
+        self.assertEqual(
+            (
+                self._node_states(task_id)["fwi"][1],
+                self._node_states(task_id)["result_check"][1],
+            ),
+            ("Blocked", "Blocked"),
+        )
+        self._finish_active(task_id, lease, "forward", state="Succeeded")
+        terminal = self._advance(task_id, lease)
+        self.assertEqual(terminal.snapshot.status, "Failed")
+        self.assertEqual(
+            [
+                self._dispatch_count(task_id, node)
+                for node in (
+                    "data_check",
+                    "forward",
+                    "quality_check",
+                    "fwi",
+                    "result_check",
+                )
+            ],
+            [1, 1, 1, 0, 0],
+        )
+        terminal_facts = self.service.get_dag_runtime_node_facts(
+            task_id, **self.scope
+        )
+        terminal_by_node = {
+            node["node_id"]: node for node in terminal_facts["nodes"]
+        }
+        self.assertEqual(
+            terminal_by_node["quality_check"]["failure"]["code"],
+            "ADAPTER_FAILED",
+        )
+        self.assertEqual(
+            terminal_by_node["result_check"]["failure"],
+            {
+                "code": "DEPENDENCY_FAILED",
+                "blocked_by_node_ids": ["quality_check"],
+            },
+        )
+
+    def test_fixed_recipe_restart_dispatches_admitted_branch_before_sibling(
+        self,
+    ) -> None:
+        task_id, _ = self._approved_dag(
+            "fixed-recipe-pre-dispatch-restart",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        lease = self._acquire("fixed-recipe-pre-dispatch-first")
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id, "data_check"
+        )
+        self._run_success(task_id, lease, "data_check")
+
+        forward = self._advance(task_id, lease)
+        self.assertEqual(forward.admitted_node_id, "forward")
+        self.assertEqual(forward.active_intent.state, "pending")
+        self.assertEqual(self._dispatch_count(task_id, "forward"), 0)
+
+        lease = self._crash_restart("fixed-recipe-pre-dispatch-successor")
+        recovered = self._advance(task_id, lease)
+        self.assertIsNone(recovered.admitted_node_id)
+        self.assertEqual(
+            [(intent.node_id, intent.state) for intent in recovered.active_intents],
+            [("forward", "pending")],
+        )
+        self.assertEqual(self._node_states(task_id)["quality_check"][1], "Pending")
+
+        scheduled = self.service.schedule_runtime_dispatch(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+        self.assertEqual(
+            (scheduled.intent.node_id, scheduled.intent.state),
+            ("forward", "dispatched"),
+        )
+        before_running = self._advance(task_id, lease)
+        self.assertIsNone(before_running.admitted_node_id)
+        self.assertEqual(
+            [(intent.node_id, intent.state) for intent in before_running.active_intents],
+            [("forward", "dispatched")],
+        )
+        self.assertEqual(self._node_states(task_id)["quality_check"][1], "Pending")
+
+        self.dispatcher.set_status(
+            scheduled.intent,
+            state="Running",
+            updated_at=self._now(),
+        )
+        self.service.refresh_runtime_status(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+        self.assertEqual(self._node_states(task_id)["forward"][1], "Running")
+        quality = self._advance(task_id, lease)
+        self.assertEqual(quality.admitted_node_id, "quality_check")
+        self.assertEqual(
+            [(intent.node_id, intent.state) for intent in quality.active_intents],
+            [("forward", "dispatched"), ("quality_check", "pending")],
+        )
+        self.assertEqual(self._dispatch_count(task_id, "forward"), 1)
+
+    def test_fixed_recipe_success_obeys_fan_in_and_records_timeline(self) -> None:
+        task_id, plan = self._approved_dag(
+            "fixed-recipe-success",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        self.assertTrue(is_fixed_recipe_parallel_plan(plan))
+        original_prepare = self.dispatcher.prepare_node
+
+        def prepare_with_real_development_source(
+            snapshot, *, node_id, input_binding
+        ):
+            prepared = original_prepare(
+                snapshot, node_id=node_id, input_binding=input_binding
+            )
+            fingerprint = copy.deepcopy(prepared.queue_fingerprint)
+            fingerprint["provenance_mode"] = "development"
+            fingerprint["source"] = {
+                "identity_complete": False,
+                "dirty": True,
+            }
+            return replace(prepared, queue_fingerprint=fingerprint)
+
+        # The real Adapter's best-effort Git probe reports dirty=True on a
+        # candidate tree.  This remains development provenance, not a claim of
+        # reproducibility, and must not block production Recipe admission.
+        self.dispatcher.prepare_node = prepare_with_real_development_source
+        lease = self._acquire("fixed-recipe-success")
+
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id, "data_check"
+        )
+        self._start_active(task_id, lease, "data_check")
+        self.clock_value += timedelta(milliseconds=100)
+        self._finish_active(task_id, lease, "data_check", state="Succeeded")
+
+        self.clock_value += timedelta(milliseconds=100)
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id, "forward"
+        )
+        self._start_active(task_id, lease, "forward")
+        self.clock_value += timedelta(milliseconds=100)
+        quality_admission = self._advance(task_id, lease)
+        self.assertEqual(quality_admission.admitted_node_id, "quality_check")
+        self._start_active(task_id, lease, "quality_check")
+        states = self._node_states(task_id)
+        self.assertEqual(
+            (states["forward"][1], states["quality_check"][1], states["fwi"][1]),
+            ("Running", "Running", "Pending"),
+        )
+
+        self.clock_value += timedelta(milliseconds=100)
+        self._finish_active(task_id, lease, "quality_check", state="Succeeded")
+        waiting_for_forward = self._advance(task_id, lease)
+        self.assertEqual(waiting_for_forward.active_intent.node_id, "forward")
+        self.assertEqual(self._node_states(task_id)["fwi"][1], "Pending")
+        self.clock_value += timedelta(milliseconds=100)
+        self._finish_active(task_id, lease, "forward", state="Succeeded")
+
+        self.clock_value += timedelta(milliseconds=100)
+        fwi = self._advance(task_id, lease)
+        self.assertEqual(fwi.admitted_node_id, "fwi")
+        self._start_active(task_id, lease, "fwi")
+        self.clock_value += timedelta(milliseconds=100)
+        self._finish_active(task_id, lease, "fwi", state="Succeeded")
+
+        self.clock_value += timedelta(milliseconds=100)
+        result_check = self._advance(task_id, lease)
+        self.assertEqual(result_check.admitted_node_id, "result_check")
+        self._start_active(task_id, lease, "result_check")
+        self.clock_value += timedelta(milliseconds=100)
+        terminal = self._finish_active(
+            task_id, lease, "result_check", state="Succeeded"
+        )
+        self.assertEqual(terminal.snapshot.status, "Succeeded")
+        self.assertEqual(
+            [
+                self._dispatch_count(task_id, node)
+                for node in (
+                    "data_check",
+                    "forward",
+                    "quality_check",
+                    "fwi",
+                    "result_check",
+                )
+            ],
+            [1, 1, 1, 1, 1],
+        )
+        for intent in self.store.list_dispatch_intents(task_id):
+            self.assertEqual(
+                intent.queue_fingerprint["source"],
+                {"identity_complete": False, "dirty": True},
+            )
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            timeline = {
+                (node_id, state): recorded_at_us
+                for node_id, state, recorded_at_us in connection.execute(
+                    "SELECT node_id, state, recorded_at_us "
+                    "FROM dag_node_state_events WHERE task_id = ?",
+                    (task_id,),
+                )
+            }
+        finally:
+            connection.close()
+        self.assertLess(
+            timeline[("data_check", "Succeeded")],
+            timeline[("forward", "Running")],
+        )
+        self.assertLess(
+            timeline[("forward", "Running")],
+            timeline[("quality_check", "Running")],
+        )
+        self.assertLess(
+            timeline[("quality_check", "Running")],
+            timeline[("quality_check", "Succeeded")],
+        )
+        self.assertLess(
+            timeline[("quality_check", "Succeeded")],
+            timeline[("forward", "Succeeded")],
+        )
+        self.assertLess(
+            timeline[("forward", "Succeeded")],
+            timeline[("fwi", "Queued")],
+        )
+        self.assertLess(
+            timeline[("fwi", "Succeeded")],
+            timeline[("result_check", "Queued")],
+        )
+        self.assertLess(
+            timeline[("result_check", "Running")],
+            timeline[("result_check", "Succeeded")],
+        )
+
+        collected = self.service.collect_artifacts(task_id, **self.scope)
+        self.assertEqual(len(collected), 8)
+        self.assertEqual(
+            Counter(value["node_id"] for value in collected),
+            Counter(
+                {
+                    "data_check": 2,
+                    "forward": 1,
+                    "quality_check": 1,
+                    "fwi": 2,
+                    "result_check": 2,
+                }
+            ),
+        )
+        for manifest in collected:
+            returned, data = self.service.read_artifact(
+                task_id, manifest["artifact_id"], **self.scope
+            )
+            self.assertEqual(returned, manifest)
+            self.assertEqual(
+                "sha256:" + hashlib.sha256(data).hexdigest(),
+                manifest["content_hash"],
+            )
+
+        trashed = self.service.trash_task(
+            task_id=task_id,
+            expected_visibility_revision=0,
+            idempotency_key="trash-fixed-recipe-success",
+            **self.scope,
+        )
+        purged = self.service.purge_task(
+            task_id=task_id,
+            expected_visibility_revision=trashed.snapshot.visibility_revision,
+            idempotency_key="purge-fixed-recipe-success",
+            **self.scope,
+        )
+        replay = self.service.purge_task(
+            task_id=task_id,
+            expected_visibility_revision=trashed.snapshot.visibility_revision,
+            idempotency_key="purge-fixed-recipe-success",
+            **self.scope,
+        )
+        self.assertEqual(purged.local_run_state, "deleted")
+        self.assertFalse(purged.replayed)
+        self.assertEqual(replay.purge_id, purged.purge_id)
+        self.assertTrue(replay.replayed)
+        self.assertEqual(self.dispatcher.purge_calls, 5)
+        self.assertEqual(
+            self.dispatcher.purge_ids, [purged.purge_id] * 5
+        )
+
+    def test_fixed_recipe_success_synchronizes_terminal_worker_evidence(self) -> None:
+        task_id, _ = self._approved_dag(
+            "fixed-recipe-terminal-evidence",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        lease = self._acquire("fixed-recipe-terminal-evidence")
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id, "data_check"
+        )
+        self._start_active(task_id, lease, "data_check")
+        intent = self._active_intent(task_id)
+        manifests, artifact_data = (
+            task_service_fixtures.ScientificRuntimeTaskServiceTest.artifact_manifests(
+                self, task_id
+            )
+        )
+        self.dispatcher.set_node_outputs(intent, manifests, artifact_data)
+        self.dispatcher.set_terminal_heartbeat(intent, state="succeeded")
+        self.dispatcher.set_status(
+            intent, state="Succeeded", updated_at=self._now()
+        )
+
+        # Prove the Store independently refuses a Recipe receipt when a caller
+        # claims terminal evidence without durably projecting it first.
+        fake_projection = mock.Mock(
+            evidence={"heartbeat": {"state": "succeeded"}}
+        )
+        event_count = self.store.latest_run_event_sequence(task_id)
+        with mock.patch.object(
+            self.service,
+            "project_worker_attempt",
+            return_value=fake_projection,
+        ):
+            with self.assertRaisesRegex(
+                TaskConflict, "concurrent Adapter status updates did not converge"
+            ):
+                self.service.refresh_runtime_status(
+                    task_id,
+                    supervisor_lease=lease,
+                    **self.scope,
+                )
+        self.assertEqual(
+            self.store.latest_run_event_sequence(task_id), event_count
+        )
+        self.assertEqual(self._node_states(task_id)["data_check"][1], "Running")
+        self.assertEqual(self._table_count("dag_node_terminal_facts", task_id), 0)
+
+        # The production service path closes the cadence race by projecting
+        # the terminal Worker document synchronously, then publishes one exact
+        # Succeeded receipt that remains readable through the product model.
+        succeeded = self.service.refresh_runtime_status(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+        self.assertEqual(succeeded.snapshot.status, "Running")
+        self.assertEqual(
+            self._node_states(task_id)["data_check"][1], "Succeeded"
+        )
+        facts = self.service.get_dag_runtime_node_facts(task_id, **self.scope)
+        self.assertIsNotNone(facts)
+        data_check = next(
+            node for node in facts["nodes"] if node["node_id"] == "data_check"
+        )
+        self.assertEqual(data_check["state"], "Succeeded")
+        connection = sqlite3.connect(self.database_path)
+        try:
+            terminal = connection.execute(
+                "SELECT terminal.worker_observation_sequence, "
+                "observation.heartbeat_state, "
+                "terminal.worker_observation_hash = observation.document_hash "
+                "FROM dag_node_terminal_facts AS terminal "
+                "JOIN worker_attempt_observations AS observation "
+                "ON observation.attempt_id = terminal.attempt_id "
+                "AND observation.observation_sequence = "
+                "terminal.worker_observation_sequence "
+                "WHERE terminal.task_id = ? AND terminal.node_id = 'data_check'",
+                (task_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(terminal, (2, "succeeded", 1))
+
+    def test_all_cache_hit_recipe_lists_reads_and_purges_no_local_run(self) -> None:
+        self.dispatcher = ReproducibleMultiNodeDagDispatcher(self.store)
+        self.service = self._new_service(self.store)
+        source_task, _ = self._approved_dag(
+            "fixed-recipe-cache-source",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        source_lease = self._acquire("fixed-recipe-cache-source")
+        for node_id in (
+            "data_check",
+            "forward",
+            "quality_check",
+            "fwi",
+            "result_check",
+        ):
+            self.assertEqual(
+                self._advance(source_task, source_lease).admitted_node_id,
+                node_id,
+            )
+            self._run_success(source_task, source_lease, node_id)
+        self.service.release_runtime_supervisor_lease(source_lease)
+        source_artifacts = self.service.collect_artifacts(
+            source_task, **self.scope
+        )
+        self.assertEqual(len(source_artifacts), 8)
+
+        target_task, _ = self._approved_dag(
+            "fixed-recipe-cache-target",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        target_lease = self._acquire("fixed-recipe-cache-target")
+        for node_id in (
+            "data_check",
+            "forward",
+            "quality_check",
+            "fwi",
+            "result_check",
+        ):
+            hit = self._advance(target_task, target_lease)
+            self.assertEqual(hit.cache_hit_node_id, node_id)
+            self.assertIsNone(hit.admitted_node_id)
+        self.assertEqual(
+            self.service.get_task(target_task, **self.scope).status,
+            "Succeeded",
+        )
+        self.assertEqual(self.store.list_dispatch_intents(target_task), ())
+        target_artifacts = self.service.collect_artifacts(
+            target_task, **self.scope
+        )
+        self.assertEqual(len(target_artifacts), 8)
+        for manifest in target_artifacts:
+            returned, data = self.service.read_artifact(
+                target_task, manifest["artifact_id"], **self.scope
+            )
+            self.assertEqual(returned, manifest)
+            self.assertEqual(
+                "sha256:" + hashlib.sha256(data).hexdigest(),
+                manifest["content_hash"],
+            )
+
+        # Exercise the v23 database authority directly on isolated copies of
+        # the completed cache-only Task.  A forged terminal status is not
+        # enough: every node must retain exactly one cache hit bound to the
+        # current Plan and Approval.
+        for corruption in ("missing_node", "wrong_approval"):
+            with self.subTest(cache_only_trash_corruption=corruption):
+                corrupted_path = (
+                    Path(self.temporary.name)
+                    / f"cache-only-trash-{corruption}.sqlite3"
+                )
+                source_connection = sqlite3.connect(self.database_path)
+                corrupted_connection = sqlite3.connect(corrupted_path)
+                try:
+                    source_connection.backup(corrupted_connection)
+                    corrupted_connection.execute("PRAGMA foreign_keys = OFF")
+                    if corruption == "missing_node":
+                        corrupted_connection.execute(
+                            "DROP TRIGGER "
+                            "dag_node_cache_hit_facts_cannot_be_deleted"
+                        )
+                        corrupted_connection.execute(
+                            "DELETE FROM dag_node_cache_hit_facts "
+                            "WHERE target_task_id = ? "
+                            "AND target_node_id = 'result_check'",
+                            (target_task,),
+                        )
+                    else:
+                        corrupted_connection.execute(
+                            "DROP TRIGGER dag_node_cache_hit_facts_are_append_only"
+                        )
+                        corrupted_connection.execute(
+                            "UPDATE dag_node_cache_hit_facts "
+                            "SET target_approval_id = 'approval-forged' "
+                            "WHERE target_task_id = ? "
+                            "AND target_node_id = 'result_check'",
+                            (target_task,),
+                        )
+                    corrupted_connection.commit()
+                    with self.assertRaisesRegex(
+                        sqlite3.IntegrityError,
+                        "only a resolved terminal task can be moved to trash",
+                    ):
+                        corrupted_connection.execute(
+                            """
+                            INSERT INTO task_visibility_events(
+                                task_id, project_id, principal_id, revision,
+                                event_id, action, previous_state, state,
+                                trashed_at, document_json, document_hash,
+                                occurred_at, recorded_at
+                            ) VALUES (?, ?, ?, 1, ?, 'trashed', 'active',
+                                      'trashed', ?, '{}', ?, ?, ?)
+                            """,
+                            (
+                                target_task,
+                                PROJECT_ID,
+                                PRINCIPAL_ID,
+                                f"visibility-corrupt-{corruption}",
+                                self._now(),
+                                "sha256:" + "0" * 64,
+                                self._now(),
+                                self._now(),
+                            ),
+                        )
+                    corrupted_connection.rollback()
+                finally:
+                    corrupted_connection.close()
+                    source_connection.close()
+
+        trashed = self.service.trash_task(
+            task_id=target_task,
+            expected_visibility_revision=0,
+            idempotency_key="trash-fixed-recipe-cache-target",
+            **self.scope,
+        )
+        purged = self.service.purge_task(
+            task_id=target_task,
+            expected_visibility_revision=trashed.snapshot.visibility_revision,
+            idempotency_key="purge-fixed-recipe-cache-target",
+            **self.scope,
+        )
+        self.assertEqual(purged.local_run_state, "not_created")
+        self.assertEqual(self.dispatcher.purge_calls, 0)
+        source_manifest = source_artifacts[0]
+        returned, data = self.service.read_artifact(
+            source_task, source_manifest["artifact_id"], **self.scope
+        )
+        self.assertEqual(returned, source_manifest)
+        self.assertEqual(
+            "sha256:" + hashlib.sha256(data).hexdigest(),
+            source_manifest["content_hash"],
+        )
+
+    def test_near_match_recipe_version_is_rejected_before_execution(self) -> None:
+        task_id, _ = self._approved_dag(
+            "near-match-recipe",
+            fixed_recipe=True,
+            fixed_recipe_version="1.0.1",
+        )
+        lease = self._acquire("near-match-recipe")
+        with self.assertRaisesRegex(
+            TaskValidationError, "FIXED_RECIPE_INVALID"
+        ):
+            self._advance(task_id, lease)
+        self.assertEqual(self._dispatch_count(task_id, "data_check"), 0)
+
+    def test_recipe_extension_on_non_recipe_topology_is_not_parallel(self) -> None:
+        plan = current_optimizer_plan_graph()
+        template = copy.deepcopy(plan["nodes"][0])
+        plan["schema_version"] = "1.2.0"
+        plan["extensions"] = {
+            "org.agent_rpc.recipe": {
+                "id": "forward_qc_fwi",
+                "version": "1.0.0",
+            }
+        }
+        plan["nodes"] = []
+        for node_id, dependencies in {
+            "a": [],
+            "b": ["a"],
+            "c": ["a"],
+            "d": ["b", "c"],
+            "e": ["d"],
+        }.items():
+            node = copy.deepcopy(template)
+            node["node_id"] = node_id
+            node["dependencies"] = dependencies
+            plan["nodes"].append(node)
+        self.assertFalse(is_fixed_recipe_parallel_plan(plan))
+
+    def test_v23_database_rejects_second_active_for_spoofed_recipe_document(
+        self,
+    ) -> None:
+        task_id, _ = self._approved_dag(
+            "v23-direct-recipe-guard",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        lease = self._acquire("v23-direct-recipe-guard")
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id,
+            "data_check",
+        )
+        self._run_success(task_id, lease, "data_check")
+        self.assertEqual(self._advance(task_id, lease).admitted_node_id, "forward")
+        self._start_active(task_id, lease, "forward")
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id,
+            "quality_check",
+        )
+
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            admission_row = connection.execute(
+                "SELECT * FROM dag_node_execution_admissions "
+                "WHERE task_id = ? AND node_id = 'quality_check'",
+                (task_id,),
+            ).fetchone()
+            self.assertIsNotNone(admission_row)
+            admission = dict(admission_row)
+            original_plan_json = connection.execute(
+                "SELECT document_json FROM plans WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        # Prepare one exact candidate row while deliberately bypassing only
+        # the append-only guards needed to simulate a compromised caller. The
+        # v23 admission trigger under test remains installed throughout.
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            for trigger in (
+                "dag_node_execution_transition_facts_cannot_be_deleted",
+                "dag_node_execution_admissions_cannot_be_deleted",
+                "dag_node_state_events_cannot_be_deleted",
+                "plans_are_append_only",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute(
+                "DELETE FROM dag_node_execution_transition_facts "
+                "WHERE intent_id = ?",
+                (admission["intent_id"],),
+            )
+            connection.execute(
+                "DELETE FROM dag_node_execution_admissions WHERE intent_id = ?",
+                (admission["intent_id"],),
+            )
+            connection.execute(
+                "DELETE FROM dag_node_state_events "
+                "WHERE task_id = ? AND node_id = 'quality_check' "
+                "AND revision = ?",
+                (task_id, admission["queued_revision"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        original_plan = json.loads(original_plan_json)
+        spoofed_topology = copy.deepcopy(original_plan)
+        spoofed_topology["nodes"][4]["dependencies"] = ["forward"]
+        spoofed_input = copy.deepcopy(original_plan)
+        spoofed_input["nodes"][3]["inputs"][1]["port"] = "fake_evidence"
+        admission_columns = list(admission)
+        insert_sql = (
+            "INSERT INTO dag_node_execution_admissions("
+            + ",".join(admission_columns)
+            + ") VALUES ("
+            + ",".join("?" for _ in admission_columns)
+            + ")"
+        )
+        admission_values = tuple(admission[column] for column in admission_columns)
+
+        for label, spoofed in (
+            ("topology", spoofed_topology),
+            ("input", spoofed_input),
+        ):
+            with self.subTest(label=label):
+                connection = sqlite3.connect(self.database_path)
+                try:
+                    connection.execute(
+                        "UPDATE plans SET document_json = ? WHERE task_id = ?",
+                        (
+                            json.dumps(
+                                spoofed,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            task_id,
+                        ),
+                    )
+                    connection.commit()
+                    with self.assertRaisesRegex(
+                        sqlite3.IntegrityError,
+                        "DAG node admission requires the exact current ready case",
+                    ):
+                        connection.execute(insert_sql, admission_values)
+                    connection.rollback()
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM dag_node_execution_admissions "
+                            "WHERE task_id = ? AND node_id = 'quality_check'",
+                            (task_id,),
+                        ).fetchone()[0],
+                        0,
+                    )
+                finally:
+                    connection.close()
+
+    def test_recipe_durable_request_hashes_must_match_admission_binding(self) -> None:
+        task_id, _ = self._approved_dag(
+            "recipe-request-binding-tamper",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        lease = self._acquire("recipe-request-binding-tamper")
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id,
+            "data_check",
+        )
+        self._run_success(task_id, lease, "data_check")
+        forward = self._advance(task_id, lease)
+        self.assertEqual(forward.admitted_node_id, "forward")
+        intent_id = forward.active_intent.intent_id
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            document = json.loads(
+                connection.execute(
+                    "SELECT request_json FROM dispatch_intents "
+                    "WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchone()[0]
+            )
+            tampered_hash = "sha256:" + "3" * 64
+            document["request"]["recipe_input_hashes"][0] = tampered_hash
+            document["queue_fingerprint"]["input_hashes"][1] = tampered_hash
+            document_json, document_hash = encode_document(document)
+            _, fingerprint_hash = encode_document(document["queue_fingerprint"])
+            connection.execute("DROP TRIGGER dispatch_intents_are_immutable")
+            connection.execute(
+                "UPDATE dispatch_intents "
+                "SET request_json = ?, request_hash = ?, fingerprint_hash = ? "
+                "WHERE intent_id = ?",
+                (
+                    document_json,
+                    document_hash,
+                    fingerprint_hash,
+                    intent_id,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(
+            TaskStoreCorruption,
+            "Recipe request differs from its exact plan",
+        ):
+            self.store.get_dispatch_intent_by_id(intent_id)
 
     def test_failed_branch_blocks_only_descendants_and_survives_restart(self) -> None:
         task_id, _ = self._approved_dag("local-failure")

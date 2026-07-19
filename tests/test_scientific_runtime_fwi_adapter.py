@@ -52,6 +52,13 @@ from scientific_runtime.fwi_adapter import (
     DeepwaveAdapter,
     SafeSubprocessWorkerLauncher,
 )
+from scientific_runtime.fixed_recipe import (
+    RECIPE_ID,
+    RECIPE_VERSION,
+    fixed_recipe_extension,
+    is_fixed_recipe_extension,
+    load_fixed_recipe_manifest,
+)
 from scientific_runtime.task_dispatcher import (
     DispatchCheckpointProof,
     DispatchCheckpointResumeResult,
@@ -89,6 +96,8 @@ HASH_DATASET = "sha256:" + "a" * 64
 HASH_ENVIRONMENT = "sha256:" + "b" * 64
 HASH_CONFIG = "sha256:" + "c" * 64
 PLAN_HASH = "sha256:" + "d" * 64
+HASH_RECIPE_INPUT_1 = "sha256:" + "e" * 64
+HASH_RECIPE_INPUT_2 = "sha256:" + "f" * 64
 
 
 def algorithm_identity() -> dict[str, Any]:
@@ -576,6 +585,288 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             self.adapter.validate(**kwargs)
         if code is not None:
             self.assertIn(code, str(raised.exception))
+
+    def test_fixed_recipe_contract_is_closed_versioned_and_isolated(self) -> None:
+        manifest = load_fixed_recipe_manifest()
+        self.assertEqual(
+            (manifest["id"], manifest["version"]),
+            (RECIPE_ID, RECIPE_VERSION),
+        )
+        self.assertEqual(
+            [node["node_id"] for node in manifest["nodes"]],
+            ["data_check", "forward", "quality_check", "fwi", "result_check"],
+        )
+        self.assertEqual(
+            [node["dependencies"] for node in manifest["nodes"]],
+            [
+                [],
+                ["data_check"],
+                ["data_check"],
+                ["forward", "quality_check"],
+                ["fwi"],
+            ],
+        )
+        self.assertEqual(len(manifest["plan_outputs"]), 8)
+        self.assertTrue(is_fixed_recipe_extension(fixed_recipe_extension()))
+        self.assertFalse(
+            is_fixed_recipe_extension(
+                {**fixed_recipe_extension(), "stage": "forward"}
+            )
+        )
+        manifest["nodes"][0]["dependencies"].append("tamper")
+        self.assertEqual(
+            load_fixed_recipe_manifest()["nodes"][0]["dependencies"], []
+        )
+
+    def test_recipe_stage_selects_exact_worker_command_without_changing_ordinary_fwi(
+        self,
+    ) -> None:
+        ordinary = self.adapter.validate(**self.execution_kwargs())
+        forward = self.adapter.validate(
+            **self.execution_kwargs(),
+            recipe=fixed_recipe_extension(),
+            recipe_stage="forward",
+            recipe_input_hashes=[HASH_RECIPE_INPUT_1],
+        )
+        inversion = self.adapter.validate(
+            **self.execution_kwargs(),
+            recipe=fixed_recipe_extension(),
+            recipe_stage="fwi",
+            recipe_input_hashes=[HASH_RECIPE_INPUT_1, HASH_RECIPE_INPUT_2],
+        )
+        self.assertEqual(
+            (ordinary.command, ordinary.worker_config["iterations"]),
+            ("invert", 2),
+        )
+        self.assertEqual(
+            (
+                forward.command,
+                forward.worker_config["preset"],
+                forward.worker_config["iterations"],
+            ),
+            ("forward", "forward", 0),
+        )
+        self.assertEqual(
+            (
+                inversion.command,
+                inversion.worker_config["preset"],
+                inversion.worker_config["iterations"],
+            ),
+            ("invert", "fwi_smoke", 2),
+        )
+        self.assertNotEqual(
+            forward.normalized_config_hash, inversion.normalized_config_hash
+        )
+        self.assertEqual(
+            forward.fingerprint["input_hashes"],
+            [HASH_DATASET, HASH_RECIPE_INPUT_1],
+        )
+        with self.assertRaisesRegex(AdapterValidationError, "FIXED_RECIPE_INVALID"):
+            self.adapter.validate(
+                **self.execution_kwargs(),
+                recipe=fixed_recipe_extension(),
+                recipe_stage="forward",
+                recipe_input_hashes=[],
+            )
+        with self.assertRaisesRegex(AdapterValidationError, "FIXED_RECIPE_INVALID"):
+            self.adapter.validate(
+                **self.execution_kwargs(),
+                recipe_input_hashes=[HASH_RECIPE_INPUT_1],
+            )
+        with self.assertRaisesRegex(AdapterValidationError, "FIXED_RECIPE_INVALID"):
+            self.adapter.validate(
+                **self.execution_kwargs(),
+                recipe={"id": RECIPE_ID, "version": "9.9.9"},
+                recipe_stage="forward",
+            )
+        with self.assertRaisesRegex(AdapterValidationError, "FIXED_RECIPE_INVALID"):
+            self.adapter.validate(
+                **self.execution_kwargs(),
+                recipe=fixed_recipe_extension(),
+                recipe_stage="unknown",
+            )
+
+    def test_only_clean_fixed_recipe_uses_reproducible_cache_fingerprint(
+        self,
+    ) -> None:
+        def production_fingerprint(**kwargs: Any) -> dict[str, Any]:
+            value = development_fingerprint()
+            value.update(
+                provenance_mode="reproducible",
+                source={
+                    "identity_complete": True,
+                    "git_commit": "1" * 40,
+                    "git_tree": "2" * 40,
+                    "dirty": False,
+                },
+                normalized_config_hash=kwargs["normalized_config_hash"],
+                input_hashes=list(kwargs["input_hashes"]),
+            )
+            return value
+
+        production = DeepwaveAdapter(
+            run_root=self.run_root,
+            launcher=self.launcher,
+            dataset_identity_provider=self.dataset_provider,
+            registry_snapshot_provider=self.registry_provider,
+            device_validator=self.device_validator,
+            fingerprint_factory=production_fingerprint,
+            clock=lambda: NOW,
+        )
+        recipe = production.validate(
+            **self.execution_kwargs(),
+            recipe=fixed_recipe_extension(),
+            recipe_stage="forward",
+            recipe_input_hashes=[HASH_RECIPE_INPUT_1],
+        )
+        self.assertEqual(recipe.fingerprint["provenance_mode"], "reproducible")
+        self.assertEqual(
+            recipe.fingerprint["input_hashes"],
+            [HASH_DATASET, HASH_RECIPE_INPUT_1],
+        )
+        with self.assertRaisesRegex(AdapterUnavailable, "source/environment provenance"):
+            production.validate(**self.execution_kwargs())
+
+    def test_default_recipe_fingerprint_never_promotes_a_dirty_checkout(
+        self,
+    ) -> None:
+        arguments = {
+            "algorithm": algorithm_identity(),
+            "normalized_config_hash": HASH_CONFIG,
+            "input_hashes": [HASH_DATASET, HASH_RECIPE_INPUT_1],
+            "seed": 2026,
+            "device": "cpu",
+            "device_details": {
+                "environment_lock_hash": HASH_ENVIRONMENT,
+                "runtime": development_fingerprint()["runtime"],
+                "device_name": "synthetic-test-cpu",
+                "compute_capability": None,
+            },
+        }
+        clean_source = {
+            "identity_complete": True,
+            "git_commit": "1" * 40,
+            "git_tree": "2" * 40,
+            "dirty": False,
+        }
+        with patch.object(
+            fwi_adapter_module,
+            "_git_source_evidence",
+            side_effect=lambda: copy.deepcopy(clean_source),
+        ):
+            recipe = fwi_adapter_module._default_fingerprint_factory(
+                **arguments, reproducible=True
+            )
+            ordinary = fwi_adapter_module._default_fingerprint_factory(
+                **arguments, reproducible=False
+            )
+        self.assertEqual(recipe["provenance_mode"], "reproducible")
+        self.assertEqual(ordinary["provenance_mode"], "development")
+        dirty_source = {**clean_source, "identity_complete": False, "dirty": True}
+        with patch.object(
+            fwi_adapter_module,
+            "_git_source_evidence",
+            side_effect=lambda: copy.deepcopy(dirty_source),
+        ):
+            dirty = fwi_adapter_module._default_fingerprint_factory(
+                **arguments, reproducible=True
+            )
+        self.assertEqual(dirty["provenance_mode"], "development")
+        self.assertIs(dirty["source"]["identity_complete"], False)
+
+    def test_recipe_submit_persists_stage_and_launches_forward_or_invert(
+        self,
+    ) -> None:
+        forward_request = self.submit_kwargs(
+            task_id="task-recipe-forward",
+            node_id="forward",
+            idempotency_key="task-recipe-forward:forward:0001",
+        )
+        forward_request["recipe"] = fixed_recipe_extension()
+        forward_request["recipe_input_hashes"] = [HASH_RECIPE_INPUT_1]
+        forward_handle = self.adapter.submit(**copy.deepcopy(forward_request))
+        self.assertEqual(self.launcher.calls[-1]["command"], "forward")
+        self.assertFalse(self.launcher.calls[-1]["checkpoint_capable"])
+        record = json.loads(
+            self.submission_record_path(forward_handle).read_text(encoding="utf-8")
+        )
+        self.assertEqual(record["recipe"], fixed_recipe_extension())
+        self.assertEqual(record["recipe_input_hashes"], [HASH_RECIPE_INPUT_1])
+        self.assertEqual(
+            record["fingerprint"]["input_hashes"],
+            [HASH_DATASET, HASH_RECIPE_INPUT_1],
+        )
+        self.assertEqual(record["worker_config"]["iterations"], 0)
+        self.assertEqual(
+            self.adapter.lookup_existing_handle(**copy.deepcopy(forward_request)),
+            forward_handle,
+        )
+
+        fwi_request = self.submit_kwargs(
+            task_id="task-recipe-fwi",
+            node_id="fwi",
+            idempotency_key="task-recipe-fwi:fwi:0001",
+        )
+        fwi_request["recipe"] = fixed_recipe_extension()
+        fwi_request["recipe_input_hashes"] = [
+            HASH_RECIPE_INPUT_1,
+            HASH_RECIPE_INPUT_2,
+        ]
+        self.adapter.submit(**fwi_request)
+        self.assertEqual(self.launcher.calls[-1]["command"], "invert")
+        self.assertTrue(self.launcher.calls[-1]["checkpoint_capable"])
+
+    def test_recipe_forward_collects_all_hash_bound_outputs_with_stage_metadata(
+        self,
+    ) -> None:
+        request = self.submit_kwargs(
+            task_id="task-recipe-collect",
+            node_id="forward",
+            idempotency_key="task-recipe-collect:forward:0001",
+        )
+        request["recipe"] = fixed_recipe_extension()
+        request["recipe_input_hashes"] = [HASH_RECIPE_INPUT_1]
+        handle = self.adapter.submit(**request)
+        run_dir = self.launcher.calls[-1]["run_dir"]
+        self.write_success_artifacts(run_dir)
+
+        loss_path = run_dir / "loss.csv"
+        loss_path.write_text(
+            "iteration,frequency_hz,loss\n0,8,1\n", encoding="utf-8"
+        )
+        metrics_path = run_dir / "metrics.json"
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        metrics.update(
+            {
+                "iterations": 0,
+                "final_loss": 1.0,
+                "loss_reduction_fraction": 0.0,
+                "model_update_relative_l2": 0.0,
+            }
+        )
+        metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+        manifest_path = run_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["command"] = "forward"
+        manifest["metrics"] = metrics
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+        status.update(iteration=0, total_iterations=0)
+        (run_dir / "status.json").write_text(
+            json.dumps(status), encoding="utf-8"
+        )
+
+        artifacts = self.adapter.collect(handle)
+        self.assertEqual(len(artifacts), 8)
+        self.assertEqual(
+            {artifact["extensions"]["org.agent_rpc.recipe_artifact"]["stage"] for artifact in artifacts},
+            {"forward"},
+        )
+        self.assertEqual(
+            {artifact["extensions"]["org.agent_rpc.recipe_artifact"]["worker_command"] for artifact in artifacts},
+            {"forward"},
+        )
+        self.assertTrue(all(not schema_errors("artifact-manifest.schema.json", artifact) for artifact in artifacts))
 
     def submit_and_run_dir(
         self,
@@ -2542,6 +2833,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             binding_document={
                 "inputs": [
                     {
+                        "input_index": 0,
                         "kind": "dataset",
                         "target_input_port": "model",
                         "dataset": input_identity,
@@ -2663,6 +2955,95 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(
             legacy.exception.code, "SUBMISSION_RECONCILIATION_REQUIRED"
         )
+
+    def test_dispatcher_binds_exact_recipe_extension_to_stage_command(self) -> None:
+        dataset = copy.deepcopy(self.dataset)
+        identity = {
+            key: dataset[key]
+            for key in ("id", "version", "content_hash", "data_type")
+        }
+        node = {
+            "node_id": "data_check",
+            "algorithm": algorithm_identity(),
+            "inputs": [{"port": "model", "dataset": identity}],
+            "parameters": parameters(),
+            "resources": resources(),
+            "idempotency_key": "task-recipe-bridge:data-check:0001",
+        }
+        plan = {
+            "plan_id": "plan-recipe-bridge",
+            "plan_hash": PLAN_HASH,
+            "task_type": "acoustic_fwi_2d",
+            "nodes": [node, {**copy.deepcopy(node), "node_id": "forward"}],
+            "extensions": {"org.agent_rpc.recipe": fixed_recipe_extension()},
+        }
+        snapshot = TaskSnapshot(
+            task_id="task-recipe-bridge",
+            project_id="project-1",
+            principal_id="user-1",
+            status="AwaitingApproval",
+            draft={"datasets": [dataset]},
+            plan=plan,
+            approval={"approval_id": "approval-recipe-bridge"},
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        binding = DagNodeInputBindingFact(
+            task_id=snapshot.task_id,
+            plan_id=plan["plan_id"],
+            plan_hash=plan["plan_hash"],
+            approval_id="approval-recipe-bridge",
+            target_node_id="data_check",
+            target_node_revision=1,
+            project_id=snapshot.project_id,
+            principal_id=snapshot.principal_id,
+            fencing_token=1,
+            owner_id="runtime-owner",
+            term_acquired_at=NOW,
+            claim_readiness_document_hash="sha256:" + "1" * 64,
+            binding_document={
+                "inputs": [
+                    {
+                        "input_index": 0,
+                        "kind": "dataset",
+                        "target_input_port": "model",
+                        "dataset": identity,
+                    }
+                ]
+            },
+            binding_document_hash="sha256:" + "2" * 64,
+            recorded_at=NOW,
+            replayed=False,
+        )
+        dispatcher = DeepwaveTaskDispatcher(self.adapter)
+        prepared = dispatcher.prepare_node(
+            snapshot, node_id="data_check", input_binding=binding
+        )
+        self.assertEqual(prepared.request["recipe"], fixed_recipe_extension())
+        self.assertEqual(prepared.request["recipe_input_hashes"], [])
+        intent = DispatchIntentSnapshot(
+            intent_id="dispatch-recipe-bridge",
+            task_id=snapshot.task_id,
+            plan_id=plan["plan_id"],
+            plan_hash=plan["plan_hash"],
+            approval_id="approval-recipe-bridge",
+            node_id="data_check",
+            node_idempotency_key=node["idempotency_key"],
+            adapter_id=prepared.adapter_id,
+            adapter_version=prepared.adapter_version,
+            request=prepared.request,
+            request_hash="sha256:" + "e" * 64,
+            queue_fingerprint=prepared.queue_fingerprint,
+            state="dispatching",
+            handle=None,
+            failure_code=None,
+            created_at=NOW,
+            dispatch_claimed_at=NOW,
+            outcome_recorded_at=None,
+        )
+        dispatcher.ensure_first_dispatch(intent)
+        self.assertEqual(self.launcher.calls[-1]["command"], "forward")
+        self.assertFalse(self.launcher.calls[-1]["checkpoint_capable"])
 
     def test_task_service_startup_adopts_real_adapter_lost_receipt(self) -> None:
         database_path = self.base / "receipt-recovery.sqlite3"
@@ -5980,6 +6361,10 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertRegex(
             validated.device_details["development_environment_snapshot_hash"],
             r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            validated.device_details["environment_lock_hash"],
+            validated.device_details["development_environment_snapshot_hash"],
         )
         self.assertEqual(self.root_snapshot(), before)
 

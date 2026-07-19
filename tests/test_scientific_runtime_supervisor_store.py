@@ -1855,7 +1855,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         }
 
     def test_fresh_v20_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 22)
+        self.assertEqual(self.store.migration_version(), 23)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -2042,6 +2042,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "dag_node_terminal_fact_requires_exact_p2_evidence",
             "dag_node_terminal_fact_requires_active_completion_term",
             "dag_node_terminal_success_requires_complete_receipt",
+            "fixed_recipe_terminal_success_requires_succeeded_worker",
             "dag_node_terminal_facts_are_append_only",
             "dag_node_terminal_facts_cannot_be_deleted",
             "dag_node_execution_transition_requires_exact_current_case",
@@ -2304,7 +2305,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         upgraded = SQLiteTaskStore(historical_path)
-        self.assertEqual(upgraded.migration_version(), 22)
+        self.assertEqual(upgraded.migration_version(), 23)
         connection = sqlite3.connect(historical_path)
         try:
             heartbeat_schema = connection.execute(
@@ -2448,11 +2449,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 14)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 22)
+        self.assertEqual(upgraded.migration_version(), 23)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 22
+                connection.execute("PRAGMA user_version").fetchone()[0], 23
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -2487,11 +2488,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 15)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 22)
+        self.assertEqual(upgraded.migration_version(), 23)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 22
+                connection.execute("PRAGMA user_version").fetchone()[0], 23
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -3178,7 +3179,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 22)
+        self.assertEqual(reopened.migration_version(), 23)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -3250,7 +3251,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 22)
+        self.assertEqual(reopened.migration_version(), 23)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)

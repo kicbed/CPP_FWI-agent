@@ -2158,7 +2158,7 @@ class WorkerLaunchControlTest(unittest.TestCase):
             result = worker_launch_bootstrap.main(
                 [
                     "--command",
-                    "invert",
+                    "forward",
                     "--config",
                     str(run_dir / "config.original.json"),
                     "--run-dir",
@@ -2177,6 +2177,7 @@ class WorkerLaunchControlTest(unittest.TestCase):
         self.assertEqual(observed_ready, [True])
         printed = json.loads(output.getvalue())
         self.assertEqual(printed["status"], "synthetic")
+        self.assertEqual(printed["command"], "forward")
         final_heartbeat = json.loads(
             (run_dir / WORKER_HEARTBEAT_NAME).read_text(encoding="utf-8")
         )

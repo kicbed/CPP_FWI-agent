@@ -33,6 +33,15 @@ from .dag_node_cache import (
     build_node_cache_identity,
 )
 from .dag_scheduler import DagScheduleError, evaluate_dag_readiness
+from .fixed_recipe import (
+    RECIPE_ALGORITHM_ID,
+    RECIPE_ALGORITHM_VERSION,
+    RECIPE_EXTENSION_KEY,
+    RECIPE_STAGES,
+    fixed_recipe_plan_inputs,
+    is_fixed_recipe_extension,
+    load_fixed_recipe_manifest,
+)
 
 
 MIGRATIONS_DIRECTORY = Path(__file__).with_name("migrations")
@@ -80,6 +89,71 @@ DOCUMENT_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 RUNTIME_TIMEOUT_ID = re.compile(r"^timeout-[0-9a-f]{32}$")
 RUNTIME_CHECKPOINT_ID = re.compile(r"^checkpoint-[0-9a-f]{32}$")
 RUNTIME_RESUME_ID = re.compile(r"^resume-[0-9a-f]{32}$")
+
+FIXED_RECIPE_MAX_ACTIVE_NODES = 2
+_FIXED_RECIPE_DEPENDENCIES = {
+    node["node_id"]: tuple(node["dependencies"])
+    for node in load_fixed_recipe_manifest()["nodes"]
+}
+_FIXED_RECIPE_PLAN_OUTPUTS = load_fixed_recipe_manifest()["plan_outputs"]
+
+
+def is_fixed_recipe_parallel_plan(plan: Mapping[str, Any]) -> bool:
+    """Return whether the exact P3 fixed Recipe may admit two live nodes."""
+
+    if not isinstance(plan, Mapping):
+        return False
+    extensions = plan.get("extensions")
+    nodes = plan.get("nodes")
+    if (
+        plan.get("schema_version") != "1.2.0"
+        or plan.get("task_type") != "acoustic_fwi_2d"
+        or not isinstance(extensions, Mapping)
+        or set(extensions) != {RECIPE_EXTENSION_KEY}
+        or not is_fixed_recipe_extension(extensions.get(RECIPE_EXTENSION_KEY))
+        or not isinstance(nodes, list)
+        or len(nodes) != len(RECIPE_STAGES)
+    ):
+        return False
+    common_parameters: Mapping[str, Any] | None = None
+    common_resources: Mapping[str, Any] | None = None
+    common_dataset: Mapping[str, Any] | None = None
+    for node, node_id in zip(nodes, RECIPE_STAGES):
+        if not isinstance(node, Mapping):
+            return False
+        inputs = node.get("inputs")
+        root = (
+            inputs[0].get("dataset")
+            if isinstance(inputs, list)
+            and inputs
+            and isinstance(inputs[0], Mapping)
+            else None
+        )
+        if (
+            not isinstance(root, Mapping)
+            or inputs != fixed_recipe_plan_inputs(node_id, root)
+            or node.get("node_id") != node_id
+            or node.get("dependencies")
+            != list(_FIXED_RECIPE_DEPENDENCIES[node_id])
+            or node.get("algorithm")
+            != {
+                "id": RECIPE_ALGORITHM_ID,
+                "version": RECIPE_ALGORITHM_VERSION,
+            }
+            or node.get("outputs") != _FIXED_RECIPE_PLAN_OUTPUTS
+        ):
+            return False
+        if common_parameters is None:
+            common_parameters = node.get("parameters")
+            common_resources = node.get("resources")
+            common_dataset = root
+        elif (
+            node.get("parameters") != common_parameters
+            or node.get("resources") != common_resources
+            or root != common_dataset
+        ):
+            return False
+    return True
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "Draft": frozenset({"Draft", "NeedsInput", "AwaitingApproval", "Cancelled"}),
@@ -1206,6 +1280,15 @@ class TaskStore(Protocol):
     ) -> DagNodeStateMapSnapshot | None:
         ...
 
+    def get_dag_runtime_node_facts(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+    ) -> dict[str, Any] | None:
+        ...
+
     def claim_ready_dag_node_candidate(
         self,
         *,
@@ -1308,6 +1391,15 @@ class TaskStore(Protocol):
         project_id: str,
         principal_id: str,
     ) -> DagNodeExecutionAdmission | None:
+        ...
+
+    def list_active_dag_node_executions(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+    ) -> tuple[DagNodeExecutionAdmission, ...]:
         ...
 
     def reconcile_dag_node_dependencies(
@@ -3230,6 +3322,300 @@ class SQLiteTaskStore:
             raise TaskStoreConflict(
                 "Worker timeout window conflicts with durable state"
             ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_dag_runtime_node_facts(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+    ) -> dict[str, Any] | None:
+        """Return a path-free, scope-bound read model for every DAG node."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            snapshot = self._load_snapshot(connection, task_id)
+            if (
+                snapshot is None
+                or snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreConflict("task does not exist in the requested scope")
+            plan = snapshot.plan
+            approval = snapshot.approval
+            if (
+                not isinstance(plan, Mapping)
+                or len(plan.get("nodes", [])) <= 1
+                or not isinstance(approval, Mapping)
+            ):
+                connection.commit()
+                return None
+            state_map = self._load_dag_node_state_map(
+                connection, task_id=task_id, plan=plan
+            )
+            states = {
+                node.node_id: node
+                for node in (state_map.nodes if state_map is not None else ())
+            }
+            blocker_map: dict[str, list[str]] = {}
+            if state_map is not None:
+                try:
+                    readiness = evaluate_dag_readiness(
+                        plan,
+                        node_states={
+                            node.node_id: node.state for node in state_map.nodes
+                        },
+                    )
+                except DagScheduleError as error:
+                    raise TaskStoreCorruption(
+                        "DAG node facts cannot evaluate durable readiness"
+                    ) from error
+                blocker_map = {
+                    blocked.node_id: list(blocked.blocked_by_node_ids)
+                    for blocked in readiness.blocked_nodes
+                }
+
+            checkpoint = snapshot.checkpoint
+            nodes: list[dict[str, Any]] = []
+            for plan_node in plan["nodes"]:
+                node_id = plan_node["node_id"]
+                state = states.get(node_id)
+                admission = self._load_dag_node_execution_admission(
+                    connection, task_id=task_id, node_id=node_id
+                )
+                intent = (
+                    self._load_dispatch_intent(
+                        connection, intent_id=admission["intent_id"]
+                    )
+                    if admission is not None
+                    else None
+                )
+                if admission is not None and intent is None:
+                    raise TaskStoreCorruption(
+                        "DAG node admission lost its dispatch intent"
+                    )
+                terminal = (
+                    connection.execute(
+                        "SELECT * FROM dag_node_terminal_facts "
+                        "WHERE intent_id = ?",
+                        (admission["intent_id"],),
+                    ).fetchone()
+                    if admission is not None
+                    else None
+                )
+                adapter_status = None
+                if terminal is not None:
+                    adapter_status = _decode_hashed_document(
+                        {
+                            "document_json": terminal["adapter_status_json"],
+                            "document_hash": terminal["adapter_status_hash"],
+                        },
+                        label="DAG node terminal Adapter status",
+                    )
+                cache_hit = connection.execute(
+                    """
+                    SELECT * FROM dag_node_cache_hit_facts
+                    WHERE target_task_id = ? AND target_plan_id = ?
+                      AND target_node_id = ?
+                    """,
+                    (task_id, plan["plan_id"], node_id),
+                ).fetchone()
+                succeeded = None
+                if state is not None and state.state == "Succeeded":
+                    succeeded = self._load_dag_node_succeeded_outputs(
+                        connection,
+                        task_id=task_id,
+                        plan=plan,
+                        approval_id=approval["approval_id"],
+                        source_state=state,
+                    )
+                outputs = []
+                lineage = None
+                cache = None
+                if succeeded is not None:
+                    outputs = [
+                        {
+                            "port": port,
+                            "data_type": output["data_type"],
+                            "artifact_manifest": copy.deepcopy(
+                                output["artifact_manifest"]
+                            ),
+                            "artifact_manifest_hash": output[
+                                "artifact_manifest_hash"
+                            ],
+                        }
+                        for port, output in sorted(
+                            succeeded["outputs_by_port"].items()
+                        )
+                    ]
+                    lineage = {
+                        "document": copy.deepcopy(
+                            succeeded["trusted_lineage_document"]
+                        ),
+                        "document_hash": succeeded[
+                            "trusted_lineage_document_hash"
+                        ],
+                        "dataset_roots": copy.deepcopy(
+                            succeeded["transitive_dataset_roots"]
+                        ),
+                        "direct_input_hashes": list(
+                            succeeded["direct_input_hashes"]
+                        ),
+                    }
+                    if cache_hit is None:
+                        cache = {
+                            "state": "miss",
+                            "cache_key_hash": succeeded[
+                                "semantic_cache_key_hash"
+                            ],
+                            "source_task_id": task_id,
+                            "source_node_id": node_id,
+                        }
+                    else:
+                        cache = {
+                            "state": "hit",
+                            "cache_key_hash": cache_hit["cache_key_hash"],
+                            "source_task_id": cache_hit["source_task_id"],
+                            "source_node_id": cache_hit["source_node_id"],
+                            "recorded_at": cache_hit["recorded_at"],
+                        }
+
+                node_checkpoint = None
+                if checkpoint is not None and checkpoint.node_id == node_id:
+                    node_checkpoint = {
+                        "checkpoint_id": checkpoint.checkpoint_id,
+                        "intent_id": checkpoint.intent_id,
+                        "attempt_id": checkpoint.attempt_id,
+                        "attempt_number": checkpoint.attempt_number,
+                        "checkpoint_index": checkpoint.checkpoint_index,
+                        "completed_updates": checkpoint.completed_updates,
+                        "manifest_size_bytes": (
+                            checkpoint.checkpoint_manifest_size_bytes
+                        ),
+                        "manifest_hash": checkpoint.checkpoint_manifest_hash,
+                        "state": checkpoint.state,
+                        "created_at": checkpoint.checkpoint_created_at,
+                        "resume_id": checkpoint.resume_id,
+                        "resume_requested_at": checkpoint.resume_requested_at,
+                        "resume_acknowledged_at": (
+                            checkpoint.resume_acknowledged_at
+                        ),
+                    }
+
+                failure = None
+                if state is not None and state.state == "Blocked":
+                    failure = {
+                        "code": "DEPENDENCY_FAILED",
+                        "blocked_by_node_ids": blocker_map.get(node_id, []),
+                    }
+                elif state is not None and state.state in {"Failed", "Cancelled"}:
+                    failure = {
+                        "code": (
+                            intent.failure_code
+                            if intent is not None and intent.failure_code is not None
+                            else (
+                                "NODE_CANCELLED"
+                                if state.state == "Cancelled"
+                                else "ADAPTER_FAILED"
+                            )
+                        ),
+                        "adapter_status": copy.deepcopy(adapter_status),
+                    }
+
+                dependency_states = {
+                    dependency: (
+                        states[dependency].state
+                        if dependency in states
+                        else None
+                    )
+                    for dependency in plan_node["dependencies"]
+                }
+                nodes.append(
+                    {
+                        "node_id": node_id,
+                        "dependencies": list(plan_node["dependencies"]),
+                        "dependency_states": dependency_states,
+                        "revision": state.revision if state is not None else None,
+                        "state": state.state if state is not None else None,
+                        "recorded_at": (
+                            state.recorded_at if state is not None else None
+                        ),
+                        "admission": (
+                            {
+                                "intent_id": admission["intent_id"],
+                                "pending_revision": int(
+                                    admission["pending_revision"]
+                                ),
+                                "queued_revision": int(
+                                    admission["queued_revision"]
+                                ),
+                                "fencing_token": int(
+                                    admission["admission_fencing_token"]
+                                ),
+                                "admitted_at": admission["admitted_at"],
+                            }
+                            if admission is not None
+                            else None
+                        ),
+                        "dispatch": (
+                            {
+                                "intent_id": intent.intent_id,
+                                "state": intent.state,
+                                "failure_code": intent.failure_code,
+                                "adapter": {
+                                    "id": intent.adapter_id,
+                                    "version": intent.adapter_version,
+                                },
+                                "created_at": intent.created_at,
+                            }
+                            if intent is not None
+                            else None
+                        ),
+                        "terminal": (
+                            {
+                                "state": terminal["node_state"],
+                                "event_sequence": int(
+                                    terminal["event_sequence"]
+                                ),
+                                "recorded_at": terminal["recorded_at"],
+                                "adapter_status": copy.deepcopy(adapter_status),
+                            }
+                            if terminal is not None
+                            else None
+                        ),
+                        "cache": cache,
+                        "checkpoint": node_checkpoint,
+                        "failure": failure,
+                        "outputs": outputs,
+                        "lineage": lineage,
+                    }
+                )
+            result = {
+                "schema_version": "1.0.0",
+                "task_id": task_id,
+                "plan_id": plan["plan_id"],
+                "plan_hash": plan["plan_hash"],
+                "runtime_initialized": state_map is not None,
+                "nodes": nodes,
+            }
+            encode_document(result)
+            connection.commit()
+            return result
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
         except Exception:
             if connection.in_transaction:
                 connection.rollback()
@@ -10632,7 +11018,7 @@ class SQLiteTaskStore:
 
         rows = connection.execute(
             """
-            SELECT intent.intent_id, admission.admitted_at_us,
+            SELECT intent.intent_id, intent.node_id, admission.admitted_at_us,
                    admission.intent_id AS admission_intent_id,
                    state.state AS latest_node_state
             FROM dispatch_intents AS intent
@@ -10669,7 +11055,44 @@ class SQLiteTaskStore:
             in {"Queued", "Running", "Waiting", "Retrying"}
         ]
         if len(active) > 1:
-            raise TaskStoreCorruption("DAG task has multiple active dispatch intents")
+            plan_row = connection.execute(
+                """
+                SELECT plan.document_json, plan.document_hash
+                FROM tasks AS task
+                JOIN plans AS plan
+                  ON plan.task_id = task.task_id
+                 AND plan.plan_id = task.current_plan_id
+                WHERE task.task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if plan_row is None:
+                raise TaskStoreCorruption(
+                    "parallel DAG intents lack their current plan"
+                )
+            plan = _decode_hashed_document(
+                plan_row, label="parallel DAG dispatch plan"
+            )
+            if (
+                not is_fixed_recipe_parallel_plan(plan)
+                or len(active) > FIXED_RECIPE_MAX_ACTIVE_NODES
+            ):
+                raise TaskStoreCorruption(
+                    "DAG task has unauthorized parallel dispatch intents"
+                )
+            try:
+                node_order = {
+                    node["node_id"]: index
+                    for index, node in enumerate(plan["nodes"])
+                }
+                active.sort(key=lambda row: node_order[row["node_id"]])
+            except (KeyError, TypeError) as error:
+                raise TaskStoreCorruption(
+                    "parallel DAG plan cannot order its active intents"
+                ) from error
+            # Pump the newest live branch until it reaches a durable terminal;
+            # the earlier branch keeps executing under inherited kernel locks.
+            return str(active[-1]["intent_id"])
         if active:
             return str(active[0]["intent_id"])
         return str(rows[-1]["intent_id"])
@@ -10818,7 +11241,12 @@ class SQLiteTaskStore:
             (row["plan_id"], row["node_id"], row["task_id"]),
         ).fetchone()
         if (
-            set(request) != request_fields
+            set(request)
+            not in (
+                request_fields,
+                request_fields | {"recipe"},
+                request_fields | {"recipe", "recipe_input_hashes"},
+            )
             or task_identity is None
             or task_identity["current_plan_id"] != row["plan_id"]
             or task_identity["current_approval_id"] != row["approval_id"]
@@ -10902,6 +11330,91 @@ class SQLiteTaskStore:
             and dag_run is not None
             and dag_run["first_intent_id"] == row["intent_id"]
         )
+        fixed_recipe_request = (
+            dag_admission is not None and is_fixed_recipe_parallel_plan(plan)
+        )
+        recipe_input_hashes: list[str] = []
+        if fixed_recipe_request:
+            binding_row = connection.execute(
+                """
+                SELECT binding_document_json, binding_document_hash
+                FROM dag_node_input_binding_facts
+                WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+                  AND target_node_id = ? AND target_node_revision = ?
+                  AND binding_document_hash = ?
+                """,
+                (
+                    row["task_id"],
+                    row["plan_id"],
+                    row["approval_id"],
+                    row["node_id"],
+                    dag_admission["pending_revision"],
+                    dag_admission["input_binding_document_hash"],
+                ),
+            ).fetchone()
+            if binding_row is None:
+                raise TaskStoreCorruption(
+                    "dispatch intent Recipe request lost its input binding"
+                )
+            binding_document = _decode_hashed_document(
+                {
+                    "document_json": binding_row["binding_document_json"],
+                    "document_hash": binding_row["binding_document_hash"],
+                },
+                label="dispatch Recipe input binding",
+            )
+            binding_inputs = binding_document.get("inputs")
+            if not isinstance(binding_inputs, list):
+                raise TaskStoreCorruption(
+                    "dispatch intent Recipe input binding is malformed"
+                )
+            for bound in binding_inputs:
+                if not isinstance(bound, Mapping):
+                    raise TaskStoreCorruption(
+                        "dispatch intent Recipe input binding is malformed"
+                    )
+                if bound.get("kind") != "node_output":
+                    continue
+                binding = bound.get("binding")
+                artifact = (
+                    binding.get("artifact")
+                    if isinstance(binding, Mapping)
+                    else None
+                )
+                content_hash = (
+                    artifact.get("content_hash")
+                    if isinstance(artifact, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(content_hash, str)
+                    or DOCUMENT_HASH.fullmatch(content_hash) is None
+                ):
+                    raise TaskStoreCorruption(
+                        "dispatch intent Recipe input binding hash is malformed"
+                    )
+                recipe_input_hashes.append(content_hash)
+        expected_request_fields = request_fields | (
+            {"recipe", "recipe_input_hashes"}
+            if fixed_recipe_request
+            else set()
+        )
+        if (
+            set(request) != expected_request_fields
+            or (
+                fixed_recipe_request
+                and request.get("recipe")
+                != plan["extensions"][RECIPE_EXTENSION_KEY]
+            )
+            or (
+                fixed_recipe_request
+                and request.get("recipe_input_hashes")
+                != recipe_input_hashes
+            )
+        ):
+            raise TaskStoreCorruption(
+                "dispatch intent Recipe request differs from its exact plan"
+            )
         has_cache_hit_table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'dag_node_cache_hit_facts'"
@@ -10968,11 +11481,17 @@ class SQLiteTaskStore:
                 "parameters": durable_node["parameters"],
                 "resources": durable_node["resources"],
             }
-            if dag_admission is None:
+            if fixed_recipe_request:
+                expected_request_core["recipe"] = plan["extensions"][
+                    RECIPE_EXTENSION_KEY
+                ]
+                expected_request_core["recipe_input_hashes"] = recipe_input_hashes
+            if dag_admission is None or fixed_recipe_request:
                 if len(durable_node["inputs"]) != 1:
-                    raise TaskStoreCorruption(
-                        "dispatch plan no longer has exactly one input"
-                    )
+                    if not fixed_recipe_request:
+                        raise TaskStoreCorruption(
+                            "dispatch plan no longer has exactly one input"
+                        )
                 input_identity = durable_node["inputs"][0]["dataset"]
                 durable_dataset = next(
                     value
@@ -11024,7 +11543,10 @@ class SQLiteTaskStore:
             or fingerprint.get("normalized_config_hash")
             != request.get("normalized_config_hash")
             or fingerprint.get("input_hashes")
-            != [request.get("dataset", {}).get("content_hash")]
+            != [
+                request.get("dataset", {}).get("content_hash"),
+                *(recipe_input_hashes if fixed_recipe_request else []),
+            ]
             or (
                 (
                     dag_admission is None
@@ -12412,6 +12934,19 @@ class SQLiteTaskStore:
         algorithm = handle.get("algorithm")
         fingerprint = handle.get("fingerprint")
         request = intent.request
+        recipe_bound = (
+            is_fixed_recipe_extension(request.get("recipe"))
+            and isinstance(request.get("recipe_input_hashes"), list)
+            and all(
+                isinstance(value, str)
+                and DOCUMENT_HASH.fullmatch(value) is not None
+                for value in request["recipe_input_hashes"]
+            )
+        )
+        expected_input_hashes = [
+            request.get("dataset", {}).get("content_hash"),
+            *(request["recipe_input_hashes"] if recipe_bound else []),
+        ]
         if (
             set(handle) != required
             or handle.get("task_id") != intent.task_id
@@ -12429,7 +12964,11 @@ class SQLiteTaskStore:
             or fingerprint.get("normalized_config_hash")
             != request.get("normalized_config_hash")
             or fingerprint.get("input_hashes")
-            != [request.get("dataset", {}).get("content_hash")]
+            != expected_input_hashes
+            or (
+                ("recipe" in request or "recipe_input_hashes" in request)
+                and not recipe_bound
+            )
             or not isinstance(handle.get("submission_id"), str)
             or not isinstance(handle.get("job_id"), str)
             or not isinstance(handle.get("request_hash"), str)
@@ -13421,9 +13960,31 @@ class SQLiteTaskStore:
                               AND terminal.task_status = 'Failed'
                               AND terminal.document_hash =
                                   negative.terminal_event_hash
-                        ) AS has_negative_reconciliation
+                        ) AS has_negative_reconciliation,
+                        (
+                            SELECT COUNT(*)
+                            FROM dag_node_cache_hit_facts AS hit
+                            JOIN tasks AS current
+                              ON current.task_id = hit.target_task_id
+                             AND current.current_plan_id = hit.target_plan_id
+                             AND current.current_approval_id =
+                                 hit.target_approval_id
+                            WHERE hit.target_task_id = ?
+                        ) AS current_cache_hit_count,
+                        (
+                            SELECT json_array_length(
+                                json_extract(plan.document_json, '$.nodes')
+                            )
+                            FROM tasks AS current
+                            JOIN plans AS plan
+                              ON plan.task_id = current.task_id
+                             AND plan.plan_id = current.current_plan_id
+                            WHERE current.task_id = ?
+                        ) AS current_plan_node_count
                     """,
                     (
+                        task_id,
+                        task_id,
                         task_id,
                         task_id,
                         task_id,
@@ -13457,7 +14018,19 @@ class SQLiteTaskStore:
                         )
                     )
                 )
-                if not (pre_runtime_abandonment or resolved_runtime):
+                cache_resolved_runtime = (
+                    task["status"] == "Succeeded"
+                    and evidence["intent_id"] is None
+                    and type(evidence["current_plan_node_count"]) is int
+                    and evidence["current_plan_node_count"] > 1
+                    and evidence["current_cache_hit_count"]
+                    == evidence["current_plan_node_count"]
+                )
+                if not (
+                    pre_runtime_abandonment
+                    or resolved_runtime
+                    or cache_resolved_runtime
+                ):
                     raise TaskStoreConflict(
                         "an unresolved task cannot be moved to trash"
                     )
@@ -16319,7 +16892,11 @@ class SQLiteTaskStore:
         if binding_row is None:
             raise TaskStoreCorruption("cached DAG target binding is missing")
         binding = _decode_hashed_document(
-            binding_row, label="cached DAG target input binding"
+            {
+                "document_json": binding_row["binding_document_json"],
+                "document_hash": binding_row["binding_document_hash"],
+            },
+            label="cached DAG target input binding",
         )
         dataset_roots, direct_hashes, _outputs = self._derive_dag_lineage_components(
             binding_document=binding,
@@ -17016,9 +17593,13 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption(
                     "persisted DAG state cannot be evaluated"
                 ) from error
-            if readiness.active_node_ids:
+            if readiness.active_node_ids and (
+                not is_fixed_recipe_parallel_plan(plan)
+                or len(readiness.active_node_ids)
+                >= FIXED_RECIPE_MAX_ACTIVE_NODES
+            ):
                 raise TaskStoreConflict(
-                    "DAG task already has an active admitted node"
+                    "DAG task already has its permitted active admitted nodes"
                 )
             if not readiness.runnable_node_ids:
                 raise TaskStoreConflict("DAG plan has no runnable Pending node")
@@ -17298,9 +17879,13 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption(
                     "persisted DAG state cannot be evaluated for input binding"
                 ) from error
-            if readiness.active_node_ids:
+            if readiness.active_node_ids and (
+                not is_fixed_recipe_parallel_plan(plan)
+                or len(readiness.active_node_ids)
+                >= FIXED_RECIPE_MAX_ACTIVE_NODES
+            ):
                 raise TaskStoreConflict(
-                    "DAG task already has an active admitted node"
+                    "DAG task already has its permitted active admitted nodes"
                 )
             if not readiness.runnable_node_ids:
                 raise TaskStoreConflict("DAG plan has no runnable Pending node")
@@ -17895,13 +18480,20 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
-    def get_active_dag_node_execution(
+    def list_active_dag_node_executions(
         self,
         *,
         task_id: str,
         project_id: str,
         principal_id: str,
-    ) -> DagNodeExecutionAdmission | None:
+    ) -> tuple[DagNodeExecutionAdmission, ...]:
+        """Return every exact active node admission in deterministic order.
+
+        Multiple rows are valid only for the server-owned fixed Recipe.  All
+        historical and otherwise-labelled plans retain the original one-live-
+        node invariant.
+        """
+
         connection = self._connect()
         try:
             connection.execute("BEGIN")
@@ -17920,7 +18512,7 @@ class SQLiteTaskStore:
                 raise TaskStoreConflict("task does not exist in the requested scope")
             rows = connection.execute(
                 """
-                SELECT admission.intent_id
+                SELECT admission.intent_id, admission.node_id
                 FROM dag_node_execution_admissions AS admission
                 JOIN dag_node_state_events AS state
                   ON state.task_id = admission.task_id
@@ -17939,51 +18531,92 @@ class SQLiteTaskStore:
                 """,
                 (task_id,),
             ).fetchall()
-            if len(rows) > 1:
-                raise TaskStoreCorruption(
-                    "DAG task has multiple active execution admissions"
-                )
             if task["status"] == "Cancelled":
                 connection.commit()
-                return None
+                return ()
             if task["status"] in {"Succeeded", "Failed"} and rows:
                 raise TaskStoreCorruption(
                     "terminal DAG Task retains an active execution admission"
                 )
             if not rows:
                 connection.commit()
-                return None
-            admission = self._load_dag_node_execution_admission(
-                connection, intent_id=rows[0]["intent_id"]
-            )
-            intent = self._load_dispatch_intent(
-                connection, intent_id=rows[0]["intent_id"]
-            )
+                return ()
             snapshot = self._load_snapshot(connection, task_id)
-            if admission is None or intent is None or snapshot is None:
+            if snapshot is None:
                 raise TaskStoreCorruption("active DAG execution cannot be read")
-            result = DagNodeExecutionAdmission(
-                snapshot=snapshot,
-                intent=intent,
-                input_binding_document_hash=admission[
-                    "input_binding_document_hash"
-                ],
-                pending_revision=int(admission["pending_revision"]),
-                queued_revision=int(admission["queued_revision"]),
-                admission_fencing_token=int(
-                    admission["admission_fencing_token"]
-                ),
-                admitted_at=admission["admitted_at"],
-                replayed=True,
-            )
+            if len(rows) > 1 and (
+                not isinstance(snapshot.plan, Mapping)
+                or not is_fixed_recipe_parallel_plan(snapshot.plan)
+                or len(rows) > FIXED_RECIPE_MAX_ACTIVE_NODES
+            ):
+                raise TaskStoreCorruption(
+                    "DAG task has unauthorized parallel execution admissions"
+                )
+            if len(rows) > 1:
+                try:
+                    node_order = {
+                        node["node_id"]: index
+                        for index, node in enumerate(snapshot.plan["nodes"])
+                    }
+                    rows.sort(key=lambda row: node_order[row["node_id"]])
+                except (KeyError, TypeError) as error:
+                    raise TaskStoreCorruption(
+                        "parallel DAG plan cannot order active admissions"
+                    ) from error
+            values: list[DagNodeExecutionAdmission] = []
+            for row in rows:
+                admission = self._load_dag_node_execution_admission(
+                    connection, intent_id=row["intent_id"]
+                )
+                intent = self._load_dispatch_intent(
+                    connection, intent_id=row["intent_id"]
+                )
+                if admission is None or intent is None:
+                    raise TaskStoreCorruption(
+                        "active DAG execution cannot be read"
+                    )
+                values.append(
+                    DagNodeExecutionAdmission(
+                        snapshot=snapshot,
+                        intent=intent,
+                        input_binding_document_hash=admission[
+                            "input_binding_document_hash"
+                        ],
+                        pending_revision=int(admission["pending_revision"]),
+                        queued_revision=int(admission["queued_revision"]),
+                        admission_fencing_token=int(
+                            admission["admission_fencing_token"]
+                        ),
+                        admitted_at=admission["admitted_at"],
+                        replayed=True,
+                    )
+                )
             connection.commit()
-            return result
+            return tuple(values)
         except Exception:
             if connection.in_transaction:
                 connection.rollback()
             raise
         finally:
             connection.close()
+
+    def get_active_dag_node_execution(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+    ) -> DagNodeExecutionAdmission | None:
+        values = self.list_active_dag_node_executions(
+            task_id=task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+        )
+        if len(values) > 1:
+            raise TaskStoreConflict(
+                "DAG task has multiple active executions; use the list projection"
+            )
+        return values[0] if values else None
 
     def get_dag_node_input_binding_for_intent(
         self, intent_id: str
@@ -24115,6 +24748,14 @@ class SQLiteTaskStore:
                         "DAG terminal transition lacks exact attempt-1 receipt evidence"
                     )
                 handle_json, handle_hash = encode_document(intent.handle)
+                if (
+                    terminal_state == "Succeeded"
+                    and is_fixed_recipe_parallel_plan(plan_document)
+                    and observation["heartbeat_state"] != "succeeded"
+                ):
+                    raise TaskStoreConflict(
+                        "fixed Recipe success requires exact succeeded Worker evidence"
+                    )
             if terminal_state == "Succeeded":
                 assert supplied_output is not None
                 manifests = supplied_output.get("manifests")

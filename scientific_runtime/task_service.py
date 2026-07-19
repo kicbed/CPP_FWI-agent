@@ -26,6 +26,11 @@ from .fwi_registry import (
     DEEPWAVE_ALGORITHM_VERSION,
     load_deepwave_manifest,
 )
+from .fixed_recipe import (
+    RECIPE_EXTENSION_KEY,
+    fixed_recipe_stage,
+    is_fixed_recipe_extension,
+)
 from .dag_scheduler import DagScheduleError, evaluate_dag_readiness
 from .task_dispatcher import (
     DispatchDeferred,
@@ -39,6 +44,7 @@ from .task_dispatcher import (
 )
 from .task_store import (
     ALLOWED_TRANSITIONS,
+    FIXED_RECIPE_MAX_ACTIVE_NODES,
     TASK_STATUSES,
     DagNodeArtifactInput,
     DagNodeCacheCandidate,
@@ -58,6 +64,7 @@ from .task_store import (
     TaskStore,
     TaskStoreConflict,
     encode_document,
+    is_fixed_recipe_parallel_plan,
 )
 
 
@@ -214,6 +221,7 @@ class DagRuntimeAdvanceResult:
     deferred_code: str | None = None
     cache_hit_node_id: str | None = None
     cache_key_hash: str | None = None
+    active_intents: tuple[DispatchIntentSnapshot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -509,21 +517,37 @@ def _validate_run_event_binding(
             "RUN_EVENT_NODE_UNKNOWN",
             ["event node_id is not present in the current plan"],
         )
-    if any(
+    fingerprint = event["fingerprint"]
+    node_output_inputs = any(
         not isinstance(binding.get("dataset"), Mapping)
         for binding in node["inputs"]
-    ):
-        raise TaskValidationError(
-            "RUN_EVENT_INPUT_BINDING_REQUIRED",
-            [
-                "node-output inputs require a verified concrete artifact hash "
-                "before runtime events are accepted"
-            ],
-        )
-    fingerprint = event["fingerprint"]
-    expected_input_hashes = [
-        binding["dataset"]["content_hash"] for binding in node["inputs"]
-    ]
+    )
+    if node_output_inputs:
+        concrete_hashes = fingerprint.get("input_hashes")
+        if (
+            not is_fixed_recipe_parallel_plan(snapshot.plan)
+            or not isinstance(concrete_hashes, list)
+            or len(concrete_hashes) != len(node["inputs"])
+            or concrete_hashes[0]
+            != node["inputs"][0].get("dataset", {}).get("content_hash")
+            or any(
+                not isinstance(value, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+                for value in concrete_hashes
+            )
+        ):
+            raise TaskValidationError(
+                "RUN_EVENT_INPUT_BINDING_REQUIRED",
+                [
+                    "node-output inputs require an exact fixed-Recipe binding "
+                    "with verified concrete artifact hashes"
+                ],
+            )
+        expected_input_hashes = list(concrete_hashes)
+    else:
+        expected_input_hashes = [
+            binding["dataset"]["content_hash"] for binding in node["inputs"]
+        ]
     mismatches: list[str] = []
     if fingerprint["algorithm"] != node["algorithm"]:
         mismatches.append("algorithm")
@@ -826,18 +850,27 @@ class TaskService:
         }
         declared_effects = set(manifest["security"]["side_effects"])
         errors: list[str] = []
+        recipe_plan = is_fixed_recipe_parallel_plan(plan)
         for node in plan["nodes"]:
             node_id = node["node_id"]
+            effective_input_ports = dict(input_ports)
+            if recipe_plan:
+                for binding in node["inputs"]:
+                    source = binding.get("source")
+                    if isinstance(source, Mapping):
+                        effective_input_ports[binding["port"]] = source[
+                            "data_type"
+                        ]
             planned_input_ports = [binding["port"] for binding in node["inputs"]]
             if (
                 len(planned_input_ports) != len(set(planned_input_ports))
-                or set(planned_input_ports) != set(input_ports)
+                or set(planned_input_ports) != set(effective_input_ports)
             ):
                 errors.append(
                     f"node {node_id} input ports differ from AlgorithmManifest"
                 )
             for binding in node["inputs"]:
-                expected_type = input_ports.get(binding["port"])
+                expected_type = effective_input_ports.get(binding["port"])
                 dataset = binding.get("dataset")
                 source = binding.get("source")
                 binding_type = (
@@ -1844,67 +1877,103 @@ class TaskService:
                 replayed=True,
             )
 
-        intent = self._store.get_dispatch_intent(task_id)
+        recipe_task = (
+            isinstance(snapshot.plan, Mapping)
+            and is_fixed_recipe_parallel_plan(snapshot.plan)
+        )
+        try:
+            intents = (
+                self._store.list_dispatch_intents(task_id)
+                if recipe_task
+                else tuple(
+                    value
+                    for value in (self._store.get_dispatch_intent(task_id),)
+                    if value is not None
+                )
+            )
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
         adapter_replayed = False
-        if intent is None:
+        if not intents:
             abandonment = snapshot.abandonment
             if (
-                snapshot.status != "Cancelled"
-                or not isinstance(abandonment, Mapping)
-                or abandonment.get("reason") != "user_discarded_draft"
+                not recipe_task
+                and (
+                    snapshot.status != "Cancelled"
+                    or not isinstance(abandonment, Mapping)
+                    or abandonment.get("reason") != "user_discarded_draft"
+                )
             ):
                 raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
             local_run_state = "not_created"
         else:
             if self._dispatcher is None:
                 raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
-            if intent.task_id != task_id:
-                raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
-            try:
-                if intent.state == "retry_exhausted" and intent.handle is None:
-                    exhaustion = (
-                        self._store.get_retry_exhaustion_cleanup_proof(
-                            purge_id=reservation.purge_id,
-                            task_id=task_id,
-                            project_id=project_id,
-                            principal_id=principal_id,
-                        )
-                    )
-                    if exhaustion is None:
-                        raise TaskDispatchError(
-                            "WORKER_RETRY_EXHAUSTION_PURGE_UNAVAILABLE"
-                        )
-                    adapter_result = self._dispatcher.purge_retry_exhausted(
-                        intent,
-                        purge_id=reservation.purge_id,
-                        exhaustion=exhaustion,
-                    )
-                elif intent.state == "dispatched" and intent.handle is not None:
-                    adapter_result = self._dispatcher.purge(
-                        intent, purge_id=reservation.purge_id
-                    )
-                else:
-                    raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
-            except DispatchError as error:
-                raise TaskDispatchError(error.code) from error
-            except TaskStoreConflict as error:
-                raise TaskConflict(str(error)) from error
-            except TaskDispatchError:
-                raise
-            except Exception as error:
-                raise TaskDispatchError("ADAPTER_PURGE_UNAVAILABLE") from error
+            planned_node_ids = (
+                {node["node_id"] for node in snapshot.plan["nodes"]}
+                if recipe_task
+                else {intents[0].node_id}
+            )
             if (
-                not isinstance(adapter_result, Mapping)
-                or set(adapter_result)
-                != {"task_id", "purge_id", "local_run_state", "replayed"}
-                or adapter_result.get("task_id") != task_id
-                or adapter_result.get("purge_id") != reservation.purge_id
-                or adapter_result.get("local_run_state") != "deleted"
-                or type(adapter_result.get("replayed")) is not bool
+                any(intent.task_id != task_id for intent in intents)
+                or len({intent.node_id for intent in intents}) != len(intents)
+                or any(intent.node_id not in planned_node_ids for intent in intents)
             ):
-                raise TaskDispatchError("ADAPTER_PURGE_INVALID")
+                raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+            for intent in intents:
+                try:
+                    if intent.state == "retry_exhausted" and intent.handle is None:
+                        if recipe_task:
+                            raise TaskDispatchError(
+                                "DISPATCH_RECEIPT_UNAVAILABLE"
+                            )
+                        exhaustion = (
+                            self._store.get_retry_exhaustion_cleanup_proof(
+                                purge_id=reservation.purge_id,
+                                task_id=task_id,
+                                project_id=project_id,
+                                principal_id=principal_id,
+                            )
+                        )
+                        if exhaustion is None:
+                            raise TaskDispatchError(
+                                "WORKER_RETRY_EXHAUSTION_PURGE_UNAVAILABLE"
+                            )
+                        adapter_result = self._dispatcher.purge_retry_exhausted(
+                            intent,
+                            purge_id=reservation.purge_id,
+                            exhaustion=exhaustion,
+                        )
+                    elif intent.state == "dispatched" and intent.handle is not None:
+                        adapter_result = self._dispatcher.purge(
+                            intent, purge_id=reservation.purge_id
+                        )
+                    else:
+                        raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+                except DispatchError as error:
+                    raise TaskDispatchError(error.code) from error
+                except TaskStoreConflict as error:
+                    raise TaskConflict(str(error)) from error
+                except TaskDispatchError:
+                    raise
+                except Exception as error:
+                    raise TaskDispatchError(
+                        "ADAPTER_PURGE_UNAVAILABLE"
+                    ) from error
+                if (
+                    not isinstance(adapter_result, Mapping)
+                    or set(adapter_result)
+                    != {"task_id", "purge_id", "local_run_state", "replayed"}
+                    or adapter_result.get("task_id") != task_id
+                    or adapter_result.get("purge_id") != reservation.purge_id
+                    or adapter_result.get("local_run_state") != "deleted"
+                    or type(adapter_result.get("replayed")) is not bool
+                ):
+                    raise TaskDispatchError("ADAPTER_PURGE_INVALID")
+                adapter_replayed = (
+                    adapter_replayed or adapter_result["replayed"]
+                )
             local_run_state = "deleted"
-            adapter_replayed = adapter_result["replayed"]
 
         try:
             completed = self._store.complete_task_purge(
@@ -2221,6 +2290,21 @@ class TaskService:
             "fingerprint",
         }
         request = intent.request
+        recipe_request = (
+            is_fixed_recipe_parallel_plan(snapshot.plan or {})
+            and isinstance(request.get("recipe_input_hashes"), list)
+            and request.get("recipe")
+            == snapshot.plan.get("extensions", {}).get(RECIPE_EXTENSION_KEY)
+            and all(
+                isinstance(value, str)
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+                for value in request["recipe_input_hashes"]
+            )
+        )
+        expected_input_hashes = [
+            request.get("dataset", {}).get("content_hash"),
+            *(request["recipe_input_hashes"] if recipe_request else []),
+        ]
         if (
             set(validated_handle) != required_handle_fields
             or not isinstance(fingerprint, Mapping)
@@ -2239,7 +2323,11 @@ class TaskService:
             or fingerprint.get("normalized_config_hash")
             != request.get("normalized_config_hash")
             or fingerprint.get("input_hashes")
-            != [request.get("dataset", {}).get("content_hash")]
+            != expected_input_hashes
+            or (
+                is_fixed_recipe_parallel_plan(snapshot.plan or {})
+                and not recipe_request
+            )
             or not isinstance(validated_handle.get("submission_id"), str)
             or not isinstance(validated_handle.get("job_id"), str)
             or not isinstance(validated_handle.get("request_hash"), str)
@@ -2576,6 +2664,34 @@ class TaskService:
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
 
+    def get_dag_runtime_node_facts(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+    ) -> dict[str, Any] | None:
+        """Read the stable, path-free per-node runtime projection.
+
+        This is the only product-facing read boundary for DAG node facts;
+        callers never receive the Store or private Worker paths.
+        """
+
+        self.get_task(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+        )
+        try:
+            value = self._store.get_dag_runtime_node_facts(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+            )
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        return copy.deepcopy(value)
+
     def claim_ready_dag_node_candidate(
         self,
         task_id: str,
@@ -2760,11 +2876,40 @@ class TaskService:
             reasons.append("preset_unsupported")
         if plan.get("task_type") != "acoustic_fwi_2d":
             reasons.append("task_type_unsupported")
-        if len(binding_inputs) != 1 or binding_inputs[0].get("kind") != "dataset":
+        recipe_plan = is_fixed_recipe_parallel_plan(plan)
+        planned_inputs = node.get("inputs")
+        exact_recipe_binding = (
+            recipe_plan
+            and isinstance(planned_inputs, list)
+            and len(binding_inputs) == len(planned_inputs)
+            and all(
+                isinstance(bound, Mapping)
+                and isinstance(planned, Mapping)
+                and bound.get("input_index") == index
+                and bound.get("target_input_port") == planned.get("port")
+                and (
+                    (
+                        isinstance(planned.get("dataset"), Mapping)
+                        and bound.get("kind") == "dataset"
+                        and bound.get("dataset") == planned.get("dataset")
+                    )
+                    or (
+                        isinstance(planned.get("source"), Mapping)
+                        and bound.get("kind") == "node_output"
+                    )
+                )
+                for index, (planned, bound) in enumerate(
+                    zip(planned_inputs, binding_inputs)
+                )
+            )
+        )
+        if exact_recipe_binding:
+            identity = binding_inputs[0].get("dataset")
+        elif len(binding_inputs) == 1 and binding_inputs[0].get("kind") == "dataset":
+            identity = binding_inputs[0].get("dataset")
+        else:
             reasons.append("dataset_root_required")
             identity = None
-        else:
-            identity = binding_inputs[0].get("dataset")
         dataset = next(
             (
                 value
@@ -2808,6 +2953,15 @@ class TaskService:
             "parameters": copy.deepcopy(node.get("parameters")),
             "resources": copy.deepcopy(node.get("resources")),
         }
+        if recipe_plan:
+            expected_request["recipe"] = copy.deepcopy(
+                plan["extensions"][RECIPE_EXTENSION_KEY]
+            )
+            expected_request["recipe_input_hashes"] = [
+                bound.get("binding", {}).get("artifact", {}).get("content_hash")
+                for bound in binding_inputs
+                if isinstance(bound, Mapping) and bound.get("kind") == "node_output"
+            ]
         prepared_request = copy.deepcopy(preparation.request)
         normalized_config_hash = prepared_request.pop(
             "normalized_config_hash", None
@@ -2821,7 +2975,17 @@ class TaskService:
             fingerprint.get("provenance_mode") == "development"
             and isinstance(source_provenance, Mapping)
             and source_provenance.get("identity_complete") is False
-            and source_provenance.get("dirty") is None
+            # The current 1.6 Adapter deliberately reports source identity as
+            # incomplete in development mode, while its best-effort Git probe
+            # may still truthfully report dirty=True/False.  P1 admission has
+            # always accepted that bounded shape.  Requiring ``dirty is None``
+            # here made the real production composition reject both a dirty
+            # candidate tree and a clean committed tree before the first DAG
+            # dispatch, even though the exact fingerprint remains hash-bound.
+            and (
+                source_provenance.get("dirty") is None
+                or type(source_provenance.get("dirty")) is bool
+            )
         )
         reproducible_provenance = (
             fingerprint.get("provenance_mode") == "reproducible"
@@ -2855,7 +3019,15 @@ class TaskService:
             or fingerprint.get("hardware", {}).get("device")
             != node.get("resources", {}).get("device")
             or not isinstance(identity, Mapping)
-            or fingerprint.get("input_hashes") != [identity.get("content_hash")]
+            or fingerprint.get("input_hashes")
+            != [
+                identity.get("content_hash"),
+                *(
+                    expected_request.get("recipe_input_hashes", [])
+                    if recipe_plan
+                    else []
+                ),
+            ]
         ):
             reasons.append("queue_fingerprint_drift")
         if reasons:
@@ -3328,8 +3500,9 @@ class TaskService:
         """Converge dependencies and admit at most one deterministic node.
 
         A claim and an input binding remain evidence only.  The final Store
-        admission is the sole transition that creates a P2 dispatch intent,
-        and the Store enforces one active node for this Task at a time.
+        admission is the sole transition that creates a P2 dispatch intent.
+        Historical DAGs retain one active node; the exact fixed Recipe may
+        admit its two fan-out branches under the bounded Store invariant.
         """
 
         _validate_opaque_id(task_id, field="task_id")
@@ -3365,6 +3538,7 @@ class TaskService:
                 admitted_node_id=None,
                 blocked_node_ids=(),
                 aggregate_status="Cancelled",
+                active_intents=(),
             )
         initial_claim: DagNodeClaimCandidate | None = None
         try:
@@ -3391,7 +3565,7 @@ class TaskService:
                 supervisor_lease=supervisor_lease,
                 supervisor_clock=self._runtime_supervisor_clock,
             )
-            active = self._store.get_active_dag_node_execution(
+            active_admissions = self._store.list_active_dag_node_executions(
                 task_id=task_id,
                 project_id=project_id,
                 principal_id=principal_id,
@@ -3403,35 +3577,84 @@ class TaskService:
 
         snapshot = reconciled.snapshot
         active_node_ids = tuple(reconciled.active_node_ids)
-        if active is not None:
-            if active_node_ids != (active.intent.node_id,):
+        active_intents = tuple(
+            admission.intent for admission in active_admissions
+        )
+        durable_active_node_ids = tuple(
+            intent.node_id for intent in active_intents
+        )
+        active_node_states = {
+            node.node_id: node.state for node in reconciled.node_states.nodes
+        }
+        if (
+            len(set(durable_active_node_ids)) != len(durable_active_node_ids)
+            or set(active_node_ids) != set(durable_active_node_ids)
+            or any(
+                active_node_states.get(node_id)
+                not in {"Queued", "Running", "Waiting", "Retrying"}
+                for node_id in durable_active_node_ids
+            )
+        ):
+            raise TaskConflict(
+                "DAG active admissions differ from durable node state"
+            )
+        parallel_recipe = is_fixed_recipe_parallel_plan(plan)
+        runnable_node_ids = tuple(reconciled.runnable_node_ids)
+        if active_intents and (
+            not parallel_recipe
+            or len(active_intents) >= FIXED_RECIPE_MAX_ACTIVE_NODES
+            or not runnable_node_ids
+            # Runtime dispatch scheduling is deliberately task-scoped and
+            # operates on the newest durable intent.  A restart may happen
+            # after admitting the first fan-out node but before dispatching
+            # it.  Admit no sibling until every existing active Recipe intent
+            # has a verified dispatch receipt; otherwise the newer sibling
+            # becomes the task's current intent and the older Pending intent
+            # can starve forever after recovery.
+            or any(intent.state != "dispatched" for intent in active_intents)
+            # Project the first branch to a durable Running fact before
+            # admitting its sibling.  Otherwise the task-scoped status pump
+            # selects the newer intent and a fast sibling can finish before
+            # the earlier branch is ever visible as Running in API/SSE.
+            or any(
+                active_node_states[intent.node_id] != "Running"
+                for intent in active_intents
+            )
+        ):
+            if len(active_intents) > 1 and not parallel_recipe:
                 raise TaskConflict(
-                    "DAG active admission differs from durable node state"
+                    "legacy DAG task has multiple active admissions"
                 )
+            primary = active_intents[-1]
             return DagRuntimeAdvanceResult(
-                snapshot=active.snapshot,
-                active_intent=active.intent,
+                snapshot=active_admissions[-1].snapshot,
+                active_intent=primary,
                 admitted_node_id=None,
                 blocked_node_ids=tuple(reconciled.blocked_node_ids),
-                aggregate_status=active.snapshot.status,
+                aggregate_status=active_admissions[-1].snapshot.status,
                 deferred_code=(
                     "CHECKPOINT_RESUME_PENDING"
-                    if active.snapshot.status == "Waiting"
-                    and active.snapshot.checkpoint is not None
-                    and active.snapshot.checkpoint.state == "resume_requested"
+                    if len(active_intents) == 1
+                    and active_admissions[-1].snapshot.status == "Waiting"
+                    and active_admissions[-1].snapshot.checkpoint is not None
+                    and active_admissions[-1].snapshot.checkpoint.state
+                    == "resume_requested"
                     else (
                         "CHECKPOINT_WAITING"
-                        if active.snapshot.status == "Waiting"
+                        if len(active_intents) == 1
+                        and active_admissions[-1].snapshot.status == "Waiting"
                         else (
                             "CANCEL_CONTROL_PENDING"
-                            if active.snapshot.cancellation is not None
-                            and active.snapshot.cancellation.state == "requested"
+                            if active_admissions[-1].snapshot.cancellation is not None
+                            and active_admissions[-1].snapshot.cancellation.state
+                            == "requested"
                             else None
                         )
                     )
                 ),
+                active_intents=active_intents,
             )
-        if active_node_ids:
+        if active_node_ids and not parallel_recipe:
             raise TaskConflict("DAG active node has no exact execution admission")
         if snapshot.status in {"Succeeded", "Failed"}:
             if reconciled.aggregate_status != snapshot.status:
@@ -3442,6 +3665,7 @@ class TaskService:
                 admitted_node_id=None,
                 blocked_node_ids=tuple(reconciled.blocked_node_ids),
                 aggregate_status=snapshot.status,
+                active_intents=(),
             )
         if snapshot.cancellation is not None:
             return DagRuntimeAdvanceResult(
@@ -3451,8 +3675,8 @@ class TaskService:
                 blocked_node_ids=tuple(reconciled.blocked_node_ids),
                 aggregate_status=snapshot.status,
                 deferred_code="CANCEL_CONTROL_PENDING",
+                active_intents=active_intents,
             )
-        runnable_node_ids = tuple(reconciled.runnable_node_ids)
         if not runnable_node_ids:
             raise TaskConflict("non-terminal DAG has no active or runnable node")
 
@@ -3511,12 +3735,13 @@ class TaskService:
             )
             return DagRuntimeAdvanceResult(
                 snapshot=hit.snapshot,
-                active_intent=None,
+                active_intent=(active_intents[-1] if active_intents else None),
                 admitted_node_id=None,
                 blocked_node_ids=tuple(reconciled.blocked_node_ids),
                 aggregate_status=hit.snapshot.status,
                 cache_hit_node_id=hit.node_id,
                 cache_key_hash=hit.cache_key_hash,
+                active_intents=active_intents,
             )
         admission = self.admit_ready_dag_node_execution(
             task_id,
@@ -3535,6 +3760,7 @@ class TaskService:
             admitted_node_id=(None if admission.replayed else claim.node.node_id),
             blocked_node_ids=tuple(reconciled.blocked_node_ids),
             aggregate_status=admission.snapshot.status,
+            active_intents=(*active_intents, admission.intent),
         )
 
     @staticmethod
@@ -5255,18 +5481,6 @@ class TaskService:
         heartbeat = evidence.get("heartbeat")
         if not isinstance(heartbeat, Mapping) or heartbeat.get("state") != "waiting":
             return snapshot
-        if self._is_dag_node_execution_intent(intent):
-            # DAG node state and Worker checkpoint state are deliberately
-            # separate facts.  Once the admitted node has already reached its
-            # durable Running projection, the ordinary P2 checkpoint pass may
-            # move only the Task aggregate to Waiting without minting another
-            # node transition or Worker attempt.  The earlier Queued->Running
-            # race remains fail closed because it must be projected through
-            # the DAG transition receipt, not the generic Task event writer.
-            node_state = self._current_dag_node_state(intent)
-            if snapshot.status == "Running" and node_state.state == "Running":
-                return snapshot
-            raise TaskDispatchError("DAG_CHECKPOINT_EARLY_UNSUPPORTED")
         if not self._checkpoint_capable_intent(intent):
             raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
         ticket = evidence.get("ticket")
@@ -5286,6 +5500,79 @@ class TaskService:
             self._parse_gate_time(started_at)
         except TaskDispatchError as error:
             raise TaskDispatchError("WORKER_EVIDENCE_INVALID") from error
+
+        if self._is_dag_node_execution_intent(intent):
+            # A fast one-update Worker can publish Waiting before the ordinary
+            # status bridge samples Running.  Project its exact immutable ready
+            # boundary through the DAG node transition, then let the next
+            # checkpoint pass own Running-to-Waiting.  This creates no new
+            # launch, intent, attempt, or resource lease.
+            for _ in range(8):
+                current = self.get_task(
+                    task_id, project_id=project_id, principal_id=principal_id
+                )
+                node_state = self._current_dag_node_state(intent)
+                if current.status in {"Running", "Waiting"} and node_state.state == "Running":
+                    return current
+                if (
+                    current.status not in {"Queued", "Running"}
+                    or node_state.state != "Queued"
+                ):
+                    raise TaskConflict(
+                        "early DAG checkpoint cannot cross the Worker ready boundary"
+                    )
+                adapter_status = self._validated_adapter_status(
+                    intent,
+                    {
+                        "job_id": intent.handle["job_id"],
+                        "task_id": task_id,
+                        "node_id": intent.node_id,
+                        "status": "Running",
+                        "stage": "running",
+                        "completed": 0,
+                        "total": intent.request["parameters"]["iterations"],
+                        "message": "Worker reached its checkpoint-ready boundary",
+                        "updated_at": started_at,
+                        "terminal": False,
+                    },
+                )
+                event = self._adapter_event(
+                    snapshot=current,
+                    intent=intent,
+                    adapter_status=adapter_status,
+                    event_type="node_started",
+                    sequence=self._store.latest_run_event_sequence(task_id) + 1,
+                )
+                event["task_status"] = self._dag_aggregate_status_after_event(
+                    snapshot=current,
+                    intent=intent,
+                    event_type="node_started",
+                )
+                self._validate_dag_runtime_event(
+                    snapshot=current,
+                    intent=intent,
+                    event=event,
+                )
+                try:
+                    projected = self._store.commit_dag_node_runtime_transition(
+                        intent_id=intent.intent_id,
+                        expected_node_state="Queued",
+                        event=event,
+                        adapter_status=adapter_status,
+                        output_receipt=None,
+                        supervisor_lease=supervisor_lease,
+                        supervisor_clock=self._runtime_supervisor_clock,
+                    )
+                except RuntimeSupervisorLeaseLost as error:
+                    raise TaskSupervisorLeaseLost() from error
+                except TaskStoreConflict:
+                    continue
+                if not isinstance(projected, TaskSnapshot):
+                    raise TaskDispatchError("DAG_RUNTIME_PROJECTION_INVALID")
+                return projected
+            raise TaskConflict(
+                "concurrent early DAG checkpoint projection did not converge"
+            )
 
         for _ in range(8):
             current = self.get_task(
@@ -5925,6 +6212,21 @@ class TaskService:
         }
         result = copy.deepcopy(dict(value))
         status = result.get("status")
+        request_recipe = intent.request.get("recipe")
+        recipe_stage = (
+            fixed_recipe_stage(intent.node_id)
+            if is_fixed_recipe_extension(request_recipe)
+            else None
+        )
+        expected_total = intent.request.get("parameters", {}).get("iterations")
+        if recipe_stage is not None and recipe_stage.get("command") == "forward":
+            # The immutable Algorithm keeps one approved parameter object on
+            # every Plan node, but a fixed forward/check operation performs no
+            # optimizer update.  The real Worker therefore truthfully reports
+            # completed=total=0.  Limit that interpretation to the exact
+            # packaged Recipe; ordinary and historical FWI retain their exact
+            # approved iteration total.
+            expected_total = 0
         if (
             set(result) != required
             or intent.handle is None
@@ -5945,8 +6247,7 @@ class TaskService:
             or result["completed"] < 0
             or result["total"] < 0
             or result["completed"] > result["total"]
-            or result["total"]
-            != intent.request.get("parameters", {}).get("iterations")
+            or result["total"] != expected_total
             or not isinstance(result.get("stage"), str)
             or not isinstance(result.get("message"), str)
             or len(result["message"]) > 1000
@@ -6273,6 +6574,17 @@ class TaskService:
             ):
                 raise TaskConflict(
                     "DAG checkpoint requires the exact current active node"
+                )
+            if node_state.state == "Queued":
+                # Let the managed-attempt projection publish the immutable
+                # ready boundary first.  A fast Worker may already be waiting
+                # at its checkpoint, but the checkpoint transaction is valid
+                # only after the DAG node itself is durably Running.
+                return TaskCheckpointProcessResult(
+                    snapshot=snapshot,
+                    state="none",
+                    adapter_result=None,
+                    replayed=True,
                 )
         if snapshot.status not in {"Running", "Waiting"}:
             return TaskCheckpointProcessResult(
@@ -8542,7 +8854,10 @@ class TaskService:
                 raise TaskDispatchError("ADAPTER_STATUS_REGRESSION")
 
             if target == "Queued":
-                if snapshot.status != "Queued":
+                if dag_execution:
+                    if self._current_dag_node_state(intent).state != "Queued":
+                        raise TaskDispatchError("ADAPTER_STATUS_REGRESSION")
+                elif snapshot.status != "Queued":
                     raise TaskDispatchError("ADAPTER_STATUS_REGRESSION")
                 return TaskRuntimeResult(snapshot, intent, adapter_status)
 
@@ -8621,6 +8936,42 @@ class TaskService:
                     current_node = self._current_dag_node_state(intent)
                     output_proof = None
                     if event_type == "node_succeeded":
+                        if (
+                            isinstance(snapshot.plan, Mapping)
+                            and is_fixed_recipe_parallel_plan(snapshot.plan)
+                        ):
+                            # Adapter status and the supervised Worker projection
+                            # are separate durable streams.  A fast Recipe stage
+                            # can publish Adapter success between projection
+                            # cadence ticks, so synchronously project its exact
+                            # terminal Worker evidence before minting the node
+                            # receipt.  Ordinary/P2 terminal-won cancellation
+                            # semantics remain unchanged.
+                            terminal_projection = self.project_worker_attempt(
+                                task_id,
+                                project_id=project_id,
+                                principal_id=principal_id,
+                                supervisor_lease=supervisor_lease,
+                            )
+                            terminal_evidence = terminal_projection.evidence
+                            terminal_heartbeat = (
+                                terminal_evidence.get("heartbeat")
+                                if isinstance(terminal_evidence, Mapping)
+                                else None
+                            )
+                            terminal_worker_state = (
+                                terminal_heartbeat.get("state")
+                                if isinstance(terminal_heartbeat, Mapping)
+                                else None
+                            )
+                            if terminal_worker_state in {"failed", "stopped"}:
+                                raise TaskDispatchError(
+                                    "ADAPTER_STATUS_CONFLICT"
+                                )
+                            if terminal_worker_state != "succeeded":
+                                return TaskRuntimeResult(
+                                    snapshot, intent, adapter_status
+                                )
                         collector = getattr(
                             self._dispatcher, "verified_node_outputs", None
                         )
@@ -8847,9 +9198,73 @@ class TaskService:
             raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
         return sorted(validated, key=lambda item: item["display"]["order"])
 
+    def _fixed_recipe_artifact_materializations(
+        self, snapshot: TaskSnapshot
+    ) -> tuple[DagNodeOutputMaterialization, ...] | None:
+        plan = snapshot.plan
+        if not isinstance(plan, Mapping) or not is_fixed_recipe_parallel_plan(plan):
+            return None
+        materialized: list[DagNodeOutputMaterialization] = []
+        expected_output_count = 0
+        for node in plan["nodes"]:
+            stage = fixed_recipe_stage(node["node_id"])
+            if stage is None:
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            highlighted_ports = {
+                value["port"] for value in stage["outputs"]
+            }
+            expected_output_count += len(highlighted_ports)
+            try:
+                outputs = self._store.get_dag_node_output_materializations(
+                    task_id=snapshot.task_id,
+                    project_id=snapshot.project_id,
+                    principal_id=snapshot.principal_id,
+                    source_node_id=node["node_id"],
+                )
+            except TaskStoreConflict as error:
+                raise TaskConflict(str(error)) from error
+            materialized.extend(
+                sorted(
+                    (
+                        value
+                        for value in outputs
+                        if value.source_output_port in highlighted_ports
+                    ),
+                    key=lambda value: value.logical_artifact_manifest.get(
+                        "display", {}
+                    ).get("order", 2**31),
+                )
+            )
+        identifiers = [
+            value.logical_artifact_manifest.get("artifact_id")
+            for value in materialized
+        ]
+        if (
+            len(materialized) != expected_output_count
+            or any(not isinstance(value, str) for value in identifiers)
+            or len(identifiers) != len(set(identifiers))
+        ):
+            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+        return tuple(materialized)
+
     def collect_artifacts(
         self, task_id: str, *, project_id: str, principal_id: str
     ) -> list[dict[str, Any]]:
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        if isinstance(snapshot.plan, Mapping) and is_fixed_recipe_parallel_plan(
+            snapshot.plan
+        ):
+            if snapshot.status != "Succeeded":
+                raise TaskDispatchError("RESULT_NOT_READY")
+            recipe_outputs = self._fixed_recipe_artifact_materializations(snapshot)
+            if recipe_outputs is None:
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            return [
+                copy.deepcopy(value.logical_artifact_manifest)
+                for value in recipe_outputs
+            ]
         runtime = self.refresh_runtime_status(
             task_id, project_id=project_id, principal_id=principal_id
         )
@@ -8880,14 +9295,102 @@ class TaskService:
         principal_id: str,
     ) -> tuple[dict[str, Any], bytes]:
         _validate_opaque_id(artifact_id, field="artifact_id")
-        runtime = self.refresh_runtime_status(
+        snapshot = self.get_task(
             task_id, project_id=project_id, principal_id=principal_id
         )
-        if runtime.snapshot.status != "Succeeded" or runtime.intent is None:
-            raise TaskDispatchError("RESULT_NOT_READY")
+        recipe_outputs: tuple[DagNodeOutputMaterialization, ...] | None = None
+        if isinstance(snapshot.plan, Mapping) and is_fixed_recipe_parallel_plan(
+            snapshot.plan
+        ):
+            if snapshot.status != "Succeeded":
+                raise TaskDispatchError("RESULT_NOT_READY")
+            recipe_outputs = self._fixed_recipe_artifact_materializations(snapshot)
+            if recipe_outputs is None:
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+        runtime: TaskRuntimeResult | None = None
+        if recipe_outputs is None:
+            runtime = self.refresh_runtime_status(
+                task_id, project_id=project_id, principal_id=principal_id
+            )
+            if runtime.snapshot.status != "Succeeded" or runtime.intent is None:
+                raise TaskDispatchError("RESULT_NOT_READY")
         if self._dispatcher is None:
             raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+        if recipe_outputs is not None:
+            matches = [
+                value
+                for value in recipe_outputs
+                if value.logical_artifact_manifest.get("artifact_id") == artifact_id
+            ]
+            if len(matches) != 1:
+                raise TaskNotFound(
+                    "artifact does not exist in the requested task"
+                )
+            materialized = matches[0]
+            try:
+                physical_intents = self._store.list_dispatch_intents(
+                    materialized.physical_task_id
+                )
+            except TaskStoreConflict as error:
+                raise TaskConflict(str(error)) from error
+            matching_intents = [
+                value
+                for value in physical_intents
+                if value.intent_id == materialized.physical_intent_id
+            ]
+            if len(matching_intents) != 1:
+                raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
+            physical_intent = matching_intents[0]
+            physical_snapshot = self.get_task(
+                materialized.physical_task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+            )
+            try:
+                manifests, manifest, data = self._dispatcher.read_artifact(
+                    physical_intent, materialized.physical_artifact_id
+                )
+            except DispatchError as error:
+                raise TaskDispatchError(error.code) from error
+            except Exception as error:
+                raise TaskDispatchError(
+                    "ADAPTER_ARTIFACT_UNAVAILABLE"
+                ) from error
+            if (
+                not isinstance(manifests, list)
+                or not all(isinstance(value, dict) for value in manifests)
+                or not isinstance(manifest, dict)
+                or not isinstance(data, bytes)
+            ):
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            validated = self._validate_collected_artifacts(
+                physical_snapshot, physical_intent, manifests
+            )
+            expected_physical = next(
+                (
+                    value
+                    for value in validated
+                    if value.get("artifact_id")
+                    == materialized.physical_artifact_id
+                ),
+                None,
+            )
+            logical = materialized.logical_artifact_manifest
+            if (
+                expected_physical is None
+                or manifest != expected_physical
+                or manifest != materialized.physical_artifact_manifest
+                or len(data) != logical.get("size_bytes")
+                or "sha256:" + hashlib.sha256(data).hexdigest()
+                != logical.get("content_hash")
+                or logical.get("content_hash") != manifest.get("content_hash")
+                or logical.get("media_type") != manifest.get("media_type")
+            ):
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            return copy.deepcopy(logical), bytes(data)
         try:
+            if runtime is None or runtime.intent is None:
+                raise TaskDispatchError("DISPATCH_RECEIPT_UNAVAILABLE")
             manifests, manifest, data = self._dispatcher.read_artifact(
                 runtime.intent, artifact_id
             )

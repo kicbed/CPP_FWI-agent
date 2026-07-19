@@ -211,6 +211,217 @@ def _dag_errors(nodes: Sequence[Mapping[str, Any]]) -> list[GateViolation]:
     return violations
 
 
+_FIXED_RECIPE_EXTENSION_KEY = "org.agent_rpc.recipe"
+_FIXED_RECIPE_EXTENSION = {"id": "forward_qc_fwi", "version": "1.0.0"}
+_FIXED_RECIPE_ALGORITHM = {"id": "deepwave.acoustic_fwi", "version": "1.6.0"}
+_FIXED_RECIPE_NODES = (
+    ("data_check", ()),
+    ("forward", ("data_check",)),
+    ("quality_check", ("data_check",)),
+    ("fwi", ("forward", "quality_check")),
+    ("result_check", ("fwi",)),
+)
+_FIXED_RECIPE_INPUT_EDGES = {
+    "data_check": (),
+    "forward": (
+        (
+            "checked_model",
+            "data_check",
+            "inverted_model",
+            "inverted_velocity_model_2d",
+        ),
+    ),
+    "quality_check": (
+        ("dataset_quality", "data_check", "loss", "loss_curve"),
+    ),
+    "fwi": (
+        ("forward_evidence", "forward", "shot_gathers_figure", "figure"),
+        (
+            "quality_evidence",
+            "quality_check",
+            "model_error_figure",
+            "figure",
+        ),
+    ),
+    "result_check": (
+        (
+            "fwi_model",
+            "fwi",
+            "inverted_model",
+            "inverted_velocity_model_2d",
+        ),
+        ("fwi_loss", "fwi", "loss", "loss_curve"),
+    ),
+}
+
+
+def _fixed_recipe_expected_inputs(
+    node_id: str, draft: Mapping[str, Any]
+) -> list[dict[str, Any]] | None:
+    datasets = draft.get("datasets")
+    if (
+        node_id not in _FIXED_RECIPE_INPUT_EDGES
+        or not isinstance(datasets, list)
+        or len(datasets) != 1
+        or not isinstance(datasets[0], Mapping)
+    ):
+        return None
+    dataset = datasets[0]
+    identity_fields = ("id", "version", "content_hash", "data_type")
+    if any(not isinstance(dataset.get(field), str) for field in identity_fields):
+        return None
+    expected: list[dict[str, Any]] = [
+        {
+            "port": "model",
+            "dataset": {field: dataset[field] for field in identity_fields},
+        }
+    ]
+    expected.extend(
+        {
+            "port": target_port,
+            "source": {
+                "node_id": source_node,
+                "port": source_port,
+                "data_type": data_type,
+            },
+        }
+        for target_port, source_node, source_port, data_type in (
+            _FIXED_RECIPE_INPUT_EDGES[node_id]
+        )
+    )
+    return expected
+
+
+def _fixed_recipe_errors(
+    draft: Mapping[str, Any], plan: Mapping[str, Any]
+) -> list[GateViolation]:
+    """Fail closed only when a document claims the packaged P3 Recipe.
+
+    Historical PlanGraphs without the Recipe extension retain their existing
+    validation behavior.  A claimed Recipe, however, must be the exact
+    versioned five-node product graph; an unknown or partial claim never turns
+    into a generic multi-Algorithm admission path.
+    """
+
+    draft_extensions = draft.get("extensions")
+    plan_extensions = plan.get("extensions")
+    draft_has_recipe = (
+        isinstance(draft_extensions, Mapping)
+        and _FIXED_RECIPE_EXTENSION_KEY in draft_extensions
+    )
+    plan_has_recipe = (
+        isinstance(plan_extensions, Mapping)
+        and _FIXED_RECIPE_EXTENSION_KEY in plan_extensions
+    )
+    if not draft_has_recipe and not plan_has_recipe:
+        return []
+
+    violations: list[GateViolation] = []
+    draft_recipe = (
+        draft_extensions.get(_FIXED_RECIPE_EXTENSION_KEY)
+        if isinstance(draft_extensions, Mapping)
+        else None
+    )
+    plan_recipe = (
+        plan_extensions.get(_FIXED_RECIPE_EXTENSION_KEY)
+        if isinstance(plan_extensions, Mapping)
+        else None
+    )
+    for path, value in (
+        (f"/draft/extensions/{_FIXED_RECIPE_EXTENSION_KEY}", draft_recipe),
+        (f"/plan/extensions/{_FIXED_RECIPE_EXTENSION_KEY}", plan_recipe),
+    ):
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"id", "version"}
+            or dict(value) != _FIXED_RECIPE_EXTENSION
+        ):
+            violations.append(
+                GateViolation(
+                    "FIXED_RECIPE_INVALID",
+                    path,
+                    "Recipe identity must match the exact packaged id/version",
+                )
+            )
+    if violations:
+        return violations
+
+    nodes = plan.get("nodes")
+    if plan.get("schema_version") != "1.2.0":
+        violations.append(
+            GateViolation(
+                "FIXED_RECIPE_PLAN_INVALID",
+                "/plan/schema_version",
+                "the fixed Recipe requires PlanGraph schema 1.2.0",
+            )
+        )
+    if plan.get("task_type") != "acoustic_fwi_2d":
+        violations.append(
+            GateViolation(
+                "FIXED_RECIPE_PLAN_INVALID",
+                "/plan/task_type",
+                "the fixed Recipe requires acoustic_fwi_2d",
+            )
+        )
+    if not isinstance(nodes, list) or len(nodes) != len(_FIXED_RECIPE_NODES):
+        violations.append(
+            GateViolation(
+                "FIXED_RECIPE_PLAN_INVALID",
+                "/plan/nodes",
+                "the fixed Recipe requires its exact five-node graph",
+            )
+        )
+        return violations
+
+    for index, ((expected_id, expected_dependencies), node) in enumerate(
+        zip(_FIXED_RECIPE_NODES, nodes)
+    ):
+        path = f"/plan/nodes/{index}"
+        if not isinstance(node, Mapping):
+            violations.append(
+                GateViolation(
+                    "FIXED_RECIPE_PLAN_INVALID",
+                    path,
+                    "Recipe node must be an object",
+                )
+            )
+            continue
+        if node.get("node_id") != expected_id:
+            violations.append(
+                GateViolation(
+                    "FIXED_RECIPE_PLAN_INVALID",
+                    path + "/node_id",
+                    "Recipe node order and identities are immutable",
+                )
+            )
+        if node.get("dependencies") != list(expected_dependencies):
+            violations.append(
+                GateViolation(
+                    "FIXED_RECIPE_PLAN_INVALID",
+                    path + "/dependencies",
+                    "Recipe dependencies differ from the packaged graph",
+                )
+            )
+        if node.get("algorithm") != _FIXED_RECIPE_ALGORITHM:
+            violations.append(
+                GateViolation(
+                    "FIXED_RECIPE_PLAN_INVALID",
+                    path + "/algorithm",
+                    "Recipe nodes must pin the immutable Deepwave FWI 1.6 Algorithm",
+                )
+            )
+        expected_inputs = _fixed_recipe_expected_inputs(expected_id, draft)
+        if expected_inputs is None or node.get("inputs") != expected_inputs:
+            violations.append(
+                GateViolation(
+                    "FIXED_RECIPE_PLAN_INVALID",
+                    path + "/inputs",
+                    "Recipe inputs differ from the packaged artifact graph",
+                )
+            )
+    return violations
+
+
 def extract_plan_data_edges(plan: Mapping[str, Any]) -> tuple[PlanDataEdge, ...]:
     """Return canonical typed data edges declared by a PlanGraph.
 
@@ -412,6 +623,15 @@ def evaluate_execution_gate(
     if violations:
         return sorted(set(violations))
 
+    fixed_recipe_violations = _fixed_recipe_errors(draft, plan)
+    violations.extend(fixed_recipe_violations)
+    plan_extensions = plan.get("extensions")
+    fixed_recipe_exact = (
+        isinstance(plan_extensions, Mapping)
+        and _FIXED_RECIPE_EXTENSION_KEY in plan_extensions
+        and not fixed_recipe_violations
+    )
+
     try:
         expected_hash = compute_plan_hash(plan)
     except ValueError as error:
@@ -597,10 +817,20 @@ def evaluate_execution_gate(
                 GateViolation("PARAMETER_SCHEMA_MISMATCH", node_path + "/parameters", "node parameters violate AlgorithmManifest parameter_schema")
             )
         manifest_inputs = {item["port"]: item["data_type"] for item in manifest["inputs"]}
+        effective_inputs = dict(manifest_inputs)
+        if fixed_recipe_exact:
+            expected_recipe_inputs = _fixed_recipe_expected_inputs(
+                str(node.get("node_id", "")), draft
+            )
+            if expected_recipe_inputs is not None:
+                for binding in expected_recipe_inputs:
+                    source = binding.get("source")
+                    if isinstance(source, Mapping):
+                        effective_inputs[binding["port"]] = source["data_type"]
         planned_input_ports = [item["port"] for item in node["inputs"]]
         if (
             len(planned_input_ports) != len(set(planned_input_ports))
-            or set(planned_input_ports) != set(manifest_inputs)
+            or set(planned_input_ports) != set(effective_inputs)
         ):
             violations.append(
                 GateViolation(
@@ -620,7 +850,7 @@ def evaluate_execution_gate(
                 if isinstance(source, Mapping)
                 else None
             )
-            if manifest_inputs.get(binding["port"]) != binding_type:
+            if effective_inputs.get(binding["port"]) != binding_type:
                 violations.append(
                     GateViolation("INPUT_TYPE_MISMATCH", input_path, "bound data type does not match the algorithm input port")
                 )

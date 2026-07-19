@@ -142,6 +142,7 @@ def managed_worker_evidence(
     attempt_id: str = MANAGED_ATTEMPT_ID,
     attempt_number: int = 1,
     job_id: str = MANAGED_JOB_ID,
+    request_hash: str = MANAGED_REQUEST_HASH,
     created_at: str = NOW,
     worker_started_at: str = NOW,
 ) -> dict:
@@ -151,7 +152,7 @@ def managed_worker_evidence(
         "attempt_id": attempt_id,
         "attempt_number": attempt_number,
         "job_id": job_id,
-        "request_hash": MANAGED_REQUEST_HASH,
+        "request_hash": request_hash,
         "created_at": created_at,
     }
     binding_hash = encode_document(binding)[1]
@@ -1199,7 +1200,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
     def test_initialization_enables_wal_and_is_reentrant(self) -> None:
         self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertEqual(self.store.migration_version(), 22)
+        self.assertEqual(self.store.migration_version(), 23)
         self.assertEqual(os.stat(self.database_path).st_mode & 0o777, 0o600)
         connection = sqlite3.connect(self.database_path)
         try:
@@ -1215,7 +1216,7 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
         created = self.create()
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.journal_mode(), "wal")
-        self.assertEqual(reopened.migration_version(), 22)
+        self.assertEqual(reopened.migration_version(), 23)
         self.assertEqual(reopened.get_task(created.snapshot.task_id), created.snapshot)
 
         def unexpected_call() -> str:
@@ -1302,12 +1303,12 @@ class ScientificRuntimeTaskServiceTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(initialize, range(8)))
-        self.assertEqual(results, [("wal", 22)] * 8)
+        self.assertEqual(results, [("wal", 23)] * 8)
 
     def test_newer_database_migration_is_rejected(self) -> None:
         connection = sqlite3.connect(self.database_path)
         try:
-            connection.execute("PRAGMA user_version = 23")
+            connection.execute("PRAGMA user_version = 24")
             connection.commit()
         finally:
             connection.close()

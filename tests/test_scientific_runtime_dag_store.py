@@ -530,7 +530,7 @@ class ScientificRuntimeDagStoreTest(unittest.TestCase):
             self.assertEqual(legacy_store.migration_version(), 17)
 
         upgraded_store = SQLiteTaskStore(legacy_path)
-        self.assertEqual(upgraded_store.migration_version(), 22)
+        self.assertEqual(upgraded_store.migration_version(), 23)
         upgraded_service = TaskService(upgraded_store, clock=lambda: NOW)
         self.assertIsNone(
             upgraded_service.get_dag_node_state_snapshot(

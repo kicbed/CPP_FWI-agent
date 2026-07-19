@@ -141,6 +141,12 @@ function loadGuidedFunctions() {
     'normalizeGuidedPlanOutputs',
     'expectedGuidedFwiPlanOutputs',
     'hasExactGuidedFwiPlanOutputs',
+    'normalizeGuidedRecipe',
+    'normalizeGuidedBoundedJson',
+    'normalizeGuidedPlanNode',
+    'normalizeGuidedPlanNodes',
+    'hasExactGuidedFixedRecipePlan',
+    'normalizeGuidedRuntimeNode',
     'normalizeGuidedTimeoutProjection',
     'normalizeGuidedReconciliationProjection',
     'normalizeGuidedTaskProjection',
@@ -153,6 +159,9 @@ function loadGuidedFunctions() {
     'guidedReconciliationExplanation',
     'guidedCancellationExplanation',
     'guidedTimeoutExplanation',
+    'guidedBoundedJsonText',
+    'renderGuidedPlanNodesHtml',
+    'renderGuidedRuntimeNodesHtml',
     'renderGuidedArtifactsHtml',
   ];
   const source = [
@@ -1456,6 +1465,108 @@ function makeGuidedTask(overrides = {}) {
   };
 }
 
+function makeGuidedRecipePlanNodes() {
+  const identities = {
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.6.0' },
+    adapter: { id: 'fwi.deepwave_adapter', version: '1.6.0' },
+  };
+  const parameters = {
+    preset: 'fwi_smoke', device: 'cpu', iterations: 2, seed: 0,
+    optimizer: 'adam', learning_rate_milli: 10000,
+  };
+  const resources = { cpu_cores: 2, gpu_count: 0, wall_time_seconds: 7200 };
+  const node = (nodeId, label, dependencies, outputs, severity) => ({
+    node_id: nodeId,
+    label,
+    dependencies,
+    algorithm: { ...identities.algorithm },
+    adapter: { ...identities.adapter },
+    parameters: { ...parameters },
+    resources: { ...resources },
+    risks: [{
+      code: `${nodeId}_bounded_risk`, severity,
+      mitigation: 'Pinned data, Algorithm, Adapter, resources, and artifact validation.',
+    }],
+    outputs,
+  });
+  return [
+    node('data_check', 'A · Dataset check', [], [
+      { port: 'checked_model', data_type: 'velocity_model_2d' },
+    ], 'low'),
+    node('forward', 'B · Forward modelling', ['data_check'], [
+      { port: 'shot_gathers_figure', data_type: 'figure' },
+    ], 'medium'),
+    node('quality_check', 'C · Quality check', ['data_check'], [
+      { port: 'quality_report', data_type: 'quality_report' },
+    ], 'medium'),
+    node('fwi', 'D · FWI', ['forward', 'quality_check'], [
+      { port: 'inverted_model', data_type: 'inverted_velocity_model_2d' },
+      { port: 'loss', data_type: 'loss_curve' },
+    ], 'high'),
+    node('result_check', 'E · Result check', ['fwi'], [
+      { port: 'result_report', data_type: 'quality_report' },
+    ], 'medium'),
+  ];
+}
+
+function makeGuidedRecipeRuntimeNodes() {
+  const planNodes = makeGuidedRecipePlanNodes();
+  const statusByNode = {
+    data_check: 'Succeeded',
+    forward: 'Running',
+    quality_check: 'Waiting',
+    fwi: 'Blocked',
+    result_check: 'Pending',
+  };
+  return planNodes.map((node, index) => ({
+    node_id: node.node_id,
+    label: node.label,
+    status: statusByNode[node.node_id],
+    dependencies: [...node.dependencies],
+    algorithm: { ...node.algorithm },
+    adapter: { ...node.adapter },
+    parameters: { ...node.parameters },
+    resources: { ...node.resources },
+    wait_reason: node.node_id === 'quality_check'
+      ? 'resource_wait' : (node.node_id === 'fwi' ? 'dependency_wait' : null),
+    cache: node.node_id === 'data_check'
+      ? { state: 'miss', key_hash: `sha256:${'1'.repeat(64)}` }
+      : (node.node_id === 'forward'
+        ? { state: 'hit', artifact_hash: `sha256:${'2'.repeat(64)}` }
+        : null),
+    checkpoint: node.node_id === 'forward'
+      ? { state: 'saved', content_hash: `sha256:${'3'.repeat(64)}` } : null,
+    failure: null,
+    lineage: {
+      input_hashes: [`sha256:${String(index + 4).repeat(64)}`],
+      output_hashes: [`sha256:${String(index + 5).repeat(64)}`],
+    },
+    outputs: node.outputs.map(output => ({
+      port: output.port,
+      content_hash: `sha256:${String(index + 5).repeat(64)}`,
+    })),
+  }));
+}
+
+function makeGuidedRecipeTask(overrides = {}) {
+  const base = makeGuidedTask({
+    status: overrides.status,
+    approval: overrides.approval,
+    plan_hash: overrides.plan_hash,
+    can_cancel: overrides.can_cancel,
+  });
+  base.recipe = {
+    id: 'forward_qc_fwi',
+    version: '1.0.0',
+    label: 'Forward + quality checks + FWI',
+  };
+  base.plan.nodes = overrides.plan_nodes || makeGuidedRecipePlanNodes();
+  if (Object.hasOwn(overrides, 'runtime_nodes')) {
+    base.runtime_nodes = overrides.runtime_nodes;
+  }
+  return base;
+}
+
 function makeGuidedManifest(type, id, overrides = {}) {
   return {
     schema_version: '1.0.0',
@@ -1510,6 +1621,29 @@ function testGuidedFormHasStrictBoundaries() {
     'goal', 'dataset_id', 'dataset_version', 'preset', 'device', 'iterations', 'seed',
     'optimizer', 'learning_rate',
   ]);
+  assert.equal(Object.hasOwn(normalized.value, 'recipe_id'), false);
+  const selectedRecipe = api.validateGuidedFwiForm({
+    ...base,
+    goal: '运行固定正演、质量检查和 FWI Recipe',
+    unsupported_operation: 'forward',
+    recipe_id: 'forward_qc_fwi',
+    recipe_version: '1.0.0',
+  });
+  assert.equal(selectedRecipe.ok, true);
+  assert.deepEqual(Object.keys(selectedRecipe.value), [
+    'goal', 'dataset_id', 'dataset_version', 'preset', 'device', 'iterations', 'seed',
+    'optimizer', 'learning_rate', 'recipe_id', 'recipe_version',
+  ]);
+  assert.equal(selectedRecipe.value.recipe_id, 'forward_qc_fwi');
+  assert.equal(selectedRecipe.value.recipe_version, '1.0.0');
+  for (const recipePatch of [
+    { recipe_id: 'forward_qc_fwi' },
+    { recipe_version: '1.0.0' },
+    { recipe_id: 'other_recipe', recipe_version: '1.0.0' },
+    { recipe_id: 'forward_qc_fwi', recipe_version: '1.0.1' },
+  ]) {
+    assert.equal(api.validateGuidedFwiForm({ ...base, ...recipePatch }).ok, false);
+  }
   assert.equal(api.validateGuidedFwiForm({
     ...base, optimizer: 'sgd', learning_rate: '10000000',
   }).ok, true);
@@ -1581,9 +1715,26 @@ function testGuidedFormHasStrictBoundaries() {
     unsupported_operation: forward.unsupported_operation,
   });
   assert.equal(rejectedForward.ok, false);
-  assert.match(rejectedForward.errors.join('；'), /P1 Guided 当前不支持正演\/forward/);
+  assert.match(rejectedForward.errors.join('；'), /普通 Guided 当前不支持正演\/forward/);
+  const recipeCatalog = {
+    datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
+    recipes: [{ id: 'forward_qc_fwi', version: '1.0.0' }],
+  };
+  const selectedForm = api.makeGuidedForm({
+    goal: forward.goal,
+    recipe_id: 'forward_qc_fwi',
+    recipe_version: '1.0.0',
+  }, recipeCatalog);
+  assert.equal(selectedForm.recipe_id, 'forward_qc_fwi');
+  assert.equal(selectedForm.recipe_version, '1.0.0');
+  assert.equal(api.validateGuidedFwiForm({ ...base, ...selectedForm }).ok, true);
+  assert.match(html, /id="guidedRecipe"/);
+  assert.match(html, /普通 Guided FWI（单节点）/);
+  assert.match(html, /只有显式选择固定、版本化 Recipe 才会生成多节点 PlanGraph/);
+  assert.match(html, /P3 固定 Recipe 不提供整图取消/);
   assert.match(html, /id="guidedIterations"[^>]+min="1" max="10000" step="1"/);
-  assert.match(html, /受支持的托管 Worker 运行后，任务卡会提供取消，只有状态变为 Cancelled 才表示已经停止/);
+  assert.match(html, /普通单节点 Guided 的受支持托管 Worker 运行后可取消/);
+  assert.match(html, /固定 Recipe 不提供整图取消/);
   assert.match(html, /自然语言未写 CUDA\/GPU 时安全默认 CPU，不会自动切换/);
   assert.match(html, /不支持：\$\{escapeHtml\(invalidOptimizer\)\}/);
   assert.match(html, /id="guidedSeed"[^>]+min="0" max="2147483647" step="1"/);
@@ -1591,7 +1742,8 @@ function testGuidedFormHasStrictBoundaries() {
 
 function testGuidedForwardIsExplicitlyBlocked() {
   const unsupportedSource = extractFunction('renderGuidedUnsupportedForwardHtml');
-  assert.match(unsupportedSource, /P1 Guided 不支持正演 \/ forward/);
+  assert.match(unsupportedSource, /普通 Guided 不支持正演 \/ forward/);
+  assert.match(unsupportedSource, /显式选择的固定 Recipe/);
   assert.match(unsupportedSource, /不会被静默改成反演/);
   assert.match(unsupportedSource, /不会创建 Draft、Plan 或运行任务/);
   assert.doesNotMatch(unsupportedSource, /submitGuidedDraft|approveGuidedFwi|method:\s*'POST'/);
@@ -1601,13 +1753,20 @@ function testGuidedForwardIsExplicitlyBlocked() {
   assert.match(renderSource, /renderGuidedUnsupportedForwardHtml\(\)/);
 
   const openSource = extractFunction('openGuidedFwi');
-  const blockAt = openSource.indexOf("overrides.unsupported_operation === 'forward'");
+  const blockAt = openSource.indexOf('requestedForward && !explicitlyRequestedRecipe');
   const sessionAt = openSource.indexOf("guidedApiPath('session')");
   assert.ok(blockAt >= 0 && sessionAt > blockAt);
+  assert.match(openSource, /overrides\.recipe_id === 'forward_qc_fwi'/);
+  assert.match(openSource, /overrides\.recipe_version === '1\.0\.0'/);
+  assert.match(openSource, /requestedForward && \(!session\.dag \|\| !state\.guided\.form\.recipe_id\)/);
   assert.match(openSource, /state\.guided\.phase = 'unsupported_forward'/);
   assert.match(openSource, /return true/);
 
   const readSource = extractFunction('readGuidedFwiForm');
+  assert.match(readSource, /document\.getElementById\('guidedRecipe'\)/);
+  assert.match(readSource, /state\.guided\.session\?\.dag === true/);
+  assert.match(readSource, /recipe_id: recipeRequested/);
+  assert.match(readSource, /recipe_version: recipeRequested/);
   assert.match(readSource, /unsupported_operation: state\.guided\.form\?\.unsupported_operation/);
   const submitSource = extractFunction('submitGuidedDraft');
   assert.ok(submitSource.indexOf('if (!validation.ok)') < submitSource.indexOf('guidedApiRequest(path'));
@@ -1966,6 +2125,7 @@ function testGuidedTaskAndCrashStatesAreHonest() {
     guidedReconciliationExplanation: api.guidedReconciliationExplanation,
     guidedCancellationExplanation: api.guidedCancellationExplanation,
     guidedTimeoutExplanation: api.guidedTimeoutExplanation,
+    renderGuidedRuntimeNodesHtml: api.renderGuidedRuntimeNodesHtml,
     isTaskReferencedByChat: () => false,
   };
   vm.runInNewContext([
@@ -2176,6 +2336,18 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   assert.ok(normalizedLegacy, 'complete 1.0/1.1 projections remain readable');
   assert.equal(normalizedLegacy.draft.optimizer, '');
   assert.equal(normalizedLegacy.draft.learningRate, null);
+  for (const historicalVersion of ['1.0.0', '1.1.0', '1.2.0', '1.3.0']) {
+    const historical = makeGuidedTask({ algorithm_version: historicalVersion });
+    historical.plan.nodes[0].outputs = historical.plan.nodes[0].outputs.slice(0, 2);
+    if (['1.0.0', '1.1.0'].includes(historicalVersion)) {
+      delete historical.draft.parameters.optimizer;
+      delete historical.draft.parameters.learning_rate_milli;
+    }
+    assert.ok(
+      api.normalizeGuidedTaskProjection(historical),
+      `historical Algorithm/Adapter ${historicalVersion} remains readable`,
+    );
+  }
   const currentMissingFigures = makeGuidedTask();
   currentMissingFigures.plan.nodes[0].outputs = currentMissingFigures.plan.nodes[0].outputs.slice(0, 2);
   assert.equal(
@@ -2230,6 +2402,210 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   assert.match(taskSource, /task\.cancellation/);
   assert.match(taskSource, /已超时，安全停止中/);
   assert.match(taskSource, /guidedTimeoutExplanation\(task\.timeout\)/);
+}
+
+function testGuidedFixedRecipePlanAndRuntimeAreExplicitAndBounded() {
+  const api = loadGuidedFunctions();
+  const catalog = {
+    datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.6.0' },
+    recipes: [{
+      id: 'forward_qc_fwi', version: '1.0.0',
+      label: 'Forward + quality checks + FWI', description: 'fixed',
+    }],
+  };
+  const session = { dag: true };
+  const review = api.normalizeGuidedTaskProjection(makeGuidedRecipeTask());
+  assert.ok(review);
+  assert.deepEqual(JSON.parse(JSON.stringify(review.recipe)), {
+    id: 'forward_qc_fwi', version: '1.0.0',
+    label: 'Forward + quality checks + FWI',
+  });
+  assert.equal(review.plan.nodeCount, 5);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(review.plan.nodes.map(node => [
+      node.nodeId, node.dependencies,
+    ]))),
+    [
+      ['data_check', []],
+      ['forward', ['data_check']],
+      ['quality_check', ['data_check']],
+      ['fwi', ['forward', 'quality_check']],
+      ['result_check', ['fwi']],
+    ],
+  );
+  assert.equal(api.isGuidedReviewReady(review, catalog, session), true);
+  assert.equal(api.isGuidedReviewReady(review, catalog, { dag: false }), false);
+  assert.equal(api.isGuidedReviewReady(review, { ...catalog, recipes: [] }, session), false);
+  assert.equal(
+    api.isGuidedReviewReady(api.normalizeGuidedTaskProjection(makeGuidedTask()), catalog, session),
+    true,
+    'ordinary Guided FWI remains an independently valid single-node Plan',
+  );
+
+  const planHtml = api.renderGuidedPlanNodesHtml(review);
+  assert.equal((planHtml.match(/data-guided-plan-node=/g) || []).length, 5);
+  for (const expected of [
+    'data_check', 'forward', 'quality_check', 'fwi', 'result_check',
+    'fwi.deepwave_adapter@1.6.0', 'CPU / GPU resources', 'risks', 'outputs',
+  ]) {
+    assert.match(planHtml, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+  const unsafePlan = makeGuidedRecipeTask();
+  unsafePlan.plan.nodes[0].label = '<img src=x onerror=alert(1)>';
+  const unsafeNormalized = api.normalizeGuidedTaskProjection(unsafePlan);
+  const unsafeHtml = api.renderGuidedPlanNodesHtml(unsafeNormalized);
+  assert.doesNotMatch(unsafeHtml, /<img src=x/);
+  assert.match(unsafeHtml, /&lt;img src=x onerror=alert\(1\)&gt;/);
+
+  const runtimeSource = makeGuidedRecipeTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: makeGuidedRecipeRuntimeNodes(),
+  });
+  const runtime = api.normalizeGuidedTaskProjection(runtimeSource);
+  assert.ok(runtime);
+  assert.equal(runtime.dispatch.state, '');
+  assert.equal(runtime.runtimeNodes.length, 5);
+  assert.equal(runtime.runtimeNodes[2].waitReason, 'resource_wait');
+  assert.equal(runtime.runtimeNodes[3].waitReason, 'dependency_wait');
+  assert.equal(runtime.runtimeNodes[1].cache.state, 'hit');
+  assert.equal(runtime.runtimeNodes[1].checkpoint.state, 'saved');
+  assert.equal(api.isGuidedApprovalCompleted(runtime, runtime.plan.hash), true);
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    can_cancel: true,
+    runtime_nodes: makeGuidedRecipeRuntimeNodes(),
+  })), null, 'the fixed Recipe cannot advertise unsupported task-wide cancellation');
+  const schedulerPendingSource = makeGuidedRecipeTask({
+    status: 'AwaitingApproval',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: makeGuidedRecipeRuntimeNodes().map(node => ({
+      ...node,
+      status: 'Pending',
+      wait_reason: node.dependencies.length ? 'dependencies' : 'scheduler',
+      cache: null,
+      checkpoint: null,
+      failure: null,
+      lineage: null,
+      outputs: [],
+    })),
+  });
+  const schedulerPending = api.normalizeGuidedTaskProjection(schedulerPendingSource);
+  assert.ok(schedulerPending);
+  assert.equal(
+    api.isGuidedApprovedSubmitPending(schedulerPending, catalog, session),
+    false,
+    'a fixed Recipe Approval is a server-scheduler hand-off, not a missing browser submit',
+  );
+  assert.equal(api.isGuidedApprovalCompleted(schedulerPending, schedulerPending.plan.hash), true);
+  const runtimeHtml = api.renderGuidedRuntimeNodesHtml(runtime);
+  assert.equal((runtimeHtml.match(/data-guided-runtime-node=/g) || []).length, 5);
+  for (const expected of [
+    'resource_wait', 'dependency_wait', '&quot;state&quot;:&quot;hit&quot;',
+    '&quot;state&quot;:&quot;saved&quot;', 'input_hashes', 'output_hashes',
+    '浏览器只读服务器事实',
+  ]) {
+    assert.match(runtimeHtml, new RegExp(expected));
+  }
+
+  const failedNodes = makeGuidedRecipeRuntimeNodes();
+  failedNodes[1].status = 'Succeeded';
+  failedNodes[2].status = 'Failed';
+  failedNodes[2].wait_reason = null;
+  failedNodes[2].failure = {
+    code: 'QUALITY_CHECK_FAILED', message: 'deterministic quality failure',
+  };
+  failedNodes[3].status = 'Blocked';
+  failedNodes[4].status = 'Blocked';
+  const failed = api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    status: 'Failed',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: failedNodes,
+  }));
+  assert.ok(failed);
+  assert.match(api.renderGuidedRuntimeNodesHtml(failed), /QUALITY_CHECK_FAILED/);
+  assert.equal(failed.runtimeNodes[3].status, 'Blocked');
+  assert.equal(failed.runtimeNodes[4].status, 'Blocked');
+
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    status: 'Succeeded',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: makeGuidedRecipeRuntimeNodes(),
+  })), null, 'workflow success requires every node to be Succeeded');
+  const prematureFanIn = makeGuidedRecipeRuntimeNodes();
+  prematureFanIn[3].status = 'Running';
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: prematureFanIn,
+  })), null, 'FWI cannot start before both fan-in dependencies succeed');
+  const unclosedFailure = makeGuidedRecipeRuntimeNodes();
+  unclosedFailure[2].status = 'Failed';
+  unclosedFailure[2].wait_reason = null;
+  unclosedFailure[2].failure = { code: 'QUALITY_CHECK_FAILED' };
+  const failureWhileSiblingRuns = api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: unclosedFailure,
+  }));
+  assert.ok(
+    failureWhileSiblingRuns,
+    'the task remains Running while the already-admitted fan-out sibling finishes',
+  );
+  assert.equal(failureWhileSiblingRuns.runtimeNodes[1].status, 'Running');
+  assert.equal(failureWhileSiblingRuns.runtimeNodes[2].status, 'Failed');
+  assert.equal(failureWhileSiblingRuns.runtimeNodes[3].status, 'Blocked');
+  assert.equal(failureWhileSiblingRuns.runtimeNodes[4].status, 'Pending');
+  const downstreamAfterFailure = makeGuidedRecipeRuntimeNodes();
+  downstreamAfterFailure[2].status = 'Failed';
+  downstreamAfterFailure[2].wait_reason = null;
+  downstreamAfterFailure[2].failure = { code: 'QUALITY_CHECK_FAILED' };
+  downstreamAfterFailure[3].status = 'Running';
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: downstreamAfterFailure,
+  })), null, 'D/E cannot start after the quality-check branch fails');
+
+  const privateRuntime = makeGuidedRecipeRuntimeNodes();
+  privateRuntime[0].lineage.relative_path = '/root/private/artifact';
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: privateRuntime,
+  })), null, 'private runtime paths fail closed');
+  const inconsistentRuntime = makeGuidedRecipeRuntimeNodes();
+  inconsistentRuntime[3].dependencies = ['forward'];
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: inconsistentRuntime,
+  })), null, 'runtime dependencies must match the approved PlanGraph');
+  const cyclic = makeGuidedRecipePlanNodes();
+  cyclic[0].dependencies = ['result_check'];
+  assert.equal(api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    plan_nodes: cyclic,
+  })), null, 'cyclic PlanGraph projections fail closed');
+  const staleApproval = makeGuidedRecipeTask({
+    status: 'Queued',
+    plan_hash: `sha256:${'b'.repeat(64)}`,
+    approval: {
+      approval_id: 'approval-guided-1', decision: 'approved',
+      plan_hash: `sha256:${'a'.repeat(64)}`,
+    },
+    runtime_nodes: makeGuidedRecipeRuntimeNodes(),
+  });
+  assert.equal(api.normalizeGuidedTaskProjection(staleApproval), null);
+
+  const reviewSource = extractFunction('renderGuidedReviewHtml');
+  assert.match(reviewSource, /plan_hash/);
+  assert.match(reviewSource, /renderGuidedPlanNodesHtml\(task\)/);
+  const taskSource = extractFunction('renderGuidedTaskHtml');
+  assert.match(taskSource, /renderGuidedRuntimeNodesHtml\(task\)/);
+  assert.match(taskSource, /浏览器不派发节点/);
+  assert.match(taskSource, /固定 Recipe 不支持整图取消/);
 }
 
 async function testGuidedRuntimeCancelUsesOneDurableMutation() {
@@ -2655,6 +3031,7 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       positive_receipt_reconciliation: true,
       exact_negative_reconciliation: true,
       automatic_reconciliation: false,
+      dag: true,
     },
   });
   assert.equal(session.mode, 'guided');
@@ -2669,9 +3046,11 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       'supervisor_leases',
       'positive_receipt_reconciliation',
       'exact_negative_reconciliation',
+      'dag',
     ],
   );
   assert.equal(session.manualRetry, false);
+  assert.equal(session.dag, true);
   assert.equal(session.streamingEvents, true);
   assert.deepEqual(
     JSON.parse(JSON.stringify(session.finiteAutomaticRetry)),
@@ -2701,6 +3080,26 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
         entrypoint_ref: '/root/private/adapter.py',
       },
     },
+    recipes: [{
+      id: 'forward_qc_fwi', version: '1.0.0',
+      label: 'Forward + quality checks + FWI',
+      description: 'Fixed five-node fan-out/fan-in workflow',
+      algorithm: { id: 'deepwave.acoustic_fwi', version: '1.6.0' },
+      adapter: { id: 'fwi.deepwave_adapter', version: '1.6.0' },
+      command_path: '/root/private/recipe.py',
+      stages: [
+        { node_id: 'data_check', dependencies: [], outputs: [{ port: 'a' }] },
+        { node_id: 'forward', dependencies: ['data_check'], outputs: [{ port: 'b' }] },
+        { node_id: 'quality_check', dependencies: ['data_check'], outputs: [{ port: 'c' }] },
+        {
+          node_id: 'fwi', dependencies: ['forward', 'quality_check'],
+          outputs: [{ port: 'd' }],
+        },
+        { node_id: 'result_check', dependencies: ['fwi'], outputs: [{ port: 'e' }] },
+      ],
+    }, {
+      id: 'dynamic_pipeline', version: '9.9.9', label: 'must not be selectable',
+    }],
   });
   assert.equal(catalog.datasets[0].metadata.path, undefined);
   assert.equal(catalog.datasets[0].relative_path, undefined);
@@ -2712,6 +3111,13 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
     JSON.parse(JSON.stringify(catalog.adapter)),
     { protocol: 'algorithm-adapter-v1', version: '1.6.0' },
   );
+  assert.deepEqual(JSON.parse(JSON.stringify(catalog.recipes)), [{
+    id: 'forward_qc_fwi', version: '1.0.0',
+    label: 'Forward + quality checks + FWI',
+    description: 'Fixed five-node fan-out/fan-in workflow',
+  }]);
+  assert.equal(catalog.recipes[0].command_path, undefined);
+  assert.equal(catalog.recipes[0].stages, undefined);
   const historical15 = api.normalizeGuidedCatalog({
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
     algorithm: {
@@ -2757,7 +3163,10 @@ function testGuidedApprovalCannotBeBypassedOrReplayedAutomatically() {
   const approveSource = extractFunction('approveGuidedFwi');
   assert.match(approveSource, /returnPhase === 'review'/);
   assert.match(approveSource, /returnPhase === 'approval_incomplete'/);
-  assert.match(approveSource, /isGuidedReviewReady\(task, state\.guided\.catalog\)/);
+  assert.match(
+    approveSource,
+    /isGuidedReviewReady\(task, state\.guided\.catalog, state\.guided\.session\)/,
+  );
   assert.match(approveSource, /guidedMutationKey\('approve', body\)/);
   assert.match(approveSource, /isGuidedApprovalCompleted\(updated, body\.plan_hash\)/);
   assert.match(approveSource, /state\.guided\.approvalReplayAvailable = true/);
@@ -3075,7 +3484,14 @@ async function testGuidedApproveFourXxRetainsOriginalKeyThroughGetRecovery() {
     extractFunction('normalizeGuidedPlanOutputs'),
     extractFunction('expectedGuidedFwiPlanOutputs'),
     extractFunction('hasExactGuidedFwiPlanOutputs'),
+    extractFunction('normalizeGuidedRecipe'),
+    extractFunction('normalizeGuidedBoundedJson'),
+    extractFunction('normalizeGuidedPlanNode'),
+    extractFunction('normalizeGuidedPlanNodes'),
+    extractFunction('hasExactGuidedFixedRecipePlan'),
+    extractFunction('normalizeGuidedRuntimeNode'),
     extractFunction('normalizeGuidedTimeoutProjection'),
+    extractFunction('normalizeGuidedReconciliationProjection'),
     extractFunction('normalizeGuidedTaskProjection'),
     extractFunction('isGuidedReviewReady'),
     extractFunction('isGuidedApprovedSubmitPending'),
@@ -3987,6 +4403,31 @@ async function testRecoveredApprovedPendingTaskIsFailClosed() {
   assert.match(replayable.toasts[1], /Mutation 尚未闭环/);
 }
 
+async function testRecoveredRecipeApprovalImmediatelyMonitorsServerScheduler() {
+  const task = makeRecoveredGuidedTask('AwaitingApproval');
+  task.recipe = {
+    id: 'forward_qc_fwi',
+    version: '1.0.0',
+    label: 'Forward + quality checks + FWI',
+  };
+  task.plan.nodeCount = 5;
+  task.approval.planId = task.plan.id;
+  task.approval.planHash = task.plan.hash;
+  task.runtimeNodes = Array.from({ length: 5 }, (_unused, index) => ({
+    nodeId: `node-${index}`,
+    status: 'Pending',
+  }));
+  const harness = createGuidedRecoveryHarness(task, false);
+
+  assert.equal(await harness.api.reopenGuidedTask(task.taskId), true);
+  assert.equal(harness.sandbox.state.guided.phase, 'monitoring');
+  assert.equal(harness.sandbox.state.guided.approvalReplayAvailable, false);
+  assert.equal(harness.sandbox.state.guided.error, '');
+  assert.equal(harness.counts.scheduledPolls, 1);
+  assert.equal(harness.requests.every(request => request.method === 'GET'), true);
+  assert.equal(Object.keys(harness.sandbox.state.guided.mutationKeys).length, 0);
+}
+
 async function main() {
   testStreamChunkExtraction();
   testMarkdownRendererUsesLibraryAndSanitizer();
@@ -4017,6 +4458,7 @@ async function main() {
   testGuidedForwardIsExplicitlyBlocked();
   testGuidedIdentifiersAndRoutesAreConstrained();
   testGuidedTaskAndCrashStatesAreHonest();
+  testGuidedFixedRecipePlanAndRuntimeAreExplicitAndBounded();
   await testGuidedRuntimeCancelUsesOneDurableMutation();
   testGuidedArtifactManifestsUseControlledDownloads();
   testCurrentEightAndHistoricalTwoArtifactContracts();
@@ -4036,6 +4478,7 @@ async function main() {
   await testGuidedTaskIndexTraversesMoreThanOneHundredWithoutHiddenCursorAdvance();
   await testGuidedCloseRetainsIndexAndReopensThroughGets();
   await testRecoveredApprovedPendingTaskIsFailClosed();
+  await testRecoveredRecipeApprovalImmediatelyMonitorsServerScheduler();
   console.log('ui message rendering tests passed');
 }
 

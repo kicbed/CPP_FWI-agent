@@ -29,6 +29,12 @@ from .fwi_adapter import (
     DeepwaveAdapter,
     is_supported_receipt_binding,
 )
+from .fixed_recipe import (
+    RECIPE_EXTENSION_KEY,
+    fixed_recipe_plan_inputs,
+    fixed_recipe_stage,
+    is_fixed_recipe_extension,
+)
 from .task_store import (
     DagNodeInputBindingFact,
     DispatchIntentSnapshot,
@@ -372,6 +378,31 @@ class DeepwaveTaskDispatcher:
         self._adapter = adapter
 
     @staticmethod
+    def _request_shape_is_valid(request: Mapping[str, Any]) -> bool:
+        fields = {
+            "task_id",
+            "node_id",
+            "plan_hash",
+            "idempotency_key",
+            "project_id",
+            "principal_id",
+            "algorithm",
+            "dataset",
+            "task_type",
+            "parameters",
+            "resources",
+        }
+        if set(request) == fields:
+            return True
+        recipe = request.get("recipe")
+        return (
+            set(request) == fields | {"recipe", "recipe_input_hashes"}
+            and is_fixed_recipe_extension(recipe)
+            and fixed_recipe_stage(request.get("node_id")) is not None
+            and isinstance(request.get("recipe_input_hashes"), list)
+        )
+
+    @staticmethod
     def _request_from_snapshot(snapshot: TaskSnapshot) -> dict[str, Any]:
         if snapshot.plan is None or len(snapshot.plan.get("nodes", [])) != 1:
             raise DispatchError("PLAN_CAPABILITY_UNSUPPORTED_IN_P1")
@@ -414,6 +445,8 @@ class DeepwaveTaskDispatcher:
 
     def _prepare_request(self, request: Mapping[str, Any]) -> DispatchPreparation:
         request = copy.deepcopy(dict(request))
+        recipe = request.get("recipe")
+        recipe_stage = request.get("node_id") if recipe is not None else None
         try:
             validated = self._adapter.validate(
                 **{
@@ -428,8 +461,11 @@ class DeepwaveTaskDispatcher:
                         "task_type",
                         "parameters",
                         "resources",
+                        "recipe",
+                        "recipe_input_hashes",
                     }
-                }
+                },
+                recipe_stage=recipe_stage,
             )
         except AdapterError as error:
             raise DispatchError(error.code) from error
@@ -477,26 +513,91 @@ class DeepwaveTaskDispatcher:
             if isinstance(value, Mapping) and value.get("node_id") == node_id
         ]
         binding_inputs = input_binding.binding_document.get("inputs")
+        extensions = plan.get("extensions")
+        recipe = (
+            extensions.get(RECIPE_EXTENSION_KEY)
+            if isinstance(extensions, Mapping)
+            else None
+        )
+        recipe_stage = fixed_recipe_stage(node_id)
+        recipe_plan = recipe is not None
+        if recipe_plan and (
+            not is_fixed_recipe_extension(recipe) or recipe_stage is None
+        ):
+            raise DispatchError("FIXED_RECIPE_INVALID")
         if (
             len(matching) != 1
             or not isinstance(binding_inputs, list)
-            or len(binding_inputs) != 1
         ):
             raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
         node = matching[0]
-        bound = binding_inputs[0]
         planned_inputs = node.get("inputs")
         if (
-            not isinstance(bound, Mapping)
-            or bound.get("kind") != "dataset"
-            or not isinstance(planned_inputs, list)
-            or len(planned_inputs) != 1
-            or not isinstance(planned_inputs[0], Mapping)
-            or bound.get("target_input_port") != planned_inputs[0].get("port")
-            or bound.get("dataset") != planned_inputs[0].get("dataset")
+            not isinstance(planned_inputs, list)
+            or len(planned_inputs) != len(binding_inputs)
+            or not planned_inputs
         ):
             raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
-        identity = bound.get("dataset")
+        if recipe_plan:
+            dataset_binding = planned_inputs[0]
+            dataset_identity = (
+                dataset_binding.get("dataset")
+                if isinstance(dataset_binding, Mapping)
+                else None
+            )
+            expected_inputs = fixed_recipe_plan_inputs(node_id, dataset_identity)
+            if planned_inputs != expected_inputs:
+                raise DispatchError("FIXED_RECIPE_INVALID")
+        elif len(planned_inputs) != 1:
+            raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
+
+        recipe_input_hashes: list[str] = []
+        for index, (planned, bound) in enumerate(zip(planned_inputs, binding_inputs)):
+            if (
+                not isinstance(planned, Mapping)
+                or not isinstance(bound, Mapping)
+                or bound.get("input_index") != index
+                or bound.get("target_input_port") != planned.get("port")
+            ):
+                raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
+            dataset_binding = planned.get("dataset")
+            source_binding = planned.get("source")
+            if isinstance(dataset_binding, Mapping):
+                if (
+                    source_binding is not None
+                    or bound.get("kind") != "dataset"
+                    or bound.get("dataset") != dataset_binding
+                ):
+                    raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
+                continue
+            bound_edge = bound.get("binding")
+            bound_source = (
+                bound_edge.get("source")
+                if isinstance(bound_edge, Mapping)
+                else None
+            )
+            if (
+                not recipe_plan
+                or not isinstance(source_binding, Mapping)
+                or bound.get("kind") != "node_output"
+                or not isinstance(bound_source, Mapping)
+                or bound_source.get("node_id") != source_binding.get("node_id")
+                or bound_source.get("output_port") != source_binding.get("port")
+                or bound_source.get("data_type") != source_binding.get("data_type")
+            ):
+                raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
+            artifact_identity = bound_edge.get("artifact")
+            content_hash = (
+                artifact_identity.get("content_hash")
+                if isinstance(artifact_identity, Mapping)
+                else None
+            )
+            if not isinstance(content_hash, str) or _SHA256.fullmatch(content_hash) is None:
+                raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
+            recipe_input_hashes.append(content_hash)
+
+        root_bound = binding_inputs[0]
+        identity = root_bound.get("dataset")
         if not isinstance(identity, Mapping):
             raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
         dataset = next(
@@ -526,6 +627,9 @@ class DeepwaveTaskDispatcher:
             "parameters": copy.deepcopy(node["parameters"]),
             "resources": copy.deepcopy(node["resources"]),
         }
+        if recipe_plan:
+            request["recipe"] = copy.deepcopy(dict(recipe))
+            request["recipe_input_hashes"] = recipe_input_hashes
         return self._prepare_request(request)
 
     def dispatch(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
@@ -574,7 +678,9 @@ class DeepwaveTaskDispatcher:
             "parameters",
             "resources",
         }
-        if set(request) != expected or not isinstance(normalized_config_hash, str):
+        if not self._request_shape_is_valid(request) or not isinstance(
+            normalized_config_hash, str
+        ):
             raise DispatchError("DISPATCH_INTENT_INVALID")
         try:
             handle = self._adapter.submit(**request)
@@ -621,7 +727,7 @@ class DeepwaveTaskDispatcher:
             "resources",
         }
         if (
-            set(request) != expected
+            not self._request_shape_is_valid(request)
             or not isinstance(normalized_config_hash, str)
             or request["task_id"] != intent.task_id
             or request["node_id"] != intent.node_id
@@ -790,7 +896,7 @@ class DeepwaveTaskDispatcher:
             "resources",
         }
         if (
-            set(request) != expected
+            not self._request_shape_is_valid(request)
             or not isinstance(normalized_config_hash, str)
             or request["task_id"] != intent.task_id
             or request["node_id"] != intent.node_id
@@ -861,7 +967,7 @@ class DeepwaveTaskDispatcher:
         }
         algorithm = request.get("algorithm")
         if (
-            set(request) != expected
+            not self._request_shape_is_valid(request)
             or not isinstance(normalized_config_hash, str)
             or request["task_id"] != intent.task_id
             or request["node_id"] != intent.node_id
@@ -1047,26 +1153,34 @@ class DeepwaveTaskDispatcher:
             expected_submission_id = (
                 "submission-" + submission_hash.removeprefix("sha256:")
             )
+            expected_request_payload = {
+                "submission_id": expected_submission_id,
+                "task_id": intent.task_id,
+                "node_id": intent.node_id,
+                "plan_hash": intent.plan_hash,
+                "idempotency_key": intent.node_idempotency_key,
+                "project_id": request["project_id"],
+                "principal_id": request["principal_id"],
+                "algorithm": copy.deepcopy(dict(request["algorithm"])),
+                "dataset": {
+                    key: copy.deepcopy(dataset.get(key))
+                    for key in ("id", "version", "content_hash", "data_type")
+                },
+                "dataset_access_scope": copy.deepcopy(dict(access_scope)),
+                "task_type": request["task_type"],
+                "parameters": copy.deepcopy(dict(request["parameters"])),
+                "resources": copy.deepcopy(dict(request["resources"])),
+                "normalized_config_hash": normalized_config_hash,
+            }
+            if "recipe" in request:
+                expected_request_payload["recipe"] = copy.deepcopy(
+                    request["recipe"]
+                )
+                expected_request_payload["recipe_input_hashes"] = copy.deepcopy(
+                    request["recipe_input_hashes"]
+                )
             expected_request_hash = encode_document(
-                {
-                    "submission_id": expected_submission_id,
-                    "task_id": intent.task_id,
-                    "node_id": intent.node_id,
-                    "plan_hash": intent.plan_hash,
-                    "idempotency_key": intent.node_idempotency_key,
-                    "project_id": request["project_id"],
-                    "principal_id": request["principal_id"],
-                    "algorithm": copy.deepcopy(dict(request["algorithm"])),
-                    "dataset": {
-                        key: copy.deepcopy(dataset.get(key))
-                        for key in ("id", "version", "content_hash", "data_type")
-                    },
-                    "dataset_access_scope": copy.deepcopy(dict(access_scope)),
-                    "task_type": request["task_type"],
-                    "parameters": copy.deepcopy(dict(request["parameters"])),
-                    "resources": copy.deepcopy(dict(request["resources"])),
-                    "normalized_config_hash": normalized_config_hash,
-                }
+                expected_request_payload
             )[1]
             created_at = datetime.fromisoformat(
                 evidence["created_at"].replace("Z", "+00:00")
@@ -1235,7 +1349,7 @@ class DeepwaveTaskDispatcher:
             "resources",
         }
         if (
-            set(request) != expected
+            not self._request_shape_is_valid(request)
             or not isinstance(normalized_config_hash, str)
             or request["task_id"] != intent.task_id
             or request["node_id"] != intent.node_id
@@ -1315,20 +1429,7 @@ class DeepwaveTaskDispatcher:
         request = copy.deepcopy(dict(intent.request))
         normalized_config_hash = request.pop("normalized_config_hash", None)
         if (
-            set(request)
-            != {
-                "task_id",
-                "node_id",
-                "plan_hash",
-                "idempotency_key",
-                "project_id",
-                "principal_id",
-                "algorithm",
-                "dataset",
-                "task_type",
-                "parameters",
-                "resources",
-            }
+            not DeepwaveTaskDispatcher._request_shape_is_valid(request)
             or not isinstance(normalized_config_hash, str)
             or request["task_id"] != intent.task_id
             or request["node_id"] != intent.node_id
@@ -1457,20 +1558,7 @@ class DeepwaveTaskDispatcher:
         request = copy.deepcopy(dict(intent.request))
         normalized_config_hash = request.pop("normalized_config_hash", None)
         if (
-            set(request)
-            != {
-                "task_id",
-                "node_id",
-                "plan_hash",
-                "idempotency_key",
-                "project_id",
-                "principal_id",
-                "algorithm",
-                "dataset",
-                "task_type",
-                "parameters",
-                "resources",
-            }
+            not DeepwaveTaskDispatcher._request_shape_is_valid(request)
             or not isinstance(normalized_config_hash, str)
             or request["task_id"] != intent.task_id
             or request["node_id"] != intent.node_id
@@ -2565,20 +2653,7 @@ class DeepwaveTaskDispatcher:
         request = copy.deepcopy(dict(intent.request))
         normalized_config_hash = request.pop("normalized_config_hash", None)
         if (
-            set(request)
-            != {
-                "task_id",
-                "node_id",
-                "plan_hash",
-                "idempotency_key",
-                "project_id",
-                "principal_id",
-                "algorithm",
-                "dataset",
-                "task_type",
-                "parameters",
-                "resources",
-            }
+            not self._request_shape_is_valid(request)
             or not isinstance(normalized_config_hash, str)
             or request["task_id"] != intent.task_id
             or request["node_id"] != intent.node_id

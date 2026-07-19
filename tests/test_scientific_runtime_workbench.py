@@ -29,7 +29,11 @@ from scientific_runtime.workbench_service import (
     WorkbenchValidationError,
     _stable_id,
 )
-from scientific_runtime_contracts import schema_errors
+from scientific_runtime_contracts import (
+    compute_plan_hash,
+    extract_plan_data_edges,
+    schema_errors,
+)
 from tests.test_scientific_runtime_contracts import (
     artifact_manifest,
     dataset_ref,
@@ -62,6 +66,18 @@ def legacy_guided_form(**changes):
     value = guided_form(**changes)
     value.pop("optimizer")
     value.pop("learning_rate")
+    return value
+
+
+def recipe_guided_form(**changes):
+    value = guided_form(
+        goal="Run the fixed forward, quality-check, and FWI Recipe."
+    )
+    value.update(
+        recipe_id="forward_qc_fwi",
+        recipe_version="1.0.0",
+    )
+    value.update(changes)
     return value
 
 
@@ -175,6 +191,7 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             self.registry,
             project_id=PROJECT_ID,
             principal_id=PRINCIPAL_ID,
+            enable_fixed_recipe_dag=True,
             clock=task_clock,
         )
 
@@ -342,8 +359,16 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
                 "positive_receipt_reconciliation": True,
                 "exact_negative_reconciliation": True,
                 "automatic_reconciliation": False,
-                "dag": False,
+                "dag": True,
             },
+        )
+        self.assertEqual(
+            [(item["id"], item["version"]) for item in capabilities["recipes"]],
+            [("forward_qc_fwi", "1.0.0")],
+        )
+        self.assertEqual(
+            capabilities["form"]["recipe_selector_fields"],
+            ["recipe_id", "recipe_version"],
         )
 
         catalog = self.workbench.list_catalog()
@@ -359,6 +384,32 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         serialized = repr(catalog)
         self.assertNotIn("entrypoint_ref", serialized)
         self.assertNotIn("/root/", serialized)
+        self.assertEqual(catalog["recipes"][0]["id"], "forward_qc_fwi")
+        self.assertEqual(
+            [stage["node_id"] for stage in catalog["recipes"][0]["stages"]],
+            ["data_check", "forward", "quality_check", "fwi", "result_check"],
+        )
+
+    def test_dag_capability_requires_explicit_production_composition(self) -> None:
+        ungated = GuidedWorkbench(
+            self.tasks,
+            self.registry,
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            clock=lambda: NOW,
+        )
+
+        capabilities = ungated.session_capabilities()
+        self.assertFalse(capabilities["capabilities"]["dag"])
+        self.assertEqual(capabilities["recipes"], [])
+        self.assertEqual(capabilities["form"]["recipe_selector_fields"], [])
+        self.assertEqual(ungated.list_catalog()["recipes"], [])
+        with self.assertRaises(WorkbenchRuntimeError) as caught:
+            ungated.create_task(
+                recipe_guided_form(),
+                "ungated-recipe-must-fail-closed",
+            )
+        self.assertEqual(caught.exception.code, "GUIDED_CAPABILITY_UNAVAILABLE")
 
     def test_startup_recovery_is_internal_bounded_and_scope_bound(self) -> None:
         calls = []
@@ -409,6 +460,180 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
         self.assertEqual(snapshot.draft["parameters"]["learning_rate_milli"], 10000)
         self.assertNotIn("idempotency_key", result["plan"]["nodes"][0])
         self.assertIsNone(result["dispatch"])
+        self.assertIsNone(result["recipe"])
+
+    def test_explicit_recipe_composes_exact_fan_out_fan_in_plan(self) -> None:
+        result = self.workbench.create_task(
+            recipe_guided_form(device="cpu", iterations=1),
+            "recipe-create-001",
+        )
+        snapshot = self.store.get_task(result["task_id"])
+        self.assertEqual(schema_errors("task-draft.schema.json", snapshot.draft), [])
+        self.assertEqual(schema_errors("plan-graph.schema.json", snapshot.plan), [])
+        self.assertEqual(snapshot.plan["schema_version"], "1.2.0")
+        self.assertEqual(
+            snapshot.draft["extensions"],
+            {"org.agent_rpc.recipe": {"id": "forward_qc_fwi", "version": "1.0.0"}},
+        )
+        self.assertEqual(snapshot.plan["extensions"], snapshot.draft["extensions"])
+        self.assertEqual(
+            [(node["node_id"], node["dependencies"]) for node in snapshot.plan["nodes"]],
+            [
+                ("data_check", []),
+                ("forward", ["data_check"]),
+                ("quality_check", ["data_check"]),
+                ("fwi", ["forward", "quality_check"]),
+                ("result_check", ["fwi"]),
+            ],
+        )
+        self.assertEqual(
+            [
+                (
+                    edge.target_node_id,
+                    edge.target_input_port,
+                    edge.source_node_id,
+                    edge.source_output_port,
+                )
+                for edge in extract_plan_data_edges(snapshot.plan)
+            ],
+            [
+                ("forward", "checked_model", "data_check", "inverted_model"),
+                ("fwi", "forward_evidence", "forward", "shot_gathers_figure"),
+                ("fwi", "quality_evidence", "quality_check", "model_error_figure"),
+                ("quality_check", "dataset_quality", "data_check", "loss"),
+                ("result_check", "fwi_loss", "fwi", "loss"),
+                ("result_check", "fwi_model", "fwi", "inverted_model"),
+            ],
+        )
+        self.assertTrue(
+            all(
+                node["algorithm"]
+                == {"id": "deepwave.acoustic_fwi", "version": "1.6.0"}
+                and len(node["outputs"]) == 8
+                for node in snapshot.plan["nodes"]
+            )
+        )
+        self.assertEqual(result["recipe"]["version"], "1.0.0")
+        self.assertTrue(
+            all(node["adapter"]["version"] == "1.6.0" for node in result["plan"]["nodes"])
+        )
+        self.assertEqual(len(result["runtime_nodes"]), 5)
+        self.assertTrue(
+            all(node["status"] == "Pending" for node in result["runtime_nodes"])
+        )
+        self.assertTrue(
+            all(
+                node["wait_reason"] == "approval_required"
+                and set(node)
+                == {
+                    "node_id",
+                    "label",
+                    "status",
+                    "dependencies",
+                    "algorithm",
+                    "adapter",
+                    "parameters",
+                    "resources",
+                    "wait_reason",
+                    "cache",
+                    "checkpoint",
+                    "failure",
+                    "lineage",
+                    "outputs",
+                }
+                for node in result["runtime_nodes"]
+            )
+        )
+        self.assertIsNone(result["dispatch"])
+
+    def test_ordinary_guided_remains_single_node_with_many_registered_algorithms(self) -> None:
+        for version in ("1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"):
+            self.registry.register_algorithm(manifest=load_deepwave_manifest(version))
+        result = self.workbench.create_task(
+            guided_form(
+                goal="Run forward checks and FWI, but no Recipe was selected."
+            ),
+            "ordinary-many-algorithms",
+        )
+        self.assertIsNone(result["recipe"])
+        self.assertEqual(
+            [node["node_id"] for node in result["plan"]["nodes"]], ["invert"]
+        )
+        self.assertEqual(result["runtime_nodes"], [])
+
+        with self.assertRaises(WorkbenchValidationError) as caught:
+            self.workbench.create_task(
+                recipe_guided_form(recipe_version="2.0.0"),
+                "unsupported-recipe",
+            )
+        self.assertEqual(caught.exception.code, "RECIPE_UNSUPPORTED")
+
+    def test_recipe_plan_hash_covers_nodes_dependencies_parameters_and_old_approval(self) -> None:
+        created = self.workbench.create_task(
+            recipe_guided_form(device="cpu", iterations=1),
+            "recipe-hash-create",
+        )
+        snapshot = self.store.get_task(created["task_id"])
+        baseline = snapshot.plan["plan_hash"]
+        for label, mutate in (
+            ("node", lambda plan: plan["nodes"][0].update(node_id="data_check_changed")),
+            ("dependency", lambda plan: plan["nodes"][3]["dependencies"].reverse()),
+            ("parameter", lambda plan: plan["nodes"][3]["parameters"].update(iterations=2)),
+        ):
+            with self.subTest(label=label):
+                changed = copy.deepcopy(snapshot.plan)
+                mutate(changed)
+                changed["plan_hash"] = "sha256:" + "0" * 64
+                self.assertNotEqual(compute_plan_hash(changed), baseline)
+
+        approved = self.workbench.approve_and_submit(
+            created["task_id"], baseline, "recipe-hash-approve"
+        )
+        self.assertTrue(approved["submitted"])
+        self.assertFalse(approved["dispatch_attempted"])
+        self.assertEqual(self.dispatcher.dispatch_calls, 0)
+        revised = self.workbench.revise_task(
+            created["task_id"],
+            1,
+            recipe_guided_form(device="cpu", iterations=2),
+            "recipe-hash-revise",
+        )
+        self.assertNotEqual(revised["plan"]["plan_hash"], baseline)
+        self.assertIsNone(revised["approval"])
+        with self.assertRaises(WorkbenchConflict) as caught:
+            self.workbench.approve_and_submit(
+                created["task_id"], baseline, "recipe-hash-old-approval"
+            )
+        self.assertEqual(caught.exception.code, "PLAN_HASH_CONFLICT")
+
+    def test_recipe_projects_no_task_wide_cancel_and_rejects_cancel_before_service(
+        self,
+    ) -> None:
+        created = self.workbench.create_task(
+            recipe_guided_form(device="cpu", iterations=1),
+            "recipe-cancel-create",
+        )
+        approved = self.workbench.approve_and_submit(
+            created["task_id"],
+            created["plan"]["plan_hash"],
+            "recipe-cancel-approve",
+        )
+        self.assertFalse(approved["can_cancel"])
+
+        original_cancel = self.tasks.cancel_task
+
+        def unexpected_cancel(**_kwargs):
+            self.fail("fixed Recipe cancellation must be rejected at the facade")
+
+        self.tasks.cancel_task = unexpected_cancel
+        try:
+            with self.assertRaises(WorkbenchConflict) as caught:
+                self.workbench.cancel_task(
+                    created["task_id"], "recipe-cancel-key", "user_requested"
+                )
+        finally:
+            self.tasks.cancel_task = original_cancel
+        self.assertEqual(caught.exception.code, "RECIPE_CANCEL_UNAVAILABLE")
 
     def test_create_lost_response_replay_is_stable_and_conflict_is_closed(self) -> None:
         first = self.workbench.create_task(guided_form(), "http-create-replay")
@@ -2248,6 +2473,96 @@ class ScientificRuntimeWorkbenchTest(unittest.TestCase):
             "source_handle_hash",
             "4242",
             "fwi-private-retry-job",
+        ):
+            self.assertNotIn(private, serialized)
+
+    def test_list_events_redacts_dag_failure_and_bounds_cache_hit_evidence(
+        self,
+    ) -> None:
+        dag_private = {
+            "intent_id": "intent-private-dag-no-retry",
+            "attempt_id": "attempt-private-dag-no-retry",
+            "attempt_number": 1,
+            "observation_sequence": 8,
+            "evidence_hash": "sha256:" + "1" * 64,
+            "private_schema_version": "1.2.0",
+            "private_proof_hash": "sha256:" + "2" * 64,
+            "failure_kind": "worker_exit",
+            "max_node_attempts": 1,
+        }
+        cache_private = {
+            "state": "hit",
+            "cache_hit_id": "cache-hit-private-001",
+            "cache_entry_id": "cache-entry-private-001",
+            "cache_key_hash": "sha256:" + "3" * 64,
+            "source_intent_id": "intent-private-cache-source",
+            "source_receipt_document_hash": "sha256:" + "4" * 64,
+            "worker_runtime_started": False,
+            "private_path": "/root/private/cache-source",
+        }
+        canonical = {
+            "schema_version": "1.0.0",
+            "event_id": "event-public-cache-hit",
+            "sequence": 9,
+            "task_id": "task-public-cache-hit",
+            "node_id": "data_check",
+            "event_type": "node_succeeded",
+            "task_status": "Running",
+            "occurred_at": NOW,
+            "fingerprint": {},
+            "extensions": {
+                "org.agent_rpc.dag_no_retry": dag_private,
+                "org.agent_rpc.node_cache": cache_private,
+                "org.agent_rpc.public_progress": {"completed": 1, "total": 5},
+            },
+        }
+
+        class ExactDagCacheEventView:
+            def list_run_events(inner_self, *_args, **_kwargs):
+                return [copy.deepcopy(canonical)]
+
+        facade = GuidedWorkbench(
+            ExactDagCacheEventView(),
+            self.registry,
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            clock=lambda: NOW,
+        )
+        projected = facade.list_events(canonical["task_id"])
+        extensions = projected[0]["extensions"]
+        self.assertNotIn("org.agent_rpc.dag_no_retry", extensions)
+        self.assertEqual(
+            extensions["org.agent_rpc.node_cache"],
+            {
+                "state": "hit",
+                "cache_key_hash": cache_private["cache_key_hash"],
+                "worker_runtime_started": False,
+            },
+        )
+        self.assertEqual(
+            extensions["org.agent_rpc.public_progress"],
+            {"completed": 1, "total": 5},
+        )
+        self.assertEqual(
+            canonical["extensions"]["org.agent_rpc.dag_no_retry"], dag_private
+        )
+        self.assertEqual(
+            canonical["extensions"]["org.agent_rpc.node_cache"], cache_private
+        )
+        serialized = repr(projected)
+        for private in (
+            dag_private["intent_id"],
+            dag_private["attempt_id"],
+            dag_private["evidence_hash"],
+            dag_private["private_proof_hash"],
+            cache_private["cache_hit_id"],
+            cache_private["cache_entry_id"],
+            cache_private["source_intent_id"],
+            cache_private["source_receipt_document_hash"],
+            cache_private["private_path"],
+            "source_intent_id",
+            "source_receipt_document_hash",
+            "/root/",
         ):
             self.assertNotIn(private, serialized)
 

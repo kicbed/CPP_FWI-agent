@@ -259,6 +259,10 @@ def create_workbench_runtime():
         registry,
         project_id=project_id,
         principal_id=principal_id,
+        # This is the only production composition in the repository that
+        # wires the durable DAG store, fixed Deepwave dispatcher, HTTP/SSE
+        # boundary, and fenced RuntimeSupervisor together.
+        enable_fixed_recipe_dag=True,
     )
     browser_origin = os.environ.get(
         "AGENT_CORS_ORIGIN", f"http://{HOST}:{PORT}"

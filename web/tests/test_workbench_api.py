@@ -152,6 +152,13 @@ def guided_form() -> dict:
     }
 
 
+def recipe_guided_form() -> dict:
+    return guided_form() | {
+        "recipe_id": "forward_qc_fwi",
+        "recipe_version": "1.0.0",
+    }
+
+
 class WorkbenchAPITest(unittest.TestCase):
     def setUp(self) -> None:
         self.application = FakeApplication()
@@ -565,10 +572,31 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertEqual(legacy_call[1][0:2], ("task-1", 1))
         self.assertEqual(legacy_call[1][2], dict(legacy, iterations=3))
 
+        recipe = recipe_guided_form()
+        response = self.mutation("POST", f"{API_PREFIX}/tasks", recipe)
+        self.assertEqual(response.status, 201)
+        recipe_call = self.application.calls[-1]
+        self.assertEqual(recipe_call[0], "create_task")
+        self.assertEqual(recipe_call[1][0], recipe)
+
+        recipe_revision = dict(recipe, expected_revision=1, iterations=2)
+        response = self.mutation(
+            "PUT", f"{API_PREFIX}/tasks/task-1/draft", recipe_revision
+        )
+        self.assertEqual(response.status, 200)
+        recipe_call = self.application.calls[-1]
+        self.assertEqual(recipe_call[0], "revise_task")
+        self.assertEqual(recipe_call[1][2], dict(recipe, iterations=2))
+
         partial_optimizer = dict(legacy, optimizer="adam")
         response = self.mutation(
             "POST", f"{API_PREFIX}/tasks", partial_optimizer
         )
+        self.assertEqual(response.status, 422)
+        self.assertEqual(self.decode(response)["error"]["code"], "INVALID_FORM")
+
+        partial_recipe = dict(form, recipe_id="forward_qc_fwi")
+        response = self.mutation("POST", f"{API_PREFIX}/tasks", partial_recipe)
         self.assertEqual(response.status, 422)
         self.assertEqual(self.decode(response)["error"]["code"], "INVALID_FORM")
 
@@ -944,6 +972,102 @@ class WorkbenchAPITest(unittest.TestCase):
             "source_outcome_document_hash",
             "source_handle_hash",
             "4242",
+            "/root/",
+        ):
+            self.assertNotIn(private, serialized)
+
+    def test_http_and_sse_bound_dag_failure_and_cache_hit_extensions(self):
+        dag_private = {
+            "intent_id": "intent-http-private-dag-no-retry",
+            "attempt_id": "attempt-http-private-dag-no-retry",
+            "attempt_number": 1,
+            "observation_sequence": 6,
+            "evidence_hash": "sha256:" + "1" * 64,
+            "private_schema_version": "1.2.0",
+            "private_proof_hash": "sha256:" + "2" * 64,
+            "failure_kind": "worker_exit",
+            "max_node_attempts": 1,
+        }
+        cache_private = {
+            "state": "hit",
+            "cache_hit_id": "cache-hit-http-private",
+            "cache_entry_id": "cache-entry-http-private",
+            "cache_key_hash": "sha256:" + "3" * 64,
+            "source_intent_id": "intent-http-private-cache-source",
+            "source_receipt_document_hash": "sha256:" + "4" * 64,
+            "worker_runtime_started": False,
+            "private_path": "/root/private/http-cache-source",
+        }
+        canonical = {
+            "schema_version": "1.0.0",
+            "event_id": "event-http-public-cache-hit",
+            "sequence": 10,
+            "task_id": "task-http-public-cache-hit",
+            "node_id": "data_check",
+            "event_type": "node_succeeded",
+            "task_status": "Running",
+            "occurred_at": "2026-07-17T08:00:00Z",
+            "fingerprint": {},
+            "extensions": {
+                "org.agent_rpc.dag_no_retry": dag_private,
+                "org.agent_rpc.node_cache": cache_private,
+            },
+        }
+
+        class ExactDagCacheEventView:
+            def list_run_events(inner_self, *_args, **_kwargs):
+                return [copy.deepcopy(canonical)]
+
+        application = GuidedWorkbench(
+            ExactDagCacheEventView(),
+            object(),
+            project_id="project-http-events",
+            principal_id="user-http-events",
+        )
+        api = WorkbenchAPI(
+            application,
+            CSRF,
+            allowed_hosts={HOST},
+            allowed_origins={ORIGIN},
+        )
+        response = api.dispatch(
+            "GET",
+            f"{API_PREFIX}/tasks/{canonical['task_id']}/events",
+            self.get_headers(),
+            b"",
+        )
+        self.assertEqual(response.status, 200)
+        event = self.decode(response)["data"]["events"][0]
+        self.assertNotIn("org.agent_rpc.dag_no_retry", event["extensions"])
+        self.assertEqual(
+            event["extensions"]["org.agent_rpc.node_cache"],
+            {
+                "state": "hit",
+                "cache_key_hash": cache_private["cache_key_hash"],
+                "worker_runtime_started": False,
+            },
+        )
+        serialized = response.body.decode("utf-8")
+        stream = api.open_event_stream(
+            "GET",
+            f"{API_PREFIX}/tasks/{canonical['task_id']}/events/stream?after_sequence=9",
+            self.get_headers() | {"Accept": "text/event-stream"},
+            b"",
+        )
+        self.assertIsInstance(stream, SSEEventStream)
+        serialized += b"".join(stream.next_batch()).decode("utf-8")
+        for private in (
+            dag_private["intent_id"],
+            dag_private["attempt_id"],
+            dag_private["evidence_hash"],
+            dag_private["private_proof_hash"],
+            cache_private["cache_hit_id"],
+            cache_private["cache_entry_id"],
+            cache_private["source_intent_id"],
+            cache_private["source_receipt_document_hash"],
+            cache_private["private_path"],
+            "source_intent_id",
+            "source_receipt_document_hash",
             "/root/",
         ):
             self.assertNotIn(private, serialized)

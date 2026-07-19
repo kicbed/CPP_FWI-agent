@@ -55,6 +55,8 @@ _FORM_FIELDS = frozenset(
         "learning_rate",
     }
 )
+_RECIPE_SELECTOR_FIELDS = frozenset({"recipe_id", "recipe_version"})
+_RECIPE_FORM_FIELDS = _FORM_FIELDS | _RECIPE_SELECTOR_FIELDS
 _ALLOWED_ARTIFACT_TYPES = {
     "application/x-npy": ".npy",
     "text/csv": ".csv",
@@ -582,7 +584,8 @@ def _validated_form(
     supplied_form_fields = set(payload) - revision_fields
     legacy_form_fields = _FORM_FIELDS - {"optimizer", "learning_rate"}
     if (
-        supplied_form_fields not in (_FORM_FIELDS, legacy_form_fields)
+        supplied_form_fields
+        not in (_FORM_FIELDS, legacy_form_fields, _RECIPE_FORM_FIELDS)
         or (revision and "expected_revision" not in payload)
         or (not revision and "expected_revision" in payload)
     ):

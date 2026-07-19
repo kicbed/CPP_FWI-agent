@@ -641,6 +641,10 @@ class RuntimeSupervisor:
         snapshot_status = getattr(snapshot, "status", None)
         aggregate_status = getattr(result, "aggregate_status", None)
         active_intent = getattr(result, "active_intent", None)
+        supplied_active_intents = getattr(result, "active_intents", None)
+        active_intents = (
+            (active_intent,) if active_intent is not None else ()
+        ) if supplied_active_intents is None else supplied_active_intents
         admitted_node_id = getattr(result, "admitted_node_id", None)
         cache_hit_node_id = getattr(result, "cache_hit_node_id", None)
         cache_key_hash = getattr(result, "cache_key_hash", None)
@@ -667,6 +671,25 @@ class RuntimeSupervisor:
             )
             and len(set(blocked_node_ids)) == len(blocked_node_ids)
         )
+        valid_active_intents = (
+            isinstance(active_intents, tuple)
+            and len(active_intents) <= 2
+            and len(
+                {
+                    getattr(intent, "intent_id", None)
+                    for intent in active_intents
+                }
+            )
+            == len(active_intents)
+            and all(
+                getattr(intent, "task_id", None) == task_id
+                for intent in active_intents
+            )
+            and (
+                active_intent is None
+                or any(intent is active_intent for intent in active_intents)
+            )
+        )
         if (
             not isinstance(task_id, str)
             or _OPAQUE_ID.fullmatch(task_id) is None
@@ -675,6 +698,7 @@ class RuntimeSupervisor:
             or getattr(snapshot, "principal_id", None) != self._principal_id
             or snapshot_status not in _DAG_AGGREGATE_STATUSES
             or aggregate_status != snapshot_status
+            or not valid_active_intents
             or (
                 active_intent is not None
                 and getattr(active_intent, "task_id", None) != task_id
@@ -876,6 +900,9 @@ class RuntimeSupervisor:
                 break
             task_id = snapshot.task_id
             dag_active_intent = None
+            dag_active_intents: tuple[Any, ...] = ()
+            parallel_dag_active = False
+            dag_intent_pre_dispatch = False
             heartbeat_checked = False
             if callable(dag_processor):
                 lease, next_heartbeat = self._heartbeat_if_due(
@@ -904,6 +931,22 @@ class RuntimeSupervisor:
                     dag_active_intent = getattr(
                         dag_result, "active_intent", None
                     )
+                    supplied_active_intents = getattr(
+                        dag_result, "active_intents", None
+                    )
+                    dag_active_intents = (
+                        (dag_active_intent,)
+                        if dag_active_intent is not None
+                        else ()
+                    ) if supplied_active_intents is None else supplied_active_intents
+                    parallel_dag_active = len(dag_active_intents) > 1
+                    dag_intent_pre_dispatch = getattr(
+                        dag_active_intent, "state", None
+                    ) in {
+                        "pending",
+                        "dispatching",
+                        "reconciliation_required",
+                    }
                     dag_advanced.append(task_id)
                     admitted_node_id = getattr(
                         dag_result, "admitted_node_id", None
@@ -1037,7 +1080,13 @@ class RuntimeSupervisor:
                     None,
                 )
             )
-            if status in {"Running", "Waiting"} and (
+            automatic_attempt_controls_deferred = (
+                parallel_dag_active or dag_intent_pre_dispatch
+            )
+            if not automatic_attempt_controls_deferred and status in {
+                "Running",
+                "Waiting",
+            } and (
                 checkpoint_supported or status == "Waiting"
             ):
                 try:
@@ -1073,7 +1122,10 @@ class RuntimeSupervisor:
                 }:
                     timeout_resolved.append(task_id)
                     continue
-            if status in {"Running", "Waiting"}:
+            if not automatic_attempt_controls_deferred and status in {
+                "Running",
+                "Waiting",
+            }:
                 try:
                     checkpoint_result = self._process_task_checkpoint(
                         task_id, lease
@@ -1526,7 +1578,10 @@ class RuntimeSupervisor:
             lease, next_heartbeat = self._heartbeat_if_due(
                 lease, next_heartbeat
             )
-            if not timeout_checked_before_checkpoint:
+            if (
+                not timeout_checked_before_checkpoint
+                and not automatic_attempt_controls_deferred
+            ):
                 try:
                     timeout_result = self._process_task_timeout(task_id, lease)
                 except Exception as error:
@@ -1557,19 +1612,22 @@ class RuntimeSupervisor:
                 }:
                     timeout_resolved.append(task_id)
                     continue
-            try:
-                retry_result = self._process_task_retry(task_id, lease)
-            except Exception as error:
-                self._raise_if_fatal_task_error(error)
-                failures.append(
-                    (
-                        task_id,
-                        self._stable_error_code(
-                            error, "WORKER_RETRY_PROCESS_FAILED"
-                        ),
+            if automatic_attempt_controls_deferred:
+                retry_result = None
+            else:
+                try:
+                    retry_result = self._process_task_retry(task_id, lease)
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "WORKER_RETRY_PROCESS_FAILED"
+                            ),
+                        )
                     )
-                )
-                continue
+                    continue
             if retry_result is not None:
                 retry_state = getattr(retry_result, "state", None)
                 retry_code = getattr(retry_result, "deferred_code", None)

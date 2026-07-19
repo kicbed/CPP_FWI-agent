@@ -695,7 +695,7 @@ DROP TABLE scientific_runtime_v21_forced_failure;
             connection.close()
 
         upgraded = SQLiteTaskStore(self.database_path)
-        self.assertEqual(upgraded.migration_version(), 22)
+        self.assertEqual(upgraded.migration_version(), 23)
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
         try:
@@ -782,6 +782,64 @@ DROP TABLE scientific_runtime_v21_forced_failure;
             len(upgraded.list_dispatch_intents(task_id)),
             2,
         )
+
+    def test_early_dag_checkpoint_projects_ready_before_waiting(self) -> None:
+        task_id, plan, _, lease, binding = self._bound_root(
+            "early-checkpoint"
+        )
+        admission = self._admit(task_id, plan, binding, lease)
+        scheduled = self.service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(scheduled.intent.state, "dispatched")
+        self.assertEqual(self._node_states(task_id)["root"], (2, "Queued"))
+
+        current = self.dispatcher.worker_observation["evidence"]
+        self.dispatcher.worker_observation = {
+            "evidence": managed_worker_evidence(
+                attempt_id=current["attempt_id"],
+                attempt_number=current["attempt_number"],
+                job_id=current["job_id"],
+                heartbeat_sequence=current["heartbeat"]["sequence"] + 1,
+                heartbeat_state="waiting",
+            ),
+            "handle": copy.deepcopy(scheduled.intent.handle),
+        }
+
+        before_projection = self.service.process_runtime_checkpoint(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(before_projection.state, "none")
+        self.assertEqual(self.dispatcher.checkpoint_probe_calls, 0)
+        self.assertEqual(self._node_states(task_id)["root"], (2, "Queued"))
+
+        projected = self.service.project_worker_attempt(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertTrue(projected.projected)
+        self.assertEqual(
+            self.service.get_task(task_id, **self.scope).status,
+            "Running",
+        )
+        self.assertEqual(self._node_states(task_id)["root"], (3, "Running"))
+
+        proof = checkpoint_wait_proof(
+            task_id,
+            self.dispatcher.worker_observation,
+            checkpoint_created_at="2026-07-15T03:00:10.000000Z",
+        )
+        proof["node_id"] = "root"
+        proof["proof_hash"] = encode_document(
+            {key: value for key, value in proof.items() if key != "proof_hash"}
+        )[1]
+        self.dispatcher.checkpoint_probe_result = proof
+
+        waiting = self.service.process_runtime_checkpoint(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual((waiting.state, waiting.snapshot.status), ("waiting", "Waiting"))
+        self.assertEqual(self._node_states(task_id)["root"], (3, "Running"))
+        self.assertEqual(self.dispatcher.dispatch_calls, 1)
 
     def test_dag_checkpoint_wait_resume_keeps_live_attempt_and_scheduler_fenced(
         self,
