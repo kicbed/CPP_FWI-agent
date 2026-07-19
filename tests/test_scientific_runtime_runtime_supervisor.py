@@ -149,6 +149,16 @@ class FakeReconciliation:
 
 
 @dataclass(frozen=True)
+class FakeDagAdvance:
+    snapshot: FakeSnapshot
+    active_intent: FakeIntent | None
+    admitted_node_id: str | None
+    blocked_node_ids: tuple[str, ...]
+    aggregate_status: str
+    deferred_code: str | None = None
+
+
+@dataclass(frozen=True)
 class FakePage:
     snapshots: tuple[FakeSnapshot, ...]
     next_cursor: str | None
@@ -614,6 +624,43 @@ class FakeTaskService:
         raise AssertionError("the observation-only supervisor must not dispatch")
 
 
+class FakeDagTaskService(FakeTaskService):
+    def __init__(
+        self,
+        snapshots: list[FakeSnapshot] | None = None,
+        intents: dict[str, FakeIntent | Exception | None] | None = None,
+    ) -> None:
+        super().__init__(snapshots, intents)
+        self.dag_calls: list[str] = []
+        self.dag_results: dict[
+            str, FakeDagAdvance | Exception | None
+        ] = {}
+
+    def advance_runtime_dag(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: FakeLease,
+    ) -> FakeDagAdvance | None:
+        assert project_id == PROJECT_ID
+        assert principal_id == PRINCIPAL_ID
+        with self.lock:
+            if supervisor_lease != self.active_lease:
+                raise RuntimeSupervisorLeaseLost(
+                    "simulated stale DAG advance write"
+                )
+            self.calls.append("dag")
+            self.dag_calls.append(task_id)
+        result = self.dag_results.get(task_id)
+        if isinstance(result, Exception):
+            raise result
+        if result is not None and result.active_intent is not None:
+            self.intents[task_id] = result.active_intent
+        return result
+
+
 def snapshot(
     task_id: str,
     status: str,
@@ -766,6 +813,33 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertNotIn("refresh", service.calls)
         finally:
             runtime.stop()
+
+    def test_terminal_task_with_pending_cancel_reenters_cancel_processor(self) -> None:
+        task_id = "terminal-cancel-replay"
+        current = snapshot(task_id, "Succeeded", "requested")
+        resolved = snapshot(task_id, "Succeeded", "superseded")
+        service = FakeTaskService([current])
+        service.cancel_results[task_id] = FakeCancelProcess(
+            snapshot=resolved,
+            state="superseded",
+            adapter_result={"state": "terminal_won"},
+            replayed=False,
+        )
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks([current], lease, float("inf"))
+
+        self.assertEqual(cycle.scanned_task_ids, (task_id,))
+        self.assertEqual(cycle.cancel_processed_task_ids, (task_id,))
+        self.assertEqual(cycle.cancel_resolved_task_ids, (task_id,))
+        self.assertEqual(cycle.refreshed_task_ids, ())
+        self.assertEqual(cycle.task_failures, ())
+        self.assertEqual(service.cancel_calls, [task_id])
+        self.assertEqual(service.intent_calls, [])
+        self.assertEqual(service.schedule_calls, [])
+        self.assertEqual(service.refresh_calls, [])
 
     def test_requested_timeout_preempts_dispatch_and_status_in_same_cycle(
         self,
@@ -1194,6 +1268,204 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertEqual(service.refresh_calls, [task_id])
         finally:
             runtime.stop()
+
+    def test_dag_admission_enters_ordinary_schedule_in_the_same_cycle(self) -> None:
+        task_id = "dag-admit"
+        current = snapshot(task_id, "AwaitingApproval")
+        admitted_snapshot = snapshot(task_id, "Queued")
+        pending_intent = FakeIntent(task_id, "pending")
+        service = FakeDagTaskService([current])
+        service.dag_results[task_id] = FakeDagAdvance(
+            snapshot=admitted_snapshot,
+            active_intent=pending_intent,
+            admitted_node_id="node-B",
+            blocked_node_ids=(),
+            aggregate_status="Queued",
+        )
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks([current], lease, float("inf"))
+
+        self.assertEqual(cycle.dag_advanced_task_ids, (task_id,))
+        self.assertEqual(cycle.dag_admitted_nodes, ((task_id, "node-B"),))
+        self.assertEqual(cycle.dag_blocked_nodes, ())
+        self.assertEqual(cycle.scanned_task_ids, (task_id,))
+        self.assertEqual(cycle.scheduled_task_ids, (task_id,))
+        self.assertEqual(cycle.dispatched_task_ids, (task_id,))
+        self.assertEqual(cycle.refreshed_task_ids, (task_id,))
+        self.assertEqual(cycle.task_failures, ())
+        self.assertEqual(service.dag_calls, [task_id])
+        self.assertEqual(service.intent_calls, [])
+        self.assertLess(service.calls.index("dag"), service.calls.index("schedule"))
+
+    def test_dag_terminal_result_skips_all_ordinary_task_processing(self) -> None:
+        task_id = "dag-terminal"
+        current = snapshot(task_id, "AwaitingApproval")
+        service = FakeDagTaskService([current])
+        service.dag_results[task_id] = FakeDagAdvance(
+            snapshot=snapshot(task_id, "Succeeded"),
+            active_intent=None,
+            admitted_node_id=None,
+            blocked_node_ids=(),
+            aggregate_status="Succeeded",
+        )
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks([current], lease, float("inf"))
+
+        self.assertEqual(cycle.dag_advanced_task_ids, (task_id,))
+        self.assertEqual(cycle.scanned_task_ids, ())
+        self.assertEqual(cycle.refreshed_task_ids, ())
+        self.assertEqual(service.dag_calls, [task_id])
+        self.assertEqual(service.intent_calls, [])
+        self.assertEqual(service.schedule_calls, [])
+        self.assertEqual(service.cancel_calls, [])
+        self.assertEqual(service.timeout_calls, [])
+
+    def test_dag_blocked_nodes_keep_exact_task_and_node_identity(self) -> None:
+        task_id = "dag-blocked"
+        current = snapshot(task_id, "AwaitingApproval")
+        service = FakeDagTaskService([current])
+        service.dag_results[task_id] = FakeDagAdvance(
+            snapshot=current,
+            active_intent=None,
+            admitted_node_id=None,
+            blocked_node_ids=("node-B", "node-C"),
+            aggregate_status="AwaitingApproval",
+            deferred_code="DAG_DEPENDENCY_BLOCKED",
+        )
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks([current], lease, float("inf"))
+
+        self.assertEqual(cycle.dag_advanced_task_ids, (task_id,))
+        self.assertEqual(
+            cycle.dag_blocked_nodes,
+            ((task_id, "node-B"), (task_id, "node-C")),
+        )
+        self.assertEqual(cycle.dag_admitted_nodes, ())
+        self.assertEqual(
+            cycle.deferred, ((task_id, "DAG_DEPENDENCY_BLOCKED"),)
+        )
+        self.assertEqual(cycle.scanned_task_ids, ())
+
+    def test_stable_dag_advance_error_is_isolated_before_later_task(self) -> None:
+        first = snapshot("dag-busy", "AwaitingApproval")
+        second = snapshot("ordinary-running", "Running")
+        service = FakeDagTaskService(
+            [first, second],
+            {second.task_id: FakeIntent(second.task_id, "dispatched")},
+        )
+        service.dag_results[first.task_id] = FakeStatusError("DAG_ADVANCE_BUSY")
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks(
+            [first, second], lease, float("inf")
+        )
+
+        self.assertEqual(service.dag_calls, [first.task_id, second.task_id])
+        self.assertEqual(cycle.dag_advanced_task_ids, ())
+        self.assertEqual(
+            cycle.task_failures, ((first.task_id, "DAG_ADVANCE_BUSY"),)
+        )
+        self.assertEqual(cycle.scanned_task_ids, (second.task_id,))
+        self.assertEqual(cycle.refreshed_task_ids, (second.task_id,))
+
+    def test_malformed_dag_advance_result_stops_the_supervisor(self) -> None:
+        task_id = "dag-malformed"
+        current = snapshot(task_id, "AwaitingApproval")
+        valid = FakeDagAdvance(
+            snapshot=current,
+            active_intent=None,
+            admitted_node_id=None,
+            blocked_node_ids=(),
+            aggregate_status="AwaitingApproval",
+        )
+        malformed_results = (
+            replace(valid, blocked_node_ids=("node-B", "node-B")),
+            replace(
+                valid,
+                admitted_node_id="node-B",
+                blocked_node_ids=("node-B",),
+            ),
+            replace(valid, admitted_node_id="invalid node"),
+            replace(valid, blocked_node_ids=["node-B"]),  # type: ignore[arg-type]
+            replace(valid, active_intent=FakeIntent("other-task", "pending")),
+            replace(
+                valid,
+                snapshot=FakeSnapshot(
+                    task_id,
+                    "other-project",
+                    PRINCIPAL_ID,
+                    "AwaitingApproval",
+                ),
+            ),
+            replace(valid, aggregate_status="Running"),
+            replace(valid, deferred_code="not-stable"),
+        )
+        for malformed in malformed_results:
+            with self.subTest(result=malformed):
+                service = FakeDagTaskService([current])
+                service.dag_results[task_id] = malformed
+                runtime = supervisor(service)
+                try:
+                    runtime.start()
+                    self.assertTrue(runtime.wait_until_stopped(timeout=1))
+                    self.assertEqual(runtime.failure_code, FATAL)
+                    self.assertFalse(runtime.healthy)
+                    self.assertEqual(service.dag_calls, [task_id])
+                    self.assertEqual(service.intent_calls, [])
+                    self.assertEqual(service.schedule_calls, [])
+                finally:
+                    self.assertTrue(runtime.stop())
+
+    def test_dag_advance_lease_loss_self_fences_before_next_task(self) -> None:
+        first = snapshot("dag-lease-lost", "AwaitingApproval")
+        second = snapshot("dag-not-reached", "AwaitingApproval")
+        service = FakeDagTaskService([first, second])
+        service.dag_results[first.task_id] = RuntimeSupervisorLeaseLost(
+            "simulated fenced DAG advance"
+        )
+        runtime = supervisor(service)
+
+        runtime.start()
+        self.assertTrue(runtime.wait_until_stopped(timeout=1))
+        self.assertEqual(runtime.failure_code, LEASE_LOST)
+        self.assertIsNone(runtime.lease)
+        self.assertEqual(service.dag_calls, [first.task_id])
+        self.assertTrue(runtime.stop())
+        self.assertEqual(service.release_calls, 0)
+
+    def test_absent_dag_hook_preserves_the_legacy_status_filter_and_path(self) -> None:
+        awaiting = snapshot("legacy-awaiting", "AwaitingApproval")
+        queued = snapshot("legacy-queued", "Queued")
+        service = FakeTaskService(
+            [awaiting, queued],
+            {queued.task_id: FakeIntent(queued.task_id, "dispatched")},
+        )
+        runtime = supervisor(service)
+        lease = FakeLease(PROJECT_ID, PRINCIPAL_ID, 8, OWNER_ID)
+        service.active_lease = lease
+
+        cycle, _, _ = runtime._observe_tasks(
+            [awaiting, queued], lease, float("inf")
+        )
+
+        self.assertFalse(hasattr(service, "advance_runtime_dag"))
+        self.assertEqual(cycle.dag_advanced_task_ids, ())
+        self.assertEqual(cycle.dag_admitted_nodes, ())
+        self.assertEqual(cycle.dag_blocked_nodes, ())
+        self.assertEqual(cycle.scanned_task_ids, (queued.task_id,))
+        self.assertEqual(cycle.refreshed_task_ids, (queued.task_id,))
+        self.assertEqual(service.intent_calls, [queued.task_id])
 
     def test_schedules_pending_and_observes_active_queued_or_running_tasks(self) -> None:
         snapshots = [

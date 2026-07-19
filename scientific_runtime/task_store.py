@@ -252,6 +252,7 @@ class SubmitGateContext:
     snapshot: TaskSnapshot
     registry: RegistrySnapshots
     budget: ApprovalBudget
+    task_budget_already_consumed: bool = False
 
 
 @dataclass(frozen=True)
@@ -544,6 +545,19 @@ class DagNodeTerminalFact:
     event_sequence: int
     completion_fencing_token: int
     receipt_document_hash: str | None
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class DagScheduleReconciliation:
+    """One fenced, convergent dependency/aggregate reconciliation result."""
+
+    snapshot: TaskSnapshot
+    node_states: DagNodeStateMapSnapshot
+    runnable_node_ids: tuple[str, ...]
+    active_node_ids: tuple[str, ...]
+    blocked_node_ids: tuple[str, ...]
+    aggregate_status: str
     replayed: bool
 
 
@@ -917,6 +931,16 @@ class TaskStore(Protocol):
     def get_dispatch_intent(self, task_id: str) -> DispatchIntentSnapshot | None:
         ...
 
+    def get_dispatch_intent_by_id(
+        self, intent_id: str
+    ) -> DispatchIntentSnapshot | None:
+        ...
+
+    def list_dispatch_intents(
+        self, task_id: str
+    ) -> tuple[DispatchIntentSnapshot, ...]:
+        ...
+
     def record_dispatch_success(
         self,
         *,
@@ -1166,6 +1190,27 @@ class TaskStore(Protocol):
         ...
 
     def is_dag_node_execution_intent(self, intent_id: str) -> bool:
+        ...
+
+    def get_active_dag_node_execution(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+    ) -> DagNodeExecutionAdmission | None:
+        ...
+
+    def reconcile_dag_node_dependencies(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagScheduleReconciliation:
         ...
 
     def record_supervised_dag_dispatch_reconciliation(
@@ -1528,6 +1573,7 @@ def _validate_cancel_adapter_proof(
     reason: str,
     result: str,
     terminal_status: str | None = None,
+    dag_terminal_node_status: str | None = None,
 ) -> dict[str, Any]:
     """Validate the exact Adapter proof before it can become task truth."""
 
@@ -1568,13 +1614,22 @@ def _validate_cancel_adapter_proof(
         )
     except TaskStoreConflict as error:
         raise TaskStoreConflict("task cancel Adapter proof is invalid") from error
+    dag_terminal_won = (
+        dag_terminal_node_status in {"Succeeded", "Failed"}
+        and proof.get("state") == "terminal_won"
+        and proof.get("code") == "CANCEL_TERMINAL_WON"
+        and proof.get("terminal_status") == dag_terminal_node_status
+    )
     final_shape_valid = False
     if result == "cancel_confirmed":
         final_shape_valid = (
-            proof.get("state") == "cancelled"
-            and proof.get("code") == "CANCEL_COMPLETED"
-            and proof.get("terminal_status") == "Cancelled"
-            and all(item is not None for item in chain)
+            (
+                proof.get("state") == "cancelled"
+                and proof.get("code") == "CANCEL_COMPLETED"
+                and proof.get("terminal_status") == "Cancelled"
+                and all(item is not None for item in chain)
+            )
+            or dag_terminal_won
         )
     elif result == "terminal_preempted":
         final_shape_valid = (
@@ -1597,6 +1652,7 @@ def _validate_cancel_adapter_proof(
         or (
             terminal_status is not None
             and proof.get("terminal_status") != terminal_status
+            and not dag_terminal_won
         )
         or proof.get("local_run_state") != "retained"
         or type(proof.get("replayed")) is not bool
@@ -2684,16 +2740,19 @@ def _expected_schema_manifest(
     connection = sqlite3.connect(":memory:", isolation_level=None)
     connection.row_factory = sqlite3.Row
     try:
-        connection.execute("PRAGMA foreign_keys = ON")
+        # v21 performs a name-preserving DROP/reCREATE rebuild.  The expected
+        # schema is data-free, so build it with FK actions disabled and then
+        # validate the finished graph exactly as the file migration does.
+        connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute(SCHEMA_MIGRATIONS_SQL)
         for migration in migrations:
             for statement in _migration_statements(migration.text):
                 connection.execute(statement)
+        connection.execute("PRAGMA foreign_keys = ON")
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise TaskStoreCorruption(
                 "expected task-store schema has invalid foreign keys"
             )
-        connection.execute("PRAGMA foreign_keys = ON")
         return _schema_manifest(connection)
     finally:
         connection.close()
@@ -2817,7 +2876,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
@@ -3069,6 +3128,266 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    @staticmethod
+    def _dag_aggregate_status(readiness: Any) -> str:
+        if readiness.all_nodes_succeeded:
+            return "Succeeded"
+        if (
+            readiness.active_node_ids
+            or readiness.runnable_node_ids
+            or readiness.waiting_node_ids
+        ):
+            return "Running"
+        if (
+            readiness.failed_node_ids
+            or readiness.cancelled_node_ids
+            or readiness.blocked_nodes
+        ):
+            return "Failed"
+        raise TaskStoreCorruption("DAG aggregate has no terminal or runnable case")
+
+    def _materialize_dag_blocked_nodes(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        plan: Mapping[str, Any],
+        approval_id: str,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        recorded_at: str,
+        recorded_at_us: int,
+    ) -> tuple[str, ...]:
+        state_map = self._load_dag_node_state_map(
+            connection, task_id=task_id, plan=plan
+        )
+        if state_map is None:
+            raise TaskStoreConflict(
+                "DAG dependency reconciliation requires initialized states"
+            )
+        states_by_id = {node.node_id: node for node in state_map.nodes}
+        try:
+            readiness = evaluate_dag_readiness(
+                plan,
+                node_states={node.node_id: node.state for node in state_map.nodes},
+            )
+        except DagScheduleError as error:
+            raise TaskStoreCorruption(
+                "persisted DAG state cannot be reconciled"
+            ) from error
+        materialized: list[str] = []
+        for blocked in readiness.blocked_nodes:
+            node = states_by_id[blocked.node_id]
+            if node.state == "Blocked":
+                continue
+            if node.state != "Pending":
+                raise TaskStoreCorruption(
+                    "pure readiness blocked a non-Pending DAG node"
+                )
+            blocker_document = {
+                "schema_version": "1.0.0",
+                "task_id": task_id,
+                "plan_id": plan["plan_id"],
+                "plan_hash": plan["plan_hash"],
+                "approval_id": approval_id,
+                "node_id": node.node_id,
+                "previous_revision": node.revision,
+                "blocked_revision": node.revision + 1,
+                "blocked_by_node_ids": list(blocked.blocked_by_node_ids),
+                "supervisor_term": {
+                    "fencing_token": supervisor_lease.fencing_token,
+                    "owner_id": supervisor_lease.owner_id,
+                    "acquired_at": supervisor_lease.acquired_at,
+                },
+                "recorded_at": recorded_at,
+            }
+            blocker_json, blocker_hash = encode_document(blocker_document)
+            connection.execute(
+                """
+                INSERT INTO dag_node_scheduler_transition_facts(
+                    task_id, plan_id, plan_hash, approval_id, node_id,
+                    previous_revision, previous_state, node_revision, state,
+                    blocker_document_json, blocker_document_hash,
+                    project_id, principal_id, fencing_token, owner_id,
+                    term_acquired_at, recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?, 'Blocked', ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    plan["plan_id"],
+                    plan["plan_hash"],
+                    approval_id,
+                    node.node_id,
+                    node.revision,
+                    node.revision + 1,
+                    blocker_json,
+                    blocker_hash,
+                    project_id,
+                    principal_id,
+                    supervisor_lease.fencing_token,
+                    supervisor_lease.owner_id,
+                    supervisor_lease.acquired_at,
+                    recorded_at,
+                    recorded_at_us,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO dag_node_state_events(
+                    task_id, plan_id, plan_hash, node_id, revision,
+                    previous_state, state, recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, 'Pending', 'Blocked', ?, ?)
+                """,
+                (
+                    task_id,
+                    plan["plan_id"],
+                    plan["plan_hash"],
+                    node.node_id,
+                    node.revision + 1,
+                    recorded_at,
+                    recorded_at_us,
+                ),
+            )
+            materialized.append(node.node_id)
+        return tuple(materialized)
+
+    def reconcile_dag_node_dependencies(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagScheduleReconciliation:
+        if (
+            not task_id
+            or not project_id
+            or not principal_id
+            or not _is_sha256(expected_plan_hash)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("DAG dependency reconciliation is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            recorded_at, recorded_at_us = _runtime_timestamp(supervisor_clock())
+            snapshot = self._load_snapshot(connection, task_id)
+            if (
+                snapshot is None
+                or snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreConflict("task does not exist in the requested scope")
+            plan = snapshot.plan
+            approval = snapshot.approval
+            if (
+                snapshot.status not in {
+                    "AwaitingApproval", "Queued", "Running", "Failed", "Succeeded"
+                }
+                or not isinstance(plan, Mapping)
+                or len(plan.get("nodes", [])) <= 1
+                or plan.get("plan_hash") != expected_plan_hash
+                or not isinstance(approval, Mapping)
+                or approval.get("decision") != "approved"
+                or approval.get("plan_id") != plan.get("plan_id")
+                or approval.get("plan_hash") != expected_plan_hash
+            ):
+                raise TaskStoreConflict(
+                    "DAG reconciliation requires the exact approved runtime plan"
+                )
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                supplied=supervisor_lease,
+                now_us=recorded_at_us,
+                action="DAG dependency reconciliation",
+            )
+            existing_states = self._load_dag_node_state_map(
+                connection, task_id=task_id, plan=plan
+            )
+            if existing_states is None:
+                if snapshot.status != "AwaitingApproval":
+                    raise TaskStoreCorruption(
+                        "runtime DAG Task lost its initialized node states"
+                    )
+                for node in sorted(plan["nodes"], key=lambda value: value["node_id"]):
+                    connection.execute(
+                        """
+                        INSERT INTO dag_node_state_events(
+                            task_id, plan_id, plan_hash, node_id, revision,
+                            previous_state, state, recorded_at, recorded_at_us
+                        ) VALUES (?, ?, ?, ?, 1, NULL, 'Pending', ?, ?)
+                        """,
+                        (
+                            task_id,
+                            plan["plan_id"],
+                            plan["plan_hash"],
+                            node["node_id"],
+                            recorded_at,
+                            recorded_at_us,
+                        ),
+                    )
+            blocked_node_ids = self._materialize_dag_blocked_nodes(
+                connection,
+                task_id=task_id,
+                plan=plan,
+                approval_id=approval["approval_id"],
+                project_id=project_id,
+                principal_id=principal_id,
+                supervisor_lease=supervisor_lease,
+                recorded_at=recorded_at,
+                recorded_at_us=recorded_at_us,
+            )
+            node_states = self._load_dag_node_state_map(
+                connection, task_id=task_id, plan=plan
+            )
+            if node_states is None:
+                raise TaskStoreCorruption("reconciled DAG state map cannot be read")
+            readiness = evaluate_dag_readiness(
+                plan,
+                node_states={node.node_id: node.state for node in node_states.nodes},
+            )
+            aggregate_status = self._dag_aggregate_status(readiness)
+            snapshot = self._load_snapshot(connection, task_id)
+            if snapshot is None:
+                raise TaskStoreCorruption("reconciled DAG Task cannot be read")
+            connection.commit()
+            return DagScheduleReconciliation(
+                snapshot=snapshot,
+                node_states=node_states,
+                runnable_node_ids=readiness.runnable_node_ids,
+                active_node_ids=readiness.active_node_ids,
+                blocked_node_ids=blocked_node_ids,
+                aggregate_status=aggregate_status,
+                replayed=not blocked_node_ids,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "DAG dependency reconciliation lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "DAG dependency reconciliation conflicts with durable state"
+            ) from error
+        finally:
+            connection.close()
+
     def _require_current_dag_node_execution(
         self,
         connection: sqlite3.Connection,
@@ -3079,7 +3398,7 @@ class SQLiteTaskStore:
         """Fail closed if a DAG-tagged P2 intent drifts from its admission."""
 
         admission = self._load_dag_node_execution_admission(
-            connection, task_id=intent.task_id
+            connection, intent_id=intent.intent_id
         )
         if admission is None:
             return None
@@ -3247,7 +3566,9 @@ class SQLiteTaskStore:
                         "Worker-exit retry exhaustion conflicts with durable state"
                     )
                 snapshot = self._load_snapshot(connection, task_id)
-                intent = self._load_dispatch_intent(connection, task_id=task_id)
+                intent = self._load_dispatch_intent(
+                    connection, intent_id=intent_id
+                )
                 if snapshot is None or intent is None or snapshot.status != "Failed":
                     raise TaskStoreCorruption(
                         "Worker-exit retry exhaustion cannot be read"
@@ -3269,7 +3590,7 @@ class SQLiteTaskStore:
                     exhausted_at=existing["exhausted_at"],
                     replayed=True,
                 )
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             attempt = connection.execute(
@@ -3475,7 +3796,7 @@ class SQLiteTaskStore:
             )
             snapshot = self._load_snapshot(connection, task_id)
             stored_intent = self._load_dispatch_intent(
-                connection, task_id=task_id
+                connection, intent_id=intent_id
             )
             if snapshot is None or stored_intent is None or snapshot.status != "Failed":
                 raise TaskStoreCorruption(
@@ -3668,7 +3989,9 @@ class SQLiteTaskStore:
                         authorized_at_us,
                     ),
                 )
-                intent = self._load_dispatch_intent(connection, task_id=task_id)
+                intent = self._load_dispatch_intent(
+                    connection, intent_id=intent_id
+                )
                 if intent is None or intent.state != "retrying":
                     raise TaskStoreConflict(
                         "Worker-exit retry is no longer awaiting delivery"
@@ -3697,7 +4020,7 @@ class SQLiteTaskStore:
                     retry_event_hash=existing["retry_event_hash"],
                 )
 
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if (
                 intent is None
                 or intent.state != "dispatched"
@@ -4165,7 +4488,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
@@ -4355,7 +4678,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             task = connection.execute(
                 "SELECT project_id, principal_id, status FROM tasks "
                 "WHERE task_id = ?",
@@ -4634,7 +4957,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             task = connection.execute(
                 "SELECT project_id, principal_id, status, current_approval_id "
                 "FROM tasks WHERE task_id = ?",
@@ -4663,7 +4986,45 @@ class SQLiteTaskStore:
                 allowed_node_states=frozenset({"Queued", "Failed"}),
             )
             dag_execution = dag_admission is not None
-            projected_task_status = "Running" if dag_execution else "Failed"
+            dag_plan_document: dict[str, Any] | None = None
+            projected_task_status = "Failed"
+            if dag_execution:
+                plan_row = connection.execute(
+                    """
+                    SELECT document_json, document_hash FROM plans
+                    WHERE task_id = ? AND plan_id = ?
+                    """,
+                    (task_id, intent.plan_id),
+                ).fetchone()
+                if plan_row is None:
+                    raise TaskStoreCorruption(
+                        "negative reconciliation DAG plan cannot be read"
+                    )
+                dag_plan_document = _decode_hashed_document(
+                    plan_row, label="negative reconciliation DAG plan"
+                )
+                state_map = self._load_dag_node_state_map(
+                    connection, task_id=task_id, plan=dag_plan_document
+                )
+                if state_map is None:
+                    raise TaskStoreCorruption(
+                        "negative reconciliation DAG states cannot be read"
+                    )
+                prospective_states = {
+                    node.node_id: node.state for node in state_map.nodes
+                }
+                prospective_states[intent.node_id] = "Failed"
+                try:
+                    prospective_readiness = evaluate_dag_readiness(
+                        dag_plan_document, node_states=prospective_states
+                    )
+                except DagScheduleError as error:
+                    raise TaskStoreCorruption(
+                        "negative reconciliation aggregate cannot be evaluated"
+                    ) from error
+                projected_task_status = self._dag_aggregate_status(
+                    prospective_readiness
+                )
 
             existing = connection.execute(
                 "SELECT * FROM dispatch_reconciliation_negative_resolutions "
@@ -4704,7 +5065,7 @@ class SQLiteTaskStore:
                         "negative reconciliation replay differs from its outcome"
                     )
                 stored_intent = self._load_dispatch_intent(
-                    connection, task_id=task_id
+                    connection, intent_id=intent_id
                 )
                 snapshot = self._load_snapshot(connection, task_id)
                 if (
@@ -4746,7 +5107,11 @@ class SQLiteTaskStore:
                 (task_id, intent.approval_id),
             ).fetchone()
             if (
-                task["status"] != "Queued"
+                (
+                    task["status"] != "Queued"
+                    if not dag_execution
+                    else task["status"] not in {"Queued", "Running"}
+                )
                 or task["current_approval_id"] != intent.approval_id
                 or outcome["outcome"] != "reconciliation_required"
                 or intent.state != "reconciliation_required"
@@ -5057,6 +5422,39 @@ class SQLiteTaskStore:
                         resolved_at_us,
                     ),
                 )
+                assert dag_plan_document is not None
+                self._materialize_dag_blocked_nodes(
+                    connection,
+                    task_id=task_id,
+                    plan=dag_plan_document,
+                    approval_id=intent.approval_id,
+                    project_id=task["project_id"],
+                    principal_id=task["principal_id"],
+                    supervisor_lease=supervisor_lease,
+                    recorded_at=resolved_at,
+                    recorded_at_us=resolved_at_us,
+                )
+                reconciled_states = self._load_dag_node_state_map(
+                    connection, task_id=task_id, plan=dag_plan_document
+                )
+                if reconciled_states is None:
+                    raise TaskStoreCorruption(
+                        "negative reconciliation DAG result cannot be read"
+                    )
+                reconciled_readiness = evaluate_dag_readiness(
+                    dag_plan_document,
+                    node_states={
+                        node.node_id: node.state
+                        for node in reconciled_states.nodes
+                    },
+                )
+                if (
+                    self._dag_aggregate_status(reconciled_readiness)
+                    != projected_task_status
+                ):
+                    raise TaskStoreCorruption(
+                        "negative reconciliation blocker aggregate changed"
+                    )
             resolution_document = {
                 "schema_version": "1.0.0",
                 "intent_id": intent_id,
@@ -5139,7 +5537,7 @@ class SQLiteTaskStore:
                 )
             snapshot = self._load_snapshot(connection, task_id)
             closed_intent = self._load_dispatch_intent(
-                connection, task_id=task_id
+                connection, intent_id=intent_id
             )
             if (
                 snapshot is None
@@ -6388,6 +6786,103 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    def _load_exact_dag_cancel_terminal_winner(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        intent_id: str,
+        attempt_id: str,
+    ) -> dict[str, Any] | None:
+        """Validate the natural terminal fact for one cancelled DAG attempt."""
+
+        terminal = connection.execute(
+            "SELECT * FROM dag_node_terminal_facts WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        if terminal is None:
+            return None
+        admission = connection.execute(
+            "SELECT * FROM dag_node_execution_admissions WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        transition = connection.execute(
+            """
+            SELECT * FROM dag_node_execution_transition_facts
+            WHERE intent_id = ? AND node_revision = ?
+            """,
+            (intent_id, terminal["node_revision"]),
+        ).fetchone()
+        latest_state = connection.execute(
+            """
+            SELECT * FROM dag_node_state_events
+            WHERE task_id = ? AND plan_id = ? AND node_id = ?
+            ORDER BY revision DESC LIMIT 1
+            """,
+            (task_id, terminal["plan_id"], terminal["node_id"]),
+        ).fetchone()
+        event = connection.execute(
+            "SELECT * FROM run_events WHERE task_id = ? AND sequence = ?",
+            (task_id, terminal["event_sequence"]),
+        ).fetchone()
+        try:
+            adapter_status = _decode_document(
+                terminal["adapter_status_json"],
+                label="DAG cancel natural-terminal Adapter status",
+            )
+            adapter_status_json, adapter_status_hash = encode_document(adapter_status)
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "DAG cancel natural-terminal proof is invalid"
+            ) from error
+        expected_event_type = {
+            "Succeeded": "node_succeeded",
+            "Failed": "node_failed",
+        }.get(terminal["node_state"])
+        if (
+            admission is None
+            or transition is None
+            or latest_state is None
+            or event is None
+            or terminal["task_id"] != task_id
+            or terminal["intent_id"] != intent_id
+            or terminal["attempt_id"] != attempt_id
+            or terminal["attempt_number"] != 1
+            or terminal["node_state"] not in {"Succeeded", "Failed"}
+            or admission["task_id"] != task_id
+            or admission["intent_id"] != intent_id
+            or admission["plan_id"] != terminal["plan_id"]
+            or admission["plan_hash"] != terminal["plan_hash"]
+            or admission["approval_id"] != terminal["approval_id"]
+            or admission["node_id"] != terminal["node_id"]
+            or transition["node_revision"] != terminal["node_revision"]
+            or transition["state"] != terminal["node_state"]
+            or transition["event_sequence"] != terminal["event_sequence"]
+            or transition["event_hash"] != terminal["event_hash"]
+            or latest_state["revision"] != terminal["node_revision"]
+            or latest_state["state"] != terminal["node_state"]
+            or event["document_hash"] != terminal["event_hash"]
+            or event["event_type"] != expected_event_type
+            or event["node_id"] != terminal["node_id"]
+            or event["task_status"] not in {"Running", "Succeeded", "Failed"}
+            or adapter_status_json != terminal["adapter_status_json"]
+            or adapter_status_hash != terminal["adapter_status_hash"]
+            or adapter_status.get("task_id") != task_id
+            or adapter_status.get("node_id") != terminal["node_id"]
+            or adapter_status.get("status") != terminal["node_state"]
+            or adapter_status.get("terminal") is not True
+        ):
+            raise TaskStoreCorruption(
+                "DAG cancel natural-terminal fact is inconsistent"
+            )
+        return {
+            "node_state": terminal["node_state"],
+            "node_id": terminal["node_id"],
+            "event_sequence": int(terminal["event_sequence"]),
+            "event_type": event["event_type"],
+            "aggregate_status": event["task_status"],
+        }
+
     def complete_supervised_cancel(
         self,
         *,
@@ -6425,6 +6920,20 @@ class SQLiteTaskStore:
             ).fetchone()
             if row is None:
                 raise TaskStoreConflict("task cancel request does not exist")
+            dag_intent = connection.execute(
+                "SELECT 1 FROM dag_node_execution_admissions WHERE intent_id = ?",
+                (row["intent_id"],),
+            ).fetchone() is not None
+            dag_winner = self._load_exact_dag_cancel_terminal_winner(
+                connection,
+                task_id=row["task_id"],
+                intent_id=row["intent_id"],
+                attempt_id=row["attempt_id"],
+            )
+            dag_terminal_won = (
+                adapter_proof.get("state") == "terminal_won"
+                and dag_winner is not None
+            )
             proof = _validate_cancel_adapter_proof(
                 adapter_proof,
                 request_id=request_id,
@@ -6432,7 +6941,18 @@ class SQLiteTaskStore:
                 attempt_id=row["attempt_id"],
                 reason=row["reason"],
                 result=result,
+                dag_terminal_node_status=(
+                    dag_winner["node_state"] if dag_terminal_won else None
+                ),
             )
+            if (
+                dag_intent
+                and proof.get("state") == "terminal_won"
+                and not dag_terminal_won
+            ):
+                raise TaskStoreConflict(
+                    "DAG terminal-won cancellation lacks its exact node terminal fact"
+                )
             proof_json, proof_hash = encode_document(proof)
             self._require_active_runtime_supervisor_lease(
                 connection,
@@ -6488,6 +7008,19 @@ class SQLiteTaskStore:
                     raise TaskStoreConflict(
                         "cancel confirmation lost the terminal race"
                     )
+                if dag_terminal_won and (
+                    task["status"] != "Running"
+                    or dag_winner["aggregate_status"] != "Running"
+                    or dag_winner["event_sequence"]
+                    != connection.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM run_events "
+                        "WHERE task_id = ?",
+                        (row["task_id"],),
+                    ).fetchone()[0]
+                ):
+                    raise TaskStoreConflict(
+                        "DAG terminal-won cancellation lacks a Running aggregate"
+                    )
                 if terminal_event is None:
                     raise TaskStoreConflict(
                         "cancel confirmation requires its terminal event"
@@ -6501,7 +7034,7 @@ class SQLiteTaskStore:
                     (row["task_id"],),
                 ).fetchone()[0]
                 intent = self._load_dispatch_intent(
-                    connection, task_id=row["task_id"]
+                    connection, intent_id=row["intent_id"]
                 )
                 if (
                     intent is None
@@ -6579,20 +7112,37 @@ class SQLiteTaskStore:
                         (row["task_id"],),
                     ).fetchone()
                     expected_type = (
-                        "node_succeeded"
-                        if terminal_status == "Succeeded"
-                        else "node_failed"
+                        dag_winner["event_type"]
+                        if dag_terminal_won
+                        else (
+                            "node_succeeded"
+                            if terminal_status == "Succeeded"
+                            else "node_failed"
+                        )
                     )
                     if (
                         terminal is None
                         or terminal["event_type"] != expected_type
                         or terminal["task_status"] != terminal_status
+                        or (
+                            dag_terminal_won
+                            and (
+                                dag_winner["aggregate_status"] != terminal_status
+                                or dag_winner["event_sequence"]
+                                != terminal["sequence"]
+                            )
+                        )
                     ):
                         raise TaskStoreCorruption(
                             "natural terminal cancel winner is inconsistent"
                         )
                     terminal_sequence = terminal["sequence"]
                 else:
+                    if dag_intent:
+                        raise TaskStoreConflict(
+                            "DAG terminal-preempted cancellation requires a "
+                            "committed node terminal fact"
+                        )
                     if task["status"] not in {"Queued", "Running", "Waiting"}:
                         raise TaskStoreConflict(
                             "terminal-preempted cancel lost the terminal race"
@@ -6611,7 +7161,7 @@ class SQLiteTaskStore:
                         (row["task_id"],),
                     ).fetchone()[0]
                     intent = self._load_dispatch_intent(
-                        connection, task_id=row["task_id"]
+                        connection, intent_id=row["intent_id"]
                     )
                     if (
                         expected_type is None
@@ -6688,7 +7238,7 @@ class SQLiteTaskStore:
                             resolved_at_us,
                         ),
                     )
-            if proof["terminal_status"] != terminal_status:
+            if proof["terminal_status"] != terminal_status and not dag_terminal_won:
                 raise TaskStoreConflict(
                     "task cancel Adapter proof contradicts the terminal outcome"
                 )
@@ -6793,6 +7343,7 @@ class SQLiteTaskStore:
         latest_version = migrations[-1].version
         expected_manifest = _expected_schema_manifest(migrations)
         connection = self._connect(require_wal=False)
+        foreign_keys_temporarily_disabled = False
         try:
             preflight_user_version = int(
                 connection.execute("PRAGMA user_version").fetchone()[0]
@@ -6821,6 +7372,14 @@ class SQLiteTaskStore:
             journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
             if str(journal_mode).lower() != "wal":
                 raise TaskStoreError("SQLite WAL mode is required for the task store")
+
+            if preflight_user_version < 21 <= latest_version:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+                    raise TaskStoreError(
+                        "task database migration cannot disable foreign keys"
+                    )
+                foreign_keys_temporarily_disabled = True
 
             connection.execute("BEGIN IMMEDIATE")
             user_version = int(
@@ -6919,6 +7478,12 @@ class SQLiteTaskStore:
                     "SQLite foreign_key_check failed for the task store"
                 )
             connection.commit()
+            if foreign_keys_temporarily_disabled:
+                connection.execute("PRAGMA foreign_keys = ON")
+                if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+                    raise TaskStoreError(
+                        "task database migration cannot restore foreign keys"
+                    )
         except sqlite3.OperationalError as error:
             if connection.in_transaction:
                 connection.rollback()
@@ -6934,6 +7499,8 @@ class SQLiteTaskStore:
                 connection.rollback()
             raise
         finally:
+            if not connection.in_transaction and foreign_keys_temporarily_disabled:
+                connection.execute("PRAGMA foreign_keys = ON")
             connection.close()
         if self.database_path.is_symlink() or not self.database_path.is_file():
             raise TaskStoreError("task database is not a regular private file")
@@ -8660,6 +9227,17 @@ class SQLiteTaskStore:
                 row["adapter_proof_json"], label="task cancel adapter proof"
             )
             _, adapter_proof_hash = encode_document(adapter_proof)
+            dag_winner = (
+                self._load_exact_dag_cancel_terminal_winner(
+                    connection,
+                    task_id=row["task_id"],
+                    intent_id=row["intent_id"],
+                    attempt_id=row["attempt_id"],
+                )
+                if adapter_proof.get("state") == "terminal_won"
+                else None
+            )
+            dag_terminal_won = dag_winner is not None
             adapter_proof = _validate_cancel_adapter_proof(
                 adapter_proof,
                 request_id=row["request_id"],
@@ -8668,6 +9246,9 @@ class SQLiteTaskStore:
                 reason=row["reason"],
                 result=row["result"],
                 terminal_status=row["terminal_status"],
+                dag_terminal_node_status=(
+                    dag_winner["node_state"] if dag_terminal_won else None
+                ),
             )
         except TaskStoreConflict as error:
             raise TaskStoreCorruption(
@@ -8716,12 +9297,50 @@ class SQLiteTaskStore:
             )
         terminal = connection.execute(
             """
-            SELECT event_type, task_status FROM run_events
+            SELECT sequence, event_type, task_status FROM run_events
             WHERE task_id = ? AND sequence = ?
             """,
             (task_id, row["terminal_event_sequence"]),
         ).fetchone()
-        if terminal is None or terminal["task_status"] != row["terminal_status"]:
+        latest_sequence = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        expected_event_type = (
+            "task_cancelled"
+            if row["result"] == "cancel_confirmed"
+            else (
+                dag_winner["event_type"]
+                if dag_terminal_won
+                else (
+                    "node_succeeded"
+                    if row["terminal_status"] == "Succeeded"
+                    else "node_failed"
+                )
+            )
+        )
+        dag_outcome_consistent = not dag_terminal_won or (
+            (
+                row["result"] == "cancel_confirmed"
+                and row["terminal_status"] == "Cancelled"
+                and dag_winner["aggregate_status"] == "Running"
+                and dag_winner["event_sequence"] + 1
+                == row["terminal_event_sequence"]
+            )
+            or (
+                row["result"] == "terminal_preempted"
+                and dag_winner["aggregate_status"] == row["terminal_status"]
+                and dag_winner["event_sequence"]
+                == row["terminal_event_sequence"]
+            )
+        )
+        if (
+            terminal is None
+            or terminal["task_status"] != row["terminal_status"]
+            or terminal["event_type"] != expected_event_type
+            or terminal["sequence"] != latest_sequence
+            or not dag_outcome_consistent
+        ):
             raise TaskStoreCorruption(
                 "task cancel outcome lacks its exact terminal event"
             )
@@ -9467,14 +10086,36 @@ class SQLiteTaskStore:
             connection, task_id, task_status=row["status"]
         )
         if cancellation is not None:
-            if cancellation.state == "requested" and row["status"] not in {
-                "Queued",
-                "Running",
-                "Waiting",
-            }:
-                raise TaskStoreCorruption(
-                    "pending cancellation has an unresolved terminal task"
-                )
+            if cancellation.state == "requested":
+                pending_status_valid = row["status"] in {
+                    "Queued",
+                    "Running",
+                    "Waiting",
+                }
+                if not pending_status_valid and row["status"] in {
+                    "Succeeded",
+                    "Failed",
+                }:
+                    dag_winner = self._load_exact_dag_cancel_terminal_winner(
+                        connection,
+                        task_id=task_id,
+                        intent_id=cancellation.intent_id,
+                        attempt_id=cancellation.attempt_id,
+                    )
+                    latest_sequence = connection.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM run_events "
+                        "WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()[0]
+                    pending_status_valid = (
+                        dag_winner is not None
+                        and dag_winner["aggregate_status"] == row["status"]
+                        and dag_winner["event_sequence"] == latest_sequence
+                    )
+                if not pending_status_valid:
+                    raise TaskStoreCorruption(
+                        "pending cancellation has an unresolved terminal task"
+                    )
             if (
                 cancellation.state == "cancelled"
                 and row["status"] != "Cancelled"
@@ -9718,25 +10359,28 @@ class SQLiteTaskStore:
         )
         if not runtime_status and event_summary["event_count"] != 0:
             raise TaskStoreCorruption("pre-runtime task unexpectedly has run events")
-        intent_binding = connection.execute(
+        intent_bindings = connection.execute(
             """
-            SELECT plan_id, plan_hash, approval_id
-            FROM dispatch_intents WHERE task_id = ?
+            SELECT intent_id, plan_id, plan_hash, approval_id
+            FROM dispatch_intents WHERE task_id = ? ORDER BY intent_id
             """,
             (task_id,),
-        ).fetchone()
-        if not runtime_status and intent_binding is not None:
+        ).fetchall()
+        if not runtime_status and intent_bindings:
             raise TaskStoreCorruption(
                 "pre-runtime task unexpectedly has a dispatch intent"
             )
         if runtime_status:
             if (
-                intent_binding is None
+                not intent_bindings
                 or plan is None
                 or approval is None
-                or intent_binding["plan_id"] != plan.get("plan_id")
-                or intent_binding["plan_hash"] != plan.get("plan_hash")
-                or intent_binding["approval_id"] != approval.get("approval_id")
+                or any(
+                    binding["plan_id"] != plan.get("plan_id")
+                    or binding["plan_hash"] != plan.get("plan_hash")
+                    or binding["approval_id"] != approval.get("approval_id")
+                    for binding in intent_bindings
+                )
             ):
                 raise TaskStoreCorruption(
                     "runtime task lacks its current dispatch intent"
@@ -9774,10 +10418,13 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption(
                     "task status does not match its latest run event"
                 )
-            if self._load_dispatch_intent(connection, task_id=task_id) is None:
-                raise TaskStoreCorruption(
-                    "runtime task dispatch intent cannot be decoded"
-                )
+            for binding in intent_bindings:
+                if self._load_dispatch_intent(
+                    connection, intent_id=binding["intent_id"]
+                ) is None:
+                    raise TaskStoreCorruption(
+                        "runtime task dispatch intent cannot be decoded"
+                    )
         return TaskSnapshot(
             task_id=row["task_id"],
             project_id=row["project_id"],
@@ -9831,9 +10478,74 @@ class SQLiteTaskStore:
             replayed=replayed,
         )
 
+    @staticmethod
+    def _select_task_dispatch_intent_id(
+        connection: sqlite3.Connection, *, task_id: str
+    ) -> str | None:
+        """Select the unique active DAG intent, or its latest durable history."""
+
+        rows = connection.execute(
+            """
+            SELECT intent.intent_id, admission.admitted_at_us,
+                   admission.intent_id AS admission_intent_id,
+                   state.state AS latest_node_state
+            FROM dispatch_intents AS intent
+            LEFT JOIN dag_node_execution_admissions AS admission
+              ON admission.intent_id = intent.intent_id
+            LEFT JOIN dag_node_state_events AS state
+              ON state.task_id = admission.task_id
+             AND state.plan_id = admission.plan_id
+             AND state.node_id = admission.node_id
+             AND NOT EXISTS (
+                 SELECT 1 FROM dag_node_state_events AS later
+                 WHERE later.task_id = state.task_id
+                   AND later.plan_id = state.plan_id
+                   AND later.node_id = state.node_id
+                   AND later.revision > state.revision
+             )
+            WHERE intent.task_id = ?
+            ORDER BY admission.admitted_at_us ASC, intent.intent_id ASC
+            """,
+            (task_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) == 1:
+            return str(rows[0]["intent_id"])
+        if any(row["admission_intent_id"] is None for row in rows):
+            raise TaskStoreCorruption(
+                "multiple dispatch intents lack exact DAG admissions"
+            )
+        active = [
+            row
+            for row in rows
+            if row["latest_node_state"]
+            in {"Queued", "Running", "Waiting", "Retrying"}
+        ]
+        if len(active) > 1:
+            raise TaskStoreCorruption("DAG task has multiple active dispatch intents")
+        if active:
+            return str(active[0]["intent_id"])
+        return str(rows[-1]["intent_id"])
+
     def _load_dispatch_intent(
-        self, connection: sqlite3.Connection, *, task_id: str
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str | None = None,
+        intent_id: str | None = None,
     ) -> DispatchIntentSnapshot | None:
+        if (task_id is None) == (intent_id is None):
+            raise TaskStoreCorruption(
+                "dispatch intent loader requires one exact selector"
+            )
+        if intent_id is None:
+            assert task_id is not None
+            intent_id = self._select_task_dispatch_intent_id(
+                connection, task_id=task_id
+            )
+            if intent_id is None:
+                return None
         row = connection.execute(
             """
             SELECT intent.intent_id, intent.task_id, intent.plan_id,
@@ -9882,9 +10594,9 @@ class SQLiteTaskStore:
             LEFT JOIN worker_retry_exhaustions AS exhaustion
               ON exhaustion.intent_id = intent.intent_id
              AND exhaustion.attempt_number = 2
-            WHERE intent.task_id = ?
+            WHERE intent.intent_id = ?
             """,
-            (task_id,),
+            (intent_id,),
         ).fetchone()
         if row is None:
             return None
@@ -10028,7 +10740,21 @@ class SQLiteTaskStore:
             label="queued event",
         )
         dag_admission = self._load_dag_node_execution_admission(
-            connection, task_id=row["task_id"]
+            connection, intent_id=row["intent_id"]
+        )
+        dag_run = connection.execute(
+            """
+            SELECT first_intent_id FROM dag_task_execution_runs
+            WHERE task_id = ?
+            """,
+            (row["task_id"],),
+        ).fetchone()
+        if dag_admission is not None and dag_run is None:
+            raise TaskStoreCorruption("DAG dispatch intent lacks its Task run anchor")
+        first_dag_intent = (
+            dag_admission is not None
+            and dag_run is not None
+            and dag_run["first_intent_id"] == row["intent_id"]
         )
         try:
             if dag_admission is None:
@@ -10062,20 +10788,7 @@ class SQLiteTaskStore:
                         "DAG dispatch intent differs from its admission"
                     )
                 durable_node = matching_nodes[0]
-            if len(durable_node["inputs"]) != 1:
-                raise TaskStoreCorruption(
-                    "dispatch plan no longer has exactly one input"
-                )
-            input_identity = durable_node["inputs"][0]["dataset"]
-            durable_dataset = next(
-                value
-                for value in draft["datasets"]
-                if all(
-                    value[key] == input_identity[key]
-                    for key in ("id", "version", "content_hash", "data_type")
-                )
-            )
-            expected_request = {
+            expected_request_core = {
                 "task_id": row["task_id"],
                 "node_id": durable_node["node_id"],
                 "plan_hash": plan["plan_hash"],
@@ -10083,11 +10796,25 @@ class SQLiteTaskStore:
                 "project_id": task_identity["project_id"],
                 "principal_id": task_identity["principal_id"],
                 "algorithm": durable_node["algorithm"],
-                "dataset": durable_dataset,
                 "task_type": plan["task_type"],
                 "parameters": durable_node["parameters"],
                 "resources": durable_node["resources"],
             }
+            if dag_admission is None:
+                if len(durable_node["inputs"]) != 1:
+                    raise TaskStoreCorruption(
+                        "dispatch plan no longer has exactly one input"
+                    )
+                input_identity = durable_node["inputs"][0]["dataset"]
+                durable_dataset = next(
+                    value
+                    for value in draft["datasets"]
+                    if all(
+                        value[key] == input_identity[key]
+                        for key in ("id", "version", "content_hash", "data_type")
+                    )
+                )
+                expected_request_core["dataset"] = durable_dataset
         except (KeyError, StopIteration, TypeError) as error:
             raise TaskStoreCorruption(
                 "dispatch intent cannot be reconstructed from durable state"
@@ -10097,7 +10824,17 @@ class SQLiteTaskStore:
             for key, value in request.items()
             if key != "normalized_config_hash"
         }
-        if request_without_config_hash != expected_request:
+        if (
+            any(
+                request_without_config_hash.get(key) != value
+                for key, value in expected_request_core.items()
+            )
+            or (
+                dag_admission is None
+                and set(request_without_config_hash) != set(expected_request_core)
+            )
+            or not isinstance(request_without_config_hash.get("dataset"), Mapping)
+        ):
             raise TaskStoreCorruption(
                 "dispatch intent request payload differs from current plan"
             )
@@ -10120,18 +10857,23 @@ class SQLiteTaskStore:
             != request.get("normalized_config_hash")
             or fingerprint.get("input_hashes")
             != [request.get("dataset", {}).get("content_hash")]
-            or documents["queued_type"] != "task_queued"
-            or documents["queued_status"] != "Queued"
-            or documents["queued_node_id"] is not None
-            or queued_event.get("sequence") != 1
-            or queued_event.get("task_id") != row["task_id"]
-            or queued_event.get("fingerprint") != fingerprint
-            or documents["queued_fingerprint_hash"] != fingerprint_hash
+            or (
+                (dag_admission is None or first_dag_intent)
+                and (
+                    documents["queued_type"] != "task_queued"
+                    or documents["queued_status"] != "Queued"
+                    or documents["queued_node_id"] is not None
+                    or queued_event.get("sequence") != 1
+                    or queued_event.get("task_id") != row["task_id"]
+                    or queued_event.get("fingerprint") != fingerprint
+                    or documents["queued_fingerprint_hash"] != fingerprint_hash
+                )
+            )
         ):
             raise TaskStoreCorruption(
                 "dispatch intent fingerprint differs from its request or queued event"
             )
-        if dag_admission is not None:
+        if first_dag_intent:
             token = row["intent_id"].removeprefix("dispatch-")
             expected_extension = {
                 "agent_rpc.dispatch": {
@@ -10778,7 +11520,7 @@ class SQLiteTaskStore:
                 }
             )
             dag_negative = dag_admission is not None
-            projected_task_status = "Running" if dag_negative else "Failed"
+            projected_task_status = "Failed"
             dag_terminal = None
             dag_transition = None
             dag_state = None
@@ -10802,6 +11544,30 @@ class SQLiteTaskStore:
                     """,
                     (row["task_id"], row["plan_id"], row["node_id"]),
                 ).fetchone()
+                final_state_map = self._load_dag_node_state_map(
+                    connection,
+                    task_id=row["task_id"],
+                    plan=plan,
+                )
+                if final_state_map is None:
+                    raise TaskStoreCorruption(
+                        "DAG negative reconciliation lacks its final state map"
+                    )
+                try:
+                    final_readiness = evaluate_dag_readiness(
+                        plan,
+                        node_states={
+                            node.node_id: node.state
+                            for node in final_state_map.nodes
+                        },
+                    )
+                except DagScheduleError as error:
+                    raise TaskStoreCorruption(
+                        "DAG negative reconciliation aggregate is invalid"
+                    ) from error
+                projected_task_status = self._dag_aggregate_status(
+                    final_readiness
+                )
             event_extension = {
                 "intent_id": row["intent_id"],
                 "attempt_id": observation["attempt_id"],
@@ -11352,6 +12118,43 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    def get_dispatch_intent_by_id(
+        self, intent_id: str
+    ) -> DispatchIntentSnapshot | None:
+        connection = self._connect()
+        try:
+            return self._load_dispatch_intent(connection, intent_id=intent_id)
+        finally:
+            connection.close()
+
+    def list_dispatch_intents(
+        self, task_id: str
+    ) -> tuple[DispatchIntentSnapshot, ...]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT intent.intent_id
+                FROM dispatch_intents AS intent
+                LEFT JOIN dag_node_execution_admissions AS admission
+                  ON admission.intent_id = intent.intent_id
+                WHERE intent.task_id = ?
+                ORDER BY COALESCE(admission.admitted_at_us, 0), intent.intent_id
+                """,
+                (task_id,),
+            ).fetchall()
+            values: list[DispatchIntentSnapshot] = []
+            for row in rows:
+                intent = self._load_dispatch_intent(
+                    connection, intent_id=row["intent_id"]
+                )
+                if intent is None:
+                    raise TaskStoreCorruption("dispatch intent cannot be read")
+                values.append(intent)
+            return tuple(values)
+        finally:
+            connection.close()
+
     @staticmethod
     def _task_id_for_intent(
         connection: sqlite3.Connection, intent_id: str
@@ -11371,7 +12174,9 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(
+                connection, intent_id=intent_id
+            )
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             if intent.state != "pending":
@@ -11381,7 +12186,7 @@ class SQLiteTaskStore:
                 "INSERT INTO dispatch_attempts(intent_id, claimed_at) VALUES (?, ?)",
                 (intent_id, now),
             )
-            claimed = self._load_dispatch_intent(connection, task_id=task_id)
+            claimed = self._load_dispatch_intent(connection, intent_id=intent_id)
             if claimed is None or claimed.state != "dispatching":
                 raise TaskStoreCorruption("claimed dispatch intent cannot be read")
             connection.commit()
@@ -11463,7 +12268,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             self._validate_dispatch_handle(intent, handle)
@@ -11490,7 +12295,7 @@ class SQLiteTaskStore:
                 """,
                 (intent_id, document_json, document_hash, now),
             )
-            stored = self._load_dispatch_intent(connection, task_id=task_id)
+            stored = self._load_dispatch_intent(connection, intent_id=intent_id)
             if stored is None or stored.state != "dispatched":
                 raise TaskStoreCorruption("dispatch success cannot be read")
             connection.commit()
@@ -11535,7 +12340,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             if intent.reconciliation is not None:
@@ -11561,7 +12366,7 @@ class SQLiteTaskStore:
                 """,
                 (intent_id, document_json, document_hash, now),
             )
-            stored = self._load_dispatch_intent(connection, task_id=task_id)
+            stored = self._load_dispatch_intent(connection, intent_id=intent_id)
             if stored is None or stored.state != "reconciliation_required":
                 raise TaskStoreCorruption(
                     "dispatch reconciliation outcome cannot be read"
@@ -14032,6 +14837,65 @@ class SQLiteTaskStore:
                     recorded_at=_runtime_timestamp(latest["recorded_at"])[0],
                 )
             )
+        try:
+            readiness = evaluate_dag_readiness(
+                plan,
+                node_states={node.node_id: node.state for node in current},
+            )
+        except DagScheduleError as error:
+            raise TaskStoreCorruption(
+                "persisted DAG node state map is not schedulable"
+            ) from error
+        blockers_by_node = {
+            blocked.node_id: blocked.blocked_by_node_ids
+            for blocked in readiness.blocked_nodes
+        }
+        for node in current:
+            if node.state != "Blocked":
+                continue
+            fact = connection.execute(
+                """
+                SELECT * FROM dag_node_scheduler_transition_facts
+                WHERE task_id = ? AND plan_id = ? AND node_id = ?
+                  AND node_revision = ?
+                """,
+                (task_id, plan_id, node.node_id, node.revision),
+            ).fetchone()
+            if fact is None:
+                raise TaskStoreCorruption(
+                    "persisted Blocked DAG node lacks its scheduler fact"
+                )
+            document = _decode_document(
+                fact["blocker_document_json"], label="DAG blocker proof"
+            )
+            document_json, document_hash = encode_document(document)
+            expected_blockers = blockers_by_node.get(node.node_id)
+            if (
+                expected_blockers is None
+                or document_json != fact["blocker_document_json"]
+                or document_hash != fact["blocker_document_hash"]
+                or document
+                != {
+                    "schema_version": "1.0.0",
+                    "task_id": task_id,
+                    "plan_id": plan_id,
+                    "plan_hash": plan_hash,
+                    "approval_id": fact["approval_id"],
+                    "node_id": node.node_id,
+                    "previous_revision": fact["previous_revision"],
+                    "blocked_revision": fact["node_revision"],
+                    "blocked_by_node_ids": list(expected_blockers),
+                    "supervisor_term": {
+                        "fencing_token": fact["fencing_token"],
+                        "owner_id": fact["owner_id"],
+                        "acquired_at": fact["term_acquired_at"],
+                    },
+                    "recorded_at": fact["recorded_at"],
+                }
+            ):
+                raise TaskStoreCorruption(
+                    "persisted DAG Blocked proof differs from pure readiness"
+                )
         return DagNodeStateMapSnapshot(
             task_id=task_id,
             plan_id=plan_id,
@@ -14056,7 +14920,7 @@ class SQLiteTaskStore:
         """
 
         admission = self._load_dag_node_execution_admission(
-            connection, task_id=task_id
+            connection, task_id=task_id, node_id=source_state.node_id
         )
         if admission is not None:
             return self._load_v20_dag_node_succeeded_outputs(
@@ -14951,7 +15815,7 @@ class SQLiteTaskStore:
             plan = snapshot.plan
             approval = snapshot.approval
             if (
-                snapshot.status != "AwaitingApproval"
+                snapshot.status not in {"AwaitingApproval", "Running"}
                 or not isinstance(plan, Mapping)
                 or len(plan.get("nodes", [])) <= 1
                 or plan.get("plan_hash") != expected_plan_hash
@@ -15010,6 +15874,10 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption(
                     "persisted DAG state cannot be evaluated"
                 ) from error
+            if readiness.active_node_ids:
+                raise TaskStoreConflict(
+                    "DAG task already has an active admitted node"
+                )
             if not readiness.runnable_node_ids:
                 raise TaskStoreConflict("DAG plan has no runnable Pending node")
             selected_node_id = readiness.runnable_node_ids[0]
@@ -15250,7 +16118,7 @@ class SQLiteTaskStore:
             plan = snapshot.plan
             approval = snapshot.approval
             if (
-                snapshot.status != "AwaitingApproval"
+                snapshot.status not in {"AwaitingApproval", "Running"}
                 or not isinstance(plan, Mapping)
                 or len(plan.get("nodes", [])) <= 1
                 or plan.get("plan_hash") != expected_plan_hash
@@ -15288,6 +16156,10 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption(
                     "persisted DAG state cannot be evaluated for input binding"
                 ) from error
+            if readiness.active_node_ids:
+                raise TaskStoreConflict(
+                    "DAG task already has an active admitted node"
+                )
             if not readiness.runnable_node_ids:
                 raise TaskStoreConflict("DAG plan has no runnable Pending node")
             selected_node_id = readiness.runnable_node_ids[0]
@@ -15741,16 +16613,42 @@ class SQLiteTaskStore:
         self,
         connection: sqlite3.Connection,
         *,
-        task_id: str,
+        task_id: str | None = None,
+        intent_id: str | None = None,
+        node_id: str | None = None,
     ) -> sqlite3.Row | None:
         """Read and verify the immutable index for one admitted DAG node."""
 
-        row = connection.execute(
-            """
-            SELECT * FROM dag_node_execution_admissions WHERE task_id = ?
-            """,
-            (task_id,),
-        ).fetchone()
+        if intent_id is not None:
+            rows = connection.execute(
+                "SELECT * FROM dag_node_execution_admissions WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchall()
+        elif task_id is not None and node_id is not None:
+            rows = connection.execute(
+                """
+                SELECT * FROM dag_node_execution_admissions
+                WHERE task_id = ? AND node_id = ?
+                """,
+                (task_id, node_id),
+            ).fetchall()
+        elif task_id is not None:
+            selected_intent_id = self._select_task_dispatch_intent_id(
+                connection, task_id=task_id
+            )
+            if selected_intent_id is None:
+                return None
+            rows = connection.execute(
+                "SELECT * FROM dag_node_execution_admissions WHERE intent_id = ?",
+                (selected_intent_id,),
+            ).fetchall()
+        else:
+            raise TaskStoreCorruption(
+                "DAG admission loader requires an exact selector"
+            )
+        if len(rows) > 1:
+            raise TaskStoreCorruption("DAG node has multiple execution admissions")
+        row = rows[0] if rows else None
         if row is None:
             return None
         document = _decode_document(
@@ -15819,6 +16717,96 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    def get_active_dag_node_execution(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+    ) -> DagNodeExecutionAdmission | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            task = connection.execute(
+                """
+                SELECT project_id, principal_id, status
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if (
+                task is None
+                or task["project_id"] != project_id
+                or task["principal_id"] != principal_id
+            ):
+                raise TaskStoreConflict("task does not exist in the requested scope")
+            rows = connection.execute(
+                """
+                SELECT admission.intent_id
+                FROM dag_node_execution_admissions AS admission
+                JOIN dag_node_state_events AS state
+                  ON state.task_id = admission.task_id
+                 AND state.plan_id = admission.plan_id
+                 AND state.node_id = admission.node_id
+                WHERE admission.task_id = ?
+                  AND state.state IN ('Queued', 'Running', 'Waiting', 'Retrying')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dag_node_state_events AS later
+                      WHERE later.task_id = state.task_id
+                        AND later.plan_id = state.plan_id
+                        AND later.node_id = state.node_id
+                        AND later.revision > state.revision
+                  )
+                ORDER BY admission.admitted_at_us, admission.intent_id
+                """,
+                (task_id,),
+            ).fetchall()
+            if len(rows) > 1:
+                raise TaskStoreCorruption(
+                    "DAG task has multiple active execution admissions"
+                )
+            if task["status"] == "Cancelled":
+                connection.commit()
+                return None
+            if task["status"] in {"Succeeded", "Failed"} and rows:
+                raise TaskStoreCorruption(
+                    "terminal DAG Task retains an active execution admission"
+                )
+            if not rows:
+                connection.commit()
+                return None
+            admission = self._load_dag_node_execution_admission(
+                connection, intent_id=rows[0]["intent_id"]
+            )
+            intent = self._load_dispatch_intent(
+                connection, intent_id=rows[0]["intent_id"]
+            )
+            snapshot = self._load_snapshot(connection, task_id)
+            if admission is None or intent is None or snapshot is None:
+                raise TaskStoreCorruption("active DAG execution cannot be read")
+            result = DagNodeExecutionAdmission(
+                snapshot=snapshot,
+                intent=intent,
+                input_binding_document_hash=admission[
+                    "input_binding_document_hash"
+                ],
+                pending_revision=int(admission["pending_revision"]),
+                queued_revision=int(admission["queued_revision"]),
+                admission_fencing_token=int(
+                    admission["admission_fencing_token"]
+                ),
+                admitted_at=admission["admitted_at"],
+                replayed=True,
+            )
+            connection.commit()
+            return result
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def record_supervised_dag_dispatch_reconciliation(
         self,
         *,
@@ -15847,7 +16835,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None or intent.intent_id != intent_id:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
@@ -15869,7 +16857,7 @@ class SQLiteTaskStore:
                 intent=intent,
                 allowed_node_states=frozenset({"Queued"}),
             )
-            if admission is None or task["status"] != "Queued":
+            if admission is None or task["status"] not in {"Queued", "Running"}:
                 raise TaskStoreConflict(
                     "DAG reconciliation requires the exact admitted queued node"
                 )
@@ -15884,7 +16872,9 @@ class SQLiteTaskStore:
                 "recorded_at": recorded_at,
             }
             if existing is not None:
-                stored = self._load_dispatch_intent(connection, task_id=task_id)
+                stored = self._load_dispatch_intent(
+                    connection, intent_id=intent_id
+                )
                 if (
                     stored is None
                     or existing["outcome"] != "reconciliation_required"
@@ -15907,7 +16897,9 @@ class SQLiteTaskStore:
                 """,
                 (intent_id, document_json, document_hash, recorded_at),
             )
-            stored = self._load_dispatch_intent(connection, task_id=task_id)
+            stored = self._load_dispatch_intent(
+                connection, intent_id=intent_id
+            )
             if stored is None or stored.state != "reconciliation_required":
                 raise TaskStoreCorruption(
                     "supervised DAG reconciliation cannot be read"
@@ -16052,10 +17044,14 @@ class SQLiteTaskStore:
                 )
 
             existing = self._load_dag_node_execution_admission(
-                connection, task_id=task_id
+                connection,
+                task_id=task_id,
+                node_id=input_binding.target_node_id,
             )
             if existing is not None:
-                intent = self._load_dispatch_intent(connection, task_id=task_id)
+                intent = self._load_dispatch_intent(
+                    connection, intent_id=existing["intent_id"]
+                )
                 if (
                     intent is None
                     or intent.intent_id != existing["intent_id"]
@@ -16088,8 +17084,34 @@ class SQLiteTaskStore:
                     replayed=True,
                 )
 
-            if snapshot.status != "AwaitingApproval":
+            run_row = connection.execute(
+                """
+                SELECT * FROM dag_task_execution_runs WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            first_admission = run_row is None
+            if first_admission and snapshot.status != "AwaitingApproval":
                 raise TaskStoreConflict("task is not awaiting DAG execution admission")
+            if not first_admission:
+                if (
+                    snapshot.status != "Running"
+                    or run_row["plan_id"] != input_binding.plan_id
+                    or run_row["plan_hash"] != input_binding.plan_hash
+                    or run_row["approval_id"] != input_binding.approval_id
+                    or run_row["project_id"] != project_id
+                    or run_row["principal_id"] != principal_id
+                ):
+                    raise TaskStoreCorruption(
+                        "successor admission differs from its DAG Task run"
+                    )
+            if connection.execute(
+                "SELECT 1 FROM task_cancel_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone() is not None:
+                raise TaskStoreConflict(
+                    "DAG admission is blocked by durable cancellation"
+                )
             if (
                 input_binding.fencing_token != supervisor_lease.fencing_token
                 or input_binding.owner_id != supervisor_lease.owner_id
@@ -16125,6 +17147,18 @@ class SQLiteTaskStore:
             )
             if budget is None:
                 raise TaskStoreCorruption("current approval has no durable budget")
+            if first_admission:
+                if budget.tasks_used != 0:
+                    raise TaskStoreConflict(
+                        "DAG Task approval budget was already consumed"
+                    )
+                gate_budget = budget
+            else:
+                if budget.tasks_used != 1:
+                    raise TaskStoreCorruption(
+                        "successor admission requires one consumed Task budget"
+                    )
+                gate_budget = replace(budget, tasks_used=0)
             try:
                 dataset_keys = [
                     (value["id"], value["version"])
@@ -16148,7 +17182,8 @@ class SQLiteTaskStore:
                 SubmitGateContext(
                     snapshot=snapshot,
                     registry=registry,
-                    budget=budget,
+                    budget=gate_budget,
+                    task_budget_already_consumed=not first_admission,
                 ),
                 admitted_at,
             )
@@ -16199,17 +17234,18 @@ class SQLiteTaskStore:
             if event_fingerprint_hash != fingerprint_hash:
                 raise TaskStoreConflict("DAG queued fingerprint is inconsistent")
 
-            consumed = connection.execute(
-                """
-                UPDATE approval_budgets
-                SET tasks_used = tasks_used + 1, updated_at = ?
-                WHERE task_id = ? AND approval_id = ?
-                  AND tasks_used < max_tasks
-                """,
-                (admitted_at, task_id, approval["approval_id"]),
-            )
-            if consumed.rowcount != 1:
-                raise TaskStoreConflict("approval task budget is exhausted")
+            if first_admission:
+                consumed = connection.execute(
+                    """
+                    UPDATE approval_budgets
+                    SET tasks_used = tasks_used + 1, updated_at = ?
+                    WHERE task_id = ? AND approval_id = ?
+                      AND tasks_used = 0 AND tasks_used < max_tasks
+                    """,
+                    (admitted_at, task_id, approval["approval_id"]),
+                )
+                if consumed.rowcount != 1:
+                    raise TaskStoreConflict("approval task budget is exhausted")
             connection.execute(
                 """
                 INSERT INTO dispatch_intents(
@@ -16310,63 +17346,84 @@ class SQLiteTaskStore:
                     admitted_at_us,
                 ),
             )
-            connection.execute(
-                """
-                INSERT INTO run_events(
-                    task_id, sequence, event_id, event_type, task_status,
-                    node_id, fingerprint_hash, document_json, document_hash,
-                    occurred_at, recorded_at
-                ) VALUES (?, 1, ?, 'task_queued', 'Queued', NULL, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    queued_event["event_id"],
-                    event_fingerprint_hash,
-                    event_json,
-                    event_hash,
-                    queued_event["occurred_at"],
-                    admitted_at,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO supervised_run_event_commits(
-                    task_id, sequence, project_id, principal_id,
-                    fencing_token, recorded_at, recorded_at_us
-                ) VALUES (?, 1, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    project_id,
-                    principal_id,
-                    supervisor_lease.fencing_token,
-                    admitted_at,
-                    admitted_at_us,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO dag_node_execution_transition_facts(
-                    intent_id, node_revision, previous_state, state,
-                    event_sequence, event_hash, reason,
-                    project_id, principal_id, fencing_token,
-                    owner_id, term_acquired_at, recorded_at, recorded_at_us
-                ) VALUES (?, ?, 'Pending', 'Queued', 1, ?,
-                          'execution_admitted', ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    intent_document["intent_id"],
-                    selected_state.revision + 1,
-                    event_hash,
-                    project_id,
-                    principal_id,
-                    supervisor_lease.fencing_token,
-                    supervisor_lease.owner_id,
-                    supervisor_lease.acquired_at,
-                    admitted_at,
-                    admitted_at_us,
-                ),
-            )
+            if first_admission:
+                connection.execute(
+                    """
+                    INSERT INTO dag_task_execution_runs(
+                        task_id, plan_id, plan_hash, approval_id,
+                        first_intent_id, project_id, principal_id,
+                        admitted_at, admitted_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        plan["plan_id"],
+                        plan["plan_hash"],
+                        approval["approval_id"],
+                        intent_document["intent_id"],
+                        project_id,
+                        principal_id,
+                        admitted_at,
+                        admitted_at_us,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO run_events(
+                        task_id, sequence, event_id, event_type, task_status,
+                        node_id, fingerprint_hash, document_json, document_hash,
+                        occurred_at, recorded_at
+                    ) VALUES (?, 1, ?, 'task_queued', 'Queued', NULL, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        queued_event["event_id"],
+                        event_fingerprint_hash,
+                        event_json,
+                        event_hash,
+                        queued_event["occurred_at"],
+                        admitted_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO supervised_run_event_commits(
+                        task_id, sequence, project_id, principal_id,
+                        fencing_token, recorded_at, recorded_at_us
+                    ) VALUES (?, 1, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        project_id,
+                        principal_id,
+                        supervisor_lease.fencing_token,
+                        admitted_at,
+                        admitted_at_us,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO dag_node_execution_transition_facts(
+                        intent_id, node_revision, previous_state, state,
+                        event_sequence, event_hash, reason,
+                        project_id, principal_id, fencing_token,
+                        owner_id, term_acquired_at, recorded_at, recorded_at_us
+                    ) VALUES (?, ?, 'Pending', 'Queued', 1, ?,
+                              'execution_admitted', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent_document["intent_id"],
+                        selected_state.revision + 1,
+                        event_hash,
+                        project_id,
+                        principal_id,
+                        supervisor_lease.fencing_token,
+                        supervisor_lease.owner_id,
+                        supervisor_lease.acquired_at,
+                        admitted_at,
+                        admitted_at_us,
+                    ),
+                )
             connection.execute(
                 """
                 INSERT INTO dag_node_state_events(
@@ -16384,20 +17441,23 @@ class SQLiteTaskStore:
                     admitted_at_us,
                 ),
             )
-            connection.execute(
-                "UPDATE tasks SET status = 'Queued', updated_at = ? WHERE task_id = ?",
-                (admitted_at, task_id),
-            )
+            if first_admission:
+                connection.execute(
+                    "UPDATE tasks SET status = 'Queued', updated_at = ? "
+                    "WHERE task_id = ?",
+                    (admitted_at, task_id),
+                )
             queued_snapshot = self._load_snapshot(connection, task_id)
             stored_intent = self._load_dispatch_intent(
-                connection, task_id=task_id
+                connection, intent_id=intent_document["intent_id"]
             )
             stored_admission = self._load_dag_node_execution_admission(
-                connection, task_id=task_id
+                connection, intent_id=intent_document["intent_id"]
             )
             if (
                 queued_snapshot is None
-                or queued_snapshot.status != "Queued"
+                or queued_snapshot.status
+                != ("Queued" if first_admission else "Running")
                 or stored_intent is None
                 or stored_intent.intent_id != intent_document["intent_id"]
                 or stored_admission is None
@@ -16470,7 +17530,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
@@ -16490,12 +17550,14 @@ class SQLiteTaskStore:
                 now_us=authorized_at_us,
                 action="supervised dispatch",
             )
-            self._require_current_dag_node_execution(
+            dag_admission = self._require_current_dag_node_execution(
                 connection,
                 intent=intent,
                 allowed_node_states=frozenset({"Queued"}),
             )
-            if task["status"] != "Queued":
+            if task["status"] != "Queued" and not (
+                dag_admission is not None and task["status"] == "Running"
+            ):
                 raise TaskStoreConflict(
                     "only a queued task can receive supervised dispatch"
                 )
@@ -16595,7 +17657,9 @@ class SQLiteTaskStore:
                     "INSERT INTO dispatch_attempts(intent_id, claimed_at) VALUES (?, ?)",
                     (intent_id, authorized_at),
                 )
-                intent = self._load_dispatch_intent(connection, task_id=task_id)
+                intent = self._load_dispatch_intent(
+                    connection, intent_id=intent_id
+                )
                 if intent is None or intent.state != "dispatching":
                     raise TaskStoreCorruption(
                         "supervised dispatch claim cannot be read"
@@ -16682,7 +17746,9 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(
+                connection, intent_id=intent_id
+            )
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
@@ -16965,7 +18031,9 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(
+                connection, intent_id=intent_id
+            )
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
@@ -17226,7 +18294,9 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(
+                connection, intent_id=intent_id
+            )
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
@@ -17828,7 +18898,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
@@ -18038,7 +19108,9 @@ class SQLiteTaskStore:
                     raise TaskStoreCorruption(
                         "private reconciliation effective outcome hash changed"
                     )
-            stored = self._load_dispatch_intent(connection, task_id=task_id)
+            stored = self._load_dispatch_intent(
+                connection, intent_id=intent_id
+            )
             if stored is None or stored.state != "dispatched":
                 raise TaskStoreCorruption(
                     "private receipt adoption cannot be read"
@@ -18437,7 +19509,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             if (
@@ -19077,7 +20149,7 @@ class SQLiteTaskStore:
                 )
 
             stored_intent = self._load_dispatch_intent(
-                connection, task_id=task_id
+                connection, intent_id=intent_id
             )
             if stored_intent is None:
                 raise TaskStoreCorruption("projected dispatch intent cannot be read")
@@ -20329,14 +21401,19 @@ class SQLiteTaskStore:
             "node_progress",
             "node_succeeded",
             "node_failed",
+            "node_cancelled",
         }:
             raise TaskStoreConflict("DAG node event type is unsupported")
         terminal_state = {
             "node_succeeded": "Succeeded",
             "node_failed": "Failed",
+            "node_cancelled": "Cancelled",
         }.get(event_type)
         if (
-            event.get("task_status") != "Running"
+            event.get("task_status")
+            not in ({"Running"} if terminal_state is None else {
+                "Running", "Succeeded", "Failed"
+            })
             or (terminal_state == "Succeeded") != (supplied_output is not None)
         ):
             raise TaskStoreConflict("DAG node event projection is inconsistent")
@@ -20360,7 +21437,7 @@ class SQLiteTaskStore:
             task_id = self._task_id_for_intent(connection, intent_id)
             if task_id is None:
                 raise TaskStoreConflict("dispatch intent does not exist")
-            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            intent = self._load_dispatch_intent(connection, intent_id=intent_id)
             if intent is None or intent.intent_id != intent_id:
                 raise TaskStoreCorruption("dispatch intent cannot be read")
             task = connection.execute(
@@ -20369,6 +21446,19 @@ class SQLiteTaskStore:
             ).fetchone()
             if task is None:
                 raise TaskStoreCorruption("DAG runtime task cannot be read")
+            if event_type == "node_cancelled" and (
+                expected_node_state != "Running"
+                or adapter_status.get("status") != "Cancelled"
+                or adapter_status.get("terminal") is not True
+                or connection.execute(
+                    "SELECT 1 FROM task_cancel_requests WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise TaskStoreConflict(
+                    "DAG node cancellation requires an exact node-local Adapter status"
+                )
             self._require_active_runtime_supervisor_lease(
                 connection,
                 project_id=task["project_id"],
@@ -20406,7 +21496,8 @@ class SQLiteTaskStore:
                     "DAG node transition differs from current durable state"
                 )
             if event_type == "node_started" and (
-                expected_node_state != "Queued" or task["status"] != "Queued"
+                expected_node_state != "Queued"
+                or task["status"] not in {"Queued", "Running"}
             ):
                 raise TaskStoreConflict("DAG node start requires Queued state")
             if event_type == "node_progress" and (
@@ -20440,19 +21531,59 @@ class SQLiteTaskStore:
                 and baseline["fingerprint_hash"] != event_fingerprint_hash
             ):
                 raise TaskStoreConflict("run fingerprint changed within a DAG node")
+
+            plan_row = connection.execute(
+                """
+                SELECT document_json, document_hash FROM plans
+                WHERE task_id = ? AND plan_id = ?
+                """,
+                (task_id, intent.plan_id),
+            ).fetchone()
+            if plan_row is None:
+                raise TaskStoreCorruption("DAG runtime plan cannot be read")
+            plan_document = _decode_hashed_document(
+                plan_row, label="DAG runtime aggregate plan"
+            )
+            aggregate_status = "Running"
+            if terminal_state is not None:
+                state_map = self._load_dag_node_state_map(
+                    connection, task_id=task_id, plan=plan_document
+                )
+                if state_map is None:
+                    raise TaskStoreCorruption("DAG runtime state map cannot be read")
+                hypothetical_states = {
+                    node.node_id: node.state for node in state_map.nodes
+                }
+                hypothetical_states[intent.node_id] = terminal_state
+                try:
+                    hypothetical_readiness = evaluate_dag_readiness(
+                        plan_document, node_states=hypothetical_states
+                    )
+                except DagScheduleError as error:
+                    raise TaskStoreCorruption(
+                        "DAG terminal aggregate cannot be evaluated"
+                    ) from error
+                aggregate_status = self._dag_aggregate_status(
+                    hypothetical_readiness
+                )
+            if event.get("task_status") != aggregate_status:
+                raise TaskStoreConflict(
+                    "DAG node event differs from the exact aggregate status"
+                )
             connection.execute(
                 """
                 INSERT INTO run_events(
                     task_id, sequence, event_id, event_type, task_status,
                     node_id, fingerprint_hash, document_json, document_hash,
                     occurred_at, recorded_at
-                ) VALUES (?, ?, ?, ?, 'Running', ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
                     next_sequence,
                     event["event_id"],
                     event_type,
+                    aggregate_status,
                     intent.node_id,
                     event_fingerprint_hash,
                     event_json,
@@ -20495,6 +21626,7 @@ class SQLiteTaskStore:
             reason = {
                 "node_started": "dispatch_receipt_adopted",
                 "node_succeeded": "adapter_succeeded",
+                "node_cancelled": "adapter_cancelled",
             }.get(event_type)
             if event_type == "node_failed":
                 error_code = (
@@ -20787,12 +21919,42 @@ class SQLiteTaskStore:
                     recorded_at_us,
                 ),
             )
+            if terminal_state is not None:
+                self._materialize_dag_blocked_nodes(
+                    connection,
+                    task_id=task_id,
+                    plan=plan_document,
+                    approval_id=intent.approval_id,
+                    project_id=task["project_id"],
+                    principal_id=task["principal_id"],
+                    supervisor_lease=supervisor_lease,
+                    recorded_at=recorded_at,
+                    recorded_at_us=recorded_at_us,
+                )
+                reconciled_states = self._load_dag_node_state_map(
+                    connection, task_id=task_id, plan=plan_document
+                )
+                if reconciled_states is None:
+                    raise TaskStoreCorruption(
+                        "terminal DAG state map cannot be read"
+                    )
+                reconciled_readiness = evaluate_dag_readiness(
+                    plan_document,
+                    node_states={
+                        node.node_id: node.state
+                        for node in reconciled_states.nodes
+                    },
+                )
+                if self._dag_aggregate_status(reconciled_readiness) != aggregate_status:
+                    raise TaskStoreCorruption(
+                        "materialized DAG blockers changed the aggregate result"
+                    )
             connection.execute(
-                "UPDATE tasks SET status = 'Running', updated_at = ? WHERE task_id = ?",
-                (recorded_at, task_id),
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+                (aggregate_status, recorded_at, task_id),
             )
             snapshot = self._load_snapshot(connection, task_id)
-            if snapshot is None or snapshot.status != "Running":
+            if snapshot is None or snapshot.status != aggregate_status:
                 raise TaskStoreCorruption("DAG node transition cannot be read")
             connection.commit()
             if terminal_state is None:

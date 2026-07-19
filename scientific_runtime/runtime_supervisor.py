@@ -18,6 +18,16 @@ from .task_store import RuntimeSupervisorLeaseLost, TaskStoreError
 
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _STABLE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_DAG_AGGREGATE_STATUSES = frozenset(
+    {
+        "AwaitingApproval",
+        "Queued",
+        "Running",
+        "Succeeded",
+        "Failed",
+        "Cancelled",
+    }
+)
 
 LEASE_HELD = "RUNTIME_SUPERVISOR_LEASE_HELD"
 LEASE_LOST = "RUNTIME_SUPERVISOR_LEASE_LOST"
@@ -61,6 +71,18 @@ class RuntimeSupervisorTaskService(Protocol):
         limit: int = 20,
         view: str = "active",
     ) -> Any:
+        ...
+
+    def advance_runtime_dag(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: Any,
+    ) -> Any | None:
+        """Optionally advance one internal multi-node DAG under this term."""
+
         ...
 
     def get_dispatch_intent(
@@ -175,6 +197,9 @@ class RuntimeSupervisorCycleResult:
     retry_processed_task_ids: tuple[str, ...] = ()
     retry_dispatched_task_ids: tuple[str, ...] = ()
     retry_exhausted_task_ids: tuple[str, ...] = ()
+    dag_advanced_task_ids: tuple[str, ...] = ()
+    dag_admitted_nodes: tuple[tuple[str, str], ...] = ()
+    dag_blocked_nodes: tuple[tuple[str, str], ...] = ()
 
 
 class _SupervisorFailure(RuntimeError):
@@ -593,6 +618,72 @@ class RuntimeSupervisor:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
 
+    def _advance_task_dag(
+        self,
+        task_id: str,
+        lease: Any,
+        processor: Callable[..., Any],
+    ) -> Any | None:
+        """Run and strictly validate one optional internal DAG advance."""
+
+        result = processor(
+            task_id,
+            project_id=self._project_id,
+            principal_id=self._principal_id,
+            supervisor_lease=lease,
+        )
+        if result is None:
+            return None
+
+        snapshot = getattr(result, "snapshot", None)
+        snapshot_status = getattr(snapshot, "status", None)
+        aggregate_status = getattr(result, "aggregate_status", None)
+        active_intent = getattr(result, "active_intent", None)
+        admitted_node_id = getattr(result, "admitted_node_id", None)
+        blocked_node_ids = getattr(result, "blocked_node_ids", None)
+        deferred_code = getattr(result, "deferred_code", None)
+        valid_admitted_node = admitted_node_id is None or (
+            isinstance(admitted_node_id, str)
+            and _OPAQUE_ID.fullmatch(admitted_node_id) is not None
+        )
+        valid_blocked_nodes = (
+            isinstance(blocked_node_ids, tuple)
+            and all(
+                isinstance(node_id, str)
+                and _OPAQUE_ID.fullmatch(node_id) is not None
+                for node_id in blocked_node_ids
+            )
+            and len(set(blocked_node_ids)) == len(blocked_node_ids)
+        )
+        if (
+            not isinstance(task_id, str)
+            or _OPAQUE_ID.fullmatch(task_id) is None
+            or getattr(snapshot, "task_id", None) != task_id
+            or getattr(snapshot, "project_id", None) != self._project_id
+            or getattr(snapshot, "principal_id", None) != self._principal_id
+            or snapshot_status not in _DAG_AGGREGATE_STATUSES
+            or aggregate_status != snapshot_status
+            or (
+                active_intent is not None
+                and getattr(active_intent, "task_id", None) != task_id
+            )
+            or not valid_admitted_node
+            or not valid_blocked_nodes
+            or (
+                admitted_node_id is not None
+                and admitted_node_id in blocked_node_ids
+            )
+            or (
+                deferred_code is not None
+                and (
+                    not isinstance(deferred_code, str)
+                    or _STABLE_CODE.fullmatch(deferred_code) is None
+                )
+            )
+        ):
+            raise _SupervisorFailure(FATAL)
+        return result
+
     def _process_task_timeout(self, task_id: str, lease: Any) -> Any:
         """Run and strictly validate one supervised timeout pass."""
 
@@ -750,21 +841,79 @@ class RuntimeSupervisor:
         retry_processed: list[str] = []
         retry_dispatched: list[str] = []
         retry_exhausted: list[str] = []
+        dag_advanced: list[str] = []
+        dag_admitted: list[tuple[str, str]] = []
+        dag_blocked: list[tuple[str, str]] = []
         deferred: list[tuple[str, str]] = []
         failures: list[tuple[str, str]] = []
         reconciliation_probe_used = False
+        dag_processor = getattr(
+            self._task_service, "advance_runtime_dag", None
+        )
         for snapshot in snapshots:
             if self._stop_event.is_set():
                 break
-            status = getattr(snapshot, "status", None)
-            if status not in {"Queued", "Running", "Waiting", "Retrying"}:
-                continue
             task_id = snapshot.task_id
-            scanned.append(task_id)
-            lease, next_heartbeat = self._heartbeat_if_due(
-                lease, next_heartbeat
-            )
+            dag_active_intent = None
+            heartbeat_checked = False
+            if callable(dag_processor):
+                lease, next_heartbeat = self._heartbeat_if_due(
+                    lease, next_heartbeat
+                )
+                heartbeat_checked = True
+                try:
+                    dag_result = self._advance_task_dag(
+                        task_id, lease, dag_processor
+                    )
+                except _SupervisorFailure:
+                    raise
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "DAG_ADVANCE_FAILED"
+                            ),
+                        )
+                    )
+                    continue
+                if dag_result is not None:
+                    snapshot = dag_result.snapshot
+                    dag_active_intent = getattr(
+                        dag_result, "active_intent", None
+                    )
+                    dag_advanced.append(task_id)
+                    admitted_node_id = getattr(
+                        dag_result, "admitted_node_id", None
+                    )
+                    if admitted_node_id is not None:
+                        dag_admitted.append((task_id, admitted_node_id))
+                    dag_blocked.extend(
+                        (task_id, node_id)
+                        for node_id in dag_result.blocked_node_ids
+                    )
+                    dag_deferred_code = getattr(
+                        dag_result, "deferred_code", None
+                    )
+                    if dag_deferred_code is not None:
+                        deferred.append((task_id, dag_deferred_code))
+            status = getattr(snapshot, "status", None)
             cancellation = getattr(snapshot, "cancellation", None)
+            terminal_cancel_pending = (
+                status in {"Succeeded", "Failed"}
+                and getattr(cancellation, "state", None) == "requested"
+            )
+            if (
+                status not in {"Queued", "Running", "Waiting", "Retrying"}
+                and not terminal_cancel_pending
+            ):
+                continue
+            scanned.append(task_id)
+            if not heartbeat_checked:
+                lease, next_heartbeat = self._heartbeat_if_due(
+                    lease, next_heartbeat
+                )
             if getattr(cancellation, "state", None) == "requested":
                 try:
                     cancellation_result = (
@@ -956,23 +1105,26 @@ class RuntimeSupervisor:
                         # cycle, and any state-changing checkpoint result gets
                         # one clean cycle boundary before further observation.
                         continue
-            try:
-                intent = self._task_service.get_dispatch_intent(
-                    task_id,
-                    project_id=self._project_id,
-                    principal_id=self._principal_id,
-                )
-            except Exception as error:
-                self._raise_if_fatal_task_error(error)
-                failures.append(
-                    (
+            if dag_active_intent is None:
+                try:
+                    intent = self._task_service.get_dispatch_intent(
                         task_id,
-                        self._stable_error_code(
-                            error, "DISPATCH_INTENT_READ_FAILED"
-                        ),
+                        project_id=self._project_id,
+                        principal_id=self._principal_id,
                     )
-                )
-                continue
+                except Exception as error:
+                    self._raise_if_fatal_task_error(error)
+                    failures.append(
+                        (
+                            task_id,
+                            self._stable_error_code(
+                                error, "DISPATCH_INTENT_READ_FAILED"
+                            ),
+                        )
+                    )
+                    continue
+            else:
+                intent = dag_active_intent
             if intent is None:
                 deferred.append((task_id, "DISPATCH_INTENT_MISSING"))
                 continue
@@ -1453,6 +1605,9 @@ class RuntimeSupervisor:
                 retry_processed_task_ids=tuple(retry_processed),
                 retry_dispatched_task_ids=tuple(retry_dispatched),
                 retry_exhausted_task_ids=tuple(retry_exhausted),
+                dag_advanced_task_ids=tuple(dag_advanced),
+                dag_admitted_nodes=tuple(dag_admitted),
+                dag_blocked_nodes=tuple(dag_blocked),
             ),
             lease,
             next_heartbeat,

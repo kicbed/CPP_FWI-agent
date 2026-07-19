@@ -23,10 +23,12 @@ import worker_launch_control as worker_control
 from worker_launch_control import (
     CANCELLED_WORKER_EXIT_CODE,
     CONTROL_DIRECTORY,
+    CUDA_LOGICAL_DEVICE_0_SLOT,
     WALL_TIME_EXCEEDED_WORKER_EXIT_CODE,
     WORKER_EXIT_NAME,
     WORKER_HEARTBEAT_NAME,
     WORKER_READY_NAME,
+    WORKER_CONFIG_NAME,
     LaunchAttemptBinding,
     ParentLaunchLease,
     WorkerCancellationRequested,
@@ -72,6 +74,45 @@ def _hold_fenced_worker(
             attempt_id=attempt_id,
             attempt_fd=attempt_fd,
             capacity_fd=capacity_fd,
+            interval_seconds=0.02,
+        )
+        heartbeat.start()
+        ready.put((True, os.getpid()))
+        stop.wait(10.0)
+        heartbeat.stop("succeeded")
+    except BaseException as error:
+        ready.put((False, f"{type(error).__name__}:{error}"))
+        if heartbeat is not None:
+            try:
+                heartbeat.stop("failed")
+            except Exception:
+                pass
+
+
+def _hold_fenced_cuda_worker(
+    run_root: str,
+    run_dir: str,
+    attempt_id: str,
+    attempt_fd: int,
+    capacity_fd: int,
+    gpu_capacity_fd: int,
+    gpu_capacity_slot: int,
+    gpu_capacity_generation: int,
+    ready: multiprocessing.Queue,
+    stop: multiprocessing.Event,
+) -> None:
+    heartbeat: WorkerHeartbeat | None = None
+    try:
+        heartbeat = WorkerHeartbeat(
+            run_root=run_root,
+            run_dir=run_dir,
+            attempt_id=attempt_id,
+            attempt_fd=attempt_fd,
+            capacity_fd=capacity_fd,
+            resource_device="cuda",
+            gpu_capacity_fd=gpu_capacity_fd,
+            gpu_capacity_slot=gpu_capacity_slot,
+            gpu_capacity_generation=gpu_capacity_generation,
             interval_seconds=0.02,
         )
         heartbeat.start()
@@ -151,6 +192,7 @@ class WorkerLaunchControlTest(unittest.TestCase):
         *,
         submission_digit: str | None = None,
         attempt_digit: str | None = None,
+        device: str = "cpu",
     ) -> tuple[LaunchAttemptBinding, Path]:
         submission_digit = submission_digit or str(index % 10)
         attempt_digit = attempt_digit or format(index % 16, "x")
@@ -166,6 +208,12 @@ class WorkerLaunchControlTest(unittest.TestCase):
             created_at=NOW,
         )
         stage_launch_attempt(self.root, run_dir, binding)
+        config_path = run_dir / WORKER_CONFIG_NAME
+        config_path.write_text(
+            json.dumps({"job_id": job_id, "device": device}),
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
         return binding, run_dir
 
     def abrupt_running_attempt(
@@ -940,6 +988,221 @@ class WorkerLaunchControlTest(unittest.TestCase):
             self.root, other_dir, max_active=1
         )
         released.abort()
+
+    def test_cpu_capacity_has_an_explicit_two_worker_upper_bound(self) -> None:
+        first, first_dir = self.binding(14)
+        second, second_dir = self.binding(15)
+        third, third_dir = self.binding(16)
+        first_lease = ParentLaunchLease.acquire(
+            self.root, first_dir, max_active=2
+        )
+        second_lease = ParentLaunchLease.acquire(
+            self.root, second_dir, max_active=2
+        )
+        try:
+            self.assertEqual(
+                {first_lease.capacity_slot, second_lease.capacity_slot},
+                {0, 1},
+            )
+            self.assertEqual(len(first_lease.pass_fds), 2)
+            self.assertEqual(len(second_lease.pass_fds), 2)
+            with self.assertRaisesRegex(
+                WorkerControlError, "ADAPTER_CONCURRENCY_LIMIT"
+            ):
+                ParentLaunchLease.acquire(
+                    self.root, third_dir, max_active=2
+                )
+        finally:
+            first_lease.abort()
+            second_lease.abort()
+        released = ParentLaunchLease.acquire(
+            self.root, third_dir, max_active=2
+        )
+        released.abort()
+        self.assertEqual(first.attempt_number, 14)
+        self.assertEqual(second.attempt_number, 15)
+        self.assertEqual(third.attempt_number, 16)
+
+    def test_cuda_device_zero_stays_locked_after_parent_close(self) -> None:
+        binding, run_dir = self.binding(17, device="cuda")
+        waiting, waiting_dir = self.binding(18, device="cuda")
+        cpu_binding, cpu_dir = self.binding(19)
+        lease = ParentLaunchLease.acquire(
+            self.root,
+            run_dir,
+            max_active=2,
+            resource_device="cuda",
+        )
+        self.assertEqual(lease.gpu_capacity_slot, CUDA_LOGICAL_DEVICE_0_SLOT)
+        self.assertEqual(len(lease.pass_fds), 3)
+        assert lease.gpu_capacity_fd is not None
+        assert lease.gpu_capacity_generation is not None
+        first_gpu_generation = lease.gpu_capacity_generation
+        context = multiprocessing.get_context("fork")
+        ready = context.Queue()
+        stop = context.Event()
+        process = context.Process(
+            target=_hold_fenced_cuda_worker,
+            args=(
+                str(self.root),
+                str(run_dir),
+                binding.attempt_id,
+                lease.attempt_fd,
+                lease.capacity_fd,
+                lease.gpu_capacity_fd,
+                lease.gpu_capacity_slot,
+                lease.gpu_capacity_generation,
+                ready,
+                stop,
+            ),
+        )
+        process.start()
+        try:
+            lease.mark_spawned(process.pid)
+            lease.close_parent()
+            started, detail = ready.get(timeout=5.0)
+            self.assertTrue(started, detail)
+            self.assertEqual(detail, process.pid)
+            with self.assertRaisesRegex(
+                WorkerControlError, "ADAPTER_CONCURRENCY_LIMIT"
+            ):
+                ParentLaunchLease.acquire(
+                    self.root,
+                    waiting_dir,
+                    max_active=2,
+                    resource_device="cuda",
+                )
+
+            # The failed CUDA admission released its generic slot instead of
+            # occupying CPU capacity while device 0 was busy.
+            cpu_lease = ParentLaunchLease.acquire(
+                self.root, cpu_dir, max_active=2
+            )
+            cpu_lease.abort()
+        finally:
+            stop.set()
+            process.join(5.0)
+            if process.is_alive():
+                process.kill()
+                process.join(5.0)
+        self.assertEqual(process.exitcode, 0)
+
+        admitted = ParentLaunchLease.acquire(
+            self.root,
+            waiting_dir,
+            max_active=2,
+            resource_device="cuda",
+        )
+        try:
+            self.assertEqual(
+                admitted.gpu_capacity_generation,
+                first_gpu_generation + 1,
+            )
+        finally:
+            admitted.abort()
+        self.assertEqual(waiting.attempt_number, 18)
+        self.assertEqual(cpu_binding.attempt_number, 19)
+
+    def test_cuda_projection_generation_drift_fails_closed(self) -> None:
+        binding, run_dir = self.binding(20, device="cuda")
+        waiting, waiting_dir = self.binding(21, device="cuda")
+        lease = ParentLaunchLease.acquire(
+            self.root,
+            run_dir,
+            max_active=2,
+            resource_device="cuda",
+        )
+        lease.mark_spawned(os.getpid())
+        assert lease.gpu_capacity_fd is not None
+        assert lease.gpu_capacity_slot is not None
+        assert lease.gpu_capacity_generation is not None
+        heartbeat = WorkerHeartbeat(
+            run_root=self.root,
+            run_dir=run_dir,
+            attempt_id=binding.attempt_id,
+            attempt_fd=os.dup(lease.attempt_fd),
+            capacity_fd=os.dup(lease.capacity_fd),
+            resource_device="cuda",
+            gpu_capacity_fd=os.dup(lease.gpu_capacity_fd),
+            gpu_capacity_slot=lease.gpu_capacity_slot,
+            gpu_capacity_generation=lease.gpu_capacity_generation,
+            interval_seconds=10.0,
+        )
+        lease.close_parent()
+        heartbeat.start()
+        gpu_projection_path = (
+            self.root
+            / CONTROL_DIRECTORY
+            / "worker-capacity"
+            / "slots"
+            / f"slot-{CUDA_LOGICAL_DEVICE_0_SLOT:03d}.json"
+        )
+        projection = json.loads(
+            gpu_projection_path.read_text(encoding="utf-8")
+        )
+        projection["generation"] += 1
+        projection.pop("record_hash")
+        worker_control._atomic_write_private_json(
+            gpu_projection_path,
+            worker_control._record_with_hash(projection),
+        )
+        try:
+            with self.assertRaisesRegex(
+                WorkerControlError, "WORKER_GPU_FENCE_LOST"
+            ):
+                heartbeat._write_active_heartbeat()
+            with self.assertRaisesRegex(
+                WorkerControlError, "ADAPTER_CONCURRENCY_LIMIT"
+            ):
+                ParentLaunchLease.acquire(
+                    self.root,
+                    waiting_dir,
+                    max_active=2,
+                    resource_device="cuda",
+                )
+        finally:
+            with self.assertRaisesRegex(
+                WorkerControlError, "WORKER_GPU_FENCE_LOST"
+            ):
+                heartbeat.stop("failed")
+
+        recovered = ParentLaunchLease.acquire(
+            self.root,
+            waiting_dir,
+            max_active=2,
+            resource_device="cuda",
+        )
+        recovered.abort()
+        self.assertEqual(waiting.attempt_number, 21)
+
+    def test_cuda_permanent_lock_inode_replacement_fails_closed(self) -> None:
+        _first, first_dir = self.binding(22, device="cuda")
+        lease = ParentLaunchLease.acquire(
+            self.root,
+            first_dir,
+            max_active=2,
+            resource_device="cuda",
+        )
+        lease.abort()
+        gpu_lock = (
+            self.root
+            / CONTROL_DIRECTORY
+            / "worker-capacity"
+            / "slots"
+            / f"slot-{CUDA_LOGICAL_DEVICE_0_SLOT:03d}.lock"
+        )
+        gpu_lock.rename(gpu_lock.with_name("slot-064.replaced.lock"))
+        gpu_lock.touch(mode=0o600)
+        _replacement, replacement_dir = self.binding(23, device="cuda")
+        with self.assertRaisesRegex(
+            WorkerControlError, "permanent lock inode changed"
+        ):
+            ParentLaunchLease.acquire(
+                self.root,
+                replacement_dir,
+                max_active=2,
+                resource_device="cuda",
+            )
 
     def test_ready_and_heartbeat_are_exact_attempt_evidence(self) -> None:
         binding, run_dir = self.binding(4)
@@ -1924,8 +2187,54 @@ class WorkerLaunchControlTest(unittest.TestCase):
                 ".worker-heartbeat.json",
                 ".worker-launch.json",
                 ".worker-ready.json",
+                "config.original.json",
             ],
         )
+
+    def test_bootstrap_rejects_config_and_lease_device_drift_before_ready(
+        self,
+    ) -> None:
+        binding, run_dir = self.binding(24, device="cuda")
+        lease = ParentLaunchLease.acquire(
+            self.root,
+            run_dir,
+            max_active=1,
+            resource_device="cpu",
+        )
+        lease.mark_spawned(os.getpid())
+        attempt_fd = os.dup(lease.attempt_fd)
+        capacity_fd = os.dup(lease.capacity_fd)
+        lease.close_parent()
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                result = worker_launch_bootstrap.main(
+                    [
+                        "--command",
+                        "invert",
+                        "--config",
+                        str(run_dir / WORKER_CONFIG_NAME),
+                        "--run-dir",
+                        str(run_dir),
+                        "--run-root",
+                        str(self.root),
+                        "--launch-attempt-id",
+                        binding.attempt_id,
+                        "--launch-attempt-fd",
+                        str(attempt_fd),
+                        "--capacity-lease-fd",
+                        str(capacity_fd),
+                        "--resource-device",
+                        "cpu",
+                    ]
+                )
+        finally:
+            os.close(attempt_fd)
+            os.close(capacity_fd)
+        self.assertEqual(result, 1)
+        self.assertIn("WORKER_RESOURCE_INVALID", stderr.getvalue())
+        self.assertFalse((run_dir / WORKER_READY_NAME).exists())
+        self.assertFalse((run_dir / WORKER_HEARTBEAT_NAME).exists())
 
     def test_staged_attempt_cannot_receive_cancel_before_worker_capability(
         self,
@@ -2069,7 +2378,7 @@ class WorkerLaunchControlTest(unittest.TestCase):
                 "--command",
                 "invert",
                 "--config",
-                str(run_dir / "missing-config.json"),
+                str(run_dir / WORKER_CONFIG_NAME),
                 "--run-dir",
                 str(run_dir),
                 "--run-root",
@@ -2587,7 +2896,7 @@ class WorkerLaunchControlTest(unittest.TestCase):
                 "--command",
                 "invert",
                 "--config",
-                str(run_dir / "missing-config.json"),
+                str(run_dir / WORKER_CONFIG_NAME),
                 "--run-dir",
                 str(run_dir),
                 "--run-root",

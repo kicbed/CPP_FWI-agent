@@ -26,6 +26,7 @@ from .fwi_registry import (
     DEEPWAVE_ALGORITHM_VERSION,
     load_deepwave_manifest,
 )
+from .dag_scheduler import DagScheduleError, evaluate_dag_readiness
 from .task_dispatcher import (
     DispatchDeferred,
     DispatchError,
@@ -197,6 +198,18 @@ class DagNodeAdmissionResult:
     queued_revision: int
     admission_fencing_token: int
     replayed: bool
+
+
+@dataclass(frozen=True)
+class DagRuntimeAdvanceResult:
+    """One deterministic Supervisor pass through the multi-node DAG gate."""
+
+    snapshot: TaskSnapshot
+    active_intent: DispatchIntentSnapshot | None
+    admitted_node_id: str | None
+    blocked_node_ids: tuple[str, ...]
+    aggregate_status: str
+    deferred_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1485,14 +1498,6 @@ class TaskService:
         except TaskStoreConflict as error:
             raise TaskConflict(str(error)) from error
         if replay is not None:
-            replay_intent = self._store.get_dispatch_intent(task_id)
-            if (
-                replay_intent is not None
-                and self._is_dag_node_execution_intent(replay_intent)
-            ):
-                raise TaskConflict(
-                    "DAG node cancellation is outside the current execution kernel"
-                )
             return TaskCancellationResult(
                 snapshot=replay.snapshot,
                 replayed=True,
@@ -1517,10 +1522,6 @@ class TaskService:
                 "automatic timeout already owns this exact Worker attempt"
             )
         intent = self._store.get_dispatch_intent(task_id)
-        if intent is not None and self._is_dag_node_execution_intent(intent):
-            raise TaskConflict(
-                "DAG node cancellation is outside the current execution kernel"
-            )
         candidate = self._store.get_task_cancel_candidate(task_id)
         if (
             intent is None
@@ -2971,6 +2972,299 @@ class TaskService:
             replayed=admitted.replayed,
         )
 
+    def _materialize_dag_node_artifact_inputs(
+        self,
+        snapshot: TaskSnapshot,
+        *,
+        target_node_id: str,
+    ) -> tuple[DagNodeArtifactInput, ...]:
+        """Read exact succeeded-node bytes for one declared data edge.
+
+        The Dispatcher read is only material.  The later Store binding still
+        proves the manifest and bytes against the immutable producer receipt,
+        Plan hash, node revision, and active Supervisor term.
+        """
+
+        plan = snapshot.plan
+        if not isinstance(plan, Mapping):
+            raise TaskConflict("DAG runtime task has no current plan")
+        matching_nodes = [
+            node
+            for node in plan.get("nodes", [])
+            if isinstance(node, Mapping) and node.get("node_id") == target_node_id
+        ]
+        if len(matching_nodes) != 1:
+            raise TaskConflict("DAG runtime target node is inconsistent")
+        target_node = matching_nodes[0]
+        source_bindings = [
+            binding
+            for binding in target_node.get("inputs", [])
+            if isinstance(binding, Mapping)
+            and isinstance(binding.get("source"), Mapping)
+        ]
+        if not source_bindings:
+            return ()
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        try:
+            historical_intents = self._store.list_dispatch_intents(
+                snapshot.task_id
+            )
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        intents_by_node: dict[str, list[DispatchIntentSnapshot]] = {}
+        for historical in historical_intents:
+            intents_by_node.setdefault(historical.node_id, []).append(historical)
+
+        materialized: list[DagNodeArtifactInput] = []
+        for binding in source_bindings:
+            source = binding["source"]
+            source_node_id = source.get("node_id")
+            source_output_port = source.get("port")
+            target_input_port = binding.get("port")
+            candidates = intents_by_node.get(source_node_id, [])
+            if (
+                not isinstance(source_node_id, str)
+                or not isinstance(source_output_port, str)
+                or not isinstance(target_input_port, str)
+                or len(candidates) != 1
+            ):
+                raise TaskDispatchError("DAG_SOURCE_RECEIPT_INVALID")
+            source_intent = candidates[0]
+            if source_intent.state != "dispatched" or source_intent.handle is None:
+                raise TaskDispatchError("DAG_SOURCE_RECEIPT_INVALID")
+            try:
+                supplied_manifests = self._dispatcher.collect(source_intent)
+            except DispatchError as error:
+                raise TaskDispatchError(error.code) from error
+            except Exception as error:
+                raise TaskDispatchError("ADAPTER_COLLECT_UNAVAILABLE") from error
+            if not isinstance(supplied_manifests, list) or not all(
+                isinstance(value, dict) for value in supplied_manifests
+            ):
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            validated_manifests = self._validate_collected_artifacts(
+                snapshot, source_intent, supplied_manifests
+            )
+            matching_manifests = [
+                manifest
+                for manifest in validated_manifests
+                if manifest.get("node_id") == source_node_id
+                and manifest.get("extensions", {})
+                .get("org.agent_rpc.adapter", {})
+                .get("output_port")
+                == source_output_port
+                and manifest.get("artifact_type") == source.get("data_type")
+            ]
+            if len(matching_manifests) != 1:
+                raise TaskDispatchError("DAG_SOURCE_RECEIPT_INVALID")
+            expected_manifest = matching_manifests[0]
+            artifact_id = expected_manifest.get("artifact_id")
+            if not isinstance(artifact_id, str):
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            try:
+                read_manifests, read_manifest, artifact_data = (
+                    self._dispatcher.read_artifact(source_intent, artifact_id)
+                )
+            except DispatchError as error:
+                raise TaskDispatchError(error.code) from error
+            except Exception as error:
+                raise TaskDispatchError("ADAPTER_ARTIFACT_UNAVAILABLE") from error
+            if (
+                not isinstance(read_manifests, list)
+                or not all(isinstance(value, dict) for value in read_manifests)
+                or not isinstance(read_manifest, dict)
+                or not isinstance(artifact_data, bytes)
+            ):
+                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+            validated_read = self._validate_collected_artifacts(
+                snapshot, source_intent, read_manifests
+            )
+            if (
+                validated_read != validated_manifests
+                or read_manifest != expected_manifest
+                or len(artifact_data) != expected_manifest.get("size_bytes")
+                or "sha256:" + hashlib.sha256(artifact_data).hexdigest()
+                != expected_manifest.get("content_hash")
+            ):
+                raise TaskDispatchError("DAG_SOURCE_RECEIPT_DIVERGED")
+            materialized.append(
+                DagNodeArtifactInput(
+                    target_input_port=target_input_port,
+                    artifact_manifest=copy.deepcopy(expected_manifest),
+                    artifact_data=bytes(artifact_data),
+                )
+            )
+        return tuple(materialized)
+
+    def advance_runtime_dag(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> DagRuntimeAdvanceResult | None:
+        """Converge dependencies and admit at most one deterministic node.
+
+        A claim and an input binding remain evidence only.  The final Store
+        admission is the sole transition that creates a P2 dispatch intent,
+        and the Store enforces one active node for this Task at a time.
+        """
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        snapshot = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        plan = snapshot.plan
+        approval = snapshot.approval
+        if (
+            not isinstance(plan, Mapping)
+            or len(plan.get("nodes", [])) <= 1
+            or not isinstance(approval, Mapping)
+            or approval.get("decision") != "approved"
+            or approval.get("plan_id") != plan.get("plan_id")
+            or approval.get("plan_hash") != plan.get("plan_hash")
+        ):
+            return None
+        # A task-wide cancellation is terminal and is never translated into
+        # more node admissions.  Its exact active-attempt delivery remains the
+        # existing P2 cancellation state machine.
+        if snapshot.status == "Cancelled":
+            return DagRuntimeAdvanceResult(
+                snapshot=snapshot,
+                active_intent=None,
+                admitted_node_id=None,
+                blocked_node_ids=(),
+                aggregate_status="Cancelled",
+            )
+        initial_claim: DagNodeClaimCandidate | None = None
+        try:
+            initialized = self._store.get_dag_node_state_snapshot(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+            )
+            if initialized is None:
+                # The existing fenced claim primitive owns first-time Pending
+                # state initialization.  It still grants no execution right.
+                initial_claim = self.claim_ready_dag_node_candidate(
+                    task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    expected_plan_hash=plan["plan_hash"],
+                    supervisor_lease=supervisor_lease,
+                )
+            reconciled = self._store.reconcile_dag_node_dependencies(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                expected_plan_hash=plan["plan_hash"],
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+            active = self._store.get_active_dag_node_execution(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+
+        snapshot = reconciled.snapshot
+        active_node_ids = tuple(reconciled.active_node_ids)
+        if active is not None:
+            if active_node_ids != (active.intent.node_id,):
+                raise TaskConflict(
+                    "DAG active admission differs from durable node state"
+                )
+            return DagRuntimeAdvanceResult(
+                snapshot=active.snapshot,
+                active_intent=active.intent,
+                admitted_node_id=None,
+                blocked_node_ids=tuple(reconciled.blocked_node_ids),
+                aggregate_status=active.snapshot.status,
+                deferred_code=(
+                    "CANCEL_CONTROL_PENDING"
+                    if active.snapshot.cancellation is not None
+                    and active.snapshot.cancellation.state == "requested"
+                    else None
+                ),
+            )
+        if active_node_ids:
+            raise TaskConflict("DAG active node has no exact execution admission")
+        if snapshot.status in {"Succeeded", "Failed"}:
+            if reconciled.aggregate_status != snapshot.status:
+                raise TaskConflict("DAG aggregate status differs from Task status")
+            return DagRuntimeAdvanceResult(
+                snapshot=snapshot,
+                active_intent=None,
+                admitted_node_id=None,
+                blocked_node_ids=tuple(reconciled.blocked_node_ids),
+                aggregate_status=snapshot.status,
+            )
+        if snapshot.cancellation is not None:
+            return DagRuntimeAdvanceResult(
+                snapshot=snapshot,
+                active_intent=None,
+                admitted_node_id=None,
+                blocked_node_ids=tuple(reconciled.blocked_node_ids),
+                aggregate_status=snapshot.status,
+                deferred_code="CANCEL_CONTROL_PENDING",
+            )
+        runnable_node_ids = tuple(reconciled.runnable_node_ids)
+        if not runnable_node_ids:
+            raise TaskConflict("non-terminal DAG has no active or runnable node")
+
+        claim = initial_claim or self.claim_ready_dag_node_candidate(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            expected_plan_hash=plan["plan_hash"],
+            supervisor_lease=supervisor_lease,
+        )
+        if claim.node.node_id != runnable_node_ids[0]:
+            raise TaskConflict("DAG claim differs from reconciled readiness")
+        artifact_inputs = self._materialize_dag_node_artifact_inputs(
+            snapshot, target_node_id=claim.node.node_id
+        )
+        binding = self.bind_ready_dag_node_inputs(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            expected_plan_hash=plan["plan_hash"],
+            claim_candidate=claim,
+            artifact_inputs=artifact_inputs,
+            supervisor_lease=supervisor_lease,
+        )
+        admission = self.admit_ready_dag_node_execution(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            expected_plan_hash=plan["plan_hash"],
+            input_binding=binding,
+            supervisor_lease=supervisor_lease,
+        )
+        if admission.intent.node_id != claim.node.node_id:
+            raise TaskDispatchError("DAG_NODE_ADMISSION_OUTCOME_INVALID")
+        return DagRuntimeAdvanceResult(
+            snapshot=admission.snapshot,
+            active_intent=admission.intent,
+            admitted_node_id=(None if admission.replayed else claim.node.node_id),
+            blocked_node_ids=tuple(reconciled.blocked_node_ids),
+            aggregate_status=admission.snapshot.status,
+        )
+
     @staticmethod
     def _worker_projection_deferred_code(
         projection: TaskWorkerProjectionResult,
@@ -3095,6 +3389,11 @@ class TaskService:
             },
         }
         if dag_execution:
+            event["task_status"] = self._dag_aggregate_status_after_event(
+                snapshot=snapshot,
+                intent=intent,
+                event_type="node_failed",
+            )
             self._validate_dag_runtime_event(
                 snapshot=snapshot, intent=intent, event=event
             )
@@ -3155,7 +3454,8 @@ class TaskService:
             )
         resolved_reconciliation = getattr(completion.intent, "reconciliation", None)
         if (
-            completion.snapshot.status != ("Running" if dag_execution else "Failed")
+            completion.snapshot.status
+            != (event["task_status"] if dag_execution else "Failed")
             or completion.intent.intent_id != intent.intent_id
             or completion.intent.state != "not_dispatched"
             or completion.intent.failure_code != "DISPATCH_NOT_STARTED"
@@ -3232,7 +3532,9 @@ class TaskService:
                 adopted=False,
                 deferred_code="RECONCILIATION_NOT_REQUIRED",
             )
-        if snapshot.status != "Queued":
+        if snapshot.status != "Queued" and not (
+            dag_execution and snapshot.status == "Running"
+        ):
             return TaskDispatchReconciliationResult(
                 intent=intent,
                 evidence_kind=None,
@@ -3654,7 +3956,9 @@ class TaskService:
                     "retry_exhausted": "WORKER_RETRY_EXHAUSTED",
                 }.get(intent.state),
             )
-        if snapshot.status != "Queued":
+        if snapshot.status != "Queued" and not (
+            dag_execution and snapshot.status == "Running"
+        ):
             raise TaskConflict("only a queued task can receive first dispatch")
         if self._dispatcher is None:
             raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
@@ -4994,7 +5298,14 @@ class TaskService:
             intent = self._store.get_dispatch_intent(listed.task_id)
             if intent is None:
                 raise TaskConflict("runtime task has no dispatch intent")
-            if intent.state != "dispatched" and listed.status != "Queued":
+            if (
+                intent.state != "dispatched"
+                and listed.status != "Queued"
+                and not (
+                    listed.status == "Running"
+                    and self._is_dag_node_execution_intent(intent)
+                )
+            ):
                 raise TaskConflict(
                     "incomplete dispatch intent has an invalid task status"
                 )
@@ -5057,6 +5368,56 @@ class TaskService:
             raise TaskConflict("DAG execution node state is inconsistent")
         return matches[0]
 
+    def _dag_aggregate_status_after_event(
+        self,
+        *,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        event_type: str,
+    ) -> str:
+        """Compute the Task aggregate implied by one prospective node event."""
+
+        if event_type in {"node_started", "node_progress"}:
+            return "Running"
+        terminal_state = {
+            "node_succeeded": "Succeeded",
+            "node_failed": "Failed",
+            "node_cancelled": "Cancelled",
+        }.get(event_type)
+        if terminal_state is None or not isinstance(snapshot.plan, Mapping):
+            raise TaskConflict("DAG runtime event cannot be aggregated")
+        state_map = self._store.get_dag_node_state_snapshot(
+            task_id=snapshot.task_id,
+            project_id=snapshot.project_id,
+            principal_id=snapshot.principal_id,
+        )
+        if state_map is None:
+            raise TaskConflict("DAG execution has no node-state map")
+        node_states = {value.node_id: value.state for value in state_map.nodes}
+        if intent.node_id not in node_states:
+            raise TaskConflict("DAG execution node state is inconsistent")
+        node_states[intent.node_id] = terminal_state
+        try:
+            readiness = evaluate_dag_readiness(
+                snapshot.plan, node_states=node_states
+            )
+        except DagScheduleError as error:
+            raise TaskConflict("DAG aggregate state is invalid") from error
+        if readiness.all_nodes_succeeded:
+            return "Succeeded"
+        if (
+            not readiness.active_node_ids
+            and not readiness.runnable_node_ids
+            and not readiness.waiting_node_ids
+            and (
+                readiness.failed_node_ids
+                or readiness.cancelled_node_ids
+                or readiness.blocked_nodes
+            )
+        ):
+            return "Failed"
+        return "Running"
+
     def _validate_dag_runtime_event(
         self,
         *,
@@ -5064,14 +5425,25 @@ class TaskService:
         intent: DispatchIntentSnapshot,
         event: Mapping[str, Any],
     ) -> None:
-        """Validate the minimal node projection without ending the whole DAG."""
+        """Validate one exact node projection and its Task aggregate status."""
 
         self._validate_schema("run-event.schema.json", event)
         event_type = event.get("event_type")
+        expected_task_status = self._dag_aggregate_status_after_event(
+            snapshot=snapshot,
+            intent=intent,
+            event_type=str(event_type),
+        )
         if (
             event_type
-            not in {"node_started", "node_progress", "node_succeeded", "node_failed"}
-            or event.get("task_status") != "Running"
+            not in {
+                "node_started",
+                "node_progress",
+                "node_succeeded",
+                "node_failed",
+                "node_cancelled",
+            }
+            or event.get("task_status") != expected_task_status
             or event.get("task_id") != snapshot.task_id
             or event.get("node_id") != intent.node_id
             or event.get("fingerprint")
@@ -5114,8 +5486,6 @@ class TaskService:
             return False
         intent = self._store.get_dispatch_intent(task_id)
         if intent is None:
-            return False
-        if self._is_dag_node_execution_intent(intent):
             return False
         try:
             return self._dispatcher.supports_exact_cancel(
@@ -5325,6 +5695,7 @@ class TaskService:
             "node_progress": "Running",
             "node_succeeded": "Succeeded",
             "node_failed": "Failed",
+            "node_cancelled": "Cancelled",
         }[event_type]
         _, identity_hash = encode_document(
             {
@@ -6055,6 +6426,112 @@ class TaskService:
             replayed=completed_replayed,
         )
 
+    def _project_dag_cancel_terminal_winner(
+        self,
+        *,
+        snapshot: TaskSnapshot,
+        intent: DispatchIntentSnapshot,
+        adapter_status: Mapping[str, Any],
+        terminal_status: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> TaskSnapshot:
+        """Project one cancellation-race winner through the normal DAG path."""
+
+        if terminal_status not in {"Succeeded", "Failed"}:
+            raise TaskDispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+        for _ in range(4):
+            current = self.get_task(
+                snapshot.task_id,
+                project_id=snapshot.project_id,
+                principal_id=snapshot.principal_id,
+            )
+            node_state = self._current_dag_node_state(intent)
+            if node_state.state in {"Succeeded", "Failed", "Cancelled"}:
+                if node_state.state != terminal_status:
+                    raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
+                return current
+            if node_state.state not in {"Queued", "Running"}:
+                raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
+            event_type = (
+                "node_started"
+                if node_state.state == "Queued"
+                else (
+                    "node_succeeded"
+                    if terminal_status == "Succeeded"
+                    else "node_failed"
+                )
+            )
+            event = self._adapter_event(
+                snapshot=current,
+                intent=intent,
+                adapter_status=adapter_status,
+                event_type=event_type,
+                sequence=self._store.latest_run_event_sequence(snapshot.task_id) + 1,
+            )
+            event["task_status"] = self._dag_aggregate_status_after_event(
+                snapshot=current,
+                intent=intent,
+                event_type=event_type,
+            )
+            self._validate_dag_runtime_event(
+                snapshot=current,
+                intent=intent,
+                event=event,
+            )
+            try:
+                output_proof = None
+                if event_type == "node_succeeded":
+                    collector = getattr(self._dispatcher, "verified_node_outputs", None)
+                    if not callable(collector):
+                        raise TaskDispatchError("DAG_OUTPUT_PROOF_UNSUPPORTED")
+                    with collector(intent) as supplied_proof:
+                        if not isinstance(supplied_proof, Mapping):
+                            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+                        manifests = supplied_proof.get("manifests")
+                        if not isinstance(manifests, list) or not all(
+                            isinstance(value, dict) for value in manifests
+                        ):
+                            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+                        validated = self._validate_collected_artifacts(
+                            current, intent, manifests
+                        )
+                        if validated != manifests:
+                            raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
+                        output_proof = {
+                            **copy.deepcopy(dict(supplied_proof)),
+                            "manifests": validated,
+                        }
+                        self._store.commit_dag_node_runtime_transition(
+                            intent_id=intent.intent_id,
+                            expected_node_state=node_state.state,
+                            event=event,
+                            adapter_status=adapter_status,
+                            output_receipt=output_proof,
+                            supervisor_lease=supervisor_lease,
+                            supervisor_clock=self._runtime_supervisor_clock,
+                        )
+                else:
+                    self._store.commit_dag_node_runtime_transition(
+                        intent_id=intent.intent_id,
+                        expected_node_state=node_state.state,
+                        event=event,
+                        adapter_status=adapter_status,
+                        output_receipt=None,
+                        supervisor_lease=supervisor_lease,
+                        supervisor_clock=self._runtime_supervisor_clock,
+                    )
+            except RuntimeSupervisorLeaseLost as error:
+                raise TaskSupervisorLeaseLost() from error
+            except TaskStoreConflict:
+                continue
+            if event_type != "node_started":
+                return self.get_task(
+                    snapshot.task_id,
+                    project_id=snapshot.project_id,
+                    principal_id=snapshot.principal_id,
+                )
+        raise TaskConflict("DAG cancellation terminal projection did not converge")
+
     def process_runtime_cancellation(
         self,
         task_id: str,
@@ -6079,14 +6556,6 @@ class TaskService:
         )
         cancellation = snapshot.cancellation
         intent = self._store.get_dispatch_intent(task_id)
-        if (
-            cancellation is not None
-            and intent is not None
-            and self._is_dag_node_execution_intent(intent)
-        ):
-            raise TaskConflict(
-                "DAG node cancellation is outside the current execution kernel"
-            )
         if cancellation is None:
             return TaskCancellationProcessResult(
                 snapshot=snapshot,
@@ -6196,6 +6665,72 @@ class TaskService:
             adapter_status = self._validated_adapter_status(intent, observed)
             if adapter_status["status"] != terminal:
                 raise TaskDispatchError("ADAPTER_CANCEL_RESPONSE_INVALID")
+            if self._is_dag_node_execution_intent(intent):
+                current = self._project_dag_cancel_terminal_winner(
+                    snapshot=snapshot,
+                    intent=intent,
+                    adapter_status=adapter_status,
+                    terminal_status=terminal,
+                    supervisor_lease=supervisor_lease,
+                )
+                terminal_event = None
+                completion_result = "terminal_preempted"
+                if current.status == "Running":
+                    completion_result = "cancel_confirmed"
+                    sequence = self._store.latest_run_event_sequence(task_id) + 1
+                    occurred_at = self._runtime_supervisor_clock()
+                    _, event_identity = encode_document(
+                        {
+                            "request_id": cancellation.request_id,
+                            "event_type": "task_cancelled",
+                            "proof_hash": adapter_result.get("proof_hash"),
+                            "sequence": sequence,
+                        }
+                    )
+                    terminal_event = {
+                        "schema_version": "1.0.0",
+                        "event_id": "event-"
+                        + event_identity.removeprefix("sha256:")[:32],
+                        "sequence": sequence,
+                        "task_id": task_id,
+                        "node_id": intent.node_id,
+                        "event_type": "task_cancelled",
+                        "task_status": "Cancelled",
+                        "occurred_at": occurred_at,
+                        "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
+                        "extensions": {
+                            "org.agent_rpc.cancellation": {
+                                "request_id": cancellation.request_id,
+                                "attempt_id": cancellation.attempt_id,
+                                "reason": cancellation.reason,
+                                "proof_hash": adapter_result.get("proof_hash"),
+                            }
+                        },
+                    }
+                    self._validate_schema("run-event.schema.json", terminal_event)
+                    _validate_run_event_semantics(terminal_event)
+                    _validate_run_event_binding(current, terminal_event)
+                elif current.status not in {"Succeeded", "Failed"}:
+                    raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
+                try:
+                    completed = self._store.complete_supervised_cancel(
+                        request_id=cancellation.request_id,
+                        result=completion_result,
+                        terminal_event=terminal_event,
+                        adapter_proof=adapter_result,
+                        supervisor_lease=supervisor_lease,
+                        supervisor_clock=self._runtime_supervisor_clock,
+                    )
+                except RuntimeSupervisorLeaseLost as error:
+                    raise TaskSupervisorLeaseLost() from error
+                except TaskStoreConflict as error:
+                    raise TaskConflict(str(error)) from error
+                return TaskCancellationProcessResult(
+                    snapshot=completed.snapshot,
+                    state=completed.cancellation.state,
+                    adapter_result=adapter_result,
+                    replayed=completed.replayed,
+                )
             current = self.get_task(
                 task_id, project_id=project_id, principal_id=principal_id
             )
@@ -6820,6 +7355,11 @@ class TaskService:
             "fingerprint": copy.deepcopy(intent.handle["fingerprint"]),
             "extensions": {"org.agent_rpc.dag_no_retry": extension},
         }
+        event["task_status"] = self._dag_aggregate_status_after_event(
+            snapshot=snapshot,
+            intent=intent,
+            event_type="node_failed",
+        )
         self._validate_dag_runtime_event(
             snapshot=snapshot, intent=intent, event=event
         )
@@ -7608,8 +8148,9 @@ class TaskService:
             terminal_for_status = {
                 "Succeeded": "Succeeded",
                 "Failed": "Failed",
+                "Cancelled": "Cancelled",
             }.get(target)
-            if node_state.state in {"Succeeded", "Failed"}:
+            if node_state.state in {"Succeeded", "Failed", "Cancelled"}:
                 if node_state.state != terminal_for_status:
                     raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
                 return TaskRuntimeResult(snapshot, intent, adapter_status)
@@ -7721,10 +8262,35 @@ class TaskService:
                     raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
                 return TaskRuntimeResult(snapshot, intent, adapter_status)
 
-            if snapshot.status == "Queued" and (
-                target in {"Running", "Succeeded"}
-                or (dag_execution and target == "Failed")
-            ):
+            if dag_execution:
+                runtime_node_state = self._current_dag_node_state(intent).state
+                if runtime_node_state == "Queued" and target in {
+                    "Running",
+                    "Succeeded",
+                    "Failed",
+                    "Cancelled",
+                }:
+                    event_type = "node_started"
+                elif target == "Running" and runtime_node_state == "Running":
+                    if (
+                        previous_progress_completed is not None
+                        and adapter_status["completed"]
+                        < previous_progress_completed
+                    ):
+                        raise TaskDispatchError("ADAPTER_PROGRESS_REGRESSION")
+                    event_type = "node_progress"
+                elif target == "Succeeded" and runtime_node_state == "Running":
+                    event_type = "node_succeeded"
+                elif target == "Failed" and runtime_node_state == "Running":
+                    event_type = "node_failed"
+                elif target == "Cancelled" and runtime_node_state == "Running":
+                    event_type = "node_cancelled"
+                else:
+                    raise TaskDispatchError("ADAPTER_STATUS_CONFLICT")
+            elif snapshot.status == "Queued" and target in {
+                "Running",
+                "Succeeded",
+            }:
                 event_type = "node_started"
             elif target == "Running" and snapshot.status == "Running":
                 if (
@@ -7749,7 +8315,11 @@ class TaskService:
                 sequence=last_sequence + 1,
             )
             if dag_execution:
-                event["task_status"] = "Running"
+                event["task_status"] = self._dag_aggregate_status_after_event(
+                    snapshot=snapshot,
+                    intent=intent,
+                    event_type=event_type,
+                )
                 self._validate_dag_runtime_event(
                     snapshot=snapshot,
                     intent=intent,
@@ -7830,7 +8400,9 @@ class TaskService:
                 # observation.  Re-read and prove convergence before failing.
                 continue
             if event_type == "node_progress" or (
-                dag_execution and event_type in {"node_succeeded", "node_failed"}
+                dag_execution
+                and event_type
+                in {"node_succeeded", "node_failed", "node_cancelled"}
             ):
                 current = self.get_task(
                     task_id, project_id=project_id, principal_id=principal_id

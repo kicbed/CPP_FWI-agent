@@ -6,7 +6,8 @@ the local execution permit needed by the fixed, single-host Worker backend:
 * one immutable attempt binding per staged launch;
 * a private per-attempt ``flock`` inherited by the Worker;
 * a bounded set of private capacity-slot ``flock`` leases;
-* an exact Worker heartbeat written only after both inherited leases validate.
+* one additional inherited logical-device ``flock`` for CUDA Workers;
+* an exact Worker heartbeat written only after every inherited lease validates.
 
 The run root is never scanned for work.  Every path is derived from an already
 validated job/attempt identity, and all JSON is private, bounded, hashed, and
@@ -54,6 +55,9 @@ MAX_CONTROL_JSON_BYTES = 64 * 1024
 MAX_CHECKPOINT_FILE_BYTES = 2 * 1024 * 1024
 MAX_CHECKPOINT_PAYLOAD_BYTES = 8 * 1024 * 1024
 MAX_CAPACITY = 64
+CUDA_DEVICE_SLOT_BASE = MAX_CAPACITY
+CUDA_LOGICAL_DEVICE_0_SLOT = CUDA_DEVICE_SLOT_BASE
+WORKER_CONFIG_NAME = "config.original.json"
 
 SUBMISSION_ID = re.compile(r"^submission-[0-9a-f]{64}$")
 ATTEMPT_ID = re.compile(r"^attempt-[0-9a-f]{32}$")
@@ -439,6 +443,39 @@ def _read_private_json(path: Path) -> dict[str, Any]:
             "WORKER_CONTROL_INVALID: private control JSON root is invalid"
         )
     return value
+
+
+def read_worker_resource_device(
+    run_root: Path | str,
+    run_dir: Path | str,
+    config_path: Path | str,
+) -> Literal["cpu", "cuda"]:
+    """Read the exact private Worker config's fixed resource device.
+
+    The Adapter and lightweight bootstrap share this path check so a caller
+    cannot pair a CUDA config with a CPU-only inherited lease (or vice versa).
+    This is only immutable launch binding; the kernel locks remain the capacity
+    authority.
+    """
+
+    _, job_dir = _validate_root_and_run(run_root, run_dir)
+    expected_path = job_dir / WORKER_CONFIG_NAME
+    candidate = Path(config_path)
+    if not candidate.is_absolute() or candidate != expected_path:
+        raise WorkerControlError(
+            "WORKER_RESOURCE_INVALID: Worker config path is not exact"
+        )
+    value = _read_private_json(expected_path)
+    if value.get("job_id") != job_dir.name:
+        raise WorkerControlError(
+            "WORKER_RESOURCE_INVALID: Worker config job identity changed"
+        )
+    device = value.get("device")
+    if device not in {"cpu", "cuda"}:
+        raise WorkerControlError(
+            "WORKER_RESOURCE_INVALID: Worker config device is invalid"
+        )
+    return device
 
 
 def _open_private_lock(path: Path, *, blocking: bool) -> int | None:
@@ -3060,7 +3097,13 @@ def _read_slot_projection(path: Path, slot: int) -> dict[str, Any] | None:
 
 
 class ParentLaunchLease:
-    """Two inherited file leases held continuously across ``Popen``/exec."""
+    """Inherited execution/capacity leases held across ``Popen``/exec.
+
+    Every Worker holds the stable submission fence and one generic managed-
+    Worker capacity slot.  A CUDA Worker additionally holds logical device 0's
+    dedicated slot, so it cannot overlap another CUDA Worker even when generic
+    capacity remains.
+    """
 
     def __init__(
         self,
@@ -3072,6 +3115,10 @@ class ParentLaunchLease:
         capacity_fd: int,
         capacity_slot: int,
         capacity_generation: int,
+        resource_device: Literal["cpu", "cuda"],
+        gpu_capacity_fd: int | None = None,
+        gpu_capacity_slot: int | None = None,
+        gpu_capacity_generation: int | None = None,
     ) -> None:
         self.root = root
         self.run_dir = run_dir
@@ -3080,6 +3127,10 @@ class ParentLaunchLease:
         self.capacity_fd = capacity_fd
         self.capacity_slot = capacity_slot
         self.capacity_generation = capacity_generation
+        self.resource_device = resource_device
+        self.gpu_capacity_fd = gpu_capacity_fd
+        self.gpu_capacity_slot = gpu_capacity_slot
+        self.gpu_capacity_generation = gpu_capacity_generation
         self._closed = False
 
     @classmethod
@@ -3089,10 +3140,15 @@ class ParentLaunchLease:
         run_dir: Path | str,
         *,
         max_active: int,
+        resource_device: Literal["cpu", "cuda"] = "cpu",
     ) -> "ParentLaunchLease":
         if type(max_active) is not int or not 1 <= max_active <= MAX_CAPACITY:
             raise WorkerControlError(
                 "WORKER_CAPACITY_POLICY_INVALID: max_active is invalid"
+            )
+        if resource_device not in {"cpu", "cuda"}:
+            raise WorkerControlError(
+                "WORKER_RESOURCE_INVALID: resource device is invalid"
             )
         root, job_dir = _validate_root_and_run(run_root, run_dir)
         staged = _read_private_json(job_dir / LAUNCH_TICKET_NAME)
@@ -3128,6 +3184,9 @@ class ParentLaunchLease:
             )
         capacity_fd = -1
         selected_slot = -1
+        gpu_capacity_fd = -1
+        gpu_capacity_slot: int | None = None
+        gpu_capacity_generation: int | None = None
         try:
             _validate_or_record_lock_identity(attempt_path, attempt_fd)
             for slot in range(max_active):
@@ -3145,6 +3204,20 @@ class ParentLaunchLease:
                 raise WorkerControlError(
                     "ADAPTER_CONCURRENCY_LIMIT: cross-process Worker capacity is full"
                 )
+            if resource_device == "cuda":
+                gpu_capacity_slot = CUDA_LOGICAL_DEVICE_0_SLOT
+                gpu_lock_path = slots / f"slot-{gpu_capacity_slot:03d}.lock"
+                gpu_candidate = _open_private_lock(
+                    gpu_lock_path, blocking=False
+                )
+                if gpu_candidate is None:
+                    raise WorkerControlError(
+                        "ADAPTER_CONCURRENCY_LIMIT: logical CUDA device 0 is busy"
+                    )
+                gpu_capacity_fd = gpu_candidate
+                _validate_or_record_lock_identity(
+                    gpu_lock_path, gpu_capacity_fd
+                )
             projection_path = slots / f"slot-{selected_slot:03d}.json"
             previous = _read_slot_projection(projection_path, selected_slot)
             generation = 1 if previous is None else previous["generation"] + 1
@@ -3160,6 +3233,31 @@ class ParentLaunchLease:
                 }
             )
             _atomic_write_private_json(projection_path, projection)
+            if gpu_capacity_slot is not None:
+                gpu_projection_path = (
+                    slots / f"slot-{gpu_capacity_slot:03d}.json"
+                )
+                gpu_previous = _read_slot_projection(
+                    gpu_projection_path, gpu_capacity_slot
+                )
+                gpu_capacity_generation = (
+                    1
+                    if gpu_previous is None
+                    else gpu_previous["generation"] + 1
+                )
+                gpu_projection = _record_with_hash(
+                    {
+                        "schema_version": CONTROL_SCHEMA_VERSION,
+                        "slot": gpu_capacity_slot,
+                        "generation": gpu_capacity_generation,
+                        "attempt_id": binding.attempt_id,
+                        "job_id": binding.job_id,
+                        "acquired_at": acquired_at,
+                    }
+                )
+                _atomic_write_private_json(
+                    gpu_projection_path, gpu_projection
+                )
             ticket.update(
                 {
                     "state": "leased",
@@ -3181,37 +3279,106 @@ class ParentLaunchLease:
                 capacity_fd=capacity_fd,
                 capacity_slot=selected_slot,
                 capacity_generation=generation,
+                resource_device=resource_device,
+                gpu_capacity_fd=(
+                    None if gpu_capacity_fd < 0 else gpu_capacity_fd
+                ),
+                gpu_capacity_slot=gpu_capacity_slot,
+                gpu_capacity_generation=gpu_capacity_generation,
             )
         except Exception:
+            if gpu_capacity_fd >= 0:
+                os.close(gpu_capacity_fd)
             if capacity_fd >= 0:
                 os.close(capacity_fd)
             os.close(attempt_fd)
             raise
 
     @property
-    def pass_fds(self) -> tuple[int, int]:
+    def pass_fds(self) -> tuple[int, ...]:
         if self._closed:
             raise WorkerControlError(
                 "WORKER_CONTROL_INVALID: inherited leases are already closed"
             )
-        return self.attempt_fd, self.capacity_fd
+        descriptors = [self.attempt_fd, self.capacity_fd]
+        if self.gpu_capacity_fd is not None:
+            descriptors.append(self.gpu_capacity_fd)
+        return tuple(descriptors)
 
     @property
     def child_arguments(self) -> list[str]:
-        return [
+        arguments = [
             "--launch-attempt-id",
             self.binding.attempt_id,
             "--launch-attempt-fd",
             str(self.attempt_fd),
             "--capacity-lease-fd",
             str(self.capacity_fd),
+            "--resource-device",
+            self.resource_device,
         ]
+        if self.resource_device == "cuda":
+            assert self.gpu_capacity_fd is not None
+            assert self.gpu_capacity_slot is not None
+            assert self.gpu_capacity_generation is not None
+            arguments.extend(
+                [
+                    "--gpu-capacity-lease-fd",
+                    str(self.gpu_capacity_fd),
+                    "--gpu-capacity-slot",
+                    str(self.gpu_capacity_slot),
+                    "--gpu-capacity-generation",
+                    str(self.gpu_capacity_generation),
+                ]
+            )
+        return arguments
+
+    def _validate_gpu_projection(self) -> None:
+        if self.resource_device == "cpu":
+            if any(
+                value is not None
+                for value in (
+                    self.gpu_capacity_fd,
+                    self.gpu_capacity_slot,
+                    self.gpu_capacity_generation,
+                )
+            ):
+                raise WorkerControlError(
+                    "WORKER_RESOURCE_INVALID: CPU launch has a GPU lease"
+                )
+            return
+        if (
+            self.gpu_capacity_fd is None
+            or self.gpu_capacity_slot != CUDA_LOGICAL_DEVICE_0_SLOT
+            or type(self.gpu_capacity_generation) is not int
+            or self.gpu_capacity_generation < 1
+        ):
+            raise WorkerControlError(
+                "WORKER_GPU_FENCE_INVALID: GPU lease identity is invalid"
+            )
+        _, slots, _ = _control_paths(self.root)
+        gpu_lock_path = slots / f"slot-{self.gpu_capacity_slot:03d}.lock"
+        _fd_matches_private_file(self.gpu_capacity_fd, gpu_lock_path)
+        projection = _read_slot_projection(
+            slots / f"slot-{self.gpu_capacity_slot:03d}.json",
+            self.gpu_capacity_slot,
+        )
+        if (
+            projection is None
+            or projection["generation"] != self.gpu_capacity_generation
+            or projection["attempt_id"] != self.binding.attempt_id
+            or projection["job_id"] != self.binding.job_id
+        ):
+            raise WorkerControlError(
+                "WORKER_GPU_FENCE_INVALID: GPU lease projection changed"
+            )
 
     def mark_spawned(self, pid: int) -> None:
         if type(pid) is not int or pid <= 0 or self._closed:
             raise WorkerControlError(
                 "WORKER_CONTROL_INVALID: spawned Worker identity is invalid"
             )
+        self._validate_gpu_projection()
         ticket = _read_ticket(self.run_dir, self.binding)
         if (
             ticket["capacity_slot"] != self.capacity_slot
@@ -3251,7 +3418,10 @@ class ParentLaunchLease:
         if self._closed:
             return
         self._closed = True
-        for descriptor in (self.attempt_fd, self.capacity_fd):
+        descriptors = [self.attempt_fd, self.capacity_fd]
+        if self.gpu_capacity_fd is not None:
+            descriptors.append(self.gpu_capacity_fd)
+        for descriptor in descriptors:
             try:
                 os.close(descriptor)
             except OSError:
@@ -3304,7 +3474,7 @@ def _fd_matches_private_file(descriptor: int, path: Path) -> None:
 
 
 class WorkerHeartbeat:
-    """Worker-owned heartbeat that retains both launch leases until stop."""
+    """Worker heartbeat retaining every inherited kernel lease until stop."""
 
     def __init__(
         self,
@@ -3314,6 +3484,10 @@ class WorkerHeartbeat:
         attempt_id: str,
         attempt_fd: int,
         capacity_fd: int,
+        resource_device: Literal["cpu", "cuda"] = "cpu",
+        gpu_capacity_fd: int | None = None,
+        gpu_capacity_slot: int | None = None,
+        gpu_capacity_generation: int | None = None,
         interval_seconds: float = 1.0,
         cancel_grace_seconds: float = 5.0,
         wall_time_seconds: int = 86_400,
@@ -3323,6 +3497,31 @@ class WorkerHeartbeat:
         if ATTEMPT_ID.fullmatch(attempt_id) is None:
             raise WorkerControlError(
                 "WORKER_FENCE_INVALID: launch attempt identity is invalid"
+            )
+        if resource_device not in {"cpu", "cuda"}:
+            raise WorkerControlError(
+                "WORKER_RESOURCE_INVALID: resource device is invalid"
+            )
+        gpu_values = (
+            gpu_capacity_fd,
+            gpu_capacity_slot,
+            gpu_capacity_generation,
+        )
+        if resource_device == "cpu" and any(
+            value is not None for value in gpu_values
+        ):
+            raise WorkerControlError(
+                "WORKER_RESOURCE_INVALID: CPU Worker cannot inherit a GPU lease"
+            )
+        if resource_device == "cuda" and (
+            type(gpu_capacity_fd) is not int
+            or gpu_capacity_fd < 0
+            or gpu_capacity_slot != CUDA_LOGICAL_DEVICE_0_SLOT
+            or type(gpu_capacity_generation) is not int
+            or gpu_capacity_generation < 1
+        ):
+            raise WorkerControlError(
+                "WORKER_GPU_FENCE_INVALID: CUDA Worker GPU lease is invalid"
             )
         if (
             isinstance(interval_seconds, bool)
@@ -3356,6 +3555,10 @@ class WorkerHeartbeat:
         self.attempt_id = attempt_id
         self.attempt_fd = attempt_fd
         self.capacity_fd = capacity_fd
+        self.resource_device = resource_device
+        self.gpu_capacity_fd = gpu_capacity_fd
+        self.gpu_capacity_slot = gpu_capacity_slot
+        self.gpu_capacity_generation = gpu_capacity_generation
         self.interval_seconds = float(interval_seconds)
         self.cancel_grace_seconds = float(cancel_grace_seconds)
         self.wall_time_seconds = wall_time_seconds
@@ -3433,6 +3636,29 @@ class WorkerHeartbeat:
             raise WorkerControlError(
                 "WORKER_FENCE_INVALID: capacity lease projection changed"
             )
+        if self.resource_device == "cuda":
+            assert self.gpu_capacity_fd is not None
+            assert self.gpu_capacity_slot is not None
+            assert self.gpu_capacity_generation is not None
+            _fd_matches_private_file(
+                self.gpu_capacity_fd,
+                slots / f"slot-{self.gpu_capacity_slot:03d}.lock",
+            )
+            os.set_inheritable(self.gpu_capacity_fd, False)
+            gpu_projection = _read_slot_projection(
+                slots / f"slot-{self.gpu_capacity_slot:03d}.json",
+                self.gpu_capacity_slot,
+            )
+            if (
+                gpu_projection is None
+                or gpu_projection["generation"]
+                != self.gpu_capacity_generation
+                or gpu_projection["attempt_id"] != self.attempt_id
+                or gpu_projection["job_id"] != self.run_dir.name
+            ):
+                raise WorkerControlError(
+                    "WORKER_GPU_FENCE_INVALID: GPU lease projection changed"
+                )
         worker_pid = os.getpid()
         if ticket["state"] == "leased" and ticket["worker_pid"] is None:
             ticket.update(
@@ -3641,6 +3867,25 @@ class WorkerHeartbeat:
             )
         os.fstat(self.attempt_fd)
         os.fstat(self.capacity_fd)
+        if self.resource_device == "cuda":
+            assert self.gpu_capacity_fd is not None
+            assert self.gpu_capacity_slot is not None
+            assert self.gpu_capacity_generation is not None
+            gpu_projection = _read_slot_projection(
+                slots / f"slot-{self.gpu_capacity_slot:03d}.json",
+                self.gpu_capacity_slot,
+            )
+            if (
+                gpu_projection is None
+                or gpu_projection["generation"]
+                != self.gpu_capacity_generation
+                or gpu_projection["attempt_id"] != self.attempt_id
+                or gpu_projection["job_id"] != self.run_dir.name
+            ):
+                raise WorkerControlError(
+                    "WORKER_GPU_FENCE_LOST: GPU capacity projection changed"
+                )
+            os.fstat(self.gpu_capacity_fd)
 
     def _write_heartbeat_locked(self, state: str) -> None:
         assert self._binding is not None
@@ -3974,7 +4219,10 @@ class WorkerHeartbeat:
         if self._closed:
             return
         self._closed = True
-        for descriptor in (self.attempt_fd, self.capacity_fd):
+        descriptors = [self.attempt_fd, self.capacity_fd]
+        if self.gpu_capacity_fd is not None:
+            descriptors.append(self.gpu_capacity_fd)
+        for descriptor in descriptors:
             try:
                 os.close(descriptor)
             except OSError:

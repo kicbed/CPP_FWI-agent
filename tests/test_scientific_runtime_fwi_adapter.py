@@ -236,6 +236,7 @@ class FakeLauncher:
         run_root: Path,
         wall_time_seconds: int,
         checkpoint_capable: bool = False,
+        resource_device: str = "cpu",
     ) -> int:
         call = {
             "command": command,
@@ -244,6 +245,7 @@ class FakeLauncher:
             "run_root": Path(run_root),
             "wall_time_seconds": wall_time_seconds,
             "checkpoint_capable": checkpoint_capable,
+            "resource_device": resource_device,
         }
         with self._lock:
             self.calls.append(call)
@@ -1638,6 +1640,7 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertEqual(
             call["config_path"], call["run_dir"] / "config.original.json"
         )
+        self.assertEqual(call["resource_device"], "cpu")
 
         config = json.loads(
             call["config_path"].read_text(encoding="utf-8")
@@ -1674,6 +1677,24 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         self.assertNotIn("config_path", handle_document)
         self.assertEqual(_status_name(self.adapter.status(handle)), "queued")
         self.assertEqual(run_dir, call["run_dir"])
+
+    def test_submit_forwards_validated_cuda_device_to_launcher(self) -> None:
+        request = self.submit_kwargs(
+            task_id="task-cuda-resource-fence",
+            idempotency_key="task-cuda-resource-fence:invert:0001",
+        )
+        request["parameters"].update(
+            {"preset": "fwi_demo", "device": "cuda", "iterations": 10_000}
+        )
+        request["resources"].update({"device": "cuda", "gpu_count": 1})
+
+        self.adapter.submit(**request)
+
+        self.assertEqual(len(self.launcher.calls), 1)
+        call = self.launcher.calls[0]
+        self.assertEqual(call["resource_device"], "cuda")
+        config = json.loads(call["config_path"].read_text(encoding="utf-8"))
+        self.assertEqual(config["device"], "cuda")
 
     def test_lookup_existing_handle_adopts_only_an_exact_launched_record(self) -> None:
         request = self.submit_kwargs(
@@ -5452,7 +5473,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         run_dir = launcher_root / "fwi-20260715T060000Z-abcdef123456"
         run_dir.mkdir(mode=0o700)
         config_path = run_dir / "config.original.json"
-        config_path.write_text("{}", encoding="utf-8")
+        config_path.write_text(
+            json.dumps({"job_id": run_dir.name, "device": "cpu"}),
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
         (run_dir / "status.json").write_text(
             json.dumps(
                 {
@@ -5542,6 +5567,8 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
                     str(attempt_fd),
                     "--capacity-lease-fd",
                     str(capacity_fd),
+                    "--resource-device",
+                    "cpu",
                 ],
             )
             self.assertIs(options["shell"], False)
@@ -5611,7 +5638,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         run_dir = launcher_root / "fwi-20260715T060001Z-abcdef123456"
         run_dir.mkdir(mode=0o700)
         config_path = run_dir / "config.original.json"
-        config_path.write_text("{}", encoding="utf-8")
+        config_path.write_text(
+            json.dumps({"job_id": run_dir.name, "device": "cpu"}),
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
         (run_dir / "status.json").write_text(
             json.dumps(
                 {
@@ -5812,7 +5843,11 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
         run_dir = launcher_root / "fwi-20260715T060002Z-abcdef123456"
         run_dir.mkdir(mode=0o700)
         config_path = run_dir / "config.original.json"
-        config_path.write_text("{}", encoding="utf-8")
+        config_path.write_text(
+            json.dumps({"job_id": run_dir.name, "device": "cpu"}),
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
 
         class FailingAbortLease:
             child_arguments: list[str] = []

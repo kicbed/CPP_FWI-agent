@@ -1,7 +1,7 @@
 """Lightweight fenced bootstrap for Adapter-managed FWI Workers.
 
-This module intentionally imports no numerical package before it validates the
-two inherited kernel leases, starts the independent heartbeat, and publishes
+This module intentionally imports no numerical package before it validates all
+inherited kernel leases, starts the independent heartbeat, and publishes
 the immutable ready receipt.  The standalone/MCP ``python -m fwi_worker`` path
 is unchanged and does not claim this Adapter-managed capacity boundary.
 """
@@ -18,8 +18,10 @@ from worker_launch_control import (
     CANCELLED_WORKER_EXIT_CODE,
     WALL_TIME_EXCEEDED_WORKER_EXIT_CODE,
     WorkerCancellationRequested,
+    WorkerControlError,
     WorkerHeartbeat,
     WorkerWallTimeExceeded,
+    read_worker_resource_device,
 )
 
 
@@ -32,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--launch-attempt-id", required=True)
     parser.add_argument("--launch-attempt-fd", required=True, type=int)
     parser.add_argument("--capacity-lease-fd", required=True, type=int)
+    parser.add_argument(
+        "--resource-device", choices=("cpu", "cuda"), default="cpu"
+    )
+    parser.add_argument("--gpu-capacity-lease-fd", type=int)
+    parser.add_argument("--gpu-capacity-slot", type=int)
+    parser.add_argument("--gpu-capacity-generation", type=int)
     parser.add_argument("--wall-time-seconds", type=int, default=86_400)
     parser.add_argument(
         "--checkpoint-after-first-update",
@@ -53,12 +61,23 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     heartbeat: WorkerHeartbeat | None = None
     try:
+        configured_device = read_worker_resource_device(
+            args.run_root, args.run_dir, args.config
+        )
+        if configured_device != args.resource_device:
+            raise WorkerControlError(
+                "WORKER_RESOURCE_INVALID: config device and inherited lease disagree"
+            )
         heartbeat = WorkerHeartbeat(
             run_root=args.run_root,
             run_dir=args.run_dir,
             attempt_id=args.launch_attempt_id,
             attempt_fd=args.launch_attempt_fd,
             capacity_fd=args.capacity_lease_fd,
+            resource_device=args.resource_device,
+            gpu_capacity_fd=args.gpu_capacity_lease_fd,
+            gpu_capacity_slot=args.gpu_capacity_slot,
+            gpu_capacity_generation=args.gpu_capacity_generation,
             wall_time_seconds=args.wall_time_seconds,
         )
         heartbeat.start()

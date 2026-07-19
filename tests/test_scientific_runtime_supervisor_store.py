@@ -357,6 +357,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         ).fetchall()
         for (trigger_name,) in trigger_names:
             connection.execute(f'DROP TRIGGER "{trigger_name}"')
+        connection.execute("DROP TABLE dag_node_scheduler_transition_facts")
+        connection.execute("DROP TABLE dag_task_execution_runs")
         connection.execute("DROP TABLE dag_node_terminal_facts")
         connection.execute("DROP TABLE dag_node_execution_transition_facts")
         connection.execute("DROP TABLE dag_node_execution_admissions")
@@ -1851,7 +1853,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         }
 
     def test_fresh_v20_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 20)
+        self.assertEqual(self.store.migration_version(), 21)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -1889,6 +1891,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "dag_node_execution_admissions",
             "dag_node_execution_transition_facts",
             "dag_node_terminal_facts",
+            "dag_task_execution_runs",
+            "dag_node_scheduler_transition_facts",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -2045,6 +2049,12 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "dag_node_execution_blocks_second_launch_attempt",
             "dag_node_execution_blocks_pre_running_retry",
             "dag_node_execution_blocks_worker_exit_retry",
+            "dag_task_execution_runs_are_append_only",
+            "dag_task_execution_runs_cannot_be_deleted",
+            "dag_node_scheduler_transition_requires_exact_case",
+            "dag_node_scheduler_transition_requires_active_term",
+            "dag_node_scheduler_transition_facts_are_append_only",
+            "dag_node_scheduler_transition_facts_cannot_be_deleted",
         }
         expected_indexes = {
             "idx_worker_attempt_timeout_windows_scope_deadline",
@@ -2066,6 +2076,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "idx_dag_node_execution_admissions_term",
             "idx_dag_node_execution_transition_facts_term",
             "idx_dag_node_terminal_facts_term",
+            "idx_dag_node_scheduler_transition_facts_term",
         }
         connection = self._connection()
         try:
@@ -2166,6 +2177,27 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 dag_migration["name"],
                 "0018_dag_node_claim_candidates.sql",
             )
+            input_binding_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 19"
+            ).fetchone()
+            self.assertEqual(
+                input_binding_migration["name"],
+                "0019_dag_node_input_bindings.sql",
+            )
+            execution_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 20"
+            ).fetchone()
+            self.assertEqual(
+                execution_migration["name"],
+                "0020_dag_node_execution_kernel.sql",
+            )
+            scheduler_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 21"
+            ).fetchone()
+            self.assertEqual(
+                scheduler_migration["name"],
+                "0021_dag_runtime_scheduler.sql",
+            )
         finally:
             connection.close()
 
@@ -2263,7 +2295,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         upgraded = SQLiteTaskStore(historical_path)
-        self.assertEqual(upgraded.migration_version(), 20)
+        self.assertEqual(upgraded.migration_version(), 21)
         connection = sqlite3.connect(historical_path)
         try:
             heartbeat_schema = connection.execute(
@@ -2407,11 +2439,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 14)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 20)
+        self.assertEqual(upgraded.migration_version(), 21)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 20
+                connection.execute("PRAGMA user_version").fetchone()[0], 21
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -2446,11 +2478,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 15)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 20)
+        self.assertEqual(upgraded.migration_version(), 21)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 20
+                connection.execute("PRAGMA user_version").fetchone()[0], 21
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -3099,7 +3131,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v20(self) -> None:
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v21(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
@@ -3137,7 +3169,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 20)
+        self.assertEqual(reopened.migration_version(), 21)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -3176,7 +3208,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v20(self) -> None:
+    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v21(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v12")
         acquired = self._acquire("upgrade-v12-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
@@ -3209,7 +3241,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 20)
+        self.assertEqual(reopened.migration_version(), 21)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)

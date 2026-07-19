@@ -3,12 +3,16 @@ from __future__ import annotations
 import contextlib
 import copy
 import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
+
+import scientific_runtime.task_store as task_store_module
 
 from scientific_runtime import (
     RegistryService,
@@ -17,6 +21,7 @@ from scientific_runtime import (
     TaskDispatchError,
     TaskService,
     TaskStoreConflict,
+    TaskStoreCorruption,
     TaskSupervisorLeaseLost,
     load_deepwave_manifest,
 )
@@ -462,7 +467,325 @@ class ScientificRuntimeDagExecutionStoreTest(unittest.TestCase):
             value["port"] for value in plan["nodes"][0]["outputs"]
         })
 
-    def test_dag_cancel_and_timeout_controls_fail_closed_in_this_kernel(self) -> None:
+    def test_nonempty_v20_dag_kernel_rebuild_preserves_exact_rows_and_advances(
+        self,
+    ) -> None:
+        legacy_migrations = Path(self.temporary.name) / "v20-migrations"
+        legacy_migrations.mkdir(mode=0o700)
+        for migration in sorted(
+            task_store_module.MIGRATIONS_DIRECTORY.glob(
+                "[0-9][0-9][0-9][0-9]_*.sql"
+            )
+        ):
+            if int(migration.name.split("_", 1)[0]) <= 20:
+                shutil.copy2(migration, legacy_migrations / migration.name)
+
+        self.database_path = Path(self.temporary.name) / "nonempty-v20.sqlite3"
+        with mock.patch.object(
+            task_store_module,
+            "MIGRATIONS_DIRECTORY",
+            legacy_migrations,
+        ):
+            self.store = SQLiteTaskStore(self.database_path)
+        self.assertEqual(self.store.migration_version(), 20)
+
+        # Current admission code needs the v21 Task-run anchor to identify the
+        # first intent.  Give this historical fixture a temporary bridge while
+        # exercising the real v20 admission/dispatch/terminal tables, then
+        # remove it before reopening so the source schema is exactly v20.
+        connection = sqlite3.connect(self.database_path, isolation_level=None)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE dag_task_execution_runs (
+                    task_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL,
+                    plan_hash TEXT NOT NULL,
+                    approval_id TEXT NOT NULL,
+                    first_intent_id TEXT NOT NULL UNIQUE,
+                    project_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    admitted_at TEXT NOT NULL,
+                    admitted_at_us INTEGER NOT NULL
+                )
+                """
+            )
+        finally:
+            connection.close()
+
+        self.registry = RegistryService(self.store, clock=lambda: NOW)
+        self.registry.register_dataset(dataset=dataset_ref())
+        self.registry.register_algorithm(manifest=load_deepwave_manifest("1.6.0"))
+        self.dispatcher = ControlledDagDispatcher(self.store)
+        self.service = TaskService(
+            self.store,
+            task_id_factory=lambda: "task-dag-execution-v20-upgrade",
+            clock=lambda: RUNTIME_NOW,
+            dispatcher=self.dispatcher,
+        )
+        task_id, plan, approval, lease, binding = self._bound_root(
+            "v20-upgrade"
+        )
+        admission = self._admit(task_id, plan, binding, lease)
+        self.service.schedule_runtime_dispatch(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.dispatcher.adapter_status = {
+            "status": "Running",
+            "stage": "inversion",
+            "completed": 1,
+            "total": 2,
+            "message": "iteration 1 of 2",
+            "updated_at": "2026-07-15T03:00:01Z",
+            "terminal": False,
+        }
+        self.service.refresh_runtime_status(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.dispatcher.manifests = self._artifact_manifests(task_id)
+        self._project_terminal_heartbeat(task_id, lease, "succeeded")
+        self.dispatcher.adapter_status = {
+            "status": "Succeeded",
+            "stage": "complete",
+            "completed": 2,
+            "total": 2,
+            "message": "complete",
+            "updated_at": "2026-07-15T03:00:02Z",
+            "terminal": True,
+        }
+        completed = self.service.refresh_runtime_status(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(completed.snapshot.status, "Running")
+        self.assertEqual(self._node_states(task_id)["root"], (4, "Succeeded"))
+
+        preserved_tables = (
+            "dispatch_intents",
+            "dag_node_execution_admissions",
+            "dag_node_terminal_facts",
+        )
+        legacy_intent = self.store.get_dispatch_intent_by_id(
+            admission.intent.intent_id
+        )
+        self.assertIsNotNone(legacy_intent)
+        connection = sqlite3.connect(self.database_path, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            before = {
+                table: [
+                    dict(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table} WHERE task_id = ? ORDER BY rowid",
+                        (task_id,),
+                    ).fetchall()
+                ]
+                for table in preserved_tables
+            }
+            transitions_before = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM dag_node_execution_transition_facts "
+                    "WHERE intent_id = ? ORDER BY node_revision",
+                    (admission.intent.intent_id,),
+                ).fetchall()
+            ]
+            self.assertTrue(all(len(rows) == 1 for rows in before.values()))
+            self.assertEqual(len(transitions_before), 3)
+            receipt_before = json.loads(
+                before["dag_node_terminal_facts"][0]["receipt_document_json"]
+            )
+            self.assertEqual(receipt_before["schema_version"], "2.0.0")
+            for table in preserved_tables:
+                table_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).fetchone()[0]
+                self.assertIn("task_id TEXT NOT NULL UNIQUE", table_sql)
+            connection.execute("DROP TABLE dag_task_execution_runs")
+        finally:
+            connection.close()
+
+        failed_rebuild_path = Path(self.temporary.name) / "failed-v21.sqlite3"
+        source = sqlite3.connect(self.database_path)
+        target = sqlite3.connect(failed_rebuild_path)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        failing_migrations = Path(self.temporary.name) / "failing-v21-migrations"
+        failing_migrations.mkdir(mode=0o700)
+        for migration in sorted(
+            task_store_module.MIGRATIONS_DIRECTORY.glob(
+                "[0-9][0-9][0-9][0-9]_*.sql"
+            )
+        ):
+            if int(migration.name.split("_", 1)[0]) <= 20:
+                shutil.copy2(migration, failing_migrations / migration.name)
+        v21_path = task_store_module.MIGRATIONS_DIRECTORY / (
+            "0021_dag_runtime_scheduler.sql"
+        )
+        v21_text = v21_path.read_text(encoding="utf-8")
+        rebuild_marker = "DROP TABLE dispatch_intents;\n"
+        self.assertIn(rebuild_marker, v21_text)
+        forced_failure = """
+CREATE TEMP TABLE scientific_runtime_v21_forced_failure (
+    value INTEGER NOT NULL CHECK (value = 0)
+);
+INSERT INTO scientific_runtime_v21_forced_failure
+SELECT 1 FROM scientific_runtime_v21_dispatch_intents LIMIT 1;
+DROP TABLE scientific_runtime_v21_forced_failure;
+"""
+        (failing_migrations / v21_path.name).write_text(
+            v21_text.replace(
+                rebuild_marker,
+                rebuild_marker + forced_failure,
+                1,
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            task_store_module,
+            "MIGRATIONS_DIRECTORY",
+            failing_migrations,
+        ):
+            with self.assertRaises(TaskStoreCorruption):
+                SQLiteTaskStore(failed_rebuild_path)
+        connection = sqlite3.connect(failed_rebuild_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 20)
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version = 21"
+                ).fetchone()
+            )
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            rolled_back = {
+                table: [
+                    dict(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table} WHERE task_id = ? ORDER BY rowid",
+                        (task_id,),
+                    ).fetchall()
+                ]
+                for table in preserved_tables
+            }
+            self.assertEqual(rolled_back, before)
+            self.assertEqual(
+                [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM dag_node_execution_transition_facts "
+                        "WHERE intent_id = ? ORDER BY node_revision",
+                        (admission.intent.intent_id,),
+                    ).fetchall()
+                ],
+                transitions_before,
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name IN "
+                    "('dag_task_execution_runs', "
+                    "'dag_node_scheduler_transition_facts')"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+        upgraded = SQLiteTaskStore(self.database_path)
+        self.assertEqual(upgraded.migration_version(), 21)
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(
+                [row[0] for row in connection.execute("PRAGMA quick_check")],
+                ["ok"],
+            )
+            after = {
+                table: [
+                    dict(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table} WHERE task_id = ? ORDER BY rowid",
+                        (task_id,),
+                    ).fetchall()
+                ]
+                for table in preserved_tables
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(
+                [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM dag_node_execution_transition_facts "
+                        "WHERE intent_id = ? ORDER BY node_revision",
+                        (admission.intent.intent_id,),
+                    ).fetchall()
+                ],
+                transitions_before,
+            )
+            transition_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'dag_node_execution_transition_facts'"
+            ).fetchone()[0]
+            self.assertIn("'Cancelled'", transition_sql)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT name FROM sqlite_temp_master WHERE name LIKE "
+                    "'scientific_runtime_v21_%'"
+                ).fetchall(),
+                [],
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT first_intent_id FROM dag_task_execution_runs "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                admission.intent.intent_id,
+            )
+        finally:
+            connection.close()
+
+        decoded = upgraded.get_dispatch_intent_by_id(admission.intent.intent_id)
+        self.assertEqual(decoded, legacy_intent)
+        state = upgraded.get_dag_node_state_snapshot(
+            task_id=task_id, **self.scope
+        )
+        self.assertEqual(
+            {node.node_id: (node.revision, node.state) for node in state.nodes},
+            {"root": (4, "Succeeded"), "spare": (1, "Pending")},
+        )
+
+        self.store = upgraded
+        self.dispatcher.store = upgraded
+        self.service = TaskService(
+            upgraded,
+            task_id_factory=lambda: "unused-after-v21-upgrade",
+            clock=lambda: RUNTIME_NOW,
+            dispatcher=self.dispatcher,
+        )
+        advanced = self.service.advance_runtime_dag(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+        self.assertEqual(advanced.admitted_node_id, "spare")
+        self.assertEqual(advanced.snapshot.status, "Running")
+        self.assertEqual(
+            upgraded.get_dispatch_intent_by_id(admission.intent.intent_id),
+            legacy_intent,
+        )
+        self.assertEqual(
+            len(upgraded.list_dispatch_intents(task_id)),
+            2,
+        )
+
+    def test_dag_timeout_checkpoint_and_private_receipt_controls_fail_closed(
+        self,
+    ) -> None:
         task_id, plan, _, lease, binding = self._bound_root("controls")
         admission = self._admit(task_id, plan, binding, lease)
         with self.assertRaisesRegex(
@@ -480,45 +803,8 @@ class ScientificRuntimeDagExecutionStoreTest(unittest.TestCase):
             task_id, supervisor_lease=lease, **self.scope
         )
         self.assertFalse(scheduled.timeout_armed)
-        self.assertFalse(self.service.can_cancel_task(task_id, **self.scope))
-        with self.assertRaisesRegex(TaskConflict, "outside the current execution"):
-            self.service.cancel_task(
-                task_id=task_id,
-                reason="user_requested",
-                idempotency_key="cancel-dag-control",
-                **self.scope,
-            )
         connection = sqlite3.connect(self.database_path)
         try:
-            attempt_id = connection.execute(
-                "SELECT attempt_id FROM worker_launch_attempts WHERE intent_id = ?",
-                (admission.intent.intent_id,),
-            ).fetchone()[0]
-            with self.assertRaises(sqlite3.IntegrityError):
-                connection.execute(
-                    """
-                    INSERT INTO task_cancel_requests(
-                        request_id, task_id, project_id, principal_id, intent_id,
-                        attempt_id, reason, idempotency_key, request_hash,
-                        request_event_sequence, document_json, document_hash,
-                        requested_at, recorded_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'user_requested', ?, ?, 1,
-                              '{}', ?, ?, ?)
-                    """,
-                    (
-                        "cancel-dag-control-raw",
-                        task_id,
-                        PROJECT_ID,
-                        PRINCIPAL_ID,
-                        admission.intent.intent_id,
-                        attempt_id,
-                        "cancel-dag-control-raw",
-                        "sha256:" + "1" * 64,
-                        "sha256:" + "2" * 64,
-                        NOW,
-                        NOW,
-                    ),
-                )
             self.assertEqual(
                 connection.execute(
                     "SELECT COUNT(*) FROM worker_attempt_timeout_windows "
@@ -528,7 +814,6 @@ class ScientificRuntimeDagExecutionStoreTest(unittest.TestCase):
                 0,
             )
         finally:
-            connection.rollback()
             connection.close()
 
         self.dispatcher.adapter_status = {

@@ -64,6 +64,7 @@ from worker_launch_control import (
     read_worker_stop_evidence,
     read_worker_exit_evidence,
     read_worker_attempt_evidence,
+    read_worker_resource_device,
     request_worker_cancel,
     request_worker_checkpoint_resume,
     request_worker_stop,
@@ -915,6 +916,7 @@ class WorkerLauncher(Protocol):
         run_root: Path,
         wall_time_seconds: int = 86_400,
         checkpoint_capable: bool = False,
+        resource_device: Literal["cpu", "cuda"] = "cpu",
     ) -> Any: ...
 
 
@@ -1387,15 +1389,16 @@ def _read_json_file(
 
 
 class SafeSubprocessWorkerLauncher:
-    """Fixed argv launcher with inherited attempt and capacity fences.
+    """Fixed argv launcher with inherited execution and resource fences.
 
     The in-process counter remains a cheap local guard.  The authoritative
     Adapter-managed, same-host capacity boundary is a set of private ``flock``
     slots beneath the run root.  Both the selected slot and the unique attempt
     lock are inherited by the Worker, so a control-process exit cannot free
     Adapter capacity or permit a duplicate managed launch while the numerical
-    process is still alive.  Standalone and legacy MCP jobs remain outside this
-    deliberately bounded slice.
+    process is still alive.  CUDA also inherits logical device 0's dedicated
+    fence.  Standalone and legacy MCP jobs remain outside this deliberately
+    bounded slice.
     """
 
     _state_lock = threading.Lock()
@@ -1620,6 +1623,7 @@ class SafeSubprocessWorkerLauncher:
         run_root: Path,
         wall_time_seconds: int = 86_400,
         checkpoint_capable: bool = False,
+        resource_device: Literal["cpu", "cuda"] = "cpu",
     ) -> int:
         """Expose only explicitly stopped failures as retry candidates."""
 
@@ -1631,6 +1635,7 @@ class SafeSubprocessWorkerLauncher:
                 run_root=run_root,
                 wall_time_seconds=wall_time_seconds,
                 checkpoint_capable=checkpoint_capable,
+                resource_device=resource_device,
             )
         except _AdapterLaunchAmbiguous:
             raise
@@ -1652,6 +1657,7 @@ class SafeSubprocessWorkerLauncher:
         run_root: Path,
         wall_time_seconds: int = 86_400,
         checkpoint_capable: bool = False,
+        resource_device: Literal["cpu", "cuda"] = "cpu",
     ) -> int:
         if command != "invert":
             raise AdapterValidationError(
@@ -1662,6 +1668,21 @@ class SafeSubprocessWorkerLauncher:
             raise AdapterValidationError(
                 "CHECKPOINT_CAPABILITY_INVALID",
                 ["checkpoint capability must be an immutable boolean"],
+            )
+        if resource_device not in {"cpu", "cuda"}:
+            raise AdapterValidationError(
+                "RESOURCE_DEVICE_INVALID",
+                ["resource device must be cpu or cuda"],
+            )
+        try:
+            config_device = read_worker_resource_device(
+                run_root, run_dir, config_path
+            )
+        except WorkerControlError as error:
+            raise AdapterUnavailable(error.code) from error
+        if config_device != resource_device:
+            raise AdapterUnavailable(
+                "WORKER_RESOURCE_INVALID: config device and Adapter resources disagree"
             )
         self._reserve()
         lease: ParentLaunchLease | None = None
@@ -1683,6 +1704,7 @@ class SafeSubprocessWorkerLauncher:
                 run_root,
                 run_dir,
                 max_active=self._max_active,
+                resource_device=resource_device,
             )
             candidate, directory_descriptor = _safe_parent_fd(log_path)
             descriptor = os.open(
@@ -5018,9 +5040,10 @@ class DeepwaveAdapter:
                     and record.get("algorithm")
                     == {"id": ALGORITHM_ID, "version": "1.6.0"}
                 ),
+                resource_device=validated.resources["device"],
             )
         except _AdapterLaunchAmbiguous as error:
-            # Popen may have succeeded and the child retains both kernel
+            # Popen may have succeeded and the child retains its kernel
             # fences.  Keep ``launching`` so exact observation can adopt it.
             raise AdapterUnavailable(str(error)) from error
         except _AdapterLaunchStopped as error:

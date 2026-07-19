@@ -412,7 +412,7 @@ class ScientificRuntimeDagInputBindingStoreTest(unittest.TestCase):
             self.assertEqual(self.store.migration_version(), 19)
 
         upgraded = SQLiteTaskStore(legacy_path)
-        self.assertEqual(upgraded.migration_version(), 20)
+        self.assertEqual(upgraded.migration_version(), 21)
         upgraded_service = TaskService(upgraded, clock=lambda: self.clock_value)
         state = upgraded_service.get_dag_node_state_snapshot(
             task_id, **self.scope
