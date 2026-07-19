@@ -357,6 +357,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         ).fetchall()
         for (trigger_name,) in trigger_names:
             connection.execute(f'DROP TRIGGER "{trigger_name}"')
+        connection.execute("DROP TABLE dag_node_cache_hit_facts")
+        connection.execute("DROP TABLE dag_node_cache_entries")
         connection.execute("DROP TABLE dag_node_scheduler_transition_facts")
         connection.execute("DROP TABLE dag_task_execution_runs")
         connection.execute("DROP TABLE dag_node_terminal_facts")
@@ -1853,7 +1855,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         }
 
     def test_fresh_v20_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 21)
+        self.assertEqual(self.store.migration_version(), 22)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -2198,6 +2200,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
                 scheduler_migration["name"],
                 "0021_dag_runtime_scheduler.sql",
             )
+            cache_migration = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = 22"
+            ).fetchone()
+            self.assertEqual(
+                cache_migration["name"],
+                "0022_dag_node_cache_lineage.sql",
+            )
         finally:
             connection.close()
 
@@ -2295,7 +2304,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         upgraded = SQLiteTaskStore(historical_path)
-        self.assertEqual(upgraded.migration_version(), 21)
+        self.assertEqual(upgraded.migration_version(), 22)
         connection = sqlite3.connect(historical_path)
         try:
             heartbeat_schema = connection.execute(
@@ -2439,11 +2448,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 14)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 21)
+        self.assertEqual(upgraded.migration_version(), 22)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 21
+                connection.execute("PRAGMA user_version").fetchone()[0], 22
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -2478,11 +2487,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 15)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 21)
+        self.assertEqual(upgraded.migration_version(), 22)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 21
+                connection.execute("PRAGMA user_version").fetchone()[0], 22
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -3169,7 +3178,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 21)
+        self.assertEqual(reopened.migration_version(), 22)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -3241,7 +3250,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 21)
+        self.assertEqual(reopened.migration_version(), 22)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)

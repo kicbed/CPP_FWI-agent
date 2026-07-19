@@ -41,9 +41,11 @@ from .task_store import (
     ALLOWED_TRANSITIONS,
     TASK_STATUSES,
     DagNodeArtifactInput,
+    DagNodeCacheCandidate,
     DagNodeClaimCandidate,
     DagNodeExecutionAdmission,
     DagNodeInputBindingFact,
+    DagNodeOutputMaterialization,
     DagNodeStateMapSnapshot,
     DispatchIntentSnapshot,
     IdempotencyConflict,
@@ -210,6 +212,8 @@ class DagRuntimeAdvanceResult:
     blocked_node_ids: tuple[str, ...]
     aggregate_status: str
     deferred_code: str | None = None
+    cache_hit_node_id: str | None = None
+    cache_key_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2811,10 +2815,39 @@ class TaskService:
         if prepared_request != expected_request:
             reasons.append("dispatch_request_drift")
         fingerprint = preparation.queue_fingerprint
+        source_provenance = fingerprint.get("source")
+        environment_provenance = fingerprint.get("environment")
+        development_provenance = (
+            fingerprint.get("provenance_mode") == "development"
+            and isinstance(source_provenance, Mapping)
+            and source_provenance.get("identity_complete") is False
+            and source_provenance.get("dirty") is None
+        )
+        reproducible_provenance = (
+            fingerprint.get("provenance_mode") == "reproducible"
+            and isinstance(source_provenance, Mapping)
+            and source_provenance.get("identity_complete") is True
+            and source_provenance.get("dirty") is False
+            and re.fullmatch(
+                r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+                str(source_provenance.get("git_commit", "")),
+            )
+            is not None
+            and re.fullmatch(
+                r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+                str(source_provenance.get("git_tree", "")),
+            )
+            is not None
+            and isinstance(environment_provenance, Mapping)
+            and re.fullmatch(
+                r"sha256:[0-9a-f]{64}",
+                str(environment_provenance.get("environment_lock_hash", "")),
+            )
+            is not None
+        )
         if (
             not isinstance(normalized_config_hash, str)
-            or fingerprint.get("provenance_mode") != "development"
-            or fingerprint.get("source", {}).get("identity_complete") is not False
+            or not (development_provenance or reproducible_provenance)
             or fingerprint.get("normalized_config_hash")
             != normalized_config_hash
             or fingerprint.get("algorithm") != node.get("algorithm")
@@ -2891,6 +2924,36 @@ class TaskService:
         self._validate_schema("run-event.schema.json", queued_event)
         return intent, queued_event
 
+    def _prepare_dag_node_execution(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        input_binding: DagNodeInputBindingFact,
+    ) -> DispatchPreparation:
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        current = self.get_task(
+            task_id, project_id=project_id, principal_id=principal_id
+        )
+        prepare_node = getattr(self._dispatcher, "prepare_node", None)
+        if not callable(prepare_node):
+            raise TaskDispatchError("DAG_NODE_PREPARATION_UNSUPPORTED")
+        try:
+            preparation = prepare_node(
+                current,
+                node_id=input_binding.target_node_id,
+                input_binding=input_binding,
+            )
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("DAG_NODE_PREPARATION_UNAVAILABLE") from error
+        if not isinstance(preparation, DispatchPreparation):
+            raise TaskDispatchError("DAG_NODE_PREPARATION_UNAVAILABLE")
+        return preparation
+
     def admit_ready_dag_node_execution(
         self,
         task_id: str,
@@ -2900,6 +2963,7 @@ class TaskService:
         expected_plan_hash: str,
         input_binding: DagNodeInputBindingFact,
         supervisor_lease: RuntimeSupervisorLease,
+        _preparation: DispatchPreparation | None = None,
     ) -> DagNodeAdmissionResult:
         """Admit one exact ready dataset-root node; dispatch remains supervised."""
 
@@ -2922,24 +2986,14 @@ class TaskService:
             or supervisor_lease.principal_id != principal_id
         ):
             raise TaskSupervisorLeaseLost()
-        if self._dispatcher is None:
-            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
-        current = self.get_task(
-            task_id, project_id=project_id, principal_id=principal_id
+        preparation = _preparation or self._prepare_dag_node_execution(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            input_binding=input_binding,
         )
-        prepare_node = getattr(self._dispatcher, "prepare_node", None)
-        if not callable(prepare_node):
-            raise TaskDispatchError("DAG_NODE_PREPARATION_UNSUPPORTED")
-        try:
-            preparation = prepare_node(
-                current,
-                node_id=input_binding.target_node_id,
-                input_binding=input_binding,
-            )
-        except DispatchError as error:
-            raise TaskDispatchError(error.code) from error
-        except Exception as error:
-            raise TaskDispatchError("DAG_NODE_PREPARATION_UNAVAILABLE") from error
+        if not isinstance(preparation, DispatchPreparation):
+            raise TaskDispatchError("DAG_NODE_PREPARATION_UNAVAILABLE")
         try:
             admitted = self._store.admit_ready_dag_node_execution(
                 task_id=task_id,
@@ -2971,6 +3025,148 @@ class TaskService:
             admission_fencing_token=admitted.admission_fencing_token,
             replayed=admitted.replayed,
         )
+
+    def _verify_dag_node_cache_candidate(
+        self, candidate: DagNodeCacheCandidate
+    ) -> dict[str, Any]:
+        """Re-open the executed source under the Adapter's nofollow verifier."""
+
+        if self._dispatcher is None:
+            raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
+        verify = getattr(self._dispatcher, "verified_node_outputs", None)
+        if not callable(verify):
+            raise TaskDispatchError("DAG_CACHE_VERIFICATION_UNSUPPORTED")
+        try:
+            with verify(candidate.source_intent) as supplied:
+                verified = copy.deepcopy(supplied)
+        except DispatchError as error:
+            raise TaskDispatchError(error.code) from error
+        except Exception as error:
+            raise TaskDispatchError("DAG_CACHE_ARTIFACT_VERIFICATION_FAILED") from error
+        if not isinstance(verified, Mapping):
+            raise TaskDispatchError("DAG_CACHE_ARTIFACT_VERIFICATION_FAILED")
+        manifests = verified.get("manifests")
+        if (
+            verified.get("schema_version") != "1.0.0"
+            or verified.get("intent_id") != candidate.source_intent.intent_id
+            or verified.get("attempt_id") != candidate.source_attempt_id
+            or verified.get("attempt_number") != candidate.source_attempt_number
+            or verified.get("receipt_record_hash")
+            != candidate.source_receipt_record_hash
+            or not isinstance(manifests, list)
+            or not manifests
+            or any(not isinstance(value, dict) for value in manifests)
+        ):
+            raise TaskDispatchError("DAG_CACHE_ARTIFACT_VERIFICATION_FAILED")
+        validated = self._validate_collected_artifacts(
+            candidate.source_snapshot,
+            candidate.source_intent,
+            manifests,
+        )
+        expected_by_hash = {
+            output["artifact_manifest_hash"]: output for output in candidate.outputs
+        }
+        if len(expected_by_hash) != len(candidate.outputs):
+            raise TaskDispatchError("DAG_CACHE_SOURCE_RECEIPT_INVALID")
+        observed: list[dict[str, Any]] = []
+        for manifest in validated:
+            _, manifest_hash = encode_document(manifest)
+            output = expected_by_hash.get(manifest_hash)
+            extension = manifest.get("extensions", {}).get(
+                "org.agent_rpc.adapter", {}
+            )
+            if (
+                output is None
+                or manifest != output["artifact_manifest"]
+                or extension.get("output_port") != output["output_port"]
+                or manifest.get("artifact_type") != output["data_type"]
+            ):
+                raise TaskDispatchError("DAG_CACHE_SOURCE_RECEIPT_DIVERGED")
+            observed.append(
+                {
+                    "output_port": output["output_port"],
+                    "data_type": output["data_type"],
+                    "schema_version": manifest["schema_version"],
+                    "media_type": manifest["media_type"],
+                    "content_hash": manifest["content_hash"],
+                    "size_bytes": manifest["size_bytes"],
+                    "artifact_manifest_hash": manifest_hash,
+                    "symlink": False,
+                }
+            )
+        if len(observed) != len(candidate.outputs):
+            raise TaskDispatchError("DAG_CACHE_SOURCE_RECEIPT_DIVERGED")
+        return {
+            "schema_version": "1.0.0",
+            "permission_scope": {
+                "project_id": candidate.source_snapshot.project_id,
+                "principal_id": candidate.source_snapshot.principal_id,
+            },
+            "cache_entry_id": candidate.cache_entry_id,
+            "cache_key_hash": candidate.cache_key_hash,
+            "source": {
+                "intent_id": candidate.source_intent.intent_id,
+                "receipt_document_hash": candidate.source_receipt_document_hash,
+                "trusted_lineage_document_hash": (
+                    candidate.trusted_lineage_document_hash
+                ),
+            },
+            "artifacts": sorted(observed, key=lambda value: value["output_port"]),
+        }
+
+    def _commit_dag_node_cache_candidate(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        input_binding: DagNodeInputBindingFact,
+        preparation: DispatchPreparation,
+        candidate: DagNodeCacheCandidate,
+        supervisor_lease: RuntimeSupervisorLease,
+    ):
+        verification = self._verify_dag_node_cache_candidate(candidate)
+        _, cache_hit_hash = encode_document(
+            {
+                "task_id": task_id,
+                "plan_id": input_binding.plan_id,
+                "approval_id": input_binding.approval_id,
+                "node_id": input_binding.target_node_id,
+                "pending_revision": input_binding.target_node_revision,
+                "input_binding_document_hash": (
+                    input_binding.binding_document_hash
+                ),
+                "cache_entry_id": candidate.cache_entry_id,
+                "cache_key_hash": candidate.cache_key_hash,
+            }
+        )
+        cache_hit_id = (
+            "cache-hit-" + cache_hit_hash.removeprefix("sha256:")[:32]
+        )
+        try:
+            return self._store.commit_dag_node_cache_hit(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                input_binding=input_binding,
+                candidate=candidate,
+                artifact_verification=verification,
+                cache_hit_id=cache_hit_id,
+                validate=lambda context, now: (
+                    self._build_dag_node_execution_admission(
+                        context,
+                        input_binding=input_binding,
+                        preparation=preparation,
+                        now=now,
+                    )
+                ),
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
 
     def _materialize_dag_node_artifact_inputs(
         self,
@@ -3006,65 +3202,62 @@ class TaskService:
             return ()
         if self._dispatcher is None:
             raise TaskDispatchError("DISPATCHER_UNAVAILABLE")
-        try:
-            historical_intents = self._store.list_dispatch_intents(
-                snapshot.task_id
-            )
-        except TaskStoreConflict as error:
-            raise TaskConflict(str(error)) from error
-        intents_by_node: dict[str, list[DispatchIntentSnapshot]] = {}
-        for historical in historical_intents:
-            intents_by_node.setdefault(historical.node_id, []).append(historical)
-
         materialized: list[DagNodeArtifactInput] = []
         for binding in source_bindings:
             source = binding["source"]
             source_node_id = source.get("node_id")
             source_output_port = source.get("port")
             target_input_port = binding.get("port")
-            candidates = intents_by_node.get(source_node_id, [])
             if (
                 not isinstance(source_node_id, str)
                 or not isinstance(source_output_port, str)
                 or not isinstance(target_input_port, str)
-                or len(candidates) != 1
             ):
                 raise TaskDispatchError("DAG_SOURCE_RECEIPT_INVALID")
-            source_intent = candidates[0]
+            try:
+                outputs = self._store.get_dag_node_output_materializations(
+                    task_id=snapshot.task_id,
+                    project_id=snapshot.project_id,
+                    principal_id=snapshot.principal_id,
+                    source_node_id=source_node_id,
+                )
+            except TaskStoreConflict as error:
+                raise TaskConflict(str(error)) from error
+            matching_outputs = [
+                value
+                for value in outputs
+                if value.source_output_port == source_output_port
+                and value.data_type == source.get("data_type")
+            ]
+            if len(matching_outputs) != 1:
+                raise TaskDispatchError("DAG_SOURCE_RECEIPT_INVALID")
+            output = matching_outputs[0]
+            try:
+                physical_intents = self._store.list_dispatch_intents(
+                    output.physical_task_id
+                )
+            except TaskStoreConflict as error:
+                raise TaskConflict(str(error)) from error
+            matching_intents = [
+                value
+                for value in physical_intents
+                if value.intent_id == output.physical_intent_id
+            ]
+            if len(matching_intents) != 1:
+                raise TaskDispatchError("DAG_SOURCE_RECEIPT_INVALID")
+            source_intent = matching_intents[0]
             if source_intent.state != "dispatched" or source_intent.handle is None:
                 raise TaskDispatchError("DAG_SOURCE_RECEIPT_INVALID")
-            try:
-                supplied_manifests = self._dispatcher.collect(source_intent)
-            except DispatchError as error:
-                raise TaskDispatchError(error.code) from error
-            except Exception as error:
-                raise TaskDispatchError("ADAPTER_COLLECT_UNAVAILABLE") from error
-            if not isinstance(supplied_manifests, list) or not all(
-                isinstance(value, dict) for value in supplied_manifests
-            ):
-                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
-            validated_manifests = self._validate_collected_artifacts(
-                snapshot, source_intent, supplied_manifests
+            physical_snapshot = self.get_task(
+                output.physical_task_id,
+                project_id=snapshot.project_id,
+                principal_id=snapshot.principal_id,
             )
-            matching_manifests = [
-                manifest
-                for manifest in validated_manifests
-                if manifest.get("node_id") == source_node_id
-                and manifest.get("extensions", {})
-                .get("org.agent_rpc.adapter", {})
-                .get("output_port")
-                == source_output_port
-                and manifest.get("artifact_type") == source.get("data_type")
-            ]
-            if len(matching_manifests) != 1:
-                raise TaskDispatchError("DAG_SOURCE_RECEIPT_INVALID")
-            expected_manifest = matching_manifests[0]
-            artifact_id = expected_manifest.get("artifact_id")
-            if not isinstance(artifact_id, str):
-                raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
             try:
                 read_manifests, read_manifest, artifact_data = (
-                    self._dispatcher.read_artifact(source_intent, artifact_id)
+                    self._dispatcher.read_artifact(
+                        source_intent, output.physical_artifact_id
+                    )
                 )
             except DispatchError as error:
                 raise TaskDispatchError(error.code) from error
@@ -3078,20 +3271,47 @@ class TaskService:
             ):
                 raise TaskDispatchError("ADAPTER_ARTIFACT_INVALID")
             validated_read = self._validate_collected_artifacts(
-                snapshot, source_intent, read_manifests
+                physical_snapshot, source_intent, read_manifests
+            )
+            expected_physical = next(
+                (
+                    value
+                    for value in validated_read
+                    if value.get("artifact_id")
+                    == output.physical_artifact_id
+                ),
+                None,
+            )
+            _, logical_hash = encode_document(
+                output.logical_artifact_manifest
+            )
+            _, physical_hash = encode_document(
+                output.physical_artifact_manifest
             )
             if (
-                validated_read != validated_manifests
-                or read_manifest != expected_manifest
-                or len(artifact_data) != expected_manifest.get("size_bytes")
+                expected_physical is None
+                or read_manifest != output.physical_artifact_manifest
+                or expected_physical != output.physical_artifact_manifest
+                or physical_hash != output.physical_artifact_manifest_hash
+                or logical_hash != output.logical_artifact_manifest_hash
+                or len(artifact_data)
+                != output.logical_artifact_manifest.get("size_bytes")
                 or "sha256:" + hashlib.sha256(artifact_data).hexdigest()
-                != expected_manifest.get("content_hash")
+                != output.logical_artifact_manifest.get("content_hash")
+                or output.logical_artifact_manifest.get("content_hash")
+                != output.physical_artifact_manifest.get("content_hash")
+                or output.logical_artifact_manifest.get("media_type")
+                != output.physical_artifact_manifest.get("media_type")
+                or output.logical_artifact_manifest.get("schema_version")
+                != output.physical_artifact_manifest.get("schema_version")
             ):
                 raise TaskDispatchError("DAG_SOURCE_RECEIPT_DIVERGED")
             materialized.append(
                 DagNodeArtifactInput(
                     target_input_port=target_input_port,
-                    artifact_manifest=copy.deepcopy(expected_manifest),
+                    artifact_manifest=copy.deepcopy(
+                        output.logical_artifact_manifest
+                    ),
                     artifact_data=bytes(artifact_data),
                 )
             )
@@ -3195,10 +3415,20 @@ class TaskService:
                 blocked_node_ids=tuple(reconciled.blocked_node_ids),
                 aggregate_status=active.snapshot.status,
                 deferred_code=(
-                    "CANCEL_CONTROL_PENDING"
-                    if active.snapshot.cancellation is not None
-                    and active.snapshot.cancellation.state == "requested"
-                    else None
+                    "CHECKPOINT_RESUME_PENDING"
+                    if active.snapshot.status == "Waiting"
+                    and active.snapshot.checkpoint is not None
+                    and active.snapshot.checkpoint.state == "resume_requested"
+                    else (
+                        "CHECKPOINT_WAITING"
+                        if active.snapshot.status == "Waiting"
+                        else (
+                            "CANCEL_CONTROL_PENDING"
+                            if active.snapshot.cancellation is not None
+                            and active.snapshot.cancellation.state == "requested"
+                            else None
+                        )
+                    )
                 ),
             )
         if active_node_ids:
@@ -3247,6 +3477,47 @@ class TaskService:
             artifact_inputs=artifact_inputs,
             supervisor_lease=supervisor_lease,
         )
+        preparation = self._prepare_dag_node_execution(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+            input_binding=binding,
+        )
+        try:
+            candidate = self._store.find_dag_node_cache_candidate(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                input_binding=binding,
+                adapter_id=preparation.adapter_id,
+                adapter_version=preparation.adapter_version,
+                queue_fingerprint=preparation.queue_fingerprint,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+        if candidate is not None:
+            hit = self._commit_dag_node_cache_candidate(
+                task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                input_binding=binding,
+                preparation=preparation,
+                candidate=candidate,
+                supervisor_lease=supervisor_lease,
+            )
+            return DagRuntimeAdvanceResult(
+                snapshot=hit.snapshot,
+                active_intent=None,
+                admitted_node_id=None,
+                blocked_node_ids=tuple(reconciled.blocked_node_ids),
+                aggregate_status=hit.snapshot.status,
+                cache_hit_node_id=hit.node_id,
+                cache_key_hash=hit.cache_key_hash,
+            )
         admission = self.admit_ready_dag_node_execution(
             task_id,
             project_id=project_id,
@@ -3254,6 +3525,7 @@ class TaskService:
             expected_plan_hash=plan["plan_hash"],
             input_binding=binding,
             supervisor_lease=supervisor_lease,
+            _preparation=preparation,
         )
         if admission.intent.node_id != claim.node.node_id:
             raise TaskDispatchError("DAG_NODE_ADMISSION_OUTCOME_INVALID")
@@ -4984,7 +5256,17 @@ class TaskService:
         if not isinstance(heartbeat, Mapping) or heartbeat.get("state") != "waiting":
             return snapshot
         if self._is_dag_node_execution_intent(intent):
-            raise TaskDispatchError("DAG_CHECKPOINT_UNSUPPORTED")
+            # DAG node state and Worker checkpoint state are deliberately
+            # separate facts.  Once the admitted node has already reached its
+            # durable Running projection, the ordinary P2 checkpoint pass may
+            # move only the Task aggregate to Waiting without minting another
+            # node transition or Worker attempt.  The earlier Queued->Running
+            # race remains fail closed because it must be projected through
+            # the DAG transition receipt, not the generic Task event writer.
+            node_state = self._current_dag_node_state(intent)
+            if snapshot.status == "Running" and node_state.state == "Running":
+                return snapshot
+            raise TaskDispatchError("DAG_CHECKPOINT_EARLY_UNSUPPORTED")
         if not self._checkpoint_capable_intent(intent):
             raise TaskDispatchError("WORKER_EVIDENCE_INVALID")
         ticket = evidence.get("ticket")
@@ -5974,17 +6256,24 @@ class TaskService:
             task_id, project_id=project_id, principal_id=principal_id
         )
         intent = self._store.get_dispatch_intent(task_id)
-        if intent is not None and self._is_dag_node_execution_intent(intent):
-            if snapshot.status == "Waiting" or snapshot.checkpoint is not None:
-                raise TaskConflict(
-                    "DAG node checkpoint is outside the current execution kernel"
-                )
-            return TaskCheckpointProcessResult(
-                snapshot=snapshot,
-                state="none",
-                adapter_result=None,
-                replayed=True,
+        dag_execution = (
+            intent is not None and self._is_dag_node_execution_intent(intent)
+        )
+        if dag_execution:
+            active = self._store.get_active_dag_node_execution(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
             )
+            node_state = self._current_dag_node_state(intent)
+            if (
+                active is None
+                or active.intent.intent_id != intent.intent_id
+                or node_state.state not in {"Queued", "Running"}
+            ):
+                raise TaskConflict(
+                    "DAG checkpoint requires the exact current active node"
+                )
         if snapshot.status not in {"Running", "Waiting"}:
             return TaskCheckpointProcessResult(
                 snapshot=snapshot,

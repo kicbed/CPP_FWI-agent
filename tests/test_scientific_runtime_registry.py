@@ -97,7 +97,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
             connection.close()
 
     def test_fresh_v20_has_all_migration_checksums_and_task_discovery_index(self) -> None:
-        self.assertEqual(self.store.migration_version(), 21)
+        self.assertEqual(self.store.migration_version(), 22)
         connection = sqlite3.connect(self.database_path)
         try:
             rows = connection.execute(
@@ -145,6 +145,7 @@ class ScientificRuntimeRegistryTest(unittest.TestCase):
                 (19, "0019_dag_node_input_bindings.sql"),
                 (20, "0020_dag_node_execution_kernel.sql"),
                 (21, "0021_dag_runtime_scheduler.sql"),
+                (22, "0022_dag_node_cache_lineage.sql"),
             ],
         )
         for version, name, checksum in rows:
@@ -1212,7 +1213,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
     def test_v1_database_upgrades_in_place_and_backfills_approval_budget(self) -> None:
         task_id, approval = self.seed_v1_database()
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 21)
+        self.assertEqual(store.migration_version(), 22)
         snapshot = store.get_task(task_id)
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.approval, approval)
@@ -1226,7 +1227,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
         task_id, _ = self.seed_v1_database()
         self.upgrade_fixture_to_v2()
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 21)
+        self.assertEqual(store.migration_version(), 22)
         self.assertEqual(store.get_task(task_id).status, "AwaitingApproval")
         connection = sqlite3.connect(self.database_path)
         try:
@@ -1267,7 +1268,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
             connection.close()
 
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 21)
+        self.assertEqual(store.migration_version(), 22)
         snapshot = store.get_task(task_id)
         self.assertEqual(snapshot.approval, approval)
         service = TaskService(
@@ -1352,7 +1353,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
             connection.close()
 
         store = SQLiteTaskStore(self.database_path)
-        self.assertEqual(store.migration_version(), 21)
+        self.assertEqual(store.migration_version(), 22)
         snapshot = store.get_task(task_id)
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.approval, approval)
@@ -1447,7 +1448,7 @@ class ScientificRuntimeV1UpgradeTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(reopen, range(8)))
-        self.assertEqual(results, [(21, approval["approval_id"])] * 8)
+        self.assertEqual(results, [(22, approval["approval_id"])] * 8)
         connection = sqlite3.connect(self.database_path)
         try:
             self.assertEqual(

@@ -3,19 +3,24 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scientific_runtime import (
+    DispatchError,
     RegistryService,
     SQLiteTaskStore,
     TaskConflict,
+    TaskDispatchError,
     TaskService,
     TaskStoreConflict,
+    TaskStoreCorruption,
     TaskSupervisorLeaseLost,
     load_deepwave_manifest,
 )
@@ -30,6 +35,7 @@ from tests.test_scientific_runtime_task_service import (
     MANAGED_SUBMISSION_ID,
     current_optimizer_plan_graph,
     current_optimizer_task_draft,
+    executable_fingerprint,
     managed_worker_evidence,
 )
 
@@ -167,6 +173,64 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
     def verified_node_outputs(self, intent):
         self._activate(intent)
         with super().verified_node_outputs(intent) as outputs:
+            yield outputs
+
+
+class ReproducibleMultiNodeDagDispatcher(MultiNodeControlledDagDispatcher):
+    """Controlled Worker whose adopted provenance is safe to cache."""
+
+    def prepare_node(self, snapshot, *, node_id, input_binding):
+        prepared = super().prepare_node(
+            snapshot, node_id=node_id, input_binding=input_binding
+        )
+        fingerprint = executable_fingerprint(self.adapter_version)
+        request = copy.deepcopy(prepared.request)
+        request["normalized_config_hash"] = fingerprint[
+            "normalized_config_hash"
+        ]
+        return replace(
+            prepared,
+            request=request,
+            queue_fingerprint=fingerprint,
+        )
+
+
+class CacheVerificationTamperingDispatcher(
+    ReproducibleMultiNodeDagDispatcher
+):
+    """Inject one failure after the durable source has been committed."""
+
+    cache_verification_tamper: str | None = None
+
+    @contextlib.contextmanager
+    def verified_node_outputs(self, intent):
+        with super().verified_node_outputs(intent) as supplied:
+            mode = self.cache_verification_tamper
+            if mode == "bytes":
+                raise DispatchError("ARTIFACT_HASH_MISMATCH")
+            if mode == "symlink":
+                raise DispatchError("ARTIFACT_SYMLINK_REJECTED")
+            outputs = copy.deepcopy(supplied)
+            if mode == "missing":
+                outputs["manifests"] = []
+            elif mode is not None:
+                manifest = outputs["manifests"][0]
+                if mode == "manifest":
+                    manifest["artifact_id"] += "-tampered"
+                elif mode == "lineage":
+                    manifest["lineage"]["inputs"][0]["content_hash"] = (
+                        "sha256:" + "1" * 64
+                    )
+                elif mode == "content_hash":
+                    manifest["content_hash"] = "sha256:" + "2" * 64
+                elif mode == "size":
+                    manifest["size_bytes"] += 1
+                elif mode == "media_type":
+                    manifest["media_type"] = "application/octet-stream"
+                elif mode == "schema_version":
+                    manifest["schema_version"] = "9.9.9"
+                else:
+                    raise AssertionError(f"unknown cache tamper mode: {mode}")
             yield outputs
 
 
@@ -366,6 +430,78 @@ class ScientificRuntimeDagRuntimeSchedulerTest(unittest.TestCase):
     def _dispatch_count(self, task_id: str, node_id: str) -> int:
         return self.dispatcher.dispatch_counts[(task_id, node_id)]
 
+    def _cacheable_source_and_target(
+        self,
+        suffix: str,
+        *,
+        tampering: bool = False,
+    ):
+        dispatcher_type = (
+            CacheVerificationTamperingDispatcher
+            if tampering
+            else ReproducibleMultiNodeDagDispatcher
+        )
+        self.dispatcher = dispatcher_type(self.store)
+        self.service = self._new_service(self.store)
+        source_task, _ = self._approved_dag(f"{suffix}-source")
+        source_lease = self._acquire(f"{suffix}-source")
+        self.assertEqual(
+            self._advance(source_task, source_lease).admitted_node_id, "a"
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dag_node_cache_entries "
+                    "WHERE source_task_id = ?",
+                    (source_task,),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+        self._run_success(source_task, source_lease, "a")
+        self.service.release_runtime_supervisor_lease(source_lease)
+
+        target_task, _ = self._approved_dag(f"{suffix}-target")
+        target_lease = self._acquire(f"{suffix}-target")
+        return source_task, target_task, target_lease
+
+    def _assert_target_has_no_worker_or_cache_facts(self, task_id: str) -> None:
+        connection = sqlite3.connect(self.database_path)
+        try:
+            for table in (
+                "dag_node_cache_hit_facts",
+                "dispatch_intents",
+                "dag_node_execution_admissions",
+            ):
+                task_column = (
+                    "target_task_id"
+                    if table == "dag_node_cache_hit_facts"
+                    else "task_id"
+                )
+                self.assertEqual(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table} "
+                        f"WHERE {task_column} = ?",
+                        (task_id,),
+                    ).fetchone()[0],
+                    0,
+                    table,
+                )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_launch_attempts AS attempt "
+                    "JOIN dispatch_intents AS intent "
+                    "ON intent.intent_id = attempt.intent_id "
+                    "WHERE intent.task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
     def _table_count(self, table: str, task_id: str) -> int:
         self.assertIn(
             table,
@@ -386,6 +522,253 @@ class ScientificRuntimeDagRuntimeSchedulerTest(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_reproducible_scope_local_cache_hit_starts_no_worker(self) -> None:
+        self.dispatcher = ReproducibleMultiNodeDagDispatcher(self.store)
+        self.service = self._new_service(self.store)
+        source_task, _ = self._approved_dag("cache-source")
+        source_lease = self._acquire("cache-source")
+        self.assertEqual(
+            self._advance(source_task, source_lease).admitted_node_id, "a"
+        )
+        self._run_success(source_task, source_lease, "a")
+        self.service.release_runtime_supervisor_lease(source_lease)
+
+        target_task, _ = self._approved_dag("cache-target")
+        target_lease = self._acquire("cache-target")
+        dispatches_before = self.dispatcher.dispatch_calls
+        hit = self._advance(target_task, target_lease)
+
+        self.assertEqual(hit.cache_hit_node_id, "a")
+        self.assertRegex(hit.cache_key_hash, r"^sha256:[0-9a-f]{64}$")
+        self.assertIsNone(hit.active_intent)
+        self.assertIsNone(hit.admitted_node_id)
+        self.assertEqual(hit.snapshot.status, "Running")
+        self.assertEqual(self._node_states(target_task)["a"], (2, "Succeeded"))
+        self.assertEqual(self._dispatch_count(target_task, "a"), 0)
+        self.assertEqual(self.dispatcher.dispatch_calls, dispatches_before)
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dag_node_cache_entries "
+                    "WHERE source_task_id = ? AND source_node_id = 'a'",
+                    (source_task,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dag_node_cache_hit_facts "
+                    "WHERE target_task_id = ? AND target_node_id = 'a'",
+                    (target_task,),
+                ).fetchone()[0],
+                1,
+            )
+            cache_event = json.loads(
+                connection.execute(
+                    "SELECT document_json FROM run_events "
+                    "WHERE task_id = ? AND event_type = 'node_succeeded'",
+                    (target_task,),
+                ).fetchone()[0]
+            )
+            cache_extension = cache_event["extensions"][
+                "org.agent_rpc.node_cache"
+            ]
+            self.assertEqual(cache_extension["state"], "hit")
+            self.assertFalse(cache_extension["worker_runtime_started"])
+            for table in (
+                "dispatch_intents",
+                "dag_node_execution_admissions",
+                "worker_launch_attempts",
+                "worker_retry_reservations",
+                "worker_exit_retry_reservations",
+            ):
+                task_column = (
+                    "task_id"
+                    if table in {"dispatch_intents", "dag_node_execution_admissions"}
+                    else None
+                )
+                if task_column is not None:
+                    count = connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE task_id = ?",
+                        (target_task,),
+                    ).fetchone()[0]
+                else:
+                    count = connection.execute(
+                        f"SELECT COUNT(*) FROM {table} AS fact "
+                        "JOIN dispatch_intents AS intent "
+                        "ON intent.intent_id = fact.intent_id "
+                        "WHERE intent.task_id = ?",
+                        (target_task,),
+                    ).fetchone()[0]
+                self.assertEqual(count, 0, table)
+            for table in (
+                "dag_node_cache_entries",
+                "dag_node_cache_hit_facts",
+            ):
+                for operation in ("UPDATE", "DELETE"):
+                    statement = (
+                        f"UPDATE {table} SET recorded_at = recorded_at"
+                        if operation == "UPDATE"
+                        else f"DELETE FROM {table}"
+                    )
+                    with self.assertRaisesRegex(
+                        sqlite3.IntegrityError, "append-only"
+                    ):
+                        connection.execute(statement)
+                    connection.rollback()
+        finally:
+            connection.close()
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            receipt_before = connection.execute(
+                "SELECT cache_key_hash, output_receipt_document_hash "
+                "FROM dag_node_cache_hit_facts WHERE target_task_id = ?",
+                (target_task,),
+            ).fetchone()
+        finally:
+            connection.close()
+        target_lease = self._crash_restart("cache-target-restart")
+        restarted = self._advance(target_task, target_lease)
+        self.assertEqual(restarted.admitted_node_id, "b")
+        self.assertEqual(self._node_states(target_task)["a"], (2, "Succeeded"))
+        self.assertEqual(self._dispatch_count(target_task, "a"), 0)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            receipt_after = connection.execute(
+                "SELECT cache_key_hash, output_receipt_document_hash "
+                "FROM dag_node_cache_hit_facts WHERE target_task_id = ?",
+                (target_task,),
+            ).fetchone()
+            self.assertEqual(receipt_after, receipt_before)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_launch_attempts AS attempt "
+                    "JOIN dispatch_intents AS intent "
+                    "ON intent.intent_id = attempt.intent_id "
+                    "WHERE intent.task_id = ?",
+                    (target_task,),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_cache_reverification_tampering_fails_closed_without_worker(self) -> None:
+        _, target_task, target_lease = self._cacheable_source_and_target(
+            "cache-reverify-tamper", tampering=True
+        )
+        dispatcher = self.dispatcher
+        self.assertIsInstance(dispatcher, CacheVerificationTamperingDispatcher)
+        dispatches_before = dispatcher.dispatch_calls
+
+        for mode in (
+            "missing",
+            "bytes",
+            "manifest",
+            "lineage",
+            "content_hash",
+            "size",
+            "media_type",
+            "schema_version",
+            "symlink",
+        ):
+            with self.subTest(mode=mode):
+                dispatcher.cache_verification_tamper = mode
+                with self.assertRaises(TaskDispatchError):
+                    self._advance(target_task, target_lease)
+                self.assertEqual(dispatcher.dispatch_calls, dispatches_before)
+                self.assertEqual(self._dispatch_count(target_task, "a"), 0)
+                self._assert_target_has_no_worker_or_cache_facts(target_task)
+
+        dispatcher.cache_verification_tamper = None
+        hit = self._advance(target_task, target_lease)
+        self.assertEqual(hit.cache_hit_node_id, "a")
+        self.assertEqual(dispatcher.dispatch_calls, dispatches_before)
+        self.assertEqual(self._dispatch_count(target_task, "a"), 0)
+
+    def test_cache_permission_document_tampering_fails_closed(self) -> None:
+        source_task, target_task, target_lease = (
+            self._cacheable_source_and_target("cache-permission-tamper")
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "DROP TRIGGER dag_node_cache_entries_are_append_only"
+            )
+            connection.execute(
+                "UPDATE dag_node_cache_entries "
+                "SET cache_key_document_json = json_set("
+                "cache_key_document_json, "
+                "'$.permission_scope.principal_id', 'attacker') "
+                "WHERE source_task_id = ? AND source_node_id = 'a'",
+                (source_task,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        dispatches_before = self.dispatcher.dispatch_calls
+        with self.assertRaises(TaskStoreCorruption):
+            self._advance(target_task, target_lease)
+        self.assertEqual(self.dispatcher.dispatch_calls, dispatches_before)
+        self._assert_target_has_no_worker_or_cache_facts(target_task)
+
+    def test_cache_lineage_document_tampering_fails_closed(self) -> None:
+        source_task, target_task, target_lease = (
+            self._cacheable_source_and_target("cache-lineage-tamper")
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "DROP TRIGGER dag_node_cache_entries_are_append_only"
+            )
+            connection.execute(
+                "UPDATE dag_node_cache_entries "
+                "SET trusted_lineage_document_json = json_set("
+                "trusted_lineage_document_json, "
+                "'$.dataset_roots[0].content_hash', "
+                "'sha256:3333333333333333333333333333333333333333333333333333333333333333') "
+                "WHERE source_task_id = ? AND source_node_id = 'a'",
+                (source_task,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        dispatches_before = self.dispatcher.dispatch_calls
+        with self.assertRaises(TaskStoreCorruption):
+            self._advance(target_task, target_lease)
+        self.assertEqual(self.dispatcher.dispatch_calls, dispatches_before)
+        self._assert_target_has_no_worker_or_cache_facts(target_task)
+
+    def test_missing_cache_entry_is_a_no_reuse_miss(self) -> None:
+        source_task, target_task, target_lease = (
+            self._cacheable_source_and_target("cache-entry-missing")
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "DROP TRIGGER dag_node_cache_entries_cannot_be_deleted"
+            )
+            connection.execute(
+                "DELETE FROM dag_node_cache_entries "
+                "WHERE source_task_id = ? AND source_node_id = 'a'",
+                (source_task,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        dispatches_before = self.dispatcher.dispatch_calls
+        miss = self._advance(target_task, target_lease)
+        self.assertIsNone(miss.cache_hit_node_id)
+        self.assertEqual(miss.admitted_node_id, "a")
+        self.assertEqual(self.dispatcher.dispatch_calls, dispatches_before)
+        self.assertEqual(self._dispatch_count(target_task, "a"), 0)
 
     def test_chain_fan_out_and_fan_in_execute_in_deterministic_order(self) -> None:
         task_id, _ = self._approved_dag("fan-in-success")

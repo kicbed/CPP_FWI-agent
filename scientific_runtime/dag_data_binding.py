@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from scientific_runtime_contracts import (
     PlanDataEdgeError,
@@ -18,6 +19,7 @@ from .dag_scheduler import DagScheduleError, PENDING, evaluate_dag_readiness
 
 
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class DagDataBindingError(ValueError):
@@ -101,6 +103,8 @@ def bind_dag_artifact_input(
     target_input_port: str,
     artifact_manifest: Mapping[str, Any],
     artifact_data: bytes,
+    expected_lineage_inputs: Sequence[Mapping[str, Any]] | None = None,
+    expected_fingerprint_input_hashes: Sequence[str] | None = None,
 ) -> DagArtifactInputBinding:
     """Validate bytes and bind one exact upstream artifact to a typed input.
 
@@ -169,26 +173,61 @@ def bind_dag_artifact_input(
     nodes_by_id = {node["node_id"]: node for node in plan["nodes"]}
     source_node = nodes_by_id[edge.source_node_id]
     source_inputs = source_node.get("inputs")
-    if not isinstance(source_inputs, list) or any(
-        not isinstance(binding, Mapping)
-        or not isinstance(binding.get("dataset"), Mapping)
-        for binding in source_inputs
+    if not isinstance(source_inputs, list):
+        raise DagDataBindingError(
+            "DAG_ARTIFACT_LINEAGE_UNSUPPORTED",
+            ["producing node inputs are not a valid Plan contract"],
+        )
+    if expected_lineage_inputs is None:
+        if any(
+            not isinstance(binding, Mapping)
+            or not isinstance(binding.get("dataset"), Mapping)
+            for binding in source_inputs
+        ):
+            raise DagDataBindingError(
+                "DAG_ARTIFACT_LINEAGE_UNSUPPORTED",
+                [
+                    "multi-level lineage requires a durable producer "
+                    "receipt resolved to Dataset roots"
+                ],
+            )
+        lineage_inputs = [
+            copy.deepcopy(dict(binding["dataset"]))
+            for binding in source_inputs
+        ]
+    else:
+        if (
+            not isinstance(expected_lineage_inputs, Sequence)
+            or isinstance(expected_lineage_inputs, (str, bytes, bytearray))
+            or not expected_lineage_inputs
+            or any(not isinstance(value, Mapping) for value in expected_lineage_inputs)
+        ):
+            raise DagDataBindingError(
+                "DAG_ARTIFACT_LINEAGE_UNSUPPORTED",
+                ["durable Dataset-root lineage is invalid"],
+            )
+        lineage_inputs = [
+            copy.deepcopy(dict(value)) for value in expected_lineage_inputs
+        ]
+    if expected_fingerprint_input_hashes is None:
+        expected_input_hashes = [
+            value.get("content_hash") for value in lineage_inputs
+        ]
+    elif (
+        not isinstance(expected_fingerprint_input_hashes, Sequence)
+        or isinstance(expected_fingerprint_input_hashes, (str, bytes, bytearray))
+        or not expected_fingerprint_input_hashes
+        or any(
+            not isinstance(value, str) or _SHA256.fullmatch(value) is None
+            for value in expected_fingerprint_input_hashes
+        )
     ):
         raise DagDataBindingError(
             "DAG_ARTIFACT_LINEAGE_UNSUPPORTED",
-            [
-                "ArtifactManifest 1.0 cannot prove lineage for an artifact "
-                "whose producing node consumes another node output"
-            ],
+            ["durable producer input hashes are invalid"],
         )
-    expected_lineage_inputs = [
-        dict(binding["dataset"])
-        for binding in source_inputs
-    ]
-    expected_input_hashes = [
-        binding["dataset"]["content_hash"]
-        for binding in source_inputs
-    ]
+    else:
+        expected_input_hashes = list(expected_fingerprint_input_hashes)
     lineage = artifact_manifest.get("lineage")
     fingerprint = artifact_manifest.get("fingerprint")
     extensions = artifact_manifest.get("extensions")
@@ -223,7 +262,7 @@ def bind_dag_artifact_input(
         ),
         (
             lineage.get("inputs") if isinstance(lineage, Mapping) else None,
-            expected_lineage_inputs,
+            lineage_inputs,
             "lineage inputs",
         ),
         (

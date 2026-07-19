@@ -14,14 +14,13 @@
 - Verified：P0、P1、P2。P2-001～P2-009B2、reconciliation 矩阵、checkpoint / Waiting /
   same-live-attempt resume 及只读 SSE 均已实现；完整故障回归和代表性 CPU/CUDA HTTP/SSE E2E
   阶段出口通过，P2 已结束。
-- In progress：P3 readiness、v18/v19 substrate、v20 单节点内核及 SQLite v21 deterministic
-  multi-node runtime 均已验证；v21 已接通 readiness→admission、fan-out/fan-in、分支局部
-  Failed/Cancelled 后代阻断、Task 聚合、active-term 重启恢复/取消裁决及 inherited CPU/GPU
-  `flock` 容量围栏。node cache/checkpoint 与 Recipe 未实现；`dag` 仍关闭，P4–P6 Pending。
+- In progress：P3 readiness、v18–v21 DAG runtime 及 SQLite v22 scope-local node cache / trusted lineage 均已验证；严格 cache hit 是无 Worker 的 append-only durable fact，控制面重启不
+  重跑已完成节点，DAG checkpoint 只复用 P2 same-live Worker/process/attempt。Recipe 未实现；
+  `dag` 仍关闭，P4–P6 Pending。
 - 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 8 个，当前约 4 个，P2 为 0、
   P3–P6 暂估约 4；这是弹性估算，不是配额。
-- 当前阻塞：无；下一安全动作是单独推进 P3 node cache/checkpoint 工作包，不混入 Recipe/API/UI
-  或 P3 阶段出口。
+- 当前阻塞：无；下一安全动作是单独推进 P3 固定 Recipe/Guided 工作包，不混入公开 DAG API/UI
+  扩张或 P3 阶段出口。
 - D-005 仍为 Proposed，不迁移或删除现有 runtime prompt-like 文件。
 - **最高优先级 D 锁**：D-001～D-012 及 D-LOCK 只可按单目标精确 diff/hash 和用户随后单独
   原样复制的一次性 `D-AUTH` 句修改；普通“继续/同意/固定/记录”无效。
@@ -59,9 +58,10 @@
   scope-bound RunEvent，并以有限重连后 GET polling 回退，不成为新的事实源或 mutation 入口。
 - reconciliation 的精确负向证明只终结为 Failed，不退款、不重试；transient/uncertain 保持
   action_required。该负向证明可进入 Trash，但无授权清理协议时 purge 必须 fail closed。
-- P3 内部 SQLite v21 exact admission 允许 deterministic per-Task 串行多节点调度、历史 exact
-  intent 与 inherited CPU/GPU `flock` slot；公开 `dag=false`。DAG 只在用户明确选择工作流或任务
-  确需拆解时运行；多算法默认独立可选。P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
+- P3 内部 SQLite v22 在 v21 exact admission/资源锁上增加 scope-bound canonical cache key、
+  Succeeded receipt/artifact 重验、path-free hit fact 与递归 Dataset lineage；公开 `dag=false`。
+  DAG 恢复、node cache、Worker checkpoint 相互独立；多算法默认独立可选。
+  P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
 - 不读取、打印或提交 `.env`、密钥、凭证、私有 prompt、模型、运行 artifact、数据库、日志、
   构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开；科学结论只限实际实验边界。

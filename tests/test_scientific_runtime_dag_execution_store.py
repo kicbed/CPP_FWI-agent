@@ -695,7 +695,7 @@ DROP TABLE scientific_runtime_v21_forced_failure;
             connection.close()
 
         upgraded = SQLiteTaskStore(self.database_path)
-        self.assertEqual(upgraded.migration_version(), 21)
+        self.assertEqual(upgraded.migration_version(), 22)
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
         try:
@@ -783,10 +783,10 @@ DROP TABLE scientific_runtime_v21_forced_failure;
             2,
         )
 
-    def test_dag_timeout_checkpoint_and_private_receipt_controls_fail_closed(
+    def test_dag_checkpoint_wait_resume_keeps_live_attempt_and_scheduler_fenced(
         self,
     ) -> None:
-        task_id, plan, _, lease, binding = self._bound_root("controls")
+        task_id, plan, approval, lease, binding = self._bound_root("controls")
         admission = self._admit(task_id, plan, binding, lease)
         with self.assertRaisesRegex(
             TaskStoreConflict, "requires a managed Worker receipt"
@@ -833,6 +833,12 @@ DROP TABLE scientific_runtime_v21_forced_failure;
 
         intent = self.store.get_dispatch_intent(task_id)
         current = self.dispatcher.worker_observation["evidence"]
+        live_identity = (
+            current["attempt_id"],
+            current["attempt_number"],
+            current["ticket"]["worker_pid"],
+            current["ready"]["worker_pid"],
+        )
         self.dispatcher.worker_observation = {
             "evidence": managed_worker_evidence(
                 attempt_id=current["attempt_id"],
@@ -843,19 +849,20 @@ DROP TABLE scientific_runtime_v21_forced_failure;
             ),
             "handle": copy.deepcopy(intent.handle),
         }
-        with self.assertRaisesRegex(
-            TaskDispatchError, "DAG_CHECKPOINT_UNSUPPORTED"
-        ):
-            self.service.project_worker_attempt(
-                task_id, supervisor_lease=lease, **self.scope
-            )
+        projected = self.service.project_worker_attempt(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertTrue(projected.projected)
+        self.assertEqual(projected.attempt_id, live_identity[0])
         self.assertEqual(
             self.service.get_task(task_id, **self.scope).status, "Running"
         )
         self.assertEqual(self._node_states(task_id)["root"], (3, "Running"))
 
         checkpoint_proof = checkpoint_wait_proof(
-            task_id, self.dispatcher.worker_observation
+            task_id,
+            self.dispatcher.worker_observation,
+            checkpoint_created_at="2026-07-15T03:00:10.000000Z",
         )
         checkpoint_proof["node_id"] = "root"
         checkpoint_proof["proof_hash"] = encode_document(
@@ -865,24 +872,75 @@ DROP TABLE scientific_runtime_v21_forced_failure;
                 if key != "proof_hash"
             }
         )[1]
-        first_sequence = self.store.latest_run_event_sequence(task_id) + 1
-        checkpoint_event, waiting_event = self.service._checkpoint_events(
-            snapshot=running.snapshot,
-            intent=intent,
-            proof=checkpoint_proof,
-            first_sequence=first_sequence,
+        self.dispatcher.checkpoint_probe_result = copy.deepcopy(
+            checkpoint_proof
         )
-        with self.assertRaisesRegex(
-            TaskStoreConflict, "checkpoint wait conflicts with durable state"
-        ):
-            self.store.record_supervised_checkpoint_wait(
-                intent_id=intent.intent_id,
-                checkpoint_proof=checkpoint_proof,
-                checkpoint_event=checkpoint_event,
-                waiting_event=waiting_event,
-                supervisor_lease=lease,
-                supervisor_clock=lambda: RUNTIME_NOW,
-            )
+
+        waiting = self.service.process_runtime_checkpoint(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(
+            (waiting.state, waiting.snapshot.status),
+            ("waiting", "Waiting"),
+        )
+        self.assertEqual(waiting.deferred_code, "CHECKPOINT_WAITING")
+        self.assertEqual(
+            (
+                waiting.snapshot.checkpoint.attempt_id,
+                waiting.snapshot.checkpoint.attempt_number,
+            ),
+            live_identity[:2],
+        )
+        waiting_schedule = self.service.advance_runtime_dag(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(waiting_schedule.aggregate_status, "Waiting")
+        self.assertEqual(waiting_schedule.deferred_code, "CHECKPOINT_WAITING")
+        self.assertEqual(
+            waiting_schedule.active_intent.intent_id,
+            intent.intent_id,
+        )
+        self.assertIsNone(waiting_schedule.admitted_node_id)
+        self.assertEqual(
+            self._node_states(task_id),
+            {"root": (3, "Running"), "spare": (1, "Pending")},
+        )
+
+        resumed = self.service.process_runtime_checkpoint(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(
+            (resumed.state, resumed.snapshot.status),
+            ("resumed", "Running"),
+        )
+        self.assertEqual(resumed.snapshot.checkpoint.state, "resumed")
+        self.assertEqual(
+            (
+                resumed.snapshot.checkpoint.attempt_id,
+                resumed.snapshot.checkpoint.attempt_number,
+            ),
+            live_identity[:2],
+        )
+        running_schedule = self.service.advance_runtime_dag(
+            task_id, supervisor_lease=lease, **self.scope
+        )
+        self.assertEqual(running_schedule.aggregate_status, "Running")
+        self.assertEqual(
+            running_schedule.active_intent.intent_id,
+            intent.intent_id,
+        )
+        self.assertIsNone(running_schedule.admitted_node_id)
+        self.assertIsNone(running_schedule.deferred_code)
+        self.assertEqual(self.dispatcher.dispatch_calls, 1)
+        self.assertEqual(self.dispatcher.checkpoint_resume_calls, 1)
+        self.assertEqual(
+            (
+                self.dispatcher.checkpoint_authorizations[0]["attempt_id"],
+                self.dispatcher.checkpoint_authorizations[0]["attempt_number"],
+            ),
+            live_identity[:2],
+        )
+
         connection = sqlite3.connect(self.database_path)
         try:
             self.assertEqual(
@@ -890,14 +948,79 @@ DROP TABLE scientific_runtime_v21_forced_failure;
                     "SELECT COUNT(*) FROM worker_checkpoint_waits WHERE task_id = ?",
                     (task_id,),
                 ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT attempt.attempt_id, attempt.attempt_number, "
+                    "observation.ticket_worker_pid, observation.ready_worker_pid "
+                    "FROM worker_launch_attempts AS attempt "
+                    "JOIN worker_attempt_observations AS observation "
+                    "ON observation.attempt_id = attempt.attempt_id "
+                    "WHERE attempt.task_id = ? "
+                    "ORDER BY observation.observation_sequence DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone(),
+                live_identity,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_launch_attempts "
+                    "WHERE task_id = ? AND attempt_number = 1",
+                    (task_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_launch_attempts "
+                    "WHERE task_id = ? AND attempt_number > 1",
+                    (task_id,),
+                ).fetchone()[0],
                 0,
+            )
+            for table in (
+                "worker_retry_reservations",
+                "worker_exit_retry_reservations",
+            ):
+                self.assertEqual(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()[0],
+                    0,
+                    table,
+                )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dispatch_intents WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dag_node_execution_admissions "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                1,
             )
         finally:
             connection.close()
         self.assertEqual(
             self.service.get_task(task_id, **self.scope).status, "Running"
         )
-        self.assertEqual(self._node_states(task_id)["root"], (3, "Running"))
+        self.assertEqual(
+            self.store.get_approval_budget(
+                task_id=task_id, approval_id=approval["approval_id"]
+            ).tasks_used,
+            1,
+        )
+        self.assertEqual(
+            self._node_states(task_id),
+            {"root": (3, "Running"), "spare": (1, "Pending")},
+        )
 
     def test_stale_term_reapproval_and_binding_tamper_fail_closed(self) -> None:
         stale_id, stale_plan, stale_approval, stale_lease, stale_binding = (

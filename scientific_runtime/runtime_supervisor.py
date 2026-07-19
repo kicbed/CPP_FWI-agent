@@ -23,6 +23,7 @@ _DAG_AGGREGATE_STATUSES = frozenset(
         "AwaitingApproval",
         "Queued",
         "Running",
+        "Waiting",
         "Succeeded",
         "Failed",
         "Cancelled",
@@ -199,6 +200,7 @@ class RuntimeSupervisorCycleResult:
     retry_exhausted_task_ids: tuple[str, ...] = ()
     dag_advanced_task_ids: tuple[str, ...] = ()
     dag_admitted_nodes: tuple[tuple[str, str], ...] = ()
+    dag_cache_hit_nodes: tuple[tuple[str, str], ...] = ()
     dag_blocked_nodes: tuple[tuple[str, str], ...] = ()
 
 
@@ -640,11 +642,21 @@ class RuntimeSupervisor:
         aggregate_status = getattr(result, "aggregate_status", None)
         active_intent = getattr(result, "active_intent", None)
         admitted_node_id = getattr(result, "admitted_node_id", None)
+        cache_hit_node_id = getattr(result, "cache_hit_node_id", None)
+        cache_key_hash = getattr(result, "cache_key_hash", None)
         blocked_node_ids = getattr(result, "blocked_node_ids", None)
         deferred_code = getattr(result, "deferred_code", None)
         valid_admitted_node = admitted_node_id is None or (
             isinstance(admitted_node_id, str)
             and _OPAQUE_ID.fullmatch(admitted_node_id) is not None
+        )
+        valid_cache_hit_node = (
+            cache_hit_node_id is None and cache_key_hash is None
+        ) or (
+            isinstance(cache_hit_node_id, str)
+            and _OPAQUE_ID.fullmatch(cache_hit_node_id) is not None
+            and isinstance(cache_key_hash, str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", cache_key_hash) is not None
         )
         valid_blocked_nodes = (
             isinstance(blocked_node_ids, tuple)
@@ -668,7 +680,15 @@ class RuntimeSupervisor:
                 and getattr(active_intent, "task_id", None) != task_id
             )
             or not valid_admitted_node
+            or not valid_cache_hit_node
             or not valid_blocked_nodes
+            or (
+                admitted_node_id is not None and cache_hit_node_id is not None
+            )
+            or (
+                cache_hit_node_id is not None
+                and (active_intent is not None or cache_hit_node_id in blocked_node_ids)
+            )
             or (
                 admitted_node_id is not None
                 and admitted_node_id in blocked_node_ids
@@ -843,6 +863,7 @@ class RuntimeSupervisor:
         retry_exhausted: list[str] = []
         dag_advanced: list[str] = []
         dag_admitted: list[tuple[str, str]] = []
+        dag_cache_hits: list[tuple[str, str]] = []
         dag_blocked: list[tuple[str, str]] = []
         deferred: list[tuple[str, str]] = []
         failures: list[tuple[str, str]] = []
@@ -889,6 +910,11 @@ class RuntimeSupervisor:
                     )
                     if admitted_node_id is not None:
                         dag_admitted.append((task_id, admitted_node_id))
+                    cache_hit_node_id = getattr(
+                        dag_result, "cache_hit_node_id", None
+                    )
+                    if cache_hit_node_id is not None:
+                        dag_cache_hits.append((task_id, cache_hit_node_id))
                     dag_blocked.extend(
                         (task_id, node_id)
                         for node_id in dag_result.blocked_node_ids
@@ -898,6 +924,11 @@ class RuntimeSupervisor:
                     )
                     if dag_deferred_code is not None:
                         deferred.append((task_id, dag_deferred_code))
+                    if cache_hit_node_id is not None:
+                        # A hit intentionally has no current dispatch intent.
+                        # Let the next cycle claim the next deterministic node
+                        # instead of falling through to historical P2 controls.
+                        continue
             status = getattr(snapshot, "status", None)
             cancellation = getattr(snapshot, "cancellation", None)
             terminal_cancel_pending = (
@@ -1607,6 +1638,7 @@ class RuntimeSupervisor:
                 retry_exhausted_task_ids=tuple(retry_exhausted),
                 dag_advanced_task_ids=tuple(dag_advanced),
                 dag_admitted_nodes=tuple(dag_admitted),
+                dag_cache_hit_nodes=tuple(dag_cache_hits),
                 dag_blocked_nodes=tuple(dag_blocked),
             ),
             lease,
