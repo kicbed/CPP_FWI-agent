@@ -9,6 +9,9 @@
     "schema_version_1_1": {
       "const": "1.1.0"
     },
+    "schema_version_1_2": {
+      "const": "1.2.0"
+    },
     "identifier": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
@@ -198,6 +201,25 @@
       "properties": {
         "port": {"$ref": "#/definitions/identifier"},
         "dataset": {"$ref": "#/definitions/dataset_identity"}
+      }
+    },
+    "node_output_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id", "port", "data_type"],
+      "properties": {
+        "node_id": {"$ref": "#/definitions/identifier"},
+        "port": {"$ref": "#/definitions/identifier"},
+        "data_type": {"$ref": "#/definitions/data_type"}
+      }
+    },
+    "node_output_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port", "source"],
+      "properties": {
+        "port": {"$ref": "#/definitions/identifier"},
+        "source": {"$ref": "#/definitions/node_output_identity"}
       }
     },
     "reproducibility_fingerprint": {

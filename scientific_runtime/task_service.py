@@ -14,8 +14,10 @@ from jsonschema import Draft7Validator
 from jsonschema.exceptions import SchemaError
 
 from scientific_runtime_contracts import (
+    PlanDataEdgeError,
     compute_plan_hash,
     evaluate_execution_gate,
+    extract_plan_data_edges,
     schema_errors,
 )
 
@@ -474,6 +476,17 @@ def _validate_run_event_binding(
             "RUN_EVENT_NODE_UNKNOWN",
             ["event node_id is not present in the current plan"],
         )
+    if any(
+        not isinstance(binding.get("dataset"), Mapping)
+        for binding in node["inputs"]
+    ):
+        raise TaskValidationError(
+            "RUN_EVENT_INPUT_BINDING_REQUIRED",
+            [
+                "node-output inputs require a verified concrete artifact hash "
+                "before runtime events are accepted"
+            ],
+        )
     fingerprint = event["fingerprint"]
     expected_input_hashes = [
         binding["dataset"]["content_hash"] for binding in node["inputs"]
@@ -514,6 +527,10 @@ def _validate_plan_draft_consistency(
 
     known_nodes = set(node_ids)
     dependencies: dict[str, list[str]] = {}
+    try:
+        extract_plan_data_edges(plan)
+    except PlanDataEdgeError as error:
+        errors.extend(error.errors)
     for node in plan["nodes"]:
         node_id = node["node_id"]
         dependencies[node_id] = list(node["dependencies"])
@@ -524,7 +541,11 @@ def _validate_plan_draft_consistency(
         if node["resources"] != draft["resources"]:
             errors.append(f"node {node_id} resources differ from the current draft")
         for binding in node["inputs"]:
-            dataset = binding["dataset"]
+            dataset = binding.get("dataset")
+            if not isinstance(dataset, Mapping):
+                # A node-output source is bound by the exact PlanGraph/hash;
+                # its concrete artifact identity does not exist in the draft.
+                continue
             identity = (
                 dataset["id"],
                 dataset["version"],
@@ -784,7 +805,16 @@ class TaskService:
                 )
             for binding in node["inputs"]:
                 expected_type = input_ports.get(binding["port"])
-                if expected_type != binding["dataset"]["data_type"]:
+                dataset = binding.get("dataset")
+                source = binding.get("source")
+                binding_type = (
+                    dataset.get("data_type")
+                    if isinstance(dataset, Mapping)
+                    else source.get("data_type")
+                    if isinstance(source, Mapping)
+                    else None
+                )
+                if expected_type != binding_type:
                     errors.append(
                         f"node {node_id} input does not match AlgorithmManifest"
                     )
@@ -1917,7 +1947,12 @@ class TaskService:
             raise TaskValidationError(
                 "PLAN_CAPABILITY_UNSUPPORTED_IN_P1", ["single_input_required"]
             )
-        identity = node["inputs"][0]["dataset"]
+        identity = node["inputs"][0].get("dataset")
+        if not isinstance(identity, Mapping):
+            raise TaskValidationError(
+                "PLAN_CAPABILITY_UNSUPPORTED_IN_P1",
+                ["node_output_input_requires_p3_admission"],
+            )
         dataset = next(
             (
                 value
@@ -2035,6 +2070,10 @@ class TaskService:
             or fingerprint.get("seed") != node.get("parameters", {}).get("seed")
             or fingerprint.get("hardware", {}).get("device")
             != node.get("resources", {}).get("device")
+            or any(
+                not isinstance(binding.get("dataset"), Mapping)
+                for binding in node.get("inputs", [])
+            )
             or fingerprint.get("input_hashes")
             != [binding["dataset"]["content_hash"] for binding in node.get("inputs", [])]
         ):

@@ -21,6 +21,18 @@ objects remain at `1.0.0`. A `1.0.0` FWI draft/plan has exactly the original
 four parameters; a `1.1.0` FWI draft/plan has exactly the six parameters, so a
 consumer never has to guess which shape was hashed or approved.
 
+P3 adds a dormant `PlanGraph`-only minor, `1.2.0`. It preserves dataset-bound
+inputs and additionally permits a node input to name an exact upstream node,
+output port, and data type. The source must be a direct dependency and must
+match one unambiguous declared output; the whole logical edge remains covered
+by `plan_hash`. A separate pure binding step verifies an `ArtifactManifest`
+against the source plus the actual artifact byte hash and size, then derives a
+canonical binding-document hash. This contract does not change the current
+Guided `1.1.0` plan, coerce artifacts into DatasetRefs, persist node state, or
+authorize node admission/dispatch. Current ArtifactManifest lineage still
+describes DatasetIdentity inputs; downstream artifact-lineage evolution is a
+later P3 boundary.
+
 `learning_rate_milli` is an integer fixed-point value (`learning_rate * 1000`),
 not a JSON float. For example, Adam learning rate `10` is represented as
 `10000`. This preserves the canonical plan-hash rule, whose cross-language

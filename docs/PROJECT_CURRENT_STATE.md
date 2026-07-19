@@ -15,12 +15,13 @@
   same-live-attempt resume 及只读 SSE 均已实现；完整故障回归和代表性 CPU/CUDA HTTP/SSE E2E
   阶段出口通过，P2 已结束。
 - In progress：历史入口“P3–P6 仍按固定顺序 Pending”已推进至 P3；纯 DAG readiness kernel 与
-  SQLite v18 dormant 初始节点状态/active-term non-executable claim candidate 已验证；typed data edge、
-  可执行节点转换/派发、资源锁、cache/checkpoint 与 Recipe 尚未实现，`dag` 仍关闭。P4–P6 Pending。
+  SQLite v18 dormant 初始节点状态/active-term non-executable claim candidate，以及 PlanGraph 1.2
+  typed node-output edge / 真实 artifact bytes-hash 纯绑定均已验证；durable 全输入绑定、可执行节点
+  转换/派发、资源锁、cache/checkpoint 与 Recipe 尚未实现，`dag` 仍关闭。P4–P6 Pending。
 - 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 8 个，当前约 4 个，P2 为 0、
   P3–P6 暂估约 4；这是弹性估算，不是配额。
-- 当前阻塞：无；下一轮界定 typed upstream artifact→downstream input/hash binding；v18 candidate
-  保持 dormant/non-executable，不做节点 admission、状态转换或真实多节点派发。
+- 当前阻塞：无；下一轮界定 durable all-input binding，精确绑定 producer Succeeded revision/receipt、
+  approval/current term；v18 candidate 与纯 binding 均不授权 admission、状态转换或真实多节点派发。
 - D-005 仍为 Proposed，不迁移或删除现有 runtime prompt-like 文件。
 - **最高优先级 D 锁**：D-001～D-012 及 D-LOCK 只可按单目标精确 diff/hash 和用户随后单独
   原样复制的一次性 `D-AUTH` 句修改；普通“继续/同意/固定/记录”无效。
@@ -58,8 +59,8 @@
   scope-bound RunEvent，并以有限重连后 GET polling 回退，不成为新的事实源或 mutation 入口。
 - reconciliation 的精确负向证明只终结为 Failed，不退款、不重试；transient/uncertain 保持
   action_required。该负向证明可进入 Trash，但无授权清理协议时 purge 必须 fail closed。
-- P3 v18 candidate 仅是 AwaitingApproval 审计事实，不授权执行；DAG 只在用户明确选择工作流或任务
-  确需拆解时运行；多算法默认独立可选，不自动串成流水线。P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
+- P3 v18 candidate 与 PlanGraph 1.2 artifact binding 均仅是审计/纯验证事实，不授权执行；DAG 只在
+  用户明确选择工作流或任务确需拆解时运行；多算法默认独立可选，不自动串成流水线。P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
 - 不读取、打印或提交 `.env`、密钥、凭证、私有 prompt、模型、运行 artifact、数据库、日志、
   构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开；科学结论只限实际实验边界。

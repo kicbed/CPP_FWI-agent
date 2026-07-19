@@ -7646,10 +7646,13 @@ class SQLiteTaskStore:
                     algorithm_keys.append(
                         (node["algorithm"]["id"], node["algorithm"]["version"])
                     )
-                    dataset_keys.extend(
-                        (binding["dataset"]["id"], binding["dataset"]["version"])
-                        for binding in node["inputs"]
-                    )
+                    for binding in node["inputs"]:
+                        dataset = binding.get("dataset")
+                        if not isinstance(dataset, Mapping):
+                            raise TaskStoreConflict(
+                                "P1 submission does not accept node-output inputs"
+                            )
+                        dataset_keys.append((dataset["id"], dataset["version"]))
             except (KeyError, TypeError) as error:
                 raise TaskStoreCorruption(
                     "current submit documents cannot identify registry records"

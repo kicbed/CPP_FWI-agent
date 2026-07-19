@@ -1,5 +1,11 @@
 """Durable scientific task runtime components introduced by D-003."""
 
+from .dag_data_binding import (
+    DagArtifactInputBinding,
+    DagDataBindingError,
+    bind_dag_artifact_input,
+)
+
 from .fwi_adapter import (
     AdapterArtifactError,
     AdapterCancelResult,
@@ -122,6 +128,8 @@ __all__ = [
     "AbandonTaskResult",
     "ApprovalBudget",
     "CreateTaskResult",
+    "DagArtifactInputBinding",
+    "DagDataBindingError",
     "DagNodeClaimCandidate",
     "DagNodeStateMapSnapshot",
     "DagNodeStateSnapshot",
@@ -184,6 +192,7 @@ __all__ = [
     "WorkbenchNotFound",
     "WorkbenchRuntimeError",
     "WorkbenchValidationError",
+    "bind_dag_artifact_input",
     "load_deepwave_manifest",
     "register_verified_fwi_baseline",
     "verified_marmousi_dataset_ref",

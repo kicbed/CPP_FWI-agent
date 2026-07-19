@@ -32,6 +32,25 @@ class GateViolation:
     message: str
 
 
+class PlanDataEdgeError(ValueError):
+    """A PlanGraph node-output binding is ambiguous or inconsistent."""
+
+    def __init__(self, errors: Sequence[str]):
+        self.errors = tuple(sorted(set(errors)))
+        super().__init__("; ".join(self.errors))
+
+
+@dataclass(frozen=True, order=True)
+class PlanDataEdge:
+    """One typed, plan-hash-bound upstream output to downstream input edge."""
+
+    target_node_id: str
+    target_input_port: str
+    source_node_id: str
+    source_output_port: str
+    data_type: str
+
+
 def _schema_documents() -> dict[str, dict[str, Any]]:
     documents: dict[str, dict[str, Any]] = {}
     for path in sorted(CONTRACT_DIR.glob("*.schema.json")):
@@ -190,6 +209,128 @@ def _dag_errors(nodes: Sequence[Mapping[str, Any]]) -> list[GateViolation]:
             GateViolation("CYCLIC_DAG", "/nodes", "plan dependencies must be acyclic")
         )
     return violations
+
+
+def extract_plan_data_edges(plan: Mapping[str, Any]) -> tuple[PlanDataEdge, ...]:
+    """Return canonical typed data edges declared by a PlanGraph.
+
+    JSON Schema validates each binding's local shape.  This cross-document
+    check proves that every node-output source is a direct dependency, names
+    exactly one declared upstream output port, and preserves its data type.
+    Dataset-bound inputs are intentionally omitted from the returned edges.
+    """
+
+    if not isinstance(plan, Mapping):
+        raise PlanDataEdgeError(["plan must be an object"])
+    nodes = plan.get("nodes")
+    if not isinstance(nodes, list):
+        raise PlanDataEdgeError(["/nodes must be an array"])
+
+    errors: list[str] = []
+    nodes_by_id: dict[str, Mapping[str, Any]] = {}
+    for node_index, node in enumerate(nodes):
+        if not isinstance(node, Mapping):
+            errors.append(f"/nodes/{node_index} must be an object")
+            continue
+        node_id = node.get("node_id")
+        if not isinstance(node_id, str) or not node_id:
+            errors.append(f"/nodes/{node_index}/node_id is invalid")
+            continue
+        if node_id in nodes_by_id:
+            errors.append(f"/nodes/{node_index}/node_id is duplicated")
+            continue
+        nodes_by_id[node_id] = node
+
+    edges: list[PlanDataEdge] = []
+    for node_index, node in enumerate(nodes):
+        if not isinstance(node, Mapping):
+            continue
+        target_node_id = node.get("node_id")
+        if not isinstance(target_node_id, str) or target_node_id not in nodes_by_id:
+            continue
+        dependencies = node.get("dependencies")
+        dependency_ids = (
+            {value for value in dependencies if isinstance(value, str)}
+            if isinstance(dependencies, list)
+            else set()
+        )
+        inputs = node.get("inputs")
+        if not isinstance(inputs, list):
+            errors.append(f"/nodes/{node_index}/inputs must be an array")
+            continue
+        seen_target_ports: set[str] = set()
+        for input_index, binding in enumerate(inputs):
+            if not isinstance(binding, Mapping):
+                errors.append(
+                    f"/nodes/{node_index}/inputs/{input_index} must be an object"
+                )
+                continue
+            path = f"/nodes/{node_index}/inputs/{input_index}"
+            target_port = binding.get("port")
+            if not isinstance(target_port, str) or not target_port:
+                errors.append(f"{path}/port is invalid")
+                continue
+            if target_port in seen_target_ports:
+                errors.append(f"{path}/port is duplicated")
+                continue
+            seen_target_ports.add(target_port)
+            source = binding.get("source")
+            if source is None:
+                continue
+            if not isinstance(source, Mapping):
+                errors.append(f"{path}/source must be an object")
+                continue
+            source_node_id = source.get("node_id")
+            source_port = source.get("port")
+            data_type = source.get("data_type")
+            if not all(
+                isinstance(value, str) and value
+                for value in (source_node_id, source_port, data_type)
+            ):
+                errors.append(f"{path}/source identity is invalid")
+                continue
+            source_node = nodes_by_id.get(source_node_id)
+            if source_node is None:
+                errors.append(f"{path}/source/node_id does not name a plan node")
+                continue
+            if source_node_id not in dependency_ids:
+                errors.append(
+                    f"{path}/source/node_id must be a direct dependency"
+                )
+            outputs = source_node.get("outputs")
+            matches = (
+                [
+                    output
+                    for output in outputs
+                    if isinstance(output, Mapping)
+                    and output.get("port") == source_port
+                ]
+                if isinstance(outputs, list)
+                else []
+            )
+            if len(matches) != 1:
+                errors.append(
+                    f"{path}/source/port must name exactly one upstream output"
+                )
+                continue
+            if matches[0].get("data_type") != data_type:
+                errors.append(
+                    f"{path}/source/data_type differs from the upstream output"
+                )
+                continue
+            edges.append(
+                PlanDataEdge(
+                    target_node_id=target_node_id,
+                    target_input_port=target_port,
+                    source_node_id=source_node_id,
+                    source_output_port=source_port,
+                    data_type=data_type,
+                )
+            )
+
+    if errors:
+        raise PlanDataEdgeError(errors)
+    return tuple(sorted(edges))
 
 
 def _resource_errors(
@@ -360,6 +501,13 @@ def evaluate_execution_gate(
         )
 
     violations.extend(_dag_errors(plan["nodes"]))
+    try:
+        extract_plan_data_edges(plan)
+    except PlanDataEdgeError as error:
+        violations.extend(
+            GateViolation("DATA_EDGE_INVALID", "/plan/nodes", detail)
+            for detail in error.errors
+        )
     idempotency_keys = [node["idempotency_key"] for node in plan["nodes"]]
     if len(idempotency_keys) != len(set(idempotency_keys)):
         violations.append(
@@ -462,12 +610,25 @@ def evaluate_execution_gate(
                 )
             )
         for input_index, binding in enumerate(node["inputs"]):
-            dataset = binding["dataset"]
             input_path = f"{node_path}/inputs/{input_index}"
-            if manifest_inputs.get(binding["port"]) != dataset["data_type"]:
+            dataset = binding.get("dataset")
+            source = binding.get("source")
+            binding_type = (
+                dataset.get("data_type")
+                if isinstance(dataset, Mapping)
+                else source.get("data_type")
+                if isinstance(source, Mapping)
+                else None
+            )
+            if manifest_inputs.get(binding["port"]) != binding_type:
                 violations.append(
-                    GateViolation("INPUT_TYPE_MISMATCH", input_path, "dataset type does not match the algorithm input port")
+                    GateViolation("INPUT_TYPE_MISMATCH", input_path, "bound data type does not match the algorithm input port")
                 )
+            if not isinstance(dataset, Mapping):
+                # A node-output binding is already covered by the approved
+                # PlanGraph/hash and the DATA_EDGE checks above.  Its concrete
+                # artifact hash is verified later at P3 node admission.
+                continue
             if (dataset["id"], dataset["version"], dataset["content_hash"], dataset["data_type"]) not in draft_datasets:
                 violations.append(
                     GateViolation("DATASET_OUTSIDE_DRAFT", input_path, "plan input is not present in the approved draft revision")

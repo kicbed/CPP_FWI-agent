@@ -364,7 +364,9 @@ class DeepwaveTaskDispatcher:
         node = snapshot.plan["nodes"][0]
         if len(node.get("inputs", [])) != 1:
             raise DispatchError("PLAN_CAPABILITY_UNSUPPORTED_IN_P1")
-        input_identity = node["inputs"][0]["dataset"]
+        input_identity = node["inputs"][0].get("dataset")
+        if not isinstance(input_identity, Mapping):
+            raise DispatchError("PLAN_CAPABILITY_UNSUPPORTED_IN_P1")
         dataset = next(
             (
                 value

@@ -11,7 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from scientific_runtime_contracts import compute_plan_hash, schema_errors
+from scientific_runtime_contracts import (
+    PlanDataEdgeError,
+    compute_plan_hash,
+    extract_plan_data_edges,
+    schema_errors,
+)
 
 
 PENDING = "Pending"
@@ -134,6 +139,10 @@ def _validated_graph(
         completed_layer = set(layer)
         for node_dependencies in remaining.values():
             node_dependencies.difference_update(completed_layer)
+    try:
+        extract_plan_data_edges(plan)
+    except PlanDataEdgeError as error:
+        raise DagScheduleError("DAG_DATA_EDGE_INVALID", error.errors) from error
     return tuple(layers), dependencies
 
 

@@ -19,7 +19,8 @@
     "schema_version": {
       "oneOf": [
         {"$ref": "common.schema.json#/definitions/schema_version"},
-        {"$ref": "common.schema.json#/definitions/schema_version_1_1"}
+        {"$ref": "common.schema.json#/definitions/schema_version_1_1"},
+        {"$ref": "common.schema.json#/definitions/schema_version_1_2"}
       ]
     },
     "plan_id": {"$ref": "common.schema.json#/definitions/opaque_id"},
@@ -58,9 +59,7 @@
           "algorithm": {"$ref": "common.schema.json#/definitions/algorithm_identity"},
           "inputs": {
             "type": "array",
-            "minItems": 1,
-            "maxItems": 1,
-            "items": {"$ref": "common.schema.json#/definitions/dataset_binding"}
+            "minItems": 1
           },
           "outputs": {
             "type": "array",
@@ -145,6 +144,42 @@
               "properties": {
                 "parameters": {
                   "$ref": "common.schema.json#/definitions/fwi_parameters_v1_1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"schema_version": {"const": "1.2.0"}}},
+      "then": {
+        "properties": {
+          "nodes": {
+            "items": {
+              "properties": {
+                "inputs": {
+                  "maxItems": 32,
+                  "items": {
+                    "oneOf": [
+                      {"$ref": "common.schema.json#/definitions/dataset_binding"},
+                      {"$ref": "common.schema.json#/definitions/node_output_binding"}
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "nodes": {
+            "items": {
+              "properties": {
+                "inputs": {
+                  "maxItems": 1,
+                  "items": {"$ref": "common.schema.json#/definitions/dataset_binding"}
                 }
               }
             }
