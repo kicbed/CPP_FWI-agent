@@ -39,7 +39,9 @@ from .task_dispatcher import (
 from .task_store import (
     ALLOWED_TRANSITIONS,
     TASK_STATUSES,
+    DagNodeArtifactInput,
     DagNodeClaimCandidate,
+    DagNodeInputBindingFact,
     DagNodeStateMapSnapshot,
     DispatchIntentSnapshot,
     IdempotencyConflict,
@@ -2549,6 +2551,87 @@ class TaskService:
                 project_id=project_id,
                 principal_id=principal_id,
                 expected_plan_hash=expected_plan_hash,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+
+    def bind_ready_dag_node_inputs(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        claim_candidate: DagNodeClaimCandidate,
+        artifact_inputs: Sequence[DagNodeArtifactInput],
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> DagNodeInputBindingFact:
+        """Persist one non-executable all-input fact under an exact claim/term."""
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", expected_plan_hash or "") is None:
+            raise TaskValidationError(
+                "INVALID_PLAN_HASH",
+                ["expected_plan_hash must be a canonical SHA-256 identity"],
+            )
+        if not isinstance(claim_candidate, DagNodeClaimCandidate):
+            raise TaskValidationError(
+                "INVALID_DAG_CLAIM",
+                ["claim_candidate must be an exact durable DAG claim"],
+            )
+        if (
+            not isinstance(artifact_inputs, Sequence)
+            or isinstance(artifact_inputs, (str, bytes, bytearray))
+            or len(artifact_inputs) > 32
+            or any(not isinstance(value, DagNodeArtifactInput) for value in artifact_inputs)
+        ):
+            raise TaskValidationError(
+                "INVALID_DAG_INPUTS",
+                ["artifact_inputs must contain at most 32 exact input materials"],
+            )
+        copied_inputs: list[DagNodeArtifactInput] = []
+        try:
+            for value in artifact_inputs:
+                if not isinstance(value.target_input_port, str):
+                    raise TypeError("target input port is invalid")
+                if not isinstance(value.artifact_manifest, Mapping):
+                    raise TypeError("artifact manifest is invalid")
+                if not isinstance(value.artifact_data, bytes):
+                    raise TypeError("artifact data must be exact bytes")
+                copied_inputs.append(
+                    DagNodeArtifactInput(
+                        target_input_port=value.target_input_port,
+                        artifact_manifest=copy.deepcopy(dict(value.artifact_manifest)),
+                        artifact_data=bytes(value.artifact_data),
+                    )
+                )
+        except (TypeError, ValueError) as error:
+            raise TaskValidationError("INVALID_DAG_INPUTS", [str(error)]) from error
+        self.get_task(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+        )
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        try:
+            return self._store.bind_ready_dag_node_inputs(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                expected_plan_hash=expected_plan_hash,
+                claim_candidate=claim_candidate,
+                artifact_inputs=tuple(copied_inputs),
                 supervisor_lease=supervisor_lease,
                 supervisor_clock=self._runtime_supervisor_clock,
             )

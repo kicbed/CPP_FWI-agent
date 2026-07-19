@@ -1839,8 +1839,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             },
         }
 
-    def test_fresh_v18_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 18)
+    def test_fresh_v19_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 19)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -2174,7 +2174,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
-    def test_real_v16_database_upgrades_catalog_constraints_to_v18(
+    def test_real_v16_database_upgrades_catalog_constraints_to_v19(
         self,
     ) -> None:
         historical_directory = Path(self.temporary.name) / "historical-v16"
@@ -2227,7 +2227,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         upgraded = SQLiteTaskStore(historical_path)
-        self.assertEqual(upgraded.migration_version(), 18)
+        self.assertEqual(upgraded.migration_version(), 19)
         connection = sqlite3.connect(historical_path)
         try:
             heartbeat_schema = connection.execute(
@@ -2352,7 +2352,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v14_database_upgrades_in_place_to_v18(self) -> None:
+    def test_v14_database_upgrades_in_place_to_v19(self) -> None:
         legacy_migrations = Path(self.temporary.name) / "v14-migrations"
         legacy_migrations.mkdir(mode=0o700)
         for migration in sorted(
@@ -2371,11 +2371,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 14)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 18)
+        self.assertEqual(upgraded.migration_version(), 19)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 18
+                connection.execute("PRAGMA user_version").fetchone()[0], 19
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -2389,7 +2389,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v15_database_upgrades_in_place_to_v18(self) -> None:
+    def test_v15_database_upgrades_in_place_to_v19(self) -> None:
         legacy_migrations = Path(self.temporary.name) / "v15-migrations"
         legacy_migrations.mkdir(mode=0o700)
         for migration in sorted(
@@ -2410,11 +2410,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 15)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 18)
+        self.assertEqual(upgraded.migration_version(), 19)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 18
+                connection.execute("PRAGMA user_version").fetchone()[0], 19
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -3063,7 +3063,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v18(self) -> None:
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v19(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
@@ -3101,7 +3101,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 18)
+        self.assertEqual(reopened.migration_version(), 19)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -3140,7 +3140,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v18(self) -> None:
+    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v19(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v12")
         acquired = self._acquire("upgrade-v12-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
@@ -3173,7 +3173,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 18)
+        self.assertEqual(reopened.migration_version(), 19)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)

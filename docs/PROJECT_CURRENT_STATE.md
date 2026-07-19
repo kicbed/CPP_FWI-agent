@@ -16,12 +16,12 @@
   阶段出口通过，P2 已结束。
 - In progress：历史入口“P3–P6 仍按固定顺序 Pending”已推进至 P3；纯 DAG readiness kernel 与
   SQLite v18 dormant 初始节点状态/active-term non-executable claim candidate，以及 PlanGraph 1.2
-  typed node-output edge / 真实 artifact bytes-hash 纯绑定均已验证；durable 全输入绑定、可执行节点
-  转换/派发、资源锁、cache/checkpoint 与 Recipe 尚未实现，`dag` 仍关闭。P4–P6 Pending。
+  typed edge/纯 bytes-hash binding、SQLite v19 active-term all-input binding substrate 均已验证；
+  producer causal writer、可执行转换/派发、资源锁、cache/checkpoint 与 Recipe 未实现；`dag` 仍关闭，P4–P6 Pending。
 - 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 8 个，当前约 4 个，P2 为 0、
   P3–P6 暂估约 4；这是弹性估算，不是配额。
-- 当前阻塞：无；下一轮界定 durable all-input binding，精确绑定 producer Succeeded revision/receipt、
-  approval/current term；v18 candidate 与纯 binding 均不授权 admission、状态转换或真实多节点派发。
+- 当前阻塞：无；下一轮界定 fixed-Adapter producer Succeeded/output causal writer 与首个 node transition；
+  v19 只有 dataset-root 可达，node-output 正路径仍无 writer，所有 binding 均不授权 admission/派发。
 - D-005 仍为 Proposed，不迁移或删除现有 runtime prompt-like 文件。
 - **最高优先级 D 锁**：D-001～D-012 及 D-LOCK 只可按单目标精确 diff/hash 和用户随后单独
   原样复制的一次性 `D-AUTH` 句修改；普通“继续/同意/固定/记录”无效。

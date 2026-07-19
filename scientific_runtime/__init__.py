@@ -70,7 +70,9 @@ from .task_dispatcher import (
 )
 from .task_store import (
     ApprovalBudget,
+    DagNodeArtifactInput,
     DagNodeClaimCandidate,
+    DagNodeInputBindingFact,
     DagNodeStateMapSnapshot,
     DagNodeStateSnapshot,
     DispatchIntentSnapshot,
@@ -130,7 +132,9 @@ __all__ = [
     "CreateTaskResult",
     "DagArtifactInputBinding",
     "DagDataBindingError",
+    "DagNodeArtifactInput",
     "DagNodeClaimCandidate",
+    "DagNodeInputBindingFact",
     "DagNodeStateMapSnapshot",
     "DagNodeStateSnapshot",
     "DeepwaveTaskDispatcher",

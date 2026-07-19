@@ -11,14 +11,16 @@
 - 总体状态：**P0、P1、P2 均已验证；P2-001～P2-009B2、reconciliation 矩阵、checkpoint /
   Waiting / same-attempt resume 与只读 SSE 均为 Implemented / Verified，P2 阶段出口已通过。
   P3 的纯确定性 DAG readiness 内核、SQLite v18 dormant 初始节点状态/active-term non-executable
-  claim candidate，以及 PlanGraph 1.2 typed node-output edge / 真实 artifact bytes-hash 纯绑定均为
-  Implemented / Verified；durable 全输入绑定、可执行节点转换/派发、资源锁、cache/checkpoint、Recipe
-  和阶段出口仍 Pending。P3 In progress，P4–P6 Pending；只有
+  claim candidate、PlanGraph 1.2 typed node-output edge / 纯 bytes-hash binding，以及 SQLite v19
+  active-term all-input binding substrate 均为 Implemented / Verified；producer causal writer、可执行
+  节点转换/派发、资源锁、cache/checkpoint、Recipe 和阶段出口仍 Pending。P3 In progress，P4–P6
+  Pending；只有
   P6 出口通过才算全项目完成**
 - 当前阶段：**P3 确定性 DAG In progress；阶段出口尚未满足**
-- 下一动作：界定 durable all-input binding fact，精确绑定 producer `Succeeded` revision/receipt、
-  approval/current term 并原子复核同一 bytes/hash；当前 v18 candidate 与纯 binding 均不具执行权限，
-  不做节点 admission、状态转换或多节点派发，也不混入 CPU/GPU 资源锁、cache/checkpoint 或 Recipe
+- 下一动作：界定 fixed-Adapter producer `Succeeded`/complete-output causal writer 与首个 node transition，
+  在同一 execution/submission fence 内拥有 receipt、manifest 和实际 artifact bytes；v19 reserved receipt
+  无公开 writer，fixture 只验证 reader contract。当前所有 binding 均不具 admission/dispatch 权限，
+  不混入 CPU/GPU 资源锁、cache/checkpoint 或 Recipe
 - 交付粒度：D-011 在 `0cbe131` 的全项目 P2–P6 历史粗估基线约 12 个；此后 8 个切片已
   Verified，当前滚动粗估约 4 个，P2 为 0、P3–P6 合计暂估约 4 个；均非固定配额
 - 默认接续：路线切片保持上述估算；用户只说“继续 D-003”时只执行一个有界工作轮次。轮次只含
@@ -40,7 +42,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 32/32；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
 | P1 最小持久垂直切片 | Verified | 既有 P1 Task Store/Registry/Adapter/atomic submit/Guided Web 全闭环及 D-006/D-007；D-008/P1-008 增加 Conversation/Task 可选引用、无级联本地对话删除和当前 Algorithm/Adapter 1.4 的 2 数值 + 6 PNG 结果画廊 | Runtime 165/165、Worker 28/28、Web 29/29、Embedding 6/6、CTest 39/39、MCP 1/1 及 UI/治理 PASS；fresh v6 CUDA 10 events、8 artifacts/6 PNG、数值更新和重启不变性 PASS | —（P1 及当前维护切片完成） |
 | P2 持久可靠性加固 | Verified（阶段完成） | SQLite v17；两次串行/累计 2W finite retry；positive/exact-negative/transient/uncertain reconciliation；current Deepwave Algorithm/Adapter 1.6 same-attempt checkpoint/Waiting/resume；scope-bound 只读 RunEvent SSE 与有限 GET polling 回退 | 候选最终树完整 P2 aggregate 592/592 + Node UI PASS；真实 CPU/CUDA Guided HTTP/SSE E2E 均 Succeeded，连续游标续传、same-attempt resume、8 artifacts/6 PNG 与有限非零更新通过 | —（P2 阶段完成；下一出口为 P3） |
-| P3 确定性 DAG | In progress | 纯 hash-bound PlanGraph readiness / failure propagation；SQLite v18 append-only 初始 Pending node facts 与 active-term non-executable claim candidate；PlanGraph 1.2 typed node-output edge 与真实 artifact bytes/hash/lineage 纯绑定 | 第 1 轮 42/42；第 2 轮 33/33；第 3 轮受影响测试 175/175、`py_compile` PASS；均未接执行 | durable 全输入绑定、可执行节点转换/派发、并行、CPU/GPU 资源锁、cache/checkpoint、固定 Recipe/Guided 与阶段出口通过 |
+| P3 确定性 DAG | In progress | 纯 hash-bound readiness/failure propagation；SQLite v18 Pending node/claim；PlanGraph 1.2 typed edge/纯 bytes binding；SQLite v19 current claim/approval/term-bound all-input binding substrate 与 reserved Succeeded-output reader | 前三轮见下；第 4 轮受影响测试 50/50、`py_compile` PASS；无生产 node-output writer/执行接线 | producer causal writer、可执行节点转换/派发、并行、CPU/GPU 资源锁、cache/checkpoint、固定 Recipe/Guided 与阶段出口通过 |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
 | P5 算法 SDK | Pending | 无 | 无 | 受控数据可匹配多个独立算法；新增真实插件无需 Orchestrator 关键词且 conformance 通过 |
 | P6 评测与加固 | Pending | 无 | 无 | 安全、故障、审计和部署验收通过 |
@@ -972,6 +974,31 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
 - 最终受影响测试 **175/175**：合同、DAG readiness/data binding/Store 与 TaskService；`py_compile` 通过。
   按 D-011 未到路线切片/阶段出口，未运行 Scientific Runtime aggregate、完整回归、CPU/CUDA、CTest
   或 MCP。下一安全动作是 durable all-input binding fact；在其精确复核同一 bytes/hash 前不做 admission。
+
+### P3 第 4 轮：durable all-input binding substrate（2026-07-19）
+
+- 状态：**本工作轮次 In progress → Implemented → Verified；P3 路线切片与阶段仍 In progress**。
+  本轮不是路线切片出口，不新增滚动余量行；全项目 P3–P6 粗估仍约 4。
+- SQLite v19 新增 append-only `dag_node_input_binding_facts`：精确引用 current claim candidate、Plan、
+  Approval、target Pending revision、scope 与 active Supervisor term；Store 在同一 `BEGIN IMMEDIATE`
+  事务内重跑 readiness，按 Plan 输入顺序复核完整 input set，并将 DatasetRef 绑定 immutable project
+  Catalog document hash。相同 claim/term 并发和重放收敛，reapproval/successor term 不能重标旧事实。
+- `dag_node_succeeded_outputs` 是 reserved aggregate receipt contract：绑定 producer exact Succeeded revision、
+  prior input-binding hash、原 Approval/term、canonical receipt 与完整 output manifest inventory。v18 的
+  initial-Pending-only trigger 保持不变，v19 没有该表的生产 writer；CodeGraph 复核 binding API 只有测试
+  caller。测试中显式移除 guard 并 seed future fact 只验证 schema/reader/hash/fail-closed contract，不是
+  真实 producer 因果证明，也不证明外部 artifact 文件在 SQLite commit 前后不可变。
+- 当前真实可达正路径是 dataset-only runnable root；返回事实的 `dispatch_authorized` 恒为 false，且不写
+  Task status、node state、RunEvent、Approval budget、dispatch intent，也不调用 Dispatcher/Adapter/Worker。
+  source input 仅对 reserved receipt、latest Succeeded revision、同一 manifest 和本次 immutable bytes
+  重算 hash 全部一致时形成 dormant fact；missing/extra/duplicate、byte/lineage/port/type drift 均回滚。
+- 候选树受影响测试 **50/50**：v19 root/replay/8-way concurrency、fixture-only receipt reader、rollback/
+  append-only，既有 DAG Store/data binding、migration registry/concurrency、Task Store 初始化、新版本拒绝、
+  purge upgrade 与 Supervisor schema；`py_compile` 通过。首次注册套件捕获并修复一个陈旧 v17 并发升级
+  断言。按 D-011 未到路线切片/阶段出口，未运行 runtime aggregate、完整回归、CPU/CUDA、CTest 或 MCP。
+- 下一安全动作：单独界定 fixed-Adapter producer success/output causal writer 与首个 node transition，要求
+  在同一 submission/execution fence 内拥有 receipt、manifest 和实际 bytes；随后 admission 仍须重新复核。
+  本轮不放宽 transition trigger，不复用 P2 task-wide receipt，不实现 chained lineage 或真实节点派发。
 
 ## 新会话恢复协议
 

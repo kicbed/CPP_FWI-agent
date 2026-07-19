@@ -21,6 +21,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from scientific_runtime_contracts import schema_errors
+
+from .dag_data_binding import (
+    DagDataBindingError,
+    bind_dag_artifact_input,
+)
 from .dag_scheduler import DagScheduleError, evaluate_dag_readiness
 
 
@@ -472,6 +478,43 @@ class DagNodeClaimCandidate:
     @property
     def dispatch_authorized(self) -> bool:
         """A P3 claim candidate is never an Adapter dispatch authorization."""
+
+        return False
+
+
+@dataclass(frozen=True)
+class DagNodeArtifactInput:
+    """Exact in-memory artifact material for one declared node-output input."""
+
+    target_input_port: str
+    artifact_manifest: Mapping[str, Any]
+    artifact_data: bytes
+
+
+@dataclass(frozen=True)
+class DagNodeInputBindingFact:
+    """Durable all-input audit fact that deliberately grants no execution right."""
+
+    task_id: str
+    plan_id: str
+    plan_hash: str
+    approval_id: str
+    target_node_id: str
+    target_node_revision: int
+    project_id: str
+    principal_id: str
+    fencing_token: int
+    owner_id: str
+    term_acquired_at: str
+    claim_readiness_document_hash: str
+    binding_document: dict[str, Any]
+    binding_document_hash: str
+    recorded_at: str
+    replayed: bool
+
+    @property
+    def dispatch_authorized(self) -> bool:
+        """A durable binding remains evidence only until a later admission step."""
 
         return False
 
@@ -1061,6 +1104,20 @@ class TaskStore(Protocol):
         supervisor_lease: RuntimeSupervisorLease,
         supervisor_clock: Callable[[], str],
     ) -> DagNodeClaimCandidate:
+        ...
+
+    def bind_ready_dag_node_inputs(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        claim_candidate: DagNodeClaimCandidate,
+        artifact_inputs: Sequence[DagNodeArtifactInput],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagNodeInputBindingFact:
         ...
 
     def authorize_supervised_dispatch(
@@ -13557,6 +13614,305 @@ class SQLiteTaskStore:
             nodes=tuple(current),
         )
 
+    @staticmethod
+    def _load_dag_node_succeeded_outputs(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        plan: Mapping[str, Any],
+        approval_id: str,
+        source_state: DagNodeStateSnapshot,
+    ) -> dict[str, Any]:
+        """Validate one reserved producer-success/output attestation.
+
+        Migration v19 deliberately has no public writer for this row.  The
+        reader exists now so later node-transition work has a fail-closed
+        contract to satisfy; current production code cannot manufacture a
+        producer success by calling this binding primitive.
+        """
+
+        row = connection.execute(
+            """
+            SELECT *
+            FROM dag_node_succeeded_outputs
+            WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+              AND node_id = ? AND node_revision = ?
+            """,
+            (
+                task_id,
+                plan["plan_id"],
+                approval_id,
+                source_state.node_id,
+                source_state.revision,
+            ),
+        ).fetchone()
+        if row is None:
+            raise TaskStoreConflict(
+                "DAG source input requires an exact durable Succeeded output receipt"
+            )
+        if source_state.state != "Succeeded":
+            raise TaskStoreConflict(
+                "DAG source input requires the latest Succeeded node revision"
+            )
+
+        try:
+            recorded_at, recorded_at_us = _runtime_timestamp(row["recorded_at"])
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "persisted DAG Succeeded output time is inconsistent"
+            ) from error
+        if recorded_at_us != row["recorded_at_us"]:
+            raise TaskStoreCorruption(
+                "persisted DAG Succeeded output time is inconsistent"
+            )
+
+        receipt = _decode_document(
+            row["receipt_document_json"],
+            label="DAG Succeeded output receipt",
+        )
+        try:
+            receipt_json, receipt_hash = encode_document(receipt)
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "persisted DAG Succeeded output receipt is not canonical JSON"
+            ) from error
+        if (
+            receipt_json != row["receipt_document_json"]
+            or receipt_hash != row["receipt_document_hash"]
+            or row["task_id"] != task_id
+            or row["plan_id"] != plan["plan_id"]
+            or row["plan_hash"] != plan["plan_hash"]
+            or row["approval_id"] != approval_id
+            or row["node_id"] != source_state.node_id
+            or row["node_revision"] != source_state.revision
+            or row["node_state"] != "Succeeded"
+            or not _is_sha256(row["input_binding_document_hash"])
+        ):
+            raise TaskStoreCorruption(
+                "persisted DAG Succeeded output identity is inconsistent"
+            )
+
+        prior_binding = connection.execute(
+            """
+            SELECT *
+            FROM dag_node_input_binding_facts
+            WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+              AND target_node_id = ? AND target_node_revision = ?
+              AND fencing_token = ? AND binding_document_hash = ?
+            """,
+            (
+                task_id,
+                plan["plan_id"],
+                approval_id,
+                source_state.node_id,
+                row["input_binding_node_revision"],
+                row["fencing_token"],
+                row["input_binding_document_hash"],
+            ),
+        ).fetchone()
+        if prior_binding is None:
+            raise TaskStoreCorruption(
+                "DAG Succeeded output lost its producer input binding"
+            )
+        prior_document = _decode_document(
+            prior_binding["binding_document_json"],
+            label="producer DAG input binding",
+        )
+        try:
+            prior_json, prior_hash = encode_document(prior_document)
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "producer DAG input binding is not canonical JSON"
+            ) from error
+
+        nodes_by_id = {
+            node["node_id"]: node
+            for node in plan["nodes"]
+            if isinstance(node, Mapping) and isinstance(node.get("node_id"), str)
+        }
+        source_node = nodes_by_id.get(source_state.node_id)
+        if not isinstance(source_node, Mapping):
+            raise TaskStoreCorruption(
+                "DAG Succeeded output source is absent from its plan"
+            )
+        expected_outputs = source_node.get("outputs")
+        expected_inputs = source_node.get("inputs")
+        if not isinstance(expected_outputs, list) or not isinstance(expected_inputs, list):
+            raise TaskStoreCorruption(
+                "DAG Succeeded output plan contract is inconsistent"
+            )
+
+        expected_prior_projection = {
+            "task_id": task_id,
+            "plan": {
+                "plan_id": plan["plan_id"],
+                "plan_hash": plan["plan_hash"],
+            },
+            "approval_id": approval_id,
+            "target": {
+                "node_id": source_state.node_id,
+                "revision": row["input_binding_node_revision"],
+                "state": "Pending",
+            },
+        }
+        if (
+            prior_json != prior_binding["binding_document_json"]
+            or prior_hash != prior_binding["binding_document_hash"]
+            or prior_hash != row["input_binding_document_hash"]
+            or prior_document.get("task_id") != expected_prior_projection["task_id"]
+            or prior_document.get("plan") != expected_prior_projection["plan"]
+            or prior_document.get("approval_id") != approval_id
+            or prior_document.get("target") != expected_prior_projection["target"]
+            or not isinstance(prior_document.get("inputs"), list)
+            or len(prior_document["inputs"]) != len(expected_inputs)
+        ):
+            raise TaskStoreCorruption(
+                "producer DAG input binding is inconsistent"
+            )
+
+        required_receipt_keys = {
+            "schema_version",
+            "task_id",
+            "plan",
+            "approval_id",
+            "node",
+            "scope",
+            "supervisor_term",
+            "input_binding_document_hash",
+            "receipt_record_hash",
+            "outputs",
+            "succeeded_at",
+        }
+        node_document = receipt.get("node")
+        scope_document = receipt.get("scope")
+        term_document = receipt.get("supervisor_term")
+        outputs_document = receipt.get("outputs")
+        if (
+            set(receipt) != required_receipt_keys
+            or receipt.get("schema_version") != "1.0.0"
+            or receipt.get("task_id") != task_id
+            or receipt.get("plan")
+            != {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"]}
+            or receipt.get("approval_id") != approval_id
+            or node_document
+            != {
+                "node_id": source_state.node_id,
+                "input_binding_revision": row["input_binding_node_revision"],
+                "succeeded_revision": source_state.revision,
+                "state": "Succeeded",
+            }
+            or scope_document
+            != {
+                "project_id": row["project_id"],
+                "principal_id": row["principal_id"],
+            }
+            or term_document
+            != {
+                "fencing_token": row["fencing_token"],
+                "owner_id": row["owner_id"],
+                "acquired_at": row["term_acquired_at"],
+            }
+            or receipt.get("input_binding_document_hash")
+            != row["input_binding_document_hash"]
+            or not _is_sha256(receipt.get("receipt_record_hash"))
+            or receipt.get("succeeded_at") != recorded_at
+            or not isinstance(outputs_document, list)
+            or len(outputs_document) != len(expected_outputs)
+        ):
+            raise TaskStoreCorruption(
+                "persisted DAG Succeeded output receipt is inconsistent"
+            )
+
+        try:
+            source_recorded_us = _runtime_timestamp(source_state.recorded_at)[1]
+            prior_recorded_us = _runtime_timestamp(prior_binding["recorded_at"])[1]
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "DAG Succeeded output chronology is inconsistent"
+            ) from error
+        if recorded_at_us < max(source_recorded_us, prior_recorded_us):
+            raise TaskStoreCorruption(
+                "DAG Succeeded output predates its causal facts"
+            )
+
+        outputs_by_port: dict[str, dict[str, Any]] = {}
+        for expected_output, output in zip(expected_outputs, outputs_document):
+            if (
+                not isinstance(expected_output, Mapping)
+                or not isinstance(output, Mapping)
+                or set(output)
+                != {
+                    "output_port",
+                    "data_type",
+                    "artifact_manifest",
+                    "artifact_manifest_hash",
+                }
+                or output.get("output_port") != expected_output.get("port")
+                or output.get("data_type") != expected_output.get("data_type")
+                or output.get("output_port") in outputs_by_port
+            ):
+                raise TaskStoreCorruption(
+                    "DAG Succeeded output inventory differs from its plan"
+                )
+            manifest = output.get("artifact_manifest")
+            if not isinstance(manifest, Mapping):
+                raise TaskStoreCorruption(
+                    "DAG Succeeded output manifest is invalid"
+                )
+            manifest_errors = schema_errors("artifact-manifest.schema.json", manifest)
+            try:
+                manifest_json, manifest_hash = encode_document(manifest)
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "DAG Succeeded output manifest is not canonical JSON"
+                ) from error
+            extensions = manifest.get("extensions")
+            adapter_extension = (
+                extensions.get("org.agent_rpc.adapter")
+                if isinstance(extensions, Mapping)
+                else None
+            )
+            lineage = manifest.get("lineage")
+            fingerprint = manifest.get("fingerprint")
+            if (
+                manifest_errors
+                or output.get("artifact_manifest_hash") != manifest_hash
+                or manifest.get("task_id") != task_id
+                or manifest.get("node_id") != source_state.node_id
+                or manifest.get("artifact_type") != expected_output.get("data_type")
+                or not _is_sha256(manifest.get("content_hash"))
+                or type(manifest.get("size_bytes")) is not int
+                or manifest["size_bytes"] < 0
+                or not isinstance(adapter_extension, Mapping)
+                or adapter_extension.get("output_port") != expected_output.get("port")
+                or not isinstance(lineage, Mapping)
+                or lineage.get("plan_hash") != plan["plan_hash"]
+                or lineage.get("algorithm") != source_node.get("algorithm")
+                or not isinstance(fingerprint, Mapping)
+                or fingerprint.get("algorithm") != source_node.get("algorithm")
+            ):
+                raise TaskStoreCorruption(
+                    "DAG Succeeded output manifest differs from its source"
+                )
+            outputs_by_port[str(output["output_port"])] = {
+                "data_type": output["data_type"],
+                "artifact_manifest": copy.deepcopy(dict(manifest)),
+                "artifact_manifest_json": manifest_json,
+                "artifact_manifest_hash": manifest_hash,
+            }
+
+        return {
+            "approval_id": approval_id,
+            "input_binding_document_hash": row["input_binding_document_hash"],
+            "receipt_document_hash": receipt_hash,
+            "receipt_record_hash": receipt["receipt_record_hash"],
+            "fencing_token": row["fencing_token"],
+            "owner_id": row["owner_id"],
+            "term_acquired_at": row["term_acquired_at"],
+            "recorded_at": recorded_at,
+            "outputs_by_port": outputs_by_port,
+        }
+
     def get_dag_node_state_snapshot(
         self,
         *,
@@ -13892,6 +14248,559 @@ class SQLiteTaskStore:
                 ) from error
             raise TaskStoreConflict(
                 "DAG node claim candidate conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def bind_ready_dag_node_inputs(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        claim_candidate: DagNodeClaimCandidate,
+        artifact_inputs: Sequence[DagNodeArtifactInput],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagNodeInputBindingFact:
+        """Persist one canonical, non-executable all-input binding fact.
+
+        Exact artifact bytes are re-hashed from the immutable ``bytes`` values
+        supplied to this call while the current Plan/Approval/node snapshot is
+        pinned by ``BEGIN IMMEDIATE``.  This does not attest that an external
+        artifact file remains immutable: the reserved producer-success rows
+        have no public writer yet, and a later execution admission must verify
+        the fixed Adapter evidence and bytes again under its kernel fences.
+        """
+
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(project_id, str)
+            or not project_id
+            or not isinstance(principal_id, str)
+            or not principal_id
+            or not _is_sha256(expected_plan_hash)
+            or not isinstance(claim_candidate, DagNodeClaimCandidate)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+            or not isinstance(artifact_inputs, Sequence)
+            or isinstance(artifact_inputs, (str, bytes, bytearray))
+            or len(artifact_inputs) > 32
+            or any(not isinstance(value, DagNodeArtifactInput) for value in artifact_inputs)
+        ):
+            raise TaskStoreConflict("DAG input binding identity is invalid")
+
+        material_by_port: dict[str, DagNodeArtifactInput] = {}
+        for material in artifact_inputs:
+            if (
+                not isinstance(material.target_input_port, str)
+                or not material.target_input_port
+                or not isinstance(material.artifact_manifest, Mapping)
+                or not isinstance(material.artifact_data, bytes)
+                or material.target_input_port in material_by_port
+            ):
+                raise TaskStoreConflict("DAG artifact input material is invalid")
+            material_by_port[material.target_input_port] = material
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            recorded_at, recorded_at_us = _runtime_timestamp(supervisor_clock())
+            snapshot = self._load_snapshot(connection, task_id)
+            if (
+                snapshot is None
+                or snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreConflict("task does not exist in the requested scope")
+            plan = snapshot.plan
+            approval = snapshot.approval
+            if (
+                snapshot.status != "AwaitingApproval"
+                or not isinstance(plan, Mapping)
+                or len(plan.get("nodes", [])) <= 1
+                or plan.get("plan_hash") != expected_plan_hash
+                or not isinstance(approval, Mapping)
+                or approval.get("decision") != "approved"
+                or approval.get("plan_id") != plan.get("plan_id")
+                or approval.get("plan_hash") != expected_plan_hash
+            ):
+                raise TaskStoreConflict(
+                    "DAG input binding requires the exact current approved multi-node plan"
+                )
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                supplied=supervisor_lease,
+                now_us=recorded_at_us,
+                action="DAG input binding",
+            )
+
+            state_map = self._load_dag_node_state_map(
+                connection,
+                task_id=task_id,
+                plan=plan,
+            )
+            if state_map is None:
+                raise TaskStoreConflict(
+                    "DAG input binding requires an initialized node-state map"
+                )
+            node_states = {node.node_id: node.state for node in state_map.nodes}
+            states_by_id = {node.node_id: node for node in state_map.nodes}
+            try:
+                readiness = evaluate_dag_readiness(plan, node_states=node_states)
+            except DagScheduleError as error:
+                raise TaskStoreCorruption(
+                    "persisted DAG state cannot be evaluated for input binding"
+                ) from error
+            if not readiness.runnable_node_ids:
+                raise TaskStoreConflict("DAG plan has no runnable Pending node")
+            selected_node_id = readiness.runnable_node_ids[0]
+            selected = states_by_id.get(selected_node_id)
+            if selected is None or selected.state != "Pending":
+                raise TaskStoreCorruption(
+                    "DAG readiness selected an invalid input-binding target"
+                )
+
+            if (
+                claim_candidate.node != selected
+                or claim_candidate.approval_id != approval.get("approval_id")
+                or claim_candidate.project_id != project_id
+                or claim_candidate.principal_id != principal_id
+                or claim_candidate.fencing_token != supervisor_lease.fencing_token
+                or claim_candidate.owner_id != supervisor_lease.owner_id
+                or claim_candidate.term_acquired_at != supervisor_lease.acquired_at
+            ):
+                raise TaskStoreConflict(
+                    "DAG input binding requires the exact current claim candidate"
+                )
+
+            readiness_document = {
+                "schema_version": "1.0.0",
+                "task_id": task_id,
+                "plan_id": state_map.plan_id,
+                "plan_hash": state_map.plan_hash,
+                "approval_id": approval["approval_id"],
+                "node_states": [
+                    {
+                        "node_id": node.node_id,
+                        "revision": node.revision,
+                        "state": node.state,
+                    }
+                    for node in state_map.nodes
+                ],
+                "topological_layers": [
+                    list(layer) for layer in readiness.topological_layers
+                ],
+                "runnable_node_ids": list(readiness.runnable_node_ids),
+                "waiting_node_ids": list(readiness.waiting_node_ids),
+                "active_node_ids": list(readiness.active_node_ids),
+                "succeeded_node_ids": list(readiness.succeeded_node_ids),
+                "failed_node_ids": list(readiness.failed_node_ids),
+                "cancelled_node_ids": list(readiness.cancelled_node_ids),
+                "blocked_nodes": [
+                    {
+                        "node_id": blocked.node_id,
+                        "blocked_by_node_ids": list(blocked.blocked_by_node_ids),
+                    }
+                    for blocked in readiness.blocked_nodes
+                ],
+                "selected_node_id": selected_node_id,
+            }
+            readiness_json, readiness_hash = encode_document(readiness_document)
+            claim_row = connection.execute(
+                """
+                SELECT *
+                FROM dag_node_claim_candidates
+                WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+                  AND node_id = ? AND node_revision = ?
+                  AND fencing_token = ?
+                """,
+                (
+                    task_id,
+                    plan["plan_id"],
+                    approval["approval_id"],
+                    selected.node_id,
+                    selected.revision,
+                    supervisor_lease.fencing_token,
+                ),
+            ).fetchone()
+            if claim_row is None:
+                raise TaskStoreConflict(
+                    "DAG input binding requires a durable claim candidate"
+                )
+            stored_readiness = _decode_document(
+                claim_row["readiness_document_json"],
+                label="DAG input-binding claim",
+            )
+            stored_readiness_json, stored_readiness_hash = encode_document(
+                stored_readiness
+            )
+            try:
+                claim_recorded_at, claim_recorded_at_us = _runtime_timestamp(
+                    claim_row["recorded_at"]
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "persisted DAG input-binding claim time is inconsistent"
+                ) from error
+            if (
+                stored_readiness_json != readiness_json
+                or stored_readiness_hash != readiness_hash
+                or claim_row["readiness_document_hash"] != readiness_hash
+                or claim_candidate.readiness_document_hash != readiness_hash
+                or claim_row["plan_hash"] != expected_plan_hash
+                or claim_row["project_id"] != project_id
+                or claim_row["principal_id"] != principal_id
+                or claim_row["owner_id"] != supervisor_lease.owner_id
+                or claim_row["term_acquired_at"] != supervisor_lease.acquired_at
+                or claim_recorded_at != claim_row["recorded_at"]
+                or claim_recorded_at_us != claim_row["recorded_at_us"]
+                or claim_candidate.recorded_at != claim_recorded_at
+                or claim_recorded_at_us > recorded_at_us
+            ):
+                raise TaskStoreCorruption(
+                    "persisted DAG input-binding claim is inconsistent"
+                )
+
+            nodes_by_id = {
+                node["node_id"]: node
+                for node in plan["nodes"]
+                if isinstance(node, Mapping)
+                and isinstance(node.get("node_id"), str)
+            }
+            target_node = nodes_by_id.get(selected.node_id)
+            if not isinstance(target_node, Mapping) or not isinstance(
+                target_node.get("inputs"), list
+            ):
+                raise TaskStoreCorruption(
+                    "DAG input-binding target differs from its plan"
+                )
+
+            input_documents: list[dict[str, Any]] = []
+            consumed_material_ports: set[str] = set()
+            for input_index, input_binding in enumerate(target_node["inputs"]):
+                if (
+                    not isinstance(input_binding, Mapping)
+                    or not isinstance(input_binding.get("port"), str)
+                ):
+                    raise TaskStoreCorruption(
+                        "persisted DAG target input contract is invalid"
+                    )
+                target_port = input_binding["port"]
+                dataset = input_binding.get("dataset")
+                source = input_binding.get("source")
+                if isinstance(dataset, Mapping) and source is None:
+                    dataset_row = connection.execute(
+                        """
+                        SELECT project_id, dataset_id, version, content_hash,
+                               data_type, document_json, document_hash
+                        FROM dataset_catalog
+                        WHERE project_id = ? AND dataset_id = ? AND version = ?
+                        """,
+                        (
+                            project_id,
+                            dataset.get("id"),
+                            dataset.get("version"),
+                        ),
+                    ).fetchone()
+                    if dataset_row is None:
+                        raise TaskStoreConflict(
+                            "DAG dataset input is absent from the current project catalog"
+                        )
+                    catalog_dataset = self._load_dataset_registration(
+                        connection,
+                        dataset_row,
+                    )
+                    dataset_identity = {
+                        key: catalog_dataset.get(key)
+                        for key in ("id", "version", "content_hash", "data_type")
+                    }
+                    if dict(dataset) != dataset_identity:
+                        raise TaskStoreConflict(
+                            "DAG dataset input differs from the immutable catalog"
+                        )
+                    input_documents.append(
+                        {
+                            "input_index": input_index,
+                            "target_input_port": target_port,
+                            "kind": "dataset",
+                            "dataset": dict(dataset),
+                            "dataset_document_hash": dataset_row["document_hash"],
+                        }
+                    )
+                    continue
+
+                if not isinstance(source, Mapping) or dataset is not None:
+                    raise TaskStoreCorruption(
+                        "persisted DAG target input kind is invalid"
+                    )
+                material = material_by_port.get(target_port)
+                if material is None:
+                    raise TaskStoreConflict(
+                        "DAG node-output inputs must be supplied exactly once"
+                    )
+                consumed_material_ports.add(target_port)
+                try:
+                    edge_binding = bind_dag_artifact_input(
+                        plan,
+                        task_id=task_id,
+                        target_node_id=selected.node_id,
+                        target_input_port=target_port,
+                        artifact_manifest=material.artifact_manifest,
+                        artifact_data=material.artifact_data,
+                    )
+                except DagDataBindingError as error:
+                    raise TaskStoreConflict(
+                        f"{error.code}: {'; '.join(error.errors)}"
+                    ) from error
+                source_state = states_by_id.get(edge_binding.source_node_id)
+                if source_state is None or source_state.state != "Succeeded":
+                    raise TaskStoreConflict(
+                        "DAG node-output input requires the latest Succeeded producer"
+                    )
+                succeeded = self._load_dag_node_succeeded_outputs(
+                    connection,
+                    task_id=task_id,
+                    plan=plan,
+                    approval_id=approval["approval_id"],
+                    source_state=source_state,
+                )
+                if _runtime_timestamp(succeeded["recorded_at"])[1] > recorded_at_us:
+                    raise TaskStoreCorruption(
+                        "DAG producer receipt is newer than its input binding"
+                    )
+                stored_output = succeeded["outputs_by_port"].get(
+                    edge_binding.source_output_port
+                )
+                if stored_output is None:
+                    raise TaskStoreCorruption(
+                        "DAG producer receipt lacks the bound output"
+                    )
+                try:
+                    supplied_manifest_json, supplied_manifest_hash = encode_document(
+                        material.artifact_manifest
+                    )
+                except TaskStoreConflict as error:
+                    raise TaskStoreConflict(
+                        "DAG artifact manifest is not finite canonical JSON"
+                    ) from error
+                if (
+                    supplied_manifest_json != stored_output["artifact_manifest_json"]
+                    or supplied_manifest_hash
+                    != stored_output["artifact_manifest_hash"]
+                    or stored_output["data_type"] != edge_binding.data_type
+                    or stored_output["artifact_manifest"]
+                    != dict(material.artifact_manifest)
+                ):
+                    raise TaskStoreConflict(
+                        "DAG artifact bytes/manifest differ from the producer receipt"
+                    )
+                input_documents.append(
+                    {
+                        "input_index": input_index,
+                        "target_input_port": target_port,
+                        "kind": "node_output",
+                        "binding": edge_binding.document(),
+                        "binding_document_hash": (
+                            edge_binding.binding_document_hash
+                        ),
+                        "artifact_manifest_hash": supplied_manifest_hash,
+                        "producer": {
+                            "node_id": source_state.node_id,
+                            "succeeded_revision": source_state.revision,
+                            "approval_id": succeeded["approval_id"],
+                            "input_binding_document_hash": succeeded[
+                                "input_binding_document_hash"
+                            ],
+                            "receipt_document_hash": succeeded[
+                                "receipt_document_hash"
+                            ],
+                            "receipt_record_hash": succeeded[
+                                "receipt_record_hash"
+                            ],
+                            "succeeded_at": succeeded["recorded_at"],
+                            "fencing_token": succeeded["fencing_token"],
+                            "owner_id": succeeded["owner_id"],
+                            "term_acquired_at": succeeded["term_acquired_at"],
+                        },
+                    }
+                )
+
+            if set(material_by_port) != consumed_material_ports:
+                raise TaskStoreConflict(
+                    "DAG artifact input set contains missing or extra target ports"
+                )
+
+            binding_document = {
+                "schema_version": "1.0.0",
+                "task_id": task_id,
+                "plan": {
+                    "plan_id": plan["plan_id"],
+                    "plan_hash": plan["plan_hash"],
+                },
+                "approval_id": approval["approval_id"],
+                "target": {
+                    "node_id": selected.node_id,
+                    "revision": selected.revision,
+                    "state": "Pending",
+                },
+                "scope": {
+                    "project_id": project_id,
+                    "principal_id": principal_id,
+                },
+                "supervisor_term": {
+                    "fencing_token": supervisor_lease.fencing_token,
+                    "owner_id": supervisor_lease.owner_id,
+                    "acquired_at": supervisor_lease.acquired_at,
+                },
+                "claim_readiness_document_hash": readiness_hash,
+                "inputs": input_documents,
+            }
+            binding_json, binding_hash = encode_document(binding_document)
+
+            existing = connection.execute(
+                """
+                SELECT *
+                FROM dag_node_input_binding_facts
+                WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+                  AND target_node_id = ? AND target_node_revision = ?
+                  AND fencing_token = ?
+                """,
+                (
+                    task_id,
+                    plan["plan_id"],
+                    approval["approval_id"],
+                    selected.node_id,
+                    selected.revision,
+                    supervisor_lease.fencing_token,
+                ),
+            ).fetchone()
+            if existing is not None:
+                existing_document = _decode_document(
+                    existing["binding_document_json"],
+                    label="DAG all-input binding",
+                )
+                existing_json, existing_hash = encode_document(existing_document)
+                try:
+                    existing_at, existing_at_us = _runtime_timestamp(
+                        existing["recorded_at"]
+                    )
+                except TaskStoreConflict as error:
+                    raise TaskStoreCorruption(
+                        "persisted DAG all-input binding time is inconsistent"
+                    ) from error
+                if (
+                    existing["plan_hash"] != plan["plan_hash"]
+                    or existing["target_node_state"] != "Pending"
+                    or existing["project_id"] != project_id
+                    or existing["principal_id"] != principal_id
+                    or existing["owner_id"] != supervisor_lease.owner_id
+                    or existing["term_acquired_at"] != supervisor_lease.acquired_at
+                    or existing["claim_readiness_document_hash"] != readiness_hash
+                    or existing_json != binding_json
+                    or existing_hash != binding_hash
+                    or existing["binding_document_hash"] != binding_hash
+                    or existing_at != existing["recorded_at"]
+                    or existing_at_us != existing["recorded_at_us"]
+                ):
+                    raise TaskStoreCorruption(
+                        "persisted DAG all-input binding is inconsistent"
+                    )
+                connection.commit()
+                return DagNodeInputBindingFact(
+                    task_id=task_id,
+                    plan_id=plan["plan_id"],
+                    plan_hash=plan["plan_hash"],
+                    approval_id=approval["approval_id"],
+                    target_node_id=selected.node_id,
+                    target_node_revision=selected.revision,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    fencing_token=supervisor_lease.fencing_token,
+                    owner_id=supervisor_lease.owner_id,
+                    term_acquired_at=supervisor_lease.acquired_at,
+                    claim_readiness_document_hash=readiness_hash,
+                    binding_document=copy.deepcopy(existing_document),
+                    binding_document_hash=binding_hash,
+                    recorded_at=existing_at,
+                    replayed=True,
+                )
+
+            connection.execute(
+                """
+                INSERT INTO dag_node_input_binding_facts(
+                    task_id, plan_id, plan_hash, approval_id,
+                    target_node_id, target_node_revision, target_node_state,
+                    project_id, principal_id, fencing_token,
+                    owner_id, term_acquired_at,
+                    claim_readiness_document_hash,
+                    binding_document_json, binding_document_hash,
+                    recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    plan["plan_id"],
+                    plan["plan_hash"],
+                    approval["approval_id"],
+                    selected.node_id,
+                    selected.revision,
+                    project_id,
+                    principal_id,
+                    supervisor_lease.fencing_token,
+                    supervisor_lease.owner_id,
+                    supervisor_lease.acquired_at,
+                    readiness_hash,
+                    binding_json,
+                    binding_hash,
+                    recorded_at,
+                    recorded_at_us,
+                ),
+            )
+            connection.commit()
+            return DagNodeInputBindingFact(
+                task_id=task_id,
+                plan_id=plan["plan_id"],
+                plan_hash=plan["plan_hash"],
+                approval_id=approval["approval_id"],
+                target_node_id=selected.node_id,
+                target_node_revision=selected.revision,
+                project_id=project_id,
+                principal_id=principal_id,
+                fencing_token=supervisor_lease.fencing_token,
+                owner_id=supervisor_lease.owner_id,
+                term_acquired_at=supervisor_lease.acquired_at,
+                claim_readiness_document_hash=readiness_hash,
+                binding_document=copy.deepcopy(binding_document),
+                binding_document_hash=binding_hash,
+                recorded_at=recorded_at,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "requires the active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "DAG input binding lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "DAG input binding conflicts with durable state"
             ) from error
         except Exception:
             if connection.in_transaction:
