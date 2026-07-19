@@ -2,7 +2,7 @@
 
 <!-- project-current-state: v1 -->
 
-更新日期：2026-07-17
+更新日期：2026-07-19
 
 这是新会话的有界路由摘要，不替代进度账本、阶段计划或现场证据。冲突时以 Git、代码、
 受影响测试和任务现场为准；普通实现与验证证据只写入 `docs/PROJECT_PROGRESS.md`。
@@ -14,10 +14,13 @@
 - Verified：P0、P1、P2。P2-001～P2-009B2、reconciliation 矩阵、checkpoint / Waiting /
   same-live-attempt resume 及只读 SSE 均已实现；完整故障回归和代表性 CPU/CUDA HTTP/SSE E2E
   阶段出口通过，P2 已结束。
-- Pending：P3–P6 仍按固定顺序 Pending；下一个未满足出口是 P3 确定性 DAG。
+- In progress：历史入口“P3–P6 仍按固定顺序 Pending”已推进至 P3；首轮纯 DAG readiness /
+  failure-propagation kernel 已验证，但 durable node lifecycle/dispatch、资源锁、cache/checkpoint
+  与 Recipe 尚无实现，`dag` 执行能力仍关闭。P4–P6 Pending。
 - 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 8 个，当前约 4 个，P2 为 0、
   P3–P6 暂估约 4；这是弹性估算，不是配额。
-- 当前阻塞：无；开始前仍须检查分支、工作树、最近提交和相关 diff。
+- 当前阻塞：无；独立待核验风险是浏览器 Catalog normalizer 仅接受 1.4/1.5、服务端 current 为 1.6；
+  下一轮先聚焦复验，不混入 DAG 持久化边界。
 - D-005 仍为 Proposed，不迁移或删除现有 runtime prompt-like 文件。
 - **最高优先级 D 锁**：D-001～D-012 及 D-LOCK 只可按单目标精确 diff/hash 和用户随后单独
   原样复制的一次性 `D-AUTH` 句修改；普通“继续/同意/固定/记录”无效。
