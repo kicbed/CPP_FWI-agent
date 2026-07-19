@@ -37,6 +37,8 @@ from .task_dispatcher import (
 from .task_store import (
     ALLOWED_TRANSITIONS,
     TASK_STATUSES,
+    DagNodeClaimCandidate,
+    DagNodeStateMapSnapshot,
     DispatchIntentSnapshot,
     IdempotencyConflict,
     RuntimeSupervisorLease,
@@ -2443,6 +2445,73 @@ class TaskService:
             return self._store.release_runtime_supervisor_lease(
                 lease=lease,
                 clock=self._runtime_supervisor_clock,
+            )
+        except RuntimeSupervisorLeaseLost as error:
+            raise TaskSupervisorLeaseLost() from error
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+
+    def get_dag_node_state_snapshot(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+    ) -> DagNodeStateMapSnapshot | None:
+        """Read dormant P3 node facts without initializing or scheduling them."""
+
+        self.get_task(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+        )
+        try:
+            return self._store.get_dag_node_state_snapshot(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+            )
+        except TaskStoreConflict as error:
+            raise TaskConflict(str(error)) from error
+
+    def claim_ready_dag_node_candidate(
+        self,
+        task_id: str,
+        *,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        supervisor_lease: RuntimeSupervisorLease,
+    ) -> DagNodeClaimCandidate:
+        """Persist a deterministic, non-executable P3 readiness candidate."""
+
+        _validate_opaque_id(task_id, field="task_id")
+        _validate_opaque_id(project_id, field="project_id")
+        _validate_opaque_id(principal_id, field="principal_id")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", expected_plan_hash or "") is None:
+            raise TaskValidationError(
+                "INVALID_PLAN_HASH",
+                ["expected_plan_hash must be a canonical SHA-256 identity"],
+            )
+        self.get_task(
+            task_id,
+            project_id=project_id,
+            principal_id=principal_id,
+        )
+        if (
+            not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or supervisor_lease.project_id != project_id
+            or supervisor_lease.principal_id != principal_id
+        ):
+            raise TaskSupervisorLeaseLost()
+        try:
+            return self._store.claim_ready_dag_node_candidate(
+                task_id=task_id,
+                project_id=project_id,
+                principal_id=principal_id,
+                expected_plan_hash=expected_plan_hash,
+                supervisor_lease=supervisor_lease,
+                supervisor_clock=self._runtime_supervisor_clock,
             )
         except RuntimeSupervisorLeaseLost as error:
             raise TaskSupervisorLeaseLost() from error

@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from .dag_scheduler import DagScheduleError, evaluate_dag_readiness
+
 
 MIGRATIONS_DIRECTORY = Path(__file__).with_name("migrations")
 APPLICATION_ID = 0x53525431  # ASCII "SRT1"
@@ -427,6 +429,51 @@ class RuntimeSupervisorLeaseAcquisition:
 
     lease: RuntimeSupervisorLease
     acquired: bool
+
+
+@dataclass(frozen=True)
+class DagNodeStateSnapshot:
+    """Latest durable lifecycle fact for one exact PlanGraph node."""
+
+    task_id: str
+    plan_id: str
+    plan_hash: str
+    node_id: str
+    revision: int
+    state: str
+    recorded_at: str
+
+
+@dataclass(frozen=True)
+class DagNodeStateMapSnapshot:
+    """Complete exact node-state map for one initialized multi-node plan."""
+
+    task_id: str
+    plan_id: str
+    plan_hash: str
+    nodes: tuple[DagNodeStateSnapshot, ...]
+
+
+@dataclass(frozen=True)
+class DagNodeClaimCandidate:
+    """Term-bound readiness audit that deliberately grants no execution right."""
+
+    node: DagNodeStateSnapshot
+    approval_id: str
+    project_id: str
+    principal_id: str
+    fencing_token: int
+    owner_id: str
+    term_acquired_at: str
+    readiness_document_hash: str
+    recorded_at: str
+    replayed: bool
+
+    @property
+    def dispatch_authorized(self) -> bool:
+        """A P3 claim candidate is never an Adapter dispatch authorization."""
+
+        return False
 
 
 @dataclass(frozen=True)
@@ -993,6 +1040,27 @@ class TaskStore(Protocol):
     def get_runtime_supervisor_lease(
         self, *, project_id: str, principal_id: str
     ) -> RuntimeSupervisorLease | None:
+        ...
+
+    def get_dag_node_state_snapshot(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+    ) -> DagNodeStateMapSnapshot | None:
+        ...
+
+    def claim_ready_dag_node_candidate(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagNodeClaimCandidate:
         ...
 
     def authorize_supervised_dispatch(
@@ -13373,6 +13441,459 @@ class SQLiteTaskStore:
                 project_id=project_id,
                 principal_id=principal_id,
             )
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _load_dag_node_state_map(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        plan: Mapping[str, Any],
+    ) -> DagNodeStateMapSnapshot | None:
+        """Load and validate the complete append-only state history."""
+
+        plan_id = plan.get("plan_id")
+        plan_hash = plan.get("plan_hash")
+        plan_nodes = plan.get("nodes")
+        if (
+            not isinstance(plan_id, str)
+            or not isinstance(plan_hash, str)
+            or not isinstance(plan_nodes, list)
+            or len(plan_nodes) <= 1
+        ):
+            raise TaskStoreConflict("task current plan is not a multi-node DAG")
+        expected_node_ids = {
+            node.get("node_id")
+            for node in plan_nodes
+            if isinstance(node, Mapping) and isinstance(node.get("node_id"), str)
+        }
+        if len(expected_node_ids) != len(plan_nodes):
+            raise TaskStoreCorruption("persisted DAG node identity is inconsistent")
+
+        rows = connection.execute(
+            """
+            SELECT task_id, plan_id, plan_hash, node_id, revision,
+                   previous_state, state, recorded_at, recorded_at_us
+            FROM dag_node_state_events
+            WHERE task_id = ? AND plan_id = ?
+            ORDER BY node_id ASC, revision ASC
+            """,
+            (task_id, plan_id),
+        ).fetchall()
+        if not rows:
+            return None
+
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            if (
+                row["task_id"] != task_id
+                or row["plan_id"] != plan_id
+                or row["plan_hash"] != plan_hash
+                or row["node_id"] not in expected_node_ids
+            ):
+                raise TaskStoreCorruption(
+                    "persisted DAG node state differs from its plan identity"
+                )
+            grouped.setdefault(row["node_id"], []).append(row)
+        if set(grouped) != expected_node_ids:
+            raise TaskStoreCorruption("persisted DAG node state map is incomplete")
+
+        current: list[DagNodeStateSnapshot] = []
+        known_states = {
+            "Pending",
+            "Queued",
+            "Running",
+            "Waiting",
+            "Retrying",
+            "Succeeded",
+            "Failed",
+            "Cancelled",
+            "Blocked",
+        }
+        for node_id in sorted(expected_node_ids):
+            history = grouped[node_id]
+            prior_state: str | None = None
+            for expected_revision, row in enumerate(history, start=1):
+                try:
+                    recorded_at, recorded_at_us = _runtime_timestamp(
+                        row["recorded_at"]
+                    )
+                except TaskStoreConflict as error:
+                    raise TaskStoreCorruption(
+                        "persisted DAG node state time is inconsistent"
+                    ) from error
+                if (
+                    type(row["revision"]) is not int
+                    or row["revision"] != expected_revision
+                    or row["previous_state"] != prior_state
+                    or row["state"] not in known_states
+                    or recorded_at != row["recorded_at"]
+                    or recorded_at_us != row["recorded_at_us"]
+                ):
+                    raise TaskStoreCorruption(
+                        "persisted DAG node state history is inconsistent"
+                    )
+                prior_state = row["state"]
+            latest = history[-1]
+            current.append(
+                DagNodeStateSnapshot(
+                    task_id=task_id,
+                    plan_id=plan_id,
+                    plan_hash=plan_hash,
+                    node_id=node_id,
+                    revision=int(latest["revision"]),
+                    state=latest["state"],
+                    recorded_at=_runtime_timestamp(latest["recorded_at"])[0],
+                )
+            )
+        return DagNodeStateMapSnapshot(
+            task_id=task_id,
+            plan_id=plan_id,
+            plan_hash=plan_hash,
+            nodes=tuple(current),
+        )
+
+    def get_dag_node_state_snapshot(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+    ) -> DagNodeStateMapSnapshot | None:
+        """Read the dormant P3 node-state map without creating facts."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            snapshot = self._load_snapshot(connection, task_id)
+            if (
+                snapshot is None
+                or snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreConflict("task does not exist in the requested scope")
+            if snapshot.plan is None:
+                connection.commit()
+                return None
+            if len(snapshot.plan.get("nodes", [])) <= 1:
+                plan_id = snapshot.plan.get("plan_id")
+                impossible = connection.execute(
+                    """
+                    SELECT 1 FROM dag_node_state_events
+                    WHERE task_id = ? AND plan_id = ?
+                    UNION ALL
+                    SELECT 1 FROM dag_node_claim_candidates
+                    WHERE task_id = ? AND plan_id = ?
+                    LIMIT 1
+                    """,
+                    (task_id, plan_id, task_id, plan_id),
+                ).fetchone()
+                if impossible is not None:
+                    raise TaskStoreCorruption(
+                        "single-node plan has impossible durable DAG facts"
+                    )
+                connection.commit()
+                return None
+            state_map = self._load_dag_node_state_map(
+                connection,
+                task_id=task_id,
+                plan=snapshot.plan,
+            )
+            connection.commit()
+            return state_map
+        except (TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def claim_ready_dag_node_candidate(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagNodeClaimCandidate:
+        """Persist one deterministic readiness candidate under an active term.
+
+        This dormant P3 primitive intentionally leaves every node ``Pending``
+        and never writes Task status, RunEvent, dispatch intent, or Approval
+        budget state.  A candidate is audit evidence only, not execution
+        authorization.
+        """
+
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(project_id, str)
+            or not project_id
+            or not isinstance(principal_id, str)
+            or not principal_id
+            or not _is_sha256(expected_plan_hash)
+        ):
+            raise TaskStoreConflict("DAG node claim identity is invalid")
+        if not isinstance(supervisor_lease, RuntimeSupervisorLease):
+            raise TaskStoreConflict("runtime supervisor lease is invalid")
+        if not callable(supervisor_clock):
+            raise TaskStoreConflict("runtime supervisor clock is invalid")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            recorded_at, recorded_at_us = _runtime_timestamp(supervisor_clock())
+            snapshot = self._load_snapshot(connection, task_id)
+            if (
+                snapshot is None
+                or snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreConflict("task does not exist in the requested scope")
+            plan = snapshot.plan
+            approval = snapshot.approval
+            if (
+                snapshot.status != "AwaitingApproval"
+                or not isinstance(plan, Mapping)
+                or len(plan.get("nodes", [])) <= 1
+                or plan.get("plan_hash") != expected_plan_hash
+                or not isinstance(approval, Mapping)
+                or approval.get("decision") != "approved"
+                or approval.get("plan_id") != plan.get("plan_id")
+                or approval.get("plan_hash") != expected_plan_hash
+            ):
+                raise TaskStoreConflict(
+                    "DAG node claim requires the exact current approved multi-node plan"
+                )
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                supplied=supervisor_lease,
+                now_us=recorded_at_us,
+                action="DAG node claim candidate",
+            )
+
+            state_map = self._load_dag_node_state_map(
+                connection,
+                task_id=task_id,
+                plan=plan,
+            )
+            if state_map is None:
+                for node in sorted(plan["nodes"], key=lambda item: item["node_id"]):
+                    connection.execute(
+                        """
+                        INSERT INTO dag_node_state_events(
+                            task_id, plan_id, plan_hash, node_id, revision,
+                            previous_state, state, recorded_at, recorded_at_us
+                        ) VALUES (?, ?, ?, ?, 1, NULL, 'Pending', ?, ?)
+                        """,
+                        (
+                            task_id,
+                            plan["plan_id"],
+                            expected_plan_hash,
+                            node["node_id"],
+                            recorded_at,
+                            recorded_at_us,
+                        ),
+                    )
+                state_map = self._load_dag_node_state_map(
+                    connection,
+                    task_id=task_id,
+                    plan=plan,
+                )
+            if state_map is None:
+                raise TaskStoreCorruption("DAG node state initialization was lost")
+
+            node_states = {node.node_id: node.state for node in state_map.nodes}
+            try:
+                readiness = evaluate_dag_readiness(plan, node_states=node_states)
+            except DagScheduleError as error:
+                raise TaskStoreCorruption(
+                    "persisted DAG state cannot be evaluated"
+                ) from error
+            if not readiness.runnable_node_ids:
+                raise TaskStoreConflict("DAG plan has no runnable Pending node")
+            selected_node_id = readiness.runnable_node_ids[0]
+            selected = next(
+                node for node in state_map.nodes if node.node_id == selected_node_id
+            )
+            if selected.state != "Pending":
+                raise TaskStoreCorruption("DAG readiness selected a non-Pending node")
+
+            readiness_document = {
+                "schema_version": "1.0.0",
+                "task_id": task_id,
+                "plan_id": state_map.plan_id,
+                "plan_hash": state_map.plan_hash,
+                "approval_id": approval["approval_id"],
+                "node_states": [
+                    {
+                        "node_id": node.node_id,
+                        "revision": node.revision,
+                        "state": node.state,
+                    }
+                    for node in state_map.nodes
+                ],
+                "topological_layers": [
+                    list(layer) for layer in readiness.topological_layers
+                ],
+                "runnable_node_ids": list(readiness.runnable_node_ids),
+                "waiting_node_ids": list(readiness.waiting_node_ids),
+                "active_node_ids": list(readiness.active_node_ids),
+                "succeeded_node_ids": list(readiness.succeeded_node_ids),
+                "failed_node_ids": list(readiness.failed_node_ids),
+                "cancelled_node_ids": list(readiness.cancelled_node_ids),
+                "blocked_nodes": [
+                    {
+                        "node_id": blocked.node_id,
+                        "blocked_by_node_ids": list(blocked.blocked_by_node_ids),
+                    }
+                    for blocked in readiness.blocked_nodes
+                ],
+                "selected_node_id": selected_node_id,
+            }
+            readiness_json, readiness_hash = encode_document(readiness_document)
+
+            existing = connection.execute(
+                """
+                SELECT * FROM dag_node_claim_candidates
+                WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+                  AND node_id = ? AND node_revision = ?
+                  AND fencing_token = ?
+                """,
+                (
+                    task_id,
+                    state_map.plan_id,
+                    approval["approval_id"],
+                    selected.node_id,
+                    selected.revision,
+                    supervisor_lease.fencing_token,
+                ),
+            ).fetchone()
+            if existing is not None:
+                stored_document = _decode_document(
+                    existing["readiness_document_json"],
+                    label="DAG readiness claim",
+                )
+                stored_json, stored_hash = encode_document(stored_document)
+                try:
+                    existing_at, existing_at_us = _runtime_timestamp(
+                        existing["recorded_at"]
+                    )
+                except TaskStoreConflict as error:
+                    raise TaskStoreCorruption(
+                        "persisted DAG node claim time is inconsistent"
+                    ) from error
+                if (
+                    existing["plan_hash"] != expected_plan_hash
+                    or existing["approval_id"] != approval["approval_id"]
+                    or existing["node_id"] != selected.node_id
+                    or existing["node_revision"] != selected.revision
+                    or existing["node_state"] != selected.state
+                    or existing["project_id"] != project_id
+                    or existing["principal_id"] != principal_id
+                    or existing["owner_id"] != supervisor_lease.owner_id
+                    or existing["term_acquired_at"] != supervisor_lease.acquired_at
+                    or stored_json != readiness_json
+                    or stored_hash != readiness_hash
+                    or existing["readiness_document_hash"] != readiness_hash
+                    or existing_at != existing["recorded_at"]
+                    or existing_at_us != existing["recorded_at_us"]
+                ):
+                    raise TaskStoreCorruption(
+                        "persisted DAG node claim candidate is inconsistent"
+                    )
+                connection.commit()
+                return DagNodeClaimCandidate(
+                    node=selected,
+                    approval_id=approval["approval_id"],
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    fencing_token=supervisor_lease.fencing_token,
+                    owner_id=supervisor_lease.owner_id,
+                    term_acquired_at=supervisor_lease.acquired_at,
+                    readiness_document_hash=readiness_hash,
+                    recorded_at=existing_at,
+                    replayed=True,
+                )
+
+            connection.execute(
+                """
+                INSERT INTO dag_node_claim_candidates(
+                    task_id, plan_id, plan_hash, approval_id,
+                    node_id, node_revision, node_state,
+                    project_id, principal_id, fencing_token,
+                    owner_id, term_acquired_at,
+                    readiness_document_json, readiness_document_hash,
+                    recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    state_map.plan_id,
+                    state_map.plan_hash,
+                    approval["approval_id"],
+                    selected.node_id,
+                    selected.revision,
+                    selected.state,
+                    project_id,
+                    principal_id,
+                    supervisor_lease.fencing_token,
+                    supervisor_lease.owner_id,
+                    supervisor_lease.acquired_at,
+                    readiness_json,
+                    readiness_hash,
+                    recorded_at,
+                    recorded_at_us,
+                ),
+            )
+            connection.commit()
+            return DagNodeClaimCandidate(
+                node=selected,
+                approval_id=approval["approval_id"],
+                project_id=project_id,
+                principal_id=principal_id,
+                fencing_token=supervisor_lease.fencing_token,
+                owner_id=supervisor_lease.owner_id,
+                term_acquired_at=supervisor_lease.acquired_at,
+                readiness_document_hash=readiness_hash,
+                recorded_at=recorded_at,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "DAG node claim candidate lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "DAG node claim candidate conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 

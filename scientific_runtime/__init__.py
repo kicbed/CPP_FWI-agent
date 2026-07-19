@@ -64,6 +64,9 @@ from .task_dispatcher import (
 )
 from .task_store import (
     ApprovalBudget,
+    DagNodeClaimCandidate,
+    DagNodeStateMapSnapshot,
+    DagNodeStateSnapshot,
     DispatchIntentSnapshot,
     RegistrySnapshots,
     RegistryWriteRecord,
@@ -119,6 +122,9 @@ __all__ = [
     "AbandonTaskResult",
     "ApprovalBudget",
     "CreateTaskResult",
+    "DagNodeClaimCandidate",
+    "DagNodeStateMapSnapshot",
+    "DagNodeStateSnapshot",
     "DeepwaveTaskDispatcher",
     "DispatchDeferred",
     "DeepwaveAdapter",
