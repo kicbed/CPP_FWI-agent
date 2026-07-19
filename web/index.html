@@ -2222,7 +2222,7 @@
         && typeof algorithmSource.adapter === 'object' && !Array.isArray(algorithmSource.adapter)
         ? algorithmSource.adapter : null;
       const supportedBinding = algorithmSource && adapterSource
-        && ['1.4.0', '1.5.0'].includes(algorithmSource.version)
+        && ['1.4.0', '1.5.0', '1.6.0'].includes(algorithmSource.version)
         && adapterSource.version === algorithmSource.version
         && adapterSource.protocol === 'algorithm-adapter-v1';
       const algorithm = supportedBinding
@@ -2361,7 +2361,7 @@
         { port: 'inverted_model', dataType: 'inverted_velocity_model_2d' },
         { port: 'loss', dataType: 'loss_curve' },
       ];
-      if (['1.4.0', '1.5.0'].includes(algorithmVersion)) {
+      if (['1.4.0', '1.5.0', '1.6.0'].includes(algorithmVersion)) {
         return [
           ...primary,
           { port: 'true_model_figure', dataType: 'figure' },

@@ -1397,7 +1397,7 @@ function testEmbeddingStatusUsesSameOriginHealthProxy() {
 function makeGuidedTask(overrides = {}) {
   const taskId = overrides.task_id || 'task-guided-1';
   const planHash = overrides.plan_hash || `sha256:${'a'.repeat(64)}`;
-  const algorithmVersion = overrides.algorithm_version || '1.5.0';
+  const algorithmVersion = overrides.algorithm_version || '1.6.0';
   const approval = overrides.approval
     ? {
         approval_id: 'approval-guided-1',
@@ -1657,7 +1657,7 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   const api = loadGuidedFunctions();
   const catalog = {
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.5.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.6.0' },
   };
   const reviewTask = api.normalizeGuidedTaskProjection(makeGuidedTask());
   assert.equal(api.isGuidedReviewReady(reviewTask, catalog), true);
@@ -2181,8 +2181,12 @@ function testGuidedTaskAndCrashStatesAreHonest() {
   assert.equal(
     api.normalizeGuidedTaskProjection(currentMissingFigures),
     null,
-    'Algorithm 1.5 cannot silently fall back to the historical two-output contract',
+    'Algorithm 1.6 cannot silently fall back to the historical two-output contract',
   );
+  const historical15 = api.normalizeGuidedTaskProjection(makeGuidedTask({
+    algorithm_version: '1.5.0',
+  }));
+  assert.ok(historical15, 'the exact historical Algorithm 1.5 output contract remains readable');
   const historical14 = api.normalizeGuidedTaskProjection(makeGuidedTask({
     algorithm_version: '1.4.0',
   }));
@@ -2691,9 +2695,9 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
       },
     }],
     algorithm: {
-      id: 'deepwave.acoustic_fwi', version: '1.5.0', entrypoint: '/root/run.py',
+      id: 'deepwave.acoustic_fwi', version: '1.6.0', entrypoint: '/root/run.py',
       adapter: {
-        protocol: 'algorithm-adapter-v1', version: '1.5.0',
+        protocol: 'algorithm-adapter-v1', version: '1.6.0',
         entrypoint_ref: '/root/private/adapter.py',
       },
     },
@@ -2702,12 +2706,21 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
   assert.equal(catalog.datasets[0].relative_path, undefined);
   assert.deepEqual(
     JSON.parse(JSON.stringify(catalog.algorithm)),
-    { id: 'deepwave.acoustic_fwi', version: '1.5.0' },
+    { id: 'deepwave.acoustic_fwi', version: '1.6.0' },
   );
   assert.deepEqual(
     JSON.parse(JSON.stringify(catalog.adapter)),
-    { protocol: 'algorithm-adapter-v1', version: '1.5.0' },
+    { protocol: 'algorithm-adapter-v1', version: '1.6.0' },
   );
+  const historical15 = api.normalizeGuidedCatalog({
+    datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
+    algorithm: {
+      id: 'deepwave.acoustic_fwi', version: '1.5.0',
+      adapter: { protocol: 'algorithm-adapter-v1', version: '1.5.0' },
+    },
+  });
+  assert.equal(historical15.algorithm.version, '1.5.0');
+  assert.equal(historical15.adapter.version, '1.5.0');
   const historical14 = api.normalizeGuidedCatalog({
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
     algorithm: {
@@ -2720,8 +2733,8 @@ function testGuidedCatalogProjectionDoesNotExposePaths() {
   assert.equal(api.normalizeGuidedCatalog({
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
     algorithm: {
-      id: 'deepwave.acoustic_fwi', version: '1.5.0',
-      adapter: { protocol: 'algorithm-adapter-v1', version: '1.4.0' },
+      id: 'deepwave.acoustic_fwi', version: '1.6.0',
+      adapter: { protocol: 'algorithm-adapter-v1', version: '1.5.0' },
     },
   }), null, 'mixed Algorithm/Adapter versions fail closed');
   const catalogPreviewSource = extractFunction('renderGuidedCatalogPreview');
@@ -2933,7 +2946,7 @@ async function testGuidedApproveFourXxRetainsOriginalKeyThroughGetRecovery() {
   const planHash = `sha256:${'b'.repeat(64)}`;
   const catalog = {
     datasets: [{ id: 'marmousi_94_288', version: '1.0.0' }],
-    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.5.0' },
+    algorithm: { id: 'deepwave.acoustic_fwi', version: '1.6.0' },
   };
   const noApprovalProjection = makeGuidedTask({ task_id: taskId, plan_hash: planHash });
   const approvedSubmitPendingProjection = makeGuidedTask({
@@ -3810,7 +3823,7 @@ function createGuidedRecoveryHarness(task, approvedSubmitPending = false) {
         phase: 'monitoring',
         csrfToken: 'csrf-token-1234567890',
         session: { mode: 'guided' },
-        catalog: { algorithm: { id: 'deepwave.acoustic_fwi', version: '1.5.0' } },
+        catalog: { algorithm: { id: 'deepwave.acoustic_fwi', version: '1.6.0' } },
         form: null,
         task,
         taskId: task.taskId,
@@ -3849,7 +3862,7 @@ function createGuidedRecoveryHarness(task, approvedSubmitPending = false) {
       throw new Error(`unexpected path ${path}`);
     },
     normalizeGuidedSession: () => ({ csrfToken: 'csrf-token-abcdefghijkl', mode: 'guided' }),
-    normalizeGuidedCatalog: () => ({ algorithm: { id: 'deepwave.acoustic_fwi', version: '1.5.0' } }),
+    normalizeGuidedCatalog: () => ({ algorithm: { id: 'deepwave.acoustic_fwi', version: '1.6.0' } }),
     normalizeGuidedTaskProjection: (_data, expectedTaskId) => (
       expectedTaskId === task.taskId ? task : null
     ),
@@ -3933,11 +3946,11 @@ async function testGuidedCloseRetainsIndexAndReopensThroughGets() {
   ]);
   assert.equal(harness.sandbox.state.guided.taskId, task.taskId);
   assert.equal(harness.sandbox.state.guided.task, task);
-  assert.equal(harness.sandbox.state.guided.catalog.algorithm.version, '1.5.0');
+  assert.equal(harness.sandbox.state.guided.catalog.algorithm.version, '1.6.0');
   assert.equal(
     harness.sandbox.state.guided.task.draft.algorithmVersion,
     '1.4.0',
-    'a historical 1.4 task remains readable after the current catalog advances to 1.5',
+    'a historical 1.4 task remains readable after the current catalog advances to 1.6',
   );
   assert.equal(harness.sandbox.state.guided.phase, 'monitoring');
   assert.equal(harness.sandbox.state.guided.taskIndex.length, 1);
