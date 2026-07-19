@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import shutil
 import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
+
+import scientific_runtime.task_store as task_store_module
 
 from scientific_runtime import (
     DagNodeArtifactInput,
@@ -218,6 +222,10 @@ class ScientificRuntimeDagInputBindingStoreTest(unittest.TestCase):
                 "DROP TRIGGER IF EXISTS "
                 "dag_node_state_events_are_initial_pending_only"
             )
+            connection.execute(
+                "DROP TRIGGER IF EXISTS "
+                "dag_node_transition_state_requires_exact_active_fact"
+            )
             connection.commit()
         finally:
             connection.close()
@@ -362,6 +370,113 @@ class ScientificRuntimeDagInputBindingStoreTest(unittest.TestCase):
         self.assertEqual(budget.tasks_used, 0)
         self.assertEqual(self._count("dispatch_intents", task_id=task_id), 0)
         self.assertEqual(self._count("run_events", task_id=task_id), 0)
+
+    def test_real_v19_pending_claim_and_binding_upgrade_in_place_to_v20(
+        self,
+    ) -> None:
+        legacy_migrations = Path(self.temporary.name) / "v19-migrations"
+        legacy_migrations.mkdir(mode=0o700)
+        for migration in sorted(
+            task_store_module.MIGRATIONS_DIRECTORY.glob(
+                "[0-9][0-9][0-9][0-9]_*.sql"
+            )
+        ):
+            if int(migration.name.split("_", 1)[0]) <= 19:
+                shutil.copy2(migration, legacy_migrations / migration.name)
+
+        legacy_directory = Path(self.temporary.name) / "legacy-v19"
+        legacy_directory.mkdir(mode=0o700)
+        legacy_path = legacy_directory / "task.sqlite3"
+        with mock.patch.object(
+            task_store_module,
+            "MIGRATIONS_DIRECTORY",
+            legacy_migrations,
+        ):
+            self.database_path = legacy_path
+            self.store = SQLiteTaskStore(legacy_path)
+            self.registry = RegistryService(
+                self.store, clock=lambda: self.clock_value
+            )
+            self.registry.register_dataset(dataset=dataset_ref())
+            self.registry.register_algorithm(manifest=self.algorithm)
+            self.next_task = 0
+            self.service = TaskService(
+                self.store,
+                task_id_factory=lambda: "task-v19-binding-upgrade",
+                clock=lambda: self.clock_value,
+            )
+            task_id, plan, approval = self._approved_typed_plan()
+            lease = self._acquire("v19-binding-supervisor")
+            claim = self._claim(task_id, plan, lease)
+            binding = self._bind(task_id, plan, lease, claim)
+            self.assertEqual(self.store.migration_version(), 19)
+
+        upgraded = SQLiteTaskStore(legacy_path)
+        self.assertEqual(upgraded.migration_version(), 20)
+        upgraded_service = TaskService(upgraded, clock=lambda: self.clock_value)
+        state = upgraded_service.get_dag_node_state_snapshot(
+            task_id, **self.scope
+        )
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(
+            [(node.node_id, node.revision, node.state) for node in state.nodes],
+            [("invert", 1, "Pending"), ("prepare", 1, "Pending")],
+        )
+
+        connection = sqlite3.connect(legacy_path)
+        try:
+            preserved_claim = connection.execute(
+                """
+                SELECT node_id, node_revision, readiness_document_hash
+                FROM dag_node_claim_candidates WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            preserved_binding = connection.execute(
+                """
+                SELECT target_node_id, target_node_revision,
+                       binding_document_hash
+                FROM dag_node_input_binding_facts WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            self.assertEqual(
+                preserved_claim,
+                (
+                    claim.node.node_id,
+                    claim.node.revision,
+                    claim.readiness_document_hash,
+                ),
+            )
+            self.assertEqual(
+                preserved_binding,
+                (
+                    binding.target_node_id,
+                    binding.target_node_revision,
+                    binding.binding_document_hash,
+                ),
+            )
+            for table in (
+                "dag_node_execution_admissions",
+                "dag_node_execution_transition_facts",
+                "dag_node_terminal_facts",
+                "dispatch_intents",
+                "run_events",
+                "worker_launch_attempts",
+            ):
+                self.assertEqual(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table}",
+                    ).fetchone()[0],
+                    0,
+                    table,
+                )
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+        finally:
+            connection.close()
 
     def test_dataset_root_replay_and_same_term_concurrency(self) -> None:
         first_task, first_plan, first_approval = self._approved_typed_plan()

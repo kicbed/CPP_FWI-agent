@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
 import re
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from .fwi_adapter import (
     is_supported_receipt_binding,
 )
 from .task_store import (
+    DagNodeInputBindingFact,
     DispatchIntentSnapshot,
     RetryExhaustionCleanupProof,
     TaskSnapshot,
@@ -210,6 +212,15 @@ class TaskDispatcher(Protocol):
     def prepare(self, snapshot: TaskSnapshot) -> DispatchPreparation:
         ...
 
+    def prepare_node(
+        self,
+        snapshot: TaskSnapshot,
+        *,
+        node_id: str,
+        input_binding: DagNodeInputBindingFact,
+    ) -> DispatchPreparation:
+        ...
+
     def dispatch(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
         ...
 
@@ -331,6 +342,9 @@ class TaskDispatcher(Protocol):
     def collect(self, intent: DispatchIntentSnapshot) -> list[dict[str, Any]]:
         ...
 
+    def verified_node_outputs(self, intent: DispatchIntentSnapshot):
+        ...
+
     def read_artifact(
         self, intent: DispatchIntentSnapshot, artifact_id: str
     ) -> tuple[list[dict[str, Any]], dict[str, Any], bytes]:
@@ -396,6 +410,10 @@ class DeepwaveTaskDispatcher:
 
     def prepare(self, snapshot: TaskSnapshot) -> DispatchPreparation:
         request = self._request_from_snapshot(snapshot)
+        return self._prepare_request(request)
+
+    def _prepare_request(self, request: Mapping[str, Any]) -> DispatchPreparation:
+        request = copy.deepcopy(dict(request))
         try:
             validated = self._adapter.validate(
                 **{
@@ -426,6 +444,89 @@ class DeepwaveTaskDispatcher:
             request=request,
             queue_fingerprint=copy.deepcopy(validated.fingerprint),
         )
+
+    def prepare_node(
+        self,
+        snapshot: TaskSnapshot,
+        *,
+        node_id: str,
+        input_binding: DagNodeInputBindingFact,
+    ) -> DispatchPreparation:
+        """Prepare one exact dataset-root DAG node without enabling public DAG."""
+
+        plan = snapshot.plan
+        approval = snapshot.approval
+        plan_nodes = plan.get("nodes") if isinstance(plan, Mapping) else None
+        if (
+            not isinstance(plan, Mapping)
+            or not isinstance(plan_nodes, list)
+            or len(plan_nodes) <= 1
+            or not isinstance(approval, Mapping)
+            or input_binding.task_id != snapshot.task_id
+            or input_binding.plan_id != plan.get("plan_id")
+            or input_binding.plan_hash != plan.get("plan_hash")
+            or input_binding.approval_id != approval.get("approval_id")
+            or input_binding.target_node_id != node_id
+            or input_binding.project_id != snapshot.project_id
+            or input_binding.principal_id != snapshot.principal_id
+        ):
+            raise DispatchError("DAG_NODE_PREPARATION_INVALID")
+        matching = [
+            value
+            for value in plan_nodes
+            if isinstance(value, Mapping) and value.get("node_id") == node_id
+        ]
+        binding_inputs = input_binding.binding_document.get("inputs")
+        if (
+            len(matching) != 1
+            or not isinstance(binding_inputs, list)
+            or len(binding_inputs) != 1
+        ):
+            raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
+        node = matching[0]
+        bound = binding_inputs[0]
+        planned_inputs = node.get("inputs")
+        if (
+            not isinstance(bound, Mapping)
+            or bound.get("kind") != "dataset"
+            or not isinstance(planned_inputs, list)
+            or len(planned_inputs) != 1
+            or not isinstance(planned_inputs[0], Mapping)
+            or bound.get("target_input_port") != planned_inputs[0].get("port")
+            or bound.get("dataset") != planned_inputs[0].get("dataset")
+        ):
+            raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
+        identity = bound.get("dataset")
+        if not isinstance(identity, Mapping):
+            raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
+        dataset = next(
+            (
+                value
+                for value in snapshot.draft.get("datasets", [])
+                if isinstance(value, Mapping)
+                and all(
+                    value.get(key) == identity.get(key)
+                    for key in ("id", "version", "content_hash", "data_type")
+                )
+            ),
+            None,
+        )
+        if dataset is None:
+            raise DispatchError("DAG_NODE_CAPABILITY_UNSUPPORTED")
+        request = {
+            "task_id": snapshot.task_id,
+            "node_id": node["node_id"],
+            "plan_hash": plan["plan_hash"],
+            "idempotency_key": node["idempotency_key"],
+            "project_id": snapshot.project_id,
+            "principal_id": snapshot.principal_id,
+            "algorithm": copy.deepcopy(node["algorithm"]),
+            "dataset": copy.deepcopy(dict(dataset)),
+            "task_type": plan["task_type"],
+            "parameters": copy.deepcopy(node["parameters"]),
+            "resources": copy.deepcopy(node["resources"]),
+        }
+        return self._prepare_request(request)
 
     def dispatch(self, intent: DispatchIntentSnapshot) -> dict[str, Any]:
         """Backward-compatible one-shot entry; production uses the scheduler."""
@@ -2365,6 +2466,45 @@ class DeepwaveTaskDispatcher:
             raise DispatchError(error.code) from error
         except Exception as error:
             raise DispatchError("ADAPTER_COLLECT_UNAVAILABLE") from error
+
+    @contextlib.contextmanager
+    def verified_node_outputs(self, intent: DispatchIntentSnapshot):
+        """Yield one path-free success proof while Adapter fences stay held."""
+
+        handle = self._handle_from_intent(intent)
+        try:
+            with self._adapter.verified_succeeded_outputs(handle) as value:
+                if not isinstance(value, Mapping):
+                    raise DispatchError("ADAPTER_ARTIFACT_INVALID")
+                proof = copy.deepcopy(dict(value))
+                if (
+                    set(proof)
+                    != {
+                        "schema_version",
+                        "receipt_record_hash",
+                        "attempt_id",
+                        "attempt_number",
+                        "manifests",
+                    }
+                    or proof.get("schema_version") != "1.0.0"
+                    or _SHA256.fullmatch(proof.get("receipt_record_hash", ""))
+                    is None
+                    or _MANAGED_ATTEMPT_ID.fullmatch(proof.get("attempt_id", ""))
+                    is None
+                    or proof.get("attempt_number") != 1
+                    or not isinstance(proof.get("manifests"), list)
+                    or not all(
+                        isinstance(item, dict) for item in proof["manifests"]
+                    )
+                ):
+                    raise DispatchError("ADAPTER_ARTIFACT_INVALID")
+                yield {**proof, "intent_id": intent.intent_id}
+        except DispatchError:
+            raise
+        except AdapterError as error:
+            raise DispatchError(error.code) from error
+        except Exception as error:
+            raise DispatchError("ADAPTER_ARTIFACT_UNAVAILABLE") from error
 
     def read_artifact(
         self, intent: DispatchIntentSnapshot, artifact_id: str

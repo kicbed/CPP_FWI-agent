@@ -351,6 +351,17 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
 
     @staticmethod
     def _drop_dag_schema(connection: sqlite3.Connection) -> None:
+        trigger_names = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'trigger' AND name LIKE 'dag_node_%'"
+        ).fetchall()
+        for (trigger_name,) in trigger_names:
+            connection.execute(f'DROP TRIGGER "{trigger_name}"')
+        connection.execute("DROP TABLE dag_node_terminal_facts")
+        connection.execute("DROP TABLE dag_node_execution_transition_facts")
+        connection.execute("DROP TABLE dag_node_execution_admissions")
+        connection.execute("DROP TABLE dag_node_succeeded_outputs")
+        connection.execute("DROP TABLE dag_node_input_binding_facts")
         connection.execute("DROP TABLE dag_node_claim_candidates")
         connection.execute("DROP TABLE dag_node_state_events")
 
@@ -1839,8 +1850,8 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             },
         }
 
-    def test_fresh_v19_has_supervisor_tables_and_immutable_triggers(self) -> None:
-        self.assertEqual(self.store.migration_version(), 19)
+    def test_fresh_v20_has_supervisor_tables_and_immutable_triggers(self) -> None:
+        self.assertEqual(self.store.migration_version(), 20)
         expected_tables = {
             "runtime_supervisor_terms",
             "runtime_supervisor_leases",
@@ -1875,6 +1886,9 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "task_checkpoint_resume_outcomes",
             "dag_node_state_events",
             "dag_node_claim_candidates",
+            "dag_node_execution_admissions",
+            "dag_node_execution_transition_facts",
+            "dag_node_terminal_facts",
         }
         expected_triggers = {
             "runtime_supervisor_terms_are_append_only",
@@ -2003,8 +2017,9 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "checkpoint_resume_authorizations_cannot_be_deleted",
             "checkpoint_resume_outcomes_are_append_only",
             "checkpoint_resume_outcomes_cannot_be_deleted",
-            "dag_node_state_events_are_initial_pending_only",
+            "dag_node_initial_state_has_exact_shape",
             "dag_node_initial_state_requires_current_approved_plan",
+            "dag_node_transition_state_requires_exact_active_fact",
             "dag_node_state_events_are_append_only",
             "dag_node_state_events_cannot_be_deleted",
             "dag_node_claim_requires_current_approved_plan",
@@ -2012,6 +2027,24 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "dag_node_claim_requires_active_term",
             "dag_node_claim_candidates_are_append_only",
             "dag_node_claim_candidates_cannot_be_deleted",
+            "dag_node_execution_admission_requires_exact_current_case",
+            "dag_node_execution_admission_requires_active_term",
+            "dag_node_execution_admission_requires_exact_document",
+            "dag_node_execution_admissions_are_append_only",
+            "dag_node_execution_admissions_cannot_be_deleted",
+            "dag_node_terminal_fact_requires_exact_current_case",
+            "dag_node_terminal_fact_requires_exact_p2_evidence",
+            "dag_node_terminal_fact_requires_active_completion_term",
+            "dag_node_terminal_success_requires_complete_receipt",
+            "dag_node_terminal_facts_are_append_only",
+            "dag_node_terminal_facts_cannot_be_deleted",
+            "dag_node_execution_transition_requires_exact_current_case",
+            "dag_node_execution_transition_requires_active_term",
+            "dag_node_execution_transition_facts_are_append_only",
+            "dag_node_execution_transition_facts_cannot_be_deleted",
+            "dag_node_execution_blocks_second_launch_attempt",
+            "dag_node_execution_blocks_pre_running_retry",
+            "dag_node_execution_blocks_worker_exit_retry",
         }
         expected_indexes = {
             "idx_worker_attempt_timeout_windows_scope_deadline",
@@ -2030,6 +2063,9 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             "idx_checkpoint_resume_authorizations_term",
             "idx_dag_node_state_events_current",
             "idx_dag_node_claim_candidates_term",
+            "idx_dag_node_execution_admissions_term",
+            "idx_dag_node_execution_transition_facts_term",
+            "idx_dag_node_terminal_facts_term",
         }
         connection = self._connection()
         try:
@@ -2174,7 +2210,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.rollback()
             connection.close()
 
-    def test_real_v16_database_upgrades_catalog_constraints_to_v19(
+    def test_real_v16_database_upgrades_catalog_constraints_to_v20(
         self,
     ) -> None:
         historical_directory = Path(self.temporary.name) / "historical-v16"
@@ -2227,7 +2263,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         upgraded = SQLiteTaskStore(historical_path)
-        self.assertEqual(upgraded.migration_version(), 19)
+        self.assertEqual(upgraded.migration_version(), 20)
         connection = sqlite3.connect(historical_path)
         try:
             heartbeat_schema = connection.execute(
@@ -2352,7 +2388,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v14_database_upgrades_in_place_to_v19(self) -> None:
+    def test_v14_database_upgrades_in_place_to_v20(self) -> None:
         legacy_migrations = Path(self.temporary.name) / "v14-migrations"
         legacy_migrations.mkdir(mode=0o700)
         for migration in sorted(
@@ -2371,11 +2407,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 14)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 19)
+        self.assertEqual(upgraded.migration_version(), 20)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 19
+                connection.execute("PRAGMA user_version").fetchone()[0], 20
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -2389,7 +2425,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v15_database_upgrades_in_place_to_v19(self) -> None:
+    def test_v15_database_upgrades_in_place_to_v20(self) -> None:
         legacy_migrations = Path(self.temporary.name) / "v15-migrations"
         legacy_migrations.mkdir(mode=0o700)
         for migration in sorted(
@@ -2410,11 +2446,11 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             self.assertEqual(legacy.migration_version(), 15)
 
         upgraded = SQLiteTaskStore(legacy_database)
-        self.assertEqual(upgraded.migration_version(), 19)
+        self.assertEqual(upgraded.migration_version(), 20)
         connection = sqlite3.connect(legacy_database)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 19
+                connection.execute("PRAGMA user_version").fetchone()[0], 20
             )
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_check").fetchall(), []
@@ -3063,7 +3099,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v19(self) -> None:
+    def test_v8_runtime_with_active_lease_upgrades_in_place_to_v20(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
@@ -3101,7 +3137,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 19)
+        self.assertEqual(reopened.migration_version(), 20)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)
@@ -3140,7 +3176,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v19(self) -> None:
+    def test_v10_runtime_with_active_lease_upgrades_in_place_to_v20(self) -> None:
         task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v12")
         acquired = self._acquire("upgrade-v12-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
@@ -3173,7 +3209,7 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
         reopened = SQLiteTaskStore(self.database_path)
-        self.assertEqual(reopened.migration_version(), 19)
+        self.assertEqual(reopened.migration_version(), 20)
         self.assertEqual(reopened.get_task(task_id).status, "Queued")
         lease = reopened.get_runtime_supervisor_lease(**self.scope)
         self.assertIsNotNone(lease)

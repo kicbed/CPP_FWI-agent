@@ -8226,6 +8226,57 @@ class DeepwaveAdapter:
             )
         return copy.deepcopy(manifests), copy.deepcopy(manifest), data
 
+    @contextlib.contextmanager
+    def verified_succeeded_outputs(self, handle: AdapterHandle):
+        """Hold the submission and execution fences across output adoption.
+
+        The yielded proof is path-free.  Its manifests have all been re-read
+        as bytes and matched by size/hash while the exact attempt is idle; the
+        caller may therefore commit the immutable SQLite receipt before this
+        context releases either inherited kernel lock.
+        """
+
+        lock_path = self._checkpoint_submission_lock_path(handle)
+        with self._lock_submission(
+            lock_path, create=False, timeout_seconds=5.0
+        ):
+            record = self._record_for_handle(handle)
+            binding = binding_from_submission_record(record)
+            with hold_idle_execution_fence(self._run_root, binding):
+                record = self._record_for_handle(handle)
+                if binding_from_submission_record(record) != binding:
+                    raise AdapterArtifactError(
+                        "ADAPTER_ARTIFACT_INVALID: launch attempt changed during collection"
+                    )
+                current = self._status_for_record(record)
+                if current.status != "Succeeded":
+                    raise AdapterArtifactError(
+                        "RESULT_NOT_READY: artifacts are available only after success"
+                    )
+                manifests = self.collect(handle)
+                for manifest in manifests:
+                    artifact_id = manifest.get("artifact_id")
+                    reread_manifests, reread_manifest, data = (
+                        self.collect_and_read_artifact(handle, artifact_id)
+                    )
+                    if (
+                        reread_manifests != manifests
+                        or reread_manifest != manifest
+                        or len(data) != manifest.get("size_bytes")
+                        or "sha256:" + hashlib.sha256(data).hexdigest()
+                        != manifest.get("content_hash")
+                    ):
+                        raise AdapterArtifactError(
+                            "ADAPTER_ARTIFACT_INVALID: artifact changed during fenced collection"
+                        )
+                yield {
+                    "schema_version": "1.0.0",
+                    "receipt_record_hash": record["record_hash"],
+                    "attempt_id": binding.attempt_id,
+                    "attempt_number": binding.attempt_number,
+                    "manifests": copy.deepcopy(manifests),
+                }
+
     def read_artifact(
         self, handle: AdapterHandle, artifact_id: str
     ) -> tuple[dict[str, Any], bytes]:

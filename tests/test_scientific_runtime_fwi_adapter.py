@@ -26,6 +26,7 @@ from PIL import Image
 
 from scientific_runtime import (
     DeepwaveTaskDispatcher,
+    DagNodeInputBindingFact,
     DispatchDeferred,
     DispatchError,
     DispatchIntentSnapshot,
@@ -2491,6 +2492,67 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
             prepared.request["normalized_config_hash"],
             prepared.queue_fingerprint["normalized_config_hash"],
         )
+        dag_plan = copy.deepcopy(snapshot.plan)
+        spare = copy.deepcopy(dag_plan["nodes"][0])
+        spare["node_id"] = "spare"
+        spare["idempotency_key"] = "task-bridge-001:spare:0001"
+        dag_plan["nodes"].append(spare)
+        dag_snapshot = dataclasses.replace(
+            snapshot,
+            plan=dag_plan,
+            approval={"approval_id": "approval-bridge-001"},
+        )
+        input_identity = copy.deepcopy(
+            dag_plan["nodes"][0]["inputs"][0]["dataset"]
+        )
+        input_binding = DagNodeInputBindingFact(
+            task_id=snapshot.task_id,
+            plan_id=dag_plan["plan_id"],
+            plan_hash=dag_plan["plan_hash"],
+            approval_id="approval-bridge-001",
+            target_node_id="invert",
+            target_node_revision=1,
+            project_id=snapshot.project_id,
+            principal_id=snapshot.principal_id,
+            fencing_token=1,
+            owner_id="runtime-owner",
+            term_acquired_at=NOW,
+            claim_readiness_document_hash="sha256:" + "1" * 64,
+            binding_document={
+                "inputs": [
+                    {
+                        "kind": "dataset",
+                        "target_input_port": "model",
+                        "dataset": input_identity,
+                    }
+                ]
+            },
+            binding_document_hash="sha256:" + "2" * 64,
+            recorded_at=NOW,
+            replayed=False,
+        )
+        node_prepared = bridge.prepare_node(
+            dag_snapshot, node_id="invert", input_binding=input_binding
+        )
+        self.assertEqual(node_prepared, prepared)
+        unsafe_binding = dataclasses.replace(
+            input_binding,
+            binding_document={
+                "inputs": [
+                    {
+                        "kind": "node_output",
+                        "target_input_port": "model",
+                        "dataset": input_identity,
+                    }
+                ]
+            },
+        )
+        with self.assertRaisesRegex(
+            DispatchError, "DAG_NODE_CAPABILITY_UNSUPPORTED"
+        ):
+            bridge.prepare_node(
+                dag_snapshot, node_id="invert", input_binding=unsafe_binding
+            )
         intent = DispatchIntentSnapshot(
             intent_id="dispatch-bridge-001",
             task_id=snapshot.task_id,
@@ -5196,9 +5258,22 @@ class ScientificRuntimeFWIAdapterTest(unittest.TestCase):
     def test_collect_recomputes_eight_safe_schema_valid_standard_artifacts(self) -> None:
         handle, run_dir = self.submit_and_run_dir()
         expected_paths = self.write_success_artifacts(run_dir)
+        binding, heartbeat = self.start_exact_worker(handle, run_dir)
+        heartbeat.stop("succeeded")
         first = _plain(self.adapter.collect(handle))
         second = _plain(self.adapter.collect(handle))
         self.assertEqual(first, second)
+        record = json.loads(
+            self.submission_record_path(handle).read_text(encoding="utf-8")
+        )
+        self.assertEqual(binding_from_submission_record(record), binding)
+        with self.adapter.verified_succeeded_outputs(handle) as proof:
+            self.assertEqual(proof["schema_version"], "1.0.0")
+            self.assertEqual(proof["receipt_record_hash"], record["record_hash"])
+            self.assertEqual(proof["attempt_id"], binding.attempt_id)
+            self.assertEqual(proof["attempt_number"], 1)
+            self.assertEqual(proof["manifests"], first)
+            self.assertNotIn(str(self.run_root), json.dumps(proof))
         manifests = _artifacts(first)
         self.assertEqual(len(manifests), 8)
         self.assertEqual([value["display"]["order"] for value in manifests], list(range(8)))

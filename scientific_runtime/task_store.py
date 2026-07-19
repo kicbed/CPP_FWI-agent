@@ -520,6 +520,34 @@ class DagNodeInputBindingFact:
 
 
 @dataclass(frozen=True)
+class DagNodeExecutionAdmission:
+    """Atomic DAG-node admission projected through the existing P2 intent."""
+
+    snapshot: TaskSnapshot
+    intent: DispatchIntentSnapshot
+    input_binding_document_hash: str
+    pending_revision: int
+    queued_revision: int
+    admission_fencing_token: int
+    admitted_at: str
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class DagNodeTerminalFact:
+    """One exact append-only DAG node terminal projection."""
+
+    snapshot: TaskSnapshot
+    intent: DispatchIntentSnapshot
+    node_revision: int
+    state: str
+    event_sequence: int
+    completion_fencing_token: int
+    receipt_document_hash: str | None
+    replayed: bool
+
+
+@dataclass(frozen=True)
 class SupervisedDispatchAuthorization:
     """One active Supervisor term authorized to enter Adapter dispatch."""
 
@@ -1118,6 +1146,49 @@ class TaskStore(Protocol):
         supervisor_lease: RuntimeSupervisorLease,
         supervisor_clock: Callable[[], str],
     ) -> DagNodeInputBindingFact:
+        ...
+
+    def admit_ready_dag_node_execution(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        input_binding: DagNodeInputBindingFact,
+        admit: Callable[
+            [SubmitGateContext, str],
+            tuple[Mapping[str, Any], Mapping[str, Any]],
+        ],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagNodeExecutionAdmission:
+        ...
+
+    def is_dag_node_execution_intent(self, intent_id: str) -> bool:
+        ...
+
+    def record_supervised_dag_dispatch_reconciliation(
+        self,
+        *,
+        intent_id: str,
+        failure_code: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DispatchIntentSnapshot:
+        ...
+
+    def commit_dag_node_runtime_transition(
+        self,
+        *,
+        intent_id: str,
+        expected_node_state: str,
+        event: Mapping[str, Any],
+        adapter_status: Mapping[str, Any],
+        output_receipt: Mapping[str, Any] | None,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagNodeTerminalFact | TaskSnapshot:
         ...
 
     def authorize_supervised_dispatch(
@@ -2998,6 +3069,94 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    def _require_current_dag_node_execution(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        intent: DispatchIntentSnapshot,
+        allowed_node_states: frozenset[str],
+    ) -> sqlite3.Row | None:
+        """Fail closed if a DAG-tagged P2 intent drifts from its admission."""
+
+        admission = self._load_dag_node_execution_admission(
+            connection, task_id=intent.task_id
+        )
+        if admission is None:
+            return None
+        task = connection.execute(
+            """
+            SELECT task.status, task.project_id, task.principal_id,
+                   task.current_plan_id, task.current_approval_id,
+                   approval.decision, approval.plan_id AS approval_plan_id,
+                   approval.plan_hash AS approval_plan_hash
+            FROM tasks AS task
+            JOIN approvals AS approval
+              ON approval.task_id = task.task_id
+             AND approval.approval_id = task.current_approval_id
+            WHERE task.task_id = ?
+            """,
+            (intent.task_id,),
+        ).fetchone()
+        binding = connection.execute(
+            """
+            SELECT 1 FROM dag_node_input_binding_facts
+            WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+              AND target_node_id = ? AND target_node_revision = ?
+              AND fencing_token = ? AND owner_id = ?
+              AND term_acquired_at = ? AND binding_document_hash = ?
+            """,
+            (
+                admission["task_id"],
+                admission["plan_id"],
+                admission["approval_id"],
+                admission["node_id"],
+                admission["pending_revision"],
+                admission["input_fencing_token"],
+                admission["input_owner_id"],
+                admission["input_term_acquired_at"],
+                admission["input_binding_document_hash"],
+            ),
+        ).fetchone()
+        latest_state = connection.execute(
+            """
+            SELECT revision, state FROM dag_node_state_events
+            WHERE task_id = ? AND plan_id = ? AND node_id = ?
+            ORDER BY revision DESC LIMIT 1
+            """,
+            (intent.task_id, intent.plan_id, intent.node_id),
+        ).fetchone()
+        if (
+            admission["intent_id"] != intent.intent_id
+            or admission["plan_id"] != intent.plan_id
+            or admission["plan_hash"] != intent.plan_hash
+            or admission["approval_id"] != intent.approval_id
+            or admission["node_id"] != intent.node_id
+            or admission["node_idempotency_key"]
+            != intent.node_idempotency_key
+            or admission["max_node_attempts"] != 1
+            or task is None
+            or task["current_plan_id"] != intent.plan_id
+            or task["current_approval_id"] != intent.approval_id
+            or task["decision"] != "approved"
+            or task["approval_plan_id"] != intent.plan_id
+            or task["approval_plan_hash"] != intent.plan_hash
+            or task["project_id"] != admission["project_id"]
+            or task["principal_id"] != admission["principal_id"]
+            or binding is None
+            or latest_state is None
+            or latest_state["state"] not in allowed_node_states
+            or int(latest_state["revision"])
+            != (
+                int(admission["queued_revision"])
+                if latest_state["state"] == "Queued"
+                else int(admission["queued_revision"]) + 1
+            )
+        ):
+            raise TaskStoreConflict(
+                "DAG node execution no longer matches its exact admission"
+            )
+        return admission
+
     def finalize_supervised_worker_exit_retry_exhaustion(
         self,
         *,
@@ -4035,6 +4194,11 @@ class SQLiteTaskStore:
                 now_us=authorized_at_us,
                 action="dispatch reconciliation",
             )
+            self._require_current_dag_node_execution(
+                connection,
+                intent=intent,
+                allowed_node_states=frozenset({"Queued"}),
+            )
             if (
                 task["status"] != "Queued"
                 or outcome["outcome"] != "reconciliation_required"
@@ -4213,6 +4377,11 @@ class SQLiteTaskStore:
                 supplied=supervisor_lease,
                 now_us=observed_at_us,
                 action="dispatch reconciliation observation",
+            )
+            self._require_current_dag_node_execution(
+                connection,
+                intent=intent,
+                allowed_node_states=frozenset({"Queued"}),
             )
             if (
                 task["status"] != "Queued"
@@ -4488,6 +4657,13 @@ class SQLiteTaskStore:
                 now_us=resolved_at_us,
                 action="negative dispatch reconciliation",
             )
+            dag_admission = self._require_current_dag_node_execution(
+                connection,
+                intent=intent,
+                allowed_node_states=frozenset({"Queued", "Failed"}),
+            )
+            dag_execution = dag_admission is not None
+            projected_task_status = "Running" if dag_execution else "Failed"
 
             existing = connection.execute(
                 "SELECT * FROM dispatch_reconciliation_negative_resolutions "
@@ -4522,7 +4698,7 @@ class SQLiteTaskStore:
                     or existing["terminal_event_hash"] != event_hash
                     or stored_event["document_hash"] != event_hash
                     or existing["approval_budget_refunded"] != 0
-                    or task["status"] != "Failed"
+                    or task["status"] != projected_task_status
                 ):
                     raise TaskStoreConflict(
                         "negative reconciliation replay differs from its outcome"
@@ -4535,7 +4711,7 @@ class SQLiteTaskStore:
                     stored_intent is None
                     or stored_intent.state != "not_dispatched"
                     or snapshot is None
-                    or snapshot.status != "Failed"
+                    or snapshot.status != projected_task_status
                 ):
                     raise TaskStoreCorruption(
                         "negative reconciliation replay cannot be read"
@@ -4669,7 +4845,7 @@ class SQLiteTaskStore:
                 or event.get("task_id") != task_id
                 or event.get("node_id") != intent.node_id
                 or event.get("event_type") != "node_failed"
-                or event.get("task_status") != "Failed"
+                or event.get("task_status") != projected_task_status
                 or event.get("error")
                 != {
                     "code": "dispatch_not_started",
@@ -4786,13 +4962,108 @@ class SQLiteTaskStore:
                     resolved_at_us,
                 ),
             )
+            if dag_execution:
+                assert dag_admission is not None
+                node_revision = int(dag_admission["queued_revision"]) + 1
+                adapter_status_json, adapter_status_hash = encode_document(
+                    proof_payload
+                )
+                connection.execute(
+                    """
+                    INSERT INTO dag_node_terminal_facts(
+                        intent_id, task_id, plan_id, plan_hash, approval_id,
+                        node_id, input_binding_node_revision,
+                        input_binding_document_hash, input_fencing_token,
+                        input_owner_id, input_term_acquired_at,
+                        node_revision, node_state, event_sequence, event_hash,
+                        attempt_id, attempt_number, worker_observation_sequence,
+                        worker_observation_hash, dispatch_handle_json,
+                        dispatch_handle_hash,
+                        dispatch_outcome_document_hash,
+                        adapter_status_json, adapter_status_hash,
+                        project_id, principal_id, completion_fencing_token,
+                        completion_owner_id, completion_term_acquired_at,
+                        receipt_document_json, receipt_document_hash,
+                        recorded_at, recorded_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Failed',
+                              ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?,
+                              ?, ?, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        task_id,
+                        intent.plan_id,
+                        intent.plan_hash,
+                        intent.approval_id,
+                        intent.node_id,
+                        dag_admission["pending_revision"],
+                        dag_admission["input_binding_document_hash"],
+                        dag_admission["input_fencing_token"],
+                        dag_admission["input_owner_id"],
+                        dag_admission["input_term_acquired_at"],
+                        node_revision,
+                        event["sequence"],
+                        event_hash,
+                        outcome["document_hash"],
+                        adapter_status_json,
+                        adapter_status_hash,
+                        task["project_id"],
+                        task["principal_id"],
+                        supervisor_lease.fencing_token,
+                        supervisor_lease.owner_id,
+                        supervisor_lease.acquired_at,
+                        resolved_at,
+                        resolved_at_us,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO dag_node_execution_transition_facts(
+                        intent_id, node_revision, previous_state, state,
+                        event_sequence, event_hash, reason,
+                        project_id, principal_id, fencing_token,
+                        owner_id, term_acquired_at, recorded_at, recorded_at_us
+                    ) VALUES (?, ?, 'Queued', 'Failed', ?, ?,
+                              'dispatch_not_started', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        node_revision,
+                        event["sequence"],
+                        event_hash,
+                        task["project_id"],
+                        task["principal_id"],
+                        supervisor_lease.fencing_token,
+                        supervisor_lease.owner_id,
+                        supervisor_lease.acquired_at,
+                        resolved_at,
+                        resolved_at_us,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO dag_node_state_events(
+                        task_id, plan_id, plan_hash, node_id, revision,
+                        previous_state, state, recorded_at, recorded_at_us
+                    ) VALUES (?, ?, ?, ?, ?, 'Queued', 'Failed', ?, ?)
+                    """,
+                    (
+                        task_id,
+                        intent.plan_id,
+                        intent.plan_hash,
+                        intent.node_id,
+                        node_revision,
+                        resolved_at,
+                        resolved_at_us,
+                    ),
+                )
             resolution_document = {
                 "schema_version": "1.0.0",
                 "intent_id": intent_id,
                 "task_id": task_id,
                 "source_outcome_hash": outcome["document_hash"],
                 "result": "not_dispatched",
-                "terminal_status": "Failed",
+                "terminal_status": projected_task_status,
                 "failure_code": "DISPATCH_NOT_STARTED",
                 "evidence": {
                     **proof_payload,
@@ -4841,9 +5112,8 @@ class SQLiteTaskStore:
                 ),
             )
             connection.execute(
-                "UPDATE tasks SET status = 'Failed', updated_at = ? "
-                "WHERE task_id = ?",
-                (resolved_at, task_id),
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+                (projected_task_status, resolved_at, task_id),
             )
             heartbeat = connection.execute(
                 """
@@ -4873,7 +5143,7 @@ class SQLiteTaskStore:
             )
             if (
                 snapshot is None
-                or snapshot.status != "Failed"
+                or snapshot.status != projected_task_status
                 or closed_intent is None
                 or closed_intent.state != "not_dispatched"
             ):
@@ -9757,12 +10027,41 @@ class SQLiteTaskStore:
             },
             label="queued event",
         )
+        dag_admission = self._load_dag_node_execution_admission(
+            connection, task_id=row["task_id"]
+        )
         try:
-            if len(plan["nodes"]) != 1:
-                raise TaskStoreCorruption(
-                    "dispatch plan no longer has exactly one node"
-                )
-            durable_node = plan["nodes"][0]
+            if dag_admission is None:
+                if len(plan["nodes"]) != 1:
+                    raise TaskStoreCorruption(
+                        "dispatch plan no longer has exactly one node"
+                    )
+                durable_node = plan["nodes"][0]
+            else:
+                matching_nodes = [
+                    value
+                    for value in plan["nodes"]
+                    if value.get("node_id") == row["node_id"]
+                ]
+                if (
+                    len(plan["nodes"]) <= 1
+                    or len(matching_nodes) != 1
+                    or dag_admission["intent_id"] != row["intent_id"]
+                    or dag_admission["plan_id"] != row["plan_id"]
+                    or dag_admission["plan_hash"] != row["plan_hash"]
+                    or dag_admission["approval_id"] != row["approval_id"]
+                    or dag_admission["node_id"] != row["node_id"]
+                    or dag_admission["node_idempotency_key"]
+                    != row["node_idempotency_key"]
+                    or dag_admission["project_id"]
+                    != task_identity["project_id"]
+                    or dag_admission["principal_id"]
+                    != task_identity["principal_id"]
+                ):
+                    raise TaskStoreCorruption(
+                        "DAG dispatch intent differs from its admission"
+                    )
+                durable_node = matching_nodes[0]
             if len(durable_node["inputs"]) != 1:
                 raise TaskStoreCorruption(
                     "dispatch plan no longer has exactly one input"
@@ -9832,6 +10131,35 @@ class SQLiteTaskStore:
             raise TaskStoreCorruption(
                 "dispatch intent fingerprint differs from its request or queued event"
             )
+        if dag_admission is not None:
+            token = row["intent_id"].removeprefix("dispatch-")
+            expected_extension = {
+                "agent_rpc.dispatch": {
+                    "state": "pending",
+                    "fingerprint_basis": "adapter_preflight",
+                    "worker_runtime_started": False,
+                },
+                "org.agent_rpc.dag_execution": {
+                    "node_id": row["node_id"],
+                    "pending_revision": dag_admission["pending_revision"],
+                    "queued_revision": dag_admission["queued_revision"],
+                    "input_binding_document_hash": dag_admission[
+                        "input_binding_document_hash"
+                    ],
+                    "max_node_attempts": 1,
+                },
+            }
+            if (
+                queued_event.get("event_id") != f"event-dag-queued-{token}"
+                or queued_event.get("event_type") != "task_queued"
+                or queued_event.get("task_status") != "Queued"
+                or queued_event.get("node_id") is not None
+                or queued_event.get("occurred_at") != row["created_at"]
+                or queued_event.get("extensions") != expected_extension
+            ):
+                raise TaskStoreCorruption(
+                    "DAG queued event differs from its exact admission"
+                )
 
         state = "pending"
         handle: dict[str, Any] | None = None
@@ -9940,7 +10268,8 @@ class SQLiteTaskStore:
             )
             term = connection.execute(
                 """
-                SELECT acquired_at_us FROM runtime_supervisor_terms
+                SELECT owner_id, acquired_at, acquired_at_us
+                FROM runtime_supervisor_terms
                 WHERE project_id = ? AND principal_id = ?
                   AND fencing_token = ?
                 """,
@@ -10406,7 +10735,8 @@ class SQLiteTaskStore:
             ).fetchone()
             term = connection.execute(
                 """
-                SELECT acquired_at_us FROM runtime_supervisor_terms
+                SELECT owner_id, acquired_at, acquired_at_us
+                FROM runtime_supervisor_terms
                 WHERE project_id = ? AND principal_id = ?
                   AND fencing_token = ?
                 """,
@@ -10447,6 +10777,31 @@ class SQLiteTaskStore:
                     ],
                 }
             )
+            dag_negative = dag_admission is not None
+            projected_task_status = "Running" if dag_negative else "Failed"
+            dag_terminal = None
+            dag_transition = None
+            dag_state = None
+            if dag_negative:
+                dag_terminal = connection.execute(
+                    "SELECT * FROM dag_node_terminal_facts WHERE intent_id = ?",
+                    (row["intent_id"],),
+                ).fetchone()
+                dag_transition = connection.execute(
+                    """
+                    SELECT * FROM dag_node_execution_transition_facts
+                    WHERE intent_id = ? AND state = 'Failed'
+                    """,
+                    (row["intent_id"],),
+                ).fetchone()
+                dag_state = connection.execute(
+                    """
+                    SELECT * FROM dag_node_state_events
+                    WHERE task_id = ? AND plan_id = ? AND node_id = ?
+                    ORDER BY revision DESC LIMIT 1
+                    """,
+                    (row["task_id"], row["plan_id"], row["node_id"]),
+                ).fetchone()
             event_extension = {
                 "intent_id": row["intent_id"],
                 "attempt_id": observation["attempt_id"],
@@ -10468,7 +10823,7 @@ class SQLiteTaskStore:
                 "task_id": row["task_id"],
                 "node_id": row["node_id"],
                 "event_type": "node_failed",
-                "task_status": "Failed",
+                "task_status": projected_task_status,
                 "error": {
                     "code": "dispatch_not_started",
                     "message": "FWI Worker did not reach its running boundary",
@@ -10486,7 +10841,7 @@ class SQLiteTaskStore:
                 "task_id": row["task_id"],
                 "source_outcome_hash": row["outcome_hash"],
                 "result": "not_dispatched",
-                "terminal_status": "Failed",
+                "terminal_status": projected_task_status,
                 "failure_code": "DISPATCH_NOT_STARTED",
                 "evidence": {
                     **proof_payload,
@@ -10558,7 +10913,7 @@ class SQLiteTaskStore:
                 or terminal["document_hash"]
                 != negative_resolution["terminal_event_hash"]
                 or terminal["event_type"] != "node_failed"
-                or terminal["task_status"] != "Failed"
+                or terminal["task_status"] != projected_task_status
                 or terminal["node_id"] != row["node_id"]
                 or terminal["fingerprint_hash"] != fingerprint_hash
                 or terminal["recorded_at"] != resolved_at
@@ -10574,7 +10929,7 @@ class SQLiteTaskStore:
                 or committed_at_us != resolved_at_us
                 or commit_record["recorded_at_us"] != resolved_at_us
                 or resolution_document != expected_resolution_document
-                or task_identity["status"] != "Failed"
+                or task_identity["status"] != projected_task_status
                 or conflicting_rows["has_retry"]
                 or conflicting_rows["has_worker_exit_retry"]
                 or conflicting_rows["has_cancel"]
@@ -10582,6 +10937,76 @@ class SQLiteTaskStore:
                 raise TaskStoreCorruption(
                     "negative reconciliation resolution is inconsistent"
                 )
+            if dag_negative:
+                assert dag_admission is not None
+                expected_node_revision = int(dag_admission["queued_revision"]) + 1
+                proof_json, proof_hash = encode_document(proof_payload)
+                if (
+                    dag_terminal is None
+                    or dag_transition is None
+                    or dag_state is None
+                    or dag_terminal["task_id"] != row["task_id"]
+                    or dag_terminal["plan_id"] != row["plan_id"]
+                    or dag_terminal["plan_hash"] != row["plan_hash"]
+                    or dag_terminal["approval_id"] != row["approval_id"]
+                    or dag_terminal["node_id"] != row["node_id"]
+                    or dag_terminal["input_binding_node_revision"]
+                    != dag_admission["pending_revision"]
+                    or dag_terminal["input_binding_document_hash"]
+                    != dag_admission["input_binding_document_hash"]
+                    or dag_terminal["input_fencing_token"]
+                    != dag_admission["input_fencing_token"]
+                    or dag_terminal["input_owner_id"]
+                    != dag_admission["input_owner_id"]
+                    or dag_terminal["input_term_acquired_at"]
+                    != dag_admission["input_term_acquired_at"]
+                    or dag_terminal["node_revision"] != expected_node_revision
+                    or dag_terminal["node_state"] != "Failed"
+                    or dag_terminal["event_sequence"] != terminal["sequence"]
+                    or dag_terminal["event_hash"] != terminal["document_hash"]
+                    or dag_terminal["attempt_id"] is not None
+                    or dag_terminal["attempt_number"] is not None
+                    or dag_terminal["worker_observation_sequence"] is not None
+                    or dag_terminal["worker_observation_hash"] is not None
+                    or dag_terminal["dispatch_handle_json"] is not None
+                    or dag_terminal["dispatch_handle_hash"] is not None
+                    or dag_terminal["dispatch_outcome_document_hash"]
+                    != row["outcome_hash"]
+                    or dag_terminal["adapter_status_json"] != proof_json
+                    or dag_terminal["adapter_status_hash"] != proof_hash
+                    or dag_terminal["project_id"]
+                    != task_identity["project_id"]
+                    or dag_terminal["principal_id"]
+                    != task_identity["principal_id"]
+                    or dag_terminal["completion_fencing_token"]
+                    != negative_resolution["fencing_token"]
+                    or term is None
+                    or dag_terminal["completion_owner_id"] != term["owner_id"]
+                    or dag_terminal["completion_term_acquired_at"]
+                    != term["acquired_at"]
+                    or dag_terminal["receipt_document_json"] is not None
+                    or dag_terminal["receipt_document_hash"] is not None
+                    or dag_terminal["recorded_at"] != resolved_at
+                    or dag_terminal["recorded_at_us"] != resolved_at_us
+                    or dag_transition["node_revision"] != expected_node_revision
+                    or dag_transition["previous_state"] != "Queued"
+                    or dag_transition["state"] != "Failed"
+                    or dag_transition["event_sequence"] != terminal["sequence"]
+                    or dag_transition["event_hash"] != terminal["document_hash"]
+                    or dag_transition["reason"] != "dispatch_not_started"
+                    or dag_transition["fencing_token"]
+                    != negative_resolution["fencing_token"]
+                    or dag_transition["recorded_at"] != resolved_at
+                    or dag_transition["recorded_at_us"] != resolved_at_us
+                    or dag_state["revision"] != expected_node_revision
+                    or dag_state["previous_state"] != "Queued"
+                    or dag_state["state"] != "Failed"
+                    or dag_state["recorded_at"] != resolved_at
+                    or dag_state["recorded_at_us"] != resolved_at_us
+                ):
+                    raise TaskStoreCorruption(
+                        "DAG negative reconciliation projection is inconsistent"
+                    )
             state = "not_dispatched"
             handle = None
             failure_code = "DISPATCH_NOT_STARTED"
@@ -13614,8 +14039,8 @@ class SQLiteTaskStore:
             nodes=tuple(current),
         )
 
-    @staticmethod
     def _load_dag_node_succeeded_outputs(
+        self,
         connection: sqlite3.Connection,
         *,
         task_id: str,
@@ -13623,13 +14048,25 @@ class SQLiteTaskStore:
         approval_id: str,
         source_state: DagNodeStateSnapshot,
     ) -> dict[str, Any]:
-        """Validate one reserved producer-success/output attestation.
+        """Validate one exact producer-success/output attestation.
 
-        Migration v19 deliberately has no public writer for this row.  The
-        reader exists now so later node-transition work has a fail-closed
-        contract to satisfy; current production code cannot manufacture a
-        producer success by calling this binding primitive.
+        Executable v20 nodes use their terminal receipt and exact P2 evidence.
+        The legacy v19 fallback remains read-only and reserved for the dormant
+        binding contract; it still has no public writer.
         """
+
+        admission = self._load_dag_node_execution_admission(
+            connection, task_id=task_id
+        )
+        if admission is not None:
+            return self._load_v20_dag_node_succeeded_outputs(
+                connection,
+                task_id=task_id,
+                plan=plan,
+                approval_id=approval_id,
+                source_state=source_state,
+                admission=admission,
+            )
 
         row = connection.execute(
             """
@@ -13913,6 +14350,497 @@ class SQLiteTaskStore:
             "outputs_by_port": outputs_by_port,
         }
 
+    @staticmethod
+    def _load_v20_dag_node_succeeded_outputs(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        plan: Mapping[str, Any],
+        approval_id: str,
+        source_state: DagNodeStateSnapshot,
+        admission: sqlite3.Row,
+    ) -> dict[str, Any]:
+        """Validate a v20 producer receipt with separate input/completion terms."""
+
+        if source_state.state != "Succeeded":
+            raise TaskStoreConflict(
+                "DAG source input requires the latest Succeeded node revision"
+            )
+        terminal = connection.execute(
+            """
+            SELECT * FROM dag_node_terminal_facts
+            WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+              AND node_id = ? AND node_revision = ?
+            """,
+            (
+                task_id,
+                plan["plan_id"],
+                approval_id,
+                source_state.node_id,
+                source_state.revision,
+            ),
+        ).fetchone()
+        legacy = connection.execute(
+            """
+            SELECT 1 FROM dag_node_succeeded_outputs
+            WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+              AND node_id = ? AND node_revision = ?
+            """,
+            (
+                task_id,
+                plan["plan_id"],
+                approval_id,
+                source_state.node_id,
+                source_state.revision,
+            ),
+        ).fetchone()
+        if terminal is None:
+            raise TaskStoreConflict(
+                "DAG source input requires an exact durable Succeeded output receipt"
+            )
+        if legacy is not None:
+            raise TaskStoreCorruption(
+                "v20 DAG execution has conflicting legacy producer output facts"
+            )
+        if (
+            terminal["intent_id"] != admission["intent_id"]
+            or terminal["task_id"] != admission["task_id"]
+            or terminal["plan_id"] != admission["plan_id"]
+            or terminal["plan_hash"] != admission["plan_hash"]
+            or terminal["approval_id"] != admission["approval_id"]
+            or terminal["node_id"] != admission["node_id"]
+            or terminal["input_binding_node_revision"]
+            != admission["pending_revision"]
+            or terminal["input_binding_document_hash"]
+            != admission["input_binding_document_hash"]
+            or terminal["input_fencing_token"] != admission["input_fencing_token"]
+            or terminal["input_owner_id"] != admission["input_owner_id"]
+            or terminal["input_term_acquired_at"]
+            != admission["input_term_acquired_at"]
+            or terminal["node_revision"] != admission["queued_revision"] + 2
+            or terminal["node_state"] != "Succeeded"
+            or terminal["attempt_number"] != 1
+            or not isinstance(terminal["attempt_id"], str)
+            or not _is_sha256(terminal["worker_observation_hash"])
+            or not _is_sha256(terminal["dispatch_handle_hash"])
+            or not _is_sha256(terminal["dispatch_outcome_document_hash"])
+            or not _is_sha256(terminal["receipt_document_hash"])
+        ):
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded output identity is inconsistent"
+            )
+
+        try:
+            recorded_at, recorded_at_us = _runtime_timestamp(
+                terminal["recorded_at"]
+            )
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded output time is invalid"
+            ) from error
+        if recorded_at_us != terminal["recorded_at_us"]:
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded output time is inconsistent"
+            )
+        receipt = _decode_document(
+            terminal["receipt_document_json"], label="v20 DAG Succeeded receipt"
+        )
+        adapter_status = _decode_document(
+            terminal["adapter_status_json"], label="v20 DAG Adapter status"
+        )
+        handle = _decode_document(
+            terminal["dispatch_handle_json"], label="v20 DAG dispatch handle"
+        )
+        try:
+            receipt_json, receipt_hash = encode_document(receipt)
+            adapter_json, adapter_hash = encode_document(adapter_status)
+            handle_json, handle_hash = encode_document(handle)
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded proof is not canonical JSON"
+            ) from error
+        if (
+            receipt_json != terminal["receipt_document_json"]
+            or receipt_hash != terminal["receipt_document_hash"]
+            or adapter_json != terminal["adapter_status_json"]
+            or adapter_hash != terminal["adapter_status_hash"]
+            or handle_json != terminal["dispatch_handle_json"]
+            or handle_hash != terminal["dispatch_handle_hash"]
+        ):
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded proof hash is inconsistent"
+            )
+
+        event = connection.execute(
+            "SELECT * FROM run_events WHERE task_id = ? AND sequence = ?",
+            (task_id, terminal["event_sequence"]),
+        ).fetchone()
+        event_commit = connection.execute(
+            """
+            SELECT * FROM supervised_run_event_commits
+            WHERE task_id = ? AND sequence = ?
+            """,
+            (task_id, terminal["event_sequence"]),
+        ).fetchone()
+        transition = connection.execute(
+            """
+            SELECT * FROM dag_node_execution_transition_facts
+            WHERE intent_id = ? AND node_revision = ?
+            """,
+            (terminal["intent_id"], terminal["node_revision"]),
+        ).fetchone()
+        effective = connection.execute(
+            """
+            SELECT * FROM effective_dispatched_intents WHERE intent_id = ?
+            """,
+            (terminal["intent_id"],),
+        ).fetchone()
+        attempt = connection.execute(
+            "SELECT * FROM worker_launch_attempts WHERE attempt_id = ?",
+            (terminal["attempt_id"],),
+        ).fetchone()
+        observation = connection.execute(
+            """
+            SELECT * FROM worker_attempt_observations
+            WHERE attempt_id = ? AND observation_sequence = ?
+            """,
+            (
+                terminal["attempt_id"],
+                terminal["worker_observation_sequence"],
+            ),
+        ).fetchone()
+        adoption = connection.execute(
+            """
+            SELECT * FROM supervised_dispatch_adoptions WHERE intent_id = ?
+            """,
+            (terminal["intent_id"],),
+        ).fetchone()
+        if any(
+            value is None
+            for value in (
+                event,
+                event_commit,
+                transition,
+                effective,
+                attempt,
+                observation,
+                adoption,
+            )
+        ):
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded output lacks its exact execution proof"
+            )
+        assert event is not None
+        assert event_commit is not None
+        assert transition is not None
+        assert effective is not None
+        assert attempt is not None
+        assert observation is not None
+        assert adoption is not None
+        event_document = _decode_hashed_document(
+            event, label="v20 DAG Succeeded event"
+        )
+        effective_document = _decode_document(
+            effective["outcome_document_json"],
+            label="v20 DAG effective dispatch outcome",
+        )
+        try:
+            effective_json, effective_hash = encode_document(effective_document)
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "v20 DAG effective dispatch outcome is not canonical JSON"
+            ) from error
+        latest_observation = connection.execute(
+            """
+            SELECT MAX(observation_sequence) FROM worker_attempt_observations
+            WHERE attempt_id = ?
+            """,
+            (terminal["attempt_id"],),
+        ).fetchone()[0]
+        try:
+            adoption_recorded_at, adoption_recorded_at_us = _runtime_timestamp(
+                adoption["recorded_at"]
+            )
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "v20 DAG dispatch adoption time is invalid"
+            ) from error
+        if (
+            event["document_hash"] != terminal["event_hash"]
+            or event["event_type"] != "node_succeeded"
+            or event["task_status"] != "Running"
+            or event["node_id"] != source_state.node_id
+            or event_document.get("fingerprint") != handle.get("fingerprint")
+            or event_commit["project_id"] != terminal["project_id"]
+            or event_commit["principal_id"] != terminal["principal_id"]
+            or event_commit["fencing_token"]
+            != terminal["completion_fencing_token"]
+            or event_commit["recorded_at"] != recorded_at
+            or event_commit["recorded_at_us"] != recorded_at_us
+            or transition["previous_state"] != "Running"
+            or transition["state"] != "Succeeded"
+            or transition["event_sequence"] != terminal["event_sequence"]
+            or transition["event_hash"] != terminal["event_hash"]
+            or transition["reason"] != "adapter_succeeded"
+            or transition["fencing_token"]
+            != terminal["completion_fencing_token"]
+            or transition["recorded_at"] != recorded_at
+            or transition["recorded_at_us"] != recorded_at_us
+            or effective_json != effective["outcome_document_json"]
+            or effective_hash != effective["outcome_document_hash"]
+            or effective_hash != terminal["dispatch_outcome_document_hash"]
+            or effective_document.get("status") != "dispatched"
+            or effective_document.get("handle") != handle
+            or attempt["intent_id"] != terminal["intent_id"]
+            or attempt["attempt_number"] != 1
+            or observation["document_hash"]
+            != terminal["worker_observation_hash"]
+            or observation["heartbeat_state"] != "succeeded"
+            or observation["observation_sequence"] != latest_observation
+            or adoption["attempt_id"] != terminal["attempt_id"]
+            or adoption["project_id"] != terminal["project_id"]
+            or adoption["principal_id"] != terminal["principal_id"]
+            or type(adoption["fencing_token"]) is not int
+            or adoption["fencing_token"] < 1
+            or adoption_recorded_at != adoption["recorded_at"]
+            or adoption_recorded_at_us != adoption["recorded_at_us"]
+            or adoption_recorded_at_us > recorded_at_us
+        ):
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded execution proof is inconsistent"
+            )
+
+        prior_binding = connection.execute(
+            """
+            SELECT * FROM dag_node_input_binding_facts
+            WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+              AND target_node_id = ? AND target_node_revision = ?
+              AND fencing_token = ? AND binding_document_hash = ?
+            """,
+            (
+                task_id,
+                plan["plan_id"],
+                approval_id,
+                source_state.node_id,
+                admission["pending_revision"],
+                admission["input_fencing_token"],
+                admission["input_binding_document_hash"],
+            ),
+        ).fetchone()
+        if prior_binding is None:
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded output lost its producer input binding"
+            )
+        prior_document = _decode_hashed_document(
+            {
+                "document_json": prior_binding["binding_document_json"],
+                "document_hash": prior_binding["binding_document_hash"],
+            },
+            label="v20 producer DAG input binding",
+        )
+        expected_target = {
+            "node_id": source_state.node_id,
+            "revision": admission["pending_revision"],
+            "state": "Pending",
+        }
+        if (
+            prior_document.get("task_id") != task_id
+            or prior_document.get("plan")
+            != {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"]}
+            or prior_document.get("approval_id") != approval_id
+            or prior_document.get("target") != expected_target
+            or prior_binding["owner_id"] != admission["input_owner_id"]
+            or prior_binding["term_acquired_at"]
+            != admission["input_term_acquired_at"]
+        ):
+            raise TaskStoreCorruption(
+                "v20 producer DAG input binding is inconsistent"
+            )
+
+        source_node = next(
+            (
+                node
+                for node in plan.get("nodes", [])
+                if isinstance(node, Mapping)
+                and node.get("node_id") == source_state.node_id
+            ),
+            None,
+        )
+        expected_outputs = (
+            source_node.get("outputs") if isinstance(source_node, Mapping) else None
+        )
+        outputs_document = receipt.get("outputs")
+        dispatch_document = receipt.get("dispatch")
+        succeeded_at = receipt.get("succeeded_at")
+        if (
+            set(receipt)
+            != {
+                "schema_version",
+                "task_id",
+                "plan",
+                "approval_id",
+                "node",
+                "input_binding_document_hash",
+                "scope",
+                "input_supervisor_term",
+                "completion_supervisor_term",
+                "dispatch",
+                "receipt_record_hash",
+                "outputs",
+                "succeeded_at",
+            }
+            or receipt.get("schema_version") != "2.0.0"
+            or receipt.get("task_id") != task_id
+            or receipt.get("plan")
+            != {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"]}
+            or receipt.get("approval_id") != approval_id
+            or receipt.get("node")
+            != {
+                "node_id": source_state.node_id,
+                "input_binding_revision": admission["pending_revision"],
+                "succeeded_revision": source_state.revision,
+                "state": "Succeeded",
+            }
+            or receipt.get("input_binding_document_hash")
+            != admission["input_binding_document_hash"]
+            or receipt.get("scope")
+            != {
+                "project_id": terminal["project_id"],
+                "principal_id": terminal["principal_id"],
+            }
+            or receipt.get("input_supervisor_term")
+            != {
+                "fencing_token": admission["input_fencing_token"],
+                "owner_id": admission["input_owner_id"],
+                "acquired_at": admission["input_term_acquired_at"],
+            }
+            or receipt.get("completion_supervisor_term")
+            != {
+                "fencing_token": terminal["completion_fencing_token"],
+                "owner_id": terminal["completion_owner_id"],
+                "acquired_at": terminal["completion_term_acquired_at"],
+            }
+            or dispatch_document
+            != {
+                "intent_id": terminal["intent_id"],
+                "node_idempotency_key": admission["node_idempotency_key"],
+                "handle_hash": handle_hash,
+                "attempt_id": terminal["attempt_id"],
+                "attempt_number": 1,
+                "worker_observation_sequence": terminal[
+                    "worker_observation_sequence"
+                ],
+                "worker_observation_hash": terminal["worker_observation_hash"],
+                "outcome_document_hash": terminal[
+                    "dispatch_outcome_document_hash"
+                ],
+            }
+            or not _is_sha256(receipt.get("receipt_record_hash"))
+            or adapter_status.get("status") != "Succeeded"
+            or adapter_status.get("updated_at") != succeeded_at
+            or event["occurred_at"] != succeeded_at
+            or not isinstance(expected_outputs, list)
+            or not isinstance(outputs_document, list)
+            or len(outputs_document) != len(expected_outputs)
+        ):
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded receipt is inconsistent"
+            )
+        try:
+            succeeded_at, succeeded_at_us = _runtime_timestamp(str(succeeded_at))
+            source_recorded_us = _runtime_timestamp(source_state.recorded_at)[1]
+            binding_recorded_us = _runtime_timestamp(prior_binding["recorded_at"])[1]
+        except TaskStoreConflict as error:
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded chronology is invalid"
+            ) from error
+        if (
+            succeeded_at_us > recorded_at_us
+            or recorded_at_us < source_recorded_us
+            or recorded_at_us < binding_recorded_us
+        ):
+            raise TaskStoreCorruption(
+                "v20 DAG Succeeded chronology is inconsistent"
+            )
+
+        outputs_by_port: dict[str, dict[str, Any]] = {}
+        for expected_output, output in zip(expected_outputs, outputs_document):
+            if (
+                not isinstance(expected_output, Mapping)
+                or not isinstance(output, Mapping)
+                or set(output)
+                != {
+                    "output_port",
+                    "data_type",
+                    "artifact_manifest",
+                    "artifact_manifest_hash",
+                }
+                or output.get("output_port") != expected_output.get("port")
+                or output.get("data_type") != expected_output.get("data_type")
+                or output.get("output_port") in outputs_by_port
+            ):
+                raise TaskStoreCorruption(
+                    "v20 DAG output inventory differs from its Plan"
+                )
+            manifest = output.get("artifact_manifest")
+            if not isinstance(manifest, Mapping):
+                raise TaskStoreCorruption("v20 DAG output manifest is invalid")
+            try:
+                manifest_json, manifest_hash = encode_document(manifest)
+            except TaskStoreConflict as error:
+                raise TaskStoreCorruption(
+                    "v20 DAG output manifest is not canonical JSON"
+                ) from error
+            extensions = manifest.get("extensions")
+            adapter_extension = (
+                extensions.get("org.agent_rpc.adapter")
+                if isinstance(extensions, Mapping)
+                else None
+            )
+            lineage = manifest.get("lineage")
+            fingerprint = manifest.get("fingerprint")
+            if (
+                schema_errors("artifact-manifest.schema.json", manifest)
+                or output.get("artifact_manifest_hash") != manifest_hash
+                or manifest.get("task_id") != task_id
+                or manifest.get("node_id") != source_state.node_id
+                or manifest.get("artifact_type") != expected_output.get("data_type")
+                or not _is_sha256(manifest.get("content_hash"))
+                or type(manifest.get("size_bytes")) is not int
+                or manifest["size_bytes"] < 0
+                or not isinstance(adapter_extension, Mapping)
+                or adapter_extension.get("output_port")
+                != expected_output.get("port")
+                or not isinstance(lineage, Mapping)
+                or lineage.get("plan_hash") != plan["plan_hash"]
+                or lineage.get("algorithm") != source_node.get("algorithm")
+                or not isinstance(fingerprint, Mapping)
+                or fingerprint.get("algorithm") != source_node.get("algorithm")
+            ):
+                raise TaskStoreCorruption(
+                    "v20 DAG output manifest differs from its source"
+                )
+            outputs_by_port[str(output["output_port"])] = {
+                "data_type": output["data_type"],
+                "artifact_manifest": copy.deepcopy(dict(manifest)),
+                "artifact_manifest_json": manifest_json,
+                "artifact_manifest_hash": manifest_hash,
+            }
+
+        return {
+            "approval_id": approval_id,
+            "input_binding_document_hash": admission[
+                "input_binding_document_hash"
+            ],
+            "receipt_document_hash": receipt_hash,
+            "receipt_record_hash": receipt["receipt_record_hash"],
+            "fencing_token": terminal["completion_fencing_token"],
+            "owner_id": terminal["completion_owner_id"],
+            "term_acquired_at": terminal["completion_term_acquired_at"],
+            "recorded_at": succeeded_at,
+            "outputs_by_port": outputs_by_port,
+        }
+
     def get_dag_node_state_snapshot(
         self,
         *,
@@ -13920,7 +14848,7 @@ class SQLiteTaskStore:
         project_id: str,
         principal_id: str,
     ) -> DagNodeStateMapSnapshot | None:
-        """Read the dormant P3 node-state map without creating facts."""
+        """Read the durable P3 node-state map without creating facts."""
 
         connection = self._connect()
         try:
@@ -14809,6 +15737,708 @@ class SQLiteTaskStore:
         finally:
             connection.close()
 
+    def _load_dag_node_execution_admission(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+    ) -> sqlite3.Row | None:
+        """Read and verify the immutable index for one admitted DAG node."""
+
+        row = connection.execute(
+            """
+            SELECT * FROM dag_node_execution_admissions WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        document = _decode_document(
+            row["document_json"], label="DAG node execution admission"
+        )
+        document_json, document_hash = encode_document(document)
+        expected = {
+            "schema_version": "1.0.0",
+            "intent_id": row["intent_id"],
+            "task_id": row["task_id"],
+            "plan": {
+                "plan_id": row["plan_id"],
+                "plan_hash": row["plan_hash"],
+            },
+            "approval_id": row["approval_id"],
+            "node": {
+                "node_id": row["node_id"],
+                "idempotency_key": row["node_idempotency_key"],
+                "pending_revision": row["pending_revision"],
+                "queued_revision": row["queued_revision"],
+            },
+            "input_binding": {
+                "document_hash": row["input_binding_document_hash"],
+                "supervisor_term": {
+                    "fencing_token": row["input_fencing_token"],
+                    "owner_id": row["input_owner_id"],
+                    "acquired_at": row["input_term_acquired_at"],
+                },
+            },
+            "scope": {
+                "project_id": row["project_id"],
+                "principal_id": row["principal_id"],
+            },
+            "admission_supervisor_term": {
+                "fencing_token": row["admission_fencing_token"],
+                "owner_id": row["admission_owner_id"],
+                "acquired_at": row["admission_term_acquired_at"],
+            },
+            "max_node_attempts": row["max_node_attempts"],
+            "admitted_at": row["admitted_at"],
+        }
+        admitted_at, admitted_at_us = _runtime_timestamp(row["admitted_at"])
+        if (
+            document != expected
+            or document_json != row["document_json"]
+            or document_hash != row["document_hash"]
+            or admitted_at != row["admitted_at"]
+            or admitted_at_us != row["admitted_at_us"]
+            or row["queued_revision"] != row["pending_revision"] + 1
+            or row["max_node_attempts"] != 1
+        ):
+            raise TaskStoreCorruption(
+                "DAG node execution admission differs from its immutable index"
+            )
+        return row
+
+    def is_dag_node_execution_intent(self, intent_id: str) -> bool:
+        connection = self._connect()
+        try:
+            return connection.execute(
+                """
+                SELECT 1 FROM dag_node_execution_admissions WHERE intent_id = ?
+                """,
+                (intent_id,),
+            ).fetchone() is not None
+        finally:
+            connection.close()
+
+    def record_supervised_dag_dispatch_reconciliation(
+        self,
+        *,
+        intent_id: str,
+        failure_code: str,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DispatchIntentSnapshot:
+        """Fence one ambiguous DAG dispatch outcome under the active term."""
+
+        if (
+            not isinstance(intent_id, str)
+            or not intent_id
+            or not isinstance(failure_code, str)
+            or not 1 <= len(failure_code) <= 128
+            or not failure_code.replace("_", "").isalnum()
+            or failure_code.upper() != failure_code
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("supervised DAG reconciliation is invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            recorded_at, recorded_at_us = _runtime_timestamp(supervisor_clock())
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None or intent.intent_id != intent_id:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            task = connection.execute(
+                "SELECT project_id, principal_id, status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("DAG dispatch task cannot be read")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=recorded_at_us,
+                action="DAG dispatch reconciliation",
+            )
+            admission = self._require_current_dag_node_execution(
+                connection,
+                intent=intent,
+                allowed_node_states=frozenset({"Queued"}),
+            )
+            if admission is None or task["status"] != "Queued":
+                raise TaskStoreConflict(
+                    "DAG reconciliation requires the exact admitted queued node"
+                )
+            existing = connection.execute(
+                "SELECT outcome, document_json FROM dispatch_outcomes "
+                "WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+            expected_document = {
+                "status": "reconciliation_required",
+                "failure_code": failure_code,
+                "recorded_at": recorded_at,
+            }
+            if existing is not None:
+                stored = self._load_dispatch_intent(connection, task_id=task_id)
+                if (
+                    stored is None
+                    or existing["outcome"] != "reconciliation_required"
+                    or stored.state != "reconciliation_required"
+                    or stored.failure_code != failure_code
+                ):
+                    raise TaskStoreConflict(
+                        "DAG dispatch reconciliation outcome already differs"
+                    )
+                connection.commit()
+                return stored
+            if intent.state != "dispatching":
+                raise TaskStoreConflict("DAG dispatch intent is not dispatching")
+            document_json, document_hash = encode_document(expected_document)
+            connection.execute(
+                """
+                INSERT INTO dispatch_outcomes(
+                    intent_id, outcome, document_json, document_hash, recorded_at
+                ) VALUES (?, 'reconciliation_required', ?, ?, ?)
+                """,
+                (intent_id, document_json, document_hash, recorded_at),
+            )
+            stored = self._load_dispatch_intent(connection, task_id=task_id)
+            if stored is None or stored.state != "reconciliation_required":
+                raise TaskStoreCorruption(
+                    "supervised DAG reconciliation cannot be read"
+                )
+            connection.commit()
+            return stored
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "DAG reconciliation lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "supervised DAG reconciliation conflicts with durable state"
+            ) from error
+        finally:
+            connection.close()
+
+    def admit_ready_dag_node_execution(
+        self,
+        *,
+        task_id: str,
+        project_id: str,
+        principal_id: str,
+        expected_plan_hash: str,
+        input_binding: DagNodeInputBindingFact,
+        admit: Callable[
+            [SubmitGateContext, str],
+            tuple[Mapping[str, Any], Mapping[str, Any]],
+        ],
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagNodeExecutionAdmission:
+        """Atomically admit one exact ready node into the unchanged P2 kernel."""
+
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(project_id, str)
+            or not project_id
+            or not isinstance(principal_id, str)
+            or not principal_id
+            or not _is_sha256(expected_plan_hash)
+            or not isinstance(input_binding, DagNodeInputBindingFact)
+            or not callable(admit)
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("DAG node execution admission is invalid")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            admitted_at, admitted_at_us = _runtime_timestamp(supervisor_clock())
+            snapshot = self._load_snapshot(connection, task_id)
+            if (
+                snapshot is None
+                or snapshot.project_id != project_id
+                or snapshot.principal_id != principal_id
+            ):
+                raise TaskStoreConflict("task does not exist in the requested scope")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=project_id,
+                principal_id=principal_id,
+                supplied=supervisor_lease,
+                now_us=admitted_at_us,
+                action="DAG node execution admission",
+            )
+            plan = snapshot.plan
+            approval = snapshot.approval
+            if (
+                not isinstance(plan, Mapping)
+                or len(plan.get("nodes", [])) <= 1
+                or plan.get("plan_hash") != expected_plan_hash
+                or not isinstance(approval, Mapping)
+                or approval.get("decision") != "approved"
+                or approval.get("plan_id") != plan.get("plan_id")
+                or approval.get("plan_hash") != expected_plan_hash
+                or input_binding.task_id != task_id
+                or input_binding.plan_id != plan.get("plan_id")
+                or input_binding.plan_hash != expected_plan_hash
+                or input_binding.approval_id != approval.get("approval_id")
+                or input_binding.project_id != project_id
+                or input_binding.principal_id != principal_id
+                or not _is_sha256(input_binding.binding_document_hash)
+            ):
+                raise TaskStoreConflict(
+                    "DAG admission requires the exact current approved plan and binding"
+                )
+
+            binding_row = connection.execute(
+                """
+                SELECT * FROM dag_node_input_binding_facts
+                WHERE task_id = ? AND plan_id = ? AND approval_id = ?
+                  AND target_node_id = ? AND target_node_revision = ?
+                  AND fencing_token = ? AND binding_document_hash = ?
+                """,
+                (
+                    task_id,
+                    input_binding.plan_id,
+                    input_binding.approval_id,
+                    input_binding.target_node_id,
+                    input_binding.target_node_revision,
+                    input_binding.fencing_token,
+                    input_binding.binding_document_hash,
+                ),
+            ).fetchone()
+            if binding_row is None:
+                raise TaskStoreConflict(
+                    "DAG admission requires the durable all-input binding"
+                )
+            binding_document = _decode_document(
+                binding_row["binding_document_json"],
+                label="DAG node execution input binding",
+            )
+            binding_json, binding_hash = encode_document(binding_document)
+            if (
+                binding_document != input_binding.binding_document
+                or binding_json != binding_row["binding_document_json"]
+                or binding_hash != input_binding.binding_document_hash
+                or binding_hash != binding_row["binding_document_hash"]
+                or binding_row["plan_hash"] != expected_plan_hash
+                or binding_row["target_node_state"] != "Pending"
+                or binding_row["project_id"] != project_id
+                or binding_row["principal_id"] != principal_id
+                or binding_row["owner_id"] != input_binding.owner_id
+                or binding_row["term_acquired_at"]
+                != input_binding.term_acquired_at
+            ):
+                raise TaskStoreCorruption(
+                    "DAG admission input binding differs from its immutable index"
+                )
+
+            existing = self._load_dag_node_execution_admission(
+                connection, task_id=task_id
+            )
+            if existing is not None:
+                intent = self._load_dispatch_intent(connection, task_id=task_id)
+                if (
+                    intent is None
+                    or intent.intent_id != existing["intent_id"]
+                    or existing["plan_id"] != input_binding.plan_id
+                    or existing["plan_hash"] != input_binding.plan_hash
+                    or existing["approval_id"] != input_binding.approval_id
+                    or existing["node_id"] != input_binding.target_node_id
+                    or existing["pending_revision"]
+                    != input_binding.target_node_revision
+                    or existing["input_binding_document_hash"]
+                    != input_binding.binding_document_hash
+                    or existing["input_fencing_token"]
+                    != input_binding.fencing_token
+                    or existing["input_owner_id"] != input_binding.owner_id
+                    or existing["input_term_acquired_at"]
+                    != input_binding.term_acquired_at
+                ):
+                    raise TaskStoreConflict(
+                        "DAG node admission replay differs from durable state"
+                    )
+                connection.commit()
+                return DagNodeExecutionAdmission(
+                    snapshot=snapshot,
+                    intent=intent,
+                    input_binding_document_hash=input_binding.binding_document_hash,
+                    pending_revision=int(existing["pending_revision"]),
+                    queued_revision=int(existing["queued_revision"]),
+                    admission_fencing_token=int(existing["admission_fencing_token"]),
+                    admitted_at=existing["admitted_at"],
+                    replayed=True,
+                )
+
+            if snapshot.status != "AwaitingApproval":
+                raise TaskStoreConflict("task is not awaiting DAG execution admission")
+            if (
+                input_binding.fencing_token != supervisor_lease.fencing_token
+                or input_binding.owner_id != supervisor_lease.owner_id
+                or input_binding.term_acquired_at != supervisor_lease.acquired_at
+            ):
+                raise RuntimeSupervisorLeaseLost(
+                    "DAG admission requires the binding's exact active term"
+                )
+            state_map = self._load_dag_node_state_map(
+                connection, task_id=task_id, plan=plan
+            )
+            selected_state = next(
+                (
+                    value
+                    for value in (state_map.nodes if state_map is not None else ())
+                    if value.node_id == input_binding.target_node_id
+                ),
+                None,
+            )
+            if (
+                selected_state is None
+                or selected_state.state != "Pending"
+                or selected_state.revision != input_binding.target_node_revision
+            ):
+                raise TaskStoreConflict(
+                    "DAG admission requires the latest Pending node revision"
+                )
+
+            budget = self._load_approval_budget(
+                connection,
+                task_id=task_id,
+                approval_id=input_binding.approval_id,
+            )
+            if budget is None:
+                raise TaskStoreCorruption("current approval has no durable budget")
+            try:
+                dataset_keys = [
+                    (value["id"], value["version"])
+                    for value in snapshot.draft.get("datasets", [])
+                ]
+                algorithm_keys = [
+                    (value["algorithm"]["id"], value["algorithm"]["version"])
+                    for value in plan["nodes"]
+                ]
+            except (KeyError, TypeError) as error:
+                raise TaskStoreCorruption(
+                    "current DAG documents cannot identify registry records"
+                ) from error
+            registry = self._load_registry_snapshots(
+                connection,
+                project_id=project_id,
+                dataset_keys=dataset_keys,
+                algorithm_keys=algorithm_keys,
+            )
+            intent_document, queued_event = admit(
+                SubmitGateContext(
+                    snapshot=snapshot,
+                    registry=registry,
+                    budget=budget,
+                ),
+                admitted_at,
+            )
+            intent_document = dict(intent_document)
+            queued_event = dict(queued_event)
+            node = next(
+                value
+                for value in plan["nodes"]
+                if value["node_id"] == selected_state.node_id
+            )
+            adapter = intent_document.get("adapter")
+            request = intent_document.get("request")
+            fingerprint = intent_document.get("queue_fingerprint")
+            if (
+                intent_document.get("schema_version") != "1.0.0"
+                or intent_document.get("task_id") != task_id
+                or intent_document.get("plan_id") != plan["plan_id"]
+                or intent_document.get("plan_hash") != plan["plan_hash"]
+                or intent_document.get("approval_id") != approval["approval_id"]
+                or intent_document.get("node_id") != node["node_id"]
+                or intent_document.get("node_idempotency_key")
+                != node["idempotency_key"]
+                or intent_document.get("created_at") != admitted_at
+                or not isinstance(intent_document.get("intent_id"), str)
+                or not isinstance(adapter, Mapping)
+                or set(adapter) != {"id", "version"}
+                or not isinstance(request, Mapping)
+                or not isinstance(fingerprint, Mapping)
+                or queued_event.get("schema_version") != "1.0.0"
+                or queued_event.get("sequence") != 1
+                or queued_event.get("task_id") != task_id
+                or queued_event.get("event_type") != "task_queued"
+                or queued_event.get("task_status") != "Queued"
+                or queued_event.get("node_id") is not None
+                or queued_event.get("occurred_at") != admitted_at
+                or queued_event.get("fingerprint") != fingerprint
+            ):
+                raise TaskStoreConflict(
+                    "DAG dispatch intent or queued event differs from admission"
+                )
+
+            intent_json, intent_hash = encode_document(intent_document)
+            _, fingerprint_hash = encode_document(fingerprint)
+            event_json, event_hash = encode_document(queued_event)
+            _, event_fingerprint_hash = encode_document(
+                queued_event.get("fingerprint", {})
+            )
+            if event_fingerprint_hash != fingerprint_hash:
+                raise TaskStoreConflict("DAG queued fingerprint is inconsistent")
+
+            consumed = connection.execute(
+                """
+                UPDATE approval_budgets
+                SET tasks_used = tasks_used + 1, updated_at = ?
+                WHERE task_id = ? AND approval_id = ?
+                  AND tasks_used < max_tasks
+                """,
+                (admitted_at, task_id, approval["approval_id"]),
+            )
+            if consumed.rowcount != 1:
+                raise TaskStoreConflict("approval task budget is exhausted")
+            connection.execute(
+                """
+                INSERT INTO dispatch_intents(
+                    intent_id, task_id, plan_id, plan_hash, approval_id,
+                    node_id, node_idempotency_key, adapter_id,
+                    adapter_version, request_json, request_hash,
+                    fingerprint_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_document["intent_id"],
+                    task_id,
+                    plan["plan_id"],
+                    plan["plan_hash"],
+                    approval["approval_id"],
+                    node["node_id"],
+                    node["idempotency_key"],
+                    adapter["id"],
+                    adapter["version"],
+                    intent_json,
+                    intent_hash,
+                    fingerprint_hash,
+                    admitted_at,
+                ),
+            )
+            admission_document = {
+                "schema_version": "1.0.0",
+                "intent_id": intent_document["intent_id"],
+                "task_id": task_id,
+                "plan": {
+                    "plan_id": plan["plan_id"],
+                    "plan_hash": plan["plan_hash"],
+                },
+                "approval_id": approval["approval_id"],
+                "node": {
+                    "node_id": node["node_id"],
+                    "idempotency_key": node["idempotency_key"],
+                    "pending_revision": selected_state.revision,
+                    "queued_revision": selected_state.revision + 1,
+                },
+                "input_binding": {
+                    "document_hash": input_binding.binding_document_hash,
+                    "supervisor_term": {
+                        "fencing_token": input_binding.fencing_token,
+                        "owner_id": input_binding.owner_id,
+                        "acquired_at": input_binding.term_acquired_at,
+                    },
+                },
+                "scope": {
+                    "project_id": project_id,
+                    "principal_id": principal_id,
+                },
+                "admission_supervisor_term": {
+                    "fencing_token": supervisor_lease.fencing_token,
+                    "owner_id": supervisor_lease.owner_id,
+                    "acquired_at": supervisor_lease.acquired_at,
+                },
+                "max_node_attempts": 1,
+                "admitted_at": admitted_at,
+            }
+            admission_json, admission_hash = encode_document(admission_document)
+            connection.execute(
+                """
+                INSERT INTO dag_node_execution_admissions(
+                    intent_id, task_id, plan_id, plan_hash, approval_id,
+                    node_id, pending_revision, queued_revision,
+                    node_idempotency_key, input_binding_document_hash,
+                    input_fencing_token, input_owner_id,
+                    input_term_acquired_at, project_id, principal_id,
+                    admission_fencing_token, admission_owner_id,
+                    admission_term_acquired_at, max_node_attempts,
+                    document_json, document_hash, admitted_at, admitted_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    intent_document["intent_id"],
+                    task_id,
+                    plan["plan_id"],
+                    plan["plan_hash"],
+                    approval["approval_id"],
+                    node["node_id"],
+                    selected_state.revision,
+                    selected_state.revision + 1,
+                    node["idempotency_key"],
+                    input_binding.binding_document_hash,
+                    input_binding.fencing_token,
+                    input_binding.owner_id,
+                    input_binding.term_acquired_at,
+                    project_id,
+                    principal_id,
+                    supervisor_lease.fencing_token,
+                    supervisor_lease.owner_id,
+                    supervisor_lease.acquired_at,
+                    admission_json,
+                    admission_hash,
+                    admitted_at,
+                    admitted_at_us,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO run_events(
+                    task_id, sequence, event_id, event_type, task_status,
+                    node_id, fingerprint_hash, document_json, document_hash,
+                    occurred_at, recorded_at
+                ) VALUES (?, 1, ?, 'task_queued', 'Queued', NULL, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    queued_event["event_id"],
+                    event_fingerprint_hash,
+                    event_json,
+                    event_hash,
+                    queued_event["occurred_at"],
+                    admitted_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO supervised_run_event_commits(
+                    task_id, sequence, project_id, principal_id,
+                    fencing_token, recorded_at, recorded_at_us
+                ) VALUES (?, 1, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    project_id,
+                    principal_id,
+                    supervisor_lease.fencing_token,
+                    admitted_at,
+                    admitted_at_us,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO dag_node_execution_transition_facts(
+                    intent_id, node_revision, previous_state, state,
+                    event_sequence, event_hash, reason,
+                    project_id, principal_id, fencing_token,
+                    owner_id, term_acquired_at, recorded_at, recorded_at_us
+                ) VALUES (?, ?, 'Pending', 'Queued', 1, ?,
+                          'execution_admitted', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_document["intent_id"],
+                    selected_state.revision + 1,
+                    event_hash,
+                    project_id,
+                    principal_id,
+                    supervisor_lease.fencing_token,
+                    supervisor_lease.owner_id,
+                    supervisor_lease.acquired_at,
+                    admitted_at,
+                    admitted_at_us,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO dag_node_state_events(
+                    task_id, plan_id, plan_hash, node_id, revision,
+                    previous_state, state, recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, 'Pending', 'Queued', ?, ?)
+                """,
+                (
+                    task_id,
+                    plan["plan_id"],
+                    plan["plan_hash"],
+                    node["node_id"],
+                    selected_state.revision + 1,
+                    admitted_at,
+                    admitted_at_us,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Queued', updated_at = ? WHERE task_id = ?",
+                (admitted_at, task_id),
+            )
+            queued_snapshot = self._load_snapshot(connection, task_id)
+            stored_intent = self._load_dispatch_intent(
+                connection, task_id=task_id
+            )
+            stored_admission = self._load_dag_node_execution_admission(
+                connection, task_id=task_id
+            )
+            if (
+                queued_snapshot is None
+                or queued_snapshot.status != "Queued"
+                or stored_intent is None
+                or stored_intent.intent_id != intent_document["intent_id"]
+                or stored_admission is None
+            ):
+                raise TaskStoreCorruption("admitted DAG node cannot be read")
+            connection.commit()
+            return DagNodeExecutionAdmission(
+                snapshot=queued_snapshot,
+                intent=stored_intent,
+                input_binding_document_hash=input_binding.binding_document_hash,
+                pending_revision=selected_state.revision,
+                queued_revision=selected_state.revision + 1,
+                admission_fencing_token=supervisor_lease.fencing_token,
+                admitted_at=admitted_at,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "DAG node execution admission lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "DAG node execution admission conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def authorize_supervised_dispatch(
         self,
         *,
@@ -14859,6 +16489,11 @@ class SQLiteTaskStore:
                 supplied=supervisor_lease,
                 now_us=authorized_at_us,
                 action="supervised dispatch",
+            )
+            self._require_current_dag_node_execution(
+                connection,
+                intent=intent,
+                allowed_node_states=frozenset({"Queued"}),
             )
             if task["status"] != "Queued":
                 raise TaskStoreConflict(
@@ -16213,6 +17848,15 @@ class SQLiteTaskStore:
                 now_us=recorded_at_us,
                 action="private receipt adoption",
             )
+            dag_admission = self._require_current_dag_node_execution(
+                connection,
+                intent=intent,
+                allowed_node_states=frozenset({"Queued"}),
+            )
+            if dag_admission is not None:
+                raise TaskStoreConflict(
+                    "DAG execution requires a managed Worker receipt"
+                )
             if (
                 task["status"] != "Queued"
                 or intent.adapter_id != "fwi.deepwave_adapter"
@@ -16834,6 +18478,11 @@ class SQLiteTaskStore:
                 raise RuntimeSupervisorLeaseLost(
                     "Worker observation lost its supervisor lease"
                 )
+            self._require_current_dag_node_execution(
+                connection,
+                intent=intent,
+                allowed_node_states=frozenset({"Queued", "Running"}),
+            )
             reconciliation_pending = (
                 intent.state == "reconciliation_required"
                 and intent.reconciliation is not None
@@ -18639,6 +20288,547 @@ class SQLiteTaskStore:
             raise TaskStoreConflict(
                 "checkpoint resume completion conflicts with durable state"
             ) from error
+        finally:
+            connection.close()
+
+    def commit_dag_node_runtime_transition(
+        self,
+        *,
+        intent_id: str,
+        expected_node_state: str,
+        event: Mapping[str, Any],
+        adapter_status: Mapping[str, Any],
+        output_receipt: Mapping[str, Any] | None,
+        supervisor_lease: RuntimeSupervisorLease,
+        supervisor_clock: Callable[[], str],
+    ) -> DagNodeTerminalFact | TaskSnapshot:
+        """Append one fenced DAG node/RunEvent projection without ending the DAG."""
+
+        if (
+            not isinstance(intent_id, str)
+            or not intent_id
+            or expected_node_state not in {"Queued", "Running"}
+            or not isinstance(event, Mapping)
+            or not isinstance(adapter_status, Mapping)
+            or (output_receipt is not None and not isinstance(output_receipt, Mapping))
+            or not isinstance(supervisor_lease, RuntimeSupervisorLease)
+            or not callable(supervisor_clock)
+        ):
+            raise TaskStoreConflict("DAG node runtime transition is invalid")
+        event = copy.deepcopy(dict(event))
+        adapter_status = copy.deepcopy(dict(adapter_status))
+        supplied_output = (
+            None if output_receipt is None else copy.deepcopy(dict(output_receipt))
+        )
+        event_json, event_hash = encode_document(event)
+        _, event_fingerprint_hash = encode_document(event.get("fingerprint", {}))
+        adapter_status_json, adapter_status_hash = encode_document(adapter_status)
+        event_type = event.get("event_type")
+        if event_type not in {
+            "node_started",
+            "node_progress",
+            "node_succeeded",
+            "node_failed",
+        }:
+            raise TaskStoreConflict("DAG node event type is unsupported")
+        terminal_state = {
+            "node_succeeded": "Succeeded",
+            "node_failed": "Failed",
+        }.get(event_type)
+        if (
+            event.get("task_status") != "Running"
+            or (terminal_state == "Succeeded") != (supplied_output is not None)
+        ):
+            raise TaskStoreConflict("DAG node event projection is inconsistent")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            recorded_at, recorded_at_us = _runtime_timestamp(supervisor_clock())
+            try:
+                _, event_occurred_at_us = _runtime_timestamp(
+                    event.get("occurred_at")
+                )
+            except TaskStoreConflict as error:
+                raise TaskStoreConflict(
+                    "DAG node event time is invalid"
+                ) from error
+            if event_occurred_at_us > recorded_at_us:
+                raise TaskStoreConflict(
+                    "DAG node event cannot occur after its durable commit"
+                )
+            task_id = self._task_id_for_intent(connection, intent_id)
+            if task_id is None:
+                raise TaskStoreConflict("dispatch intent does not exist")
+            intent = self._load_dispatch_intent(connection, task_id=task_id)
+            if intent is None or intent.intent_id != intent_id:
+                raise TaskStoreCorruption("dispatch intent cannot be read")
+            task = connection.execute(
+                "SELECT project_id, principal_id, status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskStoreCorruption("DAG runtime task cannot be read")
+            self._require_active_runtime_supervisor_lease(
+                connection,
+                project_id=task["project_id"],
+                principal_id=task["principal_id"],
+                supplied=supervisor_lease,
+                now_us=recorded_at_us,
+                action="DAG node runtime transition",
+            )
+            admission = self._require_current_dag_node_execution(
+                connection,
+                intent=intent,
+                allowed_node_states=frozenset({expected_node_state}),
+            )
+            if admission is None:
+                raise TaskStoreConflict("dispatch intent is not a DAG node execution")
+            latest_state = connection.execute(
+                """
+                SELECT revision, state FROM dag_node_state_events
+                WHERE task_id = ? AND plan_id = ? AND node_id = ?
+                ORDER BY revision DESC LIMIT 1
+                """,
+                (task_id, intent.plan_id, intent.node_id),
+            ).fetchone()
+            if (
+                latest_state is None
+                or latest_state["state"] != expected_node_state
+                or event.get("task_id") != task_id
+                or event.get("node_id") != intent.node_id
+                or intent.handle is None
+                or event.get("fingerprint") != intent.handle.get("fingerprint")
+                or task["project_id"] != supervisor_lease.project_id
+                or task["principal_id"] != supervisor_lease.principal_id
+            ):
+                raise TaskStoreConflict(
+                    "DAG node transition differs from current durable state"
+                )
+            if event_type == "node_started" and (
+                expected_node_state != "Queued" or task["status"] != "Queued"
+            ):
+                raise TaskStoreConflict("DAG node start requires Queued state")
+            if event_type == "node_progress" and (
+                expected_node_state != "Running" or task["status"] != "Running"
+            ):
+                raise TaskStoreConflict("DAG node progress requires Running state")
+            if terminal_state is not None and task["status"] not in {
+                "Queued",
+                "Running",
+            }:
+                raise TaskStoreConflict("DAG node terminal race was already lost")
+            next_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_events "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            if event.get("sequence") != next_sequence:
+                raise TaskStoreConflict("run event sequence is not the next value")
+            baseline = connection.execute(
+                """
+                SELECT fingerprint_hash FROM run_events
+                WHERE task_id = ? AND node_id = ?
+                ORDER BY sequence ASC LIMIT 1
+                """,
+                (task_id, intent.node_id),
+            ).fetchone()
+            if (
+                baseline is not None
+                and baseline["fingerprint_hash"] != event_fingerprint_hash
+            ):
+                raise TaskStoreConflict("run fingerprint changed within a DAG node")
+            connection.execute(
+                """
+                INSERT INTO run_events(
+                    task_id, sequence, event_id, event_type, task_status,
+                    node_id, fingerprint_hash, document_json, document_hash,
+                    occurred_at, recorded_at
+                ) VALUES (?, ?, ?, ?, 'Running', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    next_sequence,
+                    event["event_id"],
+                    event_type,
+                    intent.node_id,
+                    event_fingerprint_hash,
+                    event_json,
+                    event_hash,
+                    event["occurred_at"],
+                    recorded_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO supervised_run_event_commits(
+                    task_id, sequence, project_id, principal_id,
+                    fencing_token, recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    next_sequence,
+                    task["project_id"],
+                    task["principal_id"],
+                    supervisor_lease.fencing_token,
+                    recorded_at,
+                    recorded_at_us,
+                ),
+            )
+            if event_type == "node_progress":
+                connection.execute(
+                    "UPDATE tasks SET updated_at = ? WHERE task_id = ?",
+                    (recorded_at, task_id),
+                )
+                snapshot = self._load_snapshot(connection, task_id)
+                if snapshot is None or snapshot.status != "Running":
+                    raise TaskStoreCorruption("DAG progress cannot be read")
+                connection.commit()
+                return snapshot
+
+            node_revision = int(latest_state["revision"]) + 1
+            new_state = "Running" if event_type == "node_started" else terminal_state
+            assert new_state is not None
+            reason = {
+                "node_started": "dispatch_receipt_adopted",
+                "node_succeeded": "adapter_succeeded",
+            }.get(event_type)
+            if event_type == "node_failed":
+                error_code = (
+                    event.get("error", {}).get("code")
+                    if isinstance(event.get("error"), Mapping)
+                    else None
+                )
+                reason = {
+                    "dispatch_not_started": "dispatch_not_started",
+                    "worker_exit": "worker_exit_no_retry",
+                }.get(error_code, "adapter_failed")
+
+            receipt_document: dict[str, Any] | None = None
+            receipt_document_json: str | None = None
+            receipt_document_hash: str | None = None
+            attempt = None
+            observation = None
+            dispatch_outcome = None
+            handle_json = None
+            handle_hash = None
+            if terminal_state is not None:
+                attempt = connection.execute(
+                    """
+                    SELECT * FROM worker_launch_attempts
+                    WHERE intent_id = ? ORDER BY attempt_number DESC LIMIT 1
+                    """,
+                    (intent_id,),
+                ).fetchone()
+                observation = (
+                    None
+                    if attempt is None
+                    else connection.execute(
+                        """
+                        SELECT * FROM worker_attempt_observations
+                        WHERE attempt_id = ?
+                        ORDER BY observation_sequence DESC LIMIT 1
+                        """,
+                        (attempt["attempt_id"],),
+                    ).fetchone()
+                )
+                dispatch_outcome = connection.execute(
+                    """
+                    SELECT outcome_document_hash AS document_hash
+                    FROM effective_dispatched_intents WHERE intent_id = ?
+                    """,
+                    (intent_id,),
+                ).fetchone()
+                if (
+                    intent.state != "dispatched"
+                    or intent.handle is None
+                    or attempt is None
+                    or int(attempt["attempt_number"]) != 1
+                    or observation is None
+                    or dispatch_outcome is None
+                ):
+                    raise TaskStoreConflict(
+                        "DAG terminal transition lacks exact attempt-1 receipt evidence"
+                    )
+                handle_json, handle_hash = encode_document(intent.handle)
+            if terminal_state == "Succeeded":
+                assert supplied_output is not None
+                manifests = supplied_output.get("manifests")
+                receipt_record_hash = supplied_output.get("receipt_record_hash")
+                if (
+                    supplied_output.get("schema_version") != "1.0.0"
+                    or supplied_output.get("intent_id") != intent_id
+                    or supplied_output.get("attempt_id") != attempt["attempt_id"]
+                    or supplied_output.get("attempt_number") != 1
+                    or not _is_sha256(receipt_record_hash)
+                    or not isinstance(manifests, list)
+                    or not manifests
+                    or any(not isinstance(value, Mapping) for value in manifests)
+                ):
+                    raise TaskStoreConflict("DAG succeeded output proof is invalid")
+                plan_row = connection.execute(
+                    "SELECT document_json FROM plans WHERE task_id = ? AND plan_id = ?",
+                    (task_id, intent.plan_id),
+                ).fetchone()
+                if plan_row is None:
+                    raise TaskStoreCorruption("DAG terminal plan cannot be read")
+                plan_document = _decode_document(
+                    plan_row["document_json"], label="DAG terminal plan"
+                )
+                planned_node = next(
+                    (
+                        value
+                        for value in plan_document.get("nodes", [])
+                        if value.get("node_id") == intent.node_id
+                    ),
+                    None,
+                )
+                planned_outputs = (
+                    planned_node.get("outputs")
+                    if isinstance(planned_node, Mapping)
+                    else None
+                )
+                if not isinstance(planned_outputs, list) or not planned_outputs:
+                    raise TaskStoreCorruption("DAG terminal output plan is invalid")
+                manifests_by_port: dict[str, Mapping[str, Any]] = {}
+                for manifest in manifests:
+                    extension = manifest.get("extensions", {}).get(
+                        "org.agent_rpc.adapter"
+                    )
+                    port = (
+                        extension.get("output_port")
+                        if isinstance(extension, Mapping)
+                        else None
+                    )
+                    if not isinstance(port, str) or port in manifests_by_port:
+                        raise TaskStoreConflict("DAG output inventory is invalid")
+                    manifests_by_port[port] = manifest
+                output_documents: list[dict[str, Any]] = []
+                for planned_output in planned_outputs:
+                    port = planned_output.get("port")
+                    manifest = manifests_by_port.get(port)
+                    if (
+                        manifest is None
+                        or manifest.get("artifact_type")
+                        != planned_output.get("data_type")
+                    ):
+                        raise TaskStoreConflict(
+                            "DAG output inventory differs from the exact Plan"
+                        )
+                    manifest_json, manifest_hash = encode_document(manifest)
+                    output_documents.append(
+                        {
+                            "output_port": port,
+                            "data_type": planned_output["data_type"],
+                            "artifact_manifest": copy.deepcopy(dict(manifest)),
+                            "artifact_manifest_hash": manifest_hash,
+                        }
+                    )
+                    if manifest_json != encode_document(manifest)[0]:
+                        raise TaskStoreCorruption("DAG artifact canonicalization drifted")
+                if set(manifests_by_port) != {
+                    value.get("port") for value in planned_outputs
+                }:
+                    raise TaskStoreConflict("DAG output inventory has extra artifacts")
+                receipt_document = {
+                    "schema_version": "2.0.0",
+                    "task_id": task_id,
+                    "plan": {
+                        "plan_id": intent.plan_id,
+                        "plan_hash": intent.plan_hash,
+                    },
+                    "approval_id": intent.approval_id,
+                    "node": {
+                        "node_id": intent.node_id,
+                        "input_binding_revision": admission["pending_revision"],
+                        "succeeded_revision": node_revision,
+                        "state": "Succeeded",
+                    },
+                    "input_binding_document_hash": admission[
+                        "input_binding_document_hash"
+                    ],
+                    "scope": {
+                        "project_id": task["project_id"],
+                        "principal_id": task["principal_id"],
+                    },
+                    "input_supervisor_term": {
+                        "fencing_token": admission["input_fencing_token"],
+                        "owner_id": admission["input_owner_id"],
+                        "acquired_at": admission["input_term_acquired_at"],
+                    },
+                    "completion_supervisor_term": {
+                        "fencing_token": supervisor_lease.fencing_token,
+                        "owner_id": supervisor_lease.owner_id,
+                        "acquired_at": supervisor_lease.acquired_at,
+                    },
+                    "dispatch": {
+                        "intent_id": intent_id,
+                        "node_idempotency_key": intent.node_idempotency_key,
+                        "handle_hash": handle_hash,
+                        "attempt_id": attempt["attempt_id"],
+                        "attempt_number": 1,
+                        "worker_observation_sequence": observation[
+                            "observation_sequence"
+                        ],
+                        "worker_observation_hash": observation["document_hash"],
+                        "outcome_document_hash": dispatch_outcome[
+                            "document_hash"
+                        ],
+                    },
+                    "receipt_record_hash": receipt_record_hash,
+                    "outputs": output_documents,
+                    "succeeded_at": event["occurred_at"],
+                }
+                receipt_document_json, receipt_document_hash = encode_document(
+                    receipt_document
+                )
+
+            if terminal_state is not None:
+                connection.execute(
+                    """
+                    INSERT INTO dag_node_terminal_facts(
+                        intent_id, task_id, plan_id, plan_hash, approval_id,
+                        node_id, input_binding_node_revision,
+                        input_binding_document_hash, input_fencing_token,
+                        input_owner_id, input_term_acquired_at,
+                        node_revision, node_state, event_sequence, event_hash,
+                        attempt_id, attempt_number, worker_observation_sequence,
+                        worker_observation_hash, dispatch_handle_json,
+                        dispatch_handle_hash,
+                        dispatch_outcome_document_hash,
+                        adapter_status_json, adapter_status_hash,
+                        project_id, principal_id, completion_fencing_token,
+                        completion_owner_id, completion_term_acquired_at,
+                        receipt_document_json, receipt_document_hash,
+                        recorded_at, recorded_at_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        task_id,
+                        intent.plan_id,
+                        intent.plan_hash,
+                        intent.approval_id,
+                        intent.node_id,
+                        admission["pending_revision"],
+                        admission["input_binding_document_hash"],
+                        admission["input_fencing_token"],
+                        admission["input_owner_id"],
+                        admission["input_term_acquired_at"],
+                        node_revision,
+                        terminal_state,
+                        next_sequence,
+                        event_hash,
+                        attempt["attempt_id"],
+                        observation["observation_sequence"],
+                        observation["document_hash"],
+                        handle_json,
+                        handle_hash,
+                        dispatch_outcome["document_hash"],
+                        adapter_status_json,
+                        adapter_status_hash,
+                        task["project_id"],
+                        task["principal_id"],
+                        supervisor_lease.fencing_token,
+                        supervisor_lease.owner_id,
+                        supervisor_lease.acquired_at,
+                        receipt_document_json,
+                        receipt_document_hash,
+                        recorded_at,
+                        recorded_at_us,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO dag_node_execution_transition_facts(
+                    intent_id, node_revision, previous_state, state,
+                    event_sequence, event_hash, reason,
+                    project_id, principal_id, fencing_token,
+                    owner_id, term_acquired_at, recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    node_revision,
+                    expected_node_state,
+                    new_state,
+                    next_sequence,
+                    event_hash,
+                    reason,
+                    task["project_id"],
+                    task["principal_id"],
+                    supervisor_lease.fencing_token,
+                    supervisor_lease.owner_id,
+                    supervisor_lease.acquired_at,
+                    recorded_at,
+                    recorded_at_us,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO dag_node_state_events(
+                    task_id, plan_id, plan_hash, node_id, revision,
+                    previous_state, state, recorded_at, recorded_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    intent.plan_id,
+                    intent.plan_hash,
+                    intent.node_id,
+                    node_revision,
+                    expected_node_state,
+                    new_state,
+                    recorded_at,
+                    recorded_at_us,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'Running', updated_at = ? WHERE task_id = ?",
+                (recorded_at, task_id),
+            )
+            snapshot = self._load_snapshot(connection, task_id)
+            if snapshot is None or snapshot.status != "Running":
+                raise TaskStoreCorruption("DAG node transition cannot be read")
+            connection.commit()
+            if terminal_state is None:
+                return snapshot
+            return DagNodeTerminalFact(
+                snapshot=snapshot,
+                intent=intent,
+                node_revision=node_revision,
+                state=terminal_state,
+                event_sequence=next_sequence,
+                completion_fencing_token=supervisor_lease.fencing_token,
+                receipt_document_hash=receipt_document_hash,
+                replayed=False,
+            )
+        except (RuntimeSupervisorLeaseLost, TaskStoreConflict, TaskStoreCorruption):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            _raise_operational_error(error)
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "active term" in str(error):
+                raise RuntimeSupervisorLeaseLost(
+                    "DAG node transition lost its supervisor lease"
+                ) from error
+            raise TaskStoreConflict(
+                "DAG node transition conflicts with durable state"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 

@@ -10,18 +10,18 @@
 ## 当前路由
 
 - 活跃分支：`feature/scientific-agent-runtime`；基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`。
-- Accepted：D-003 固定 P0→P1→P2→P3→P4→P5→P6；只有 P6 出口通过才算全项目完成。
+- Accepted：D-003 固定 P0→P1→P2→P3→P4→P5→P6；历史入口“P3–P6 仍按固定顺序 Pending”已推进至 P3；只有 P6 出口通过才算全项目完成。
 - Verified：P0、P1、P2。P2-001～P2-009B2、reconciliation 矩阵、checkpoint / Waiting /
   same-live-attempt resume 及只读 SSE 均已实现；完整故障回归和代表性 CPU/CUDA HTTP/SSE E2E
   阶段出口通过，P2 已结束。
-- In progress：历史入口“P3–P6 仍按固定顺序 Pending”已推进至 P3；纯 DAG readiness kernel 与
-  SQLite v18 dormant 初始节点状态/active-term non-executable claim candidate，以及 PlanGraph 1.2
-  typed edge/纯 bytes-hash binding、SQLite v19 active-term all-input binding substrate 均已验证；
-  producer causal writer、可执行转换/派发、资源锁、cache/checkpoint 与 Recipe 未实现；`dag` 仍关闭，P4–P6 Pending。
+- In progress：P3 的 readiness、SQLite v18 claim、PlanGraph 1.2 bytes-hash binding、SQLite v19
+  all-input binding，以及 SQLite v20 dataset-root 可执行纵向内核均已验证；后者经既有 P2
+  Dispatcher/Adapter/Worker、receipt/RunEvent/reconciliation 完成单节点闭环。successor admission、
+  多节点调度/聚合、资源锁、cache/checkpoint 与 Recipe 未实现；`dag` 仍关闭，P4–P6 Pending。
 - 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 8 个，当前约 4 个，P2 为 0、
   P3–P6 暂估约 4；这是弹性估算，不是配额。
-- 当前阻塞：无；下一轮界定 fixed-Adapter producer Succeeded/output causal writer 与首个 node transition；
-  v19 只有 dataset-root 可达，node-output 正路径仍无 writer，所有 binding 均不授权 admission/派发。
+- 当前阻塞：无；下一安全动作是另开工作包界定 successor-node admission、同 Task 多 intent 与资源
+  所有权；v20 当前只允许每 Task 一个 dataset-root 节点，node-output 尚不能触发下游执行。
 - D-005 仍为 Proposed，不迁移或删除现有 runtime prompt-like 文件。
 - **最高优先级 D 锁**：D-001～D-012 及 D-LOCK 只可按单目标精确 diff/hash 和用户随后单独
   原样复制的一次性 `D-AUTH` 句修改；普通“继续/同意/固定/记录”无效。
@@ -59,8 +59,9 @@
   scope-bound RunEvent，并以有限重连后 GET polling 回退，不成为新的事实源或 mutation 入口。
 - reconciliation 的精确负向证明只终结为 Failed，不退款、不重试；transient/uncertain 保持
   action_required。该负向证明可进入 Trash，但无授权清理协议时 purge 必须 fail closed。
-- P3 v18 candidate 与 PlanGraph 1.2 artifact binding 均仅是审计/纯验证事实，不授权执行；DAG 只在
-  用户明确选择工作流或任务确需拆解时运行；多算法默认独立可选，不自动串成流水线。P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
+- P3 v18 candidate、v19 binding 本身仍不授权执行；只有内部 v20 exact admission 可进入单节点 P2
+  内核，且公开 `dag=false`。DAG 只在用户明确选择工作流或任务确需拆解时运行；多算法默认独立
+  可选，不自动串成流水线。P6 评测/观测/安全加固是全项目最终出口，P5 不是项目终点。
 - 不读取、打印或提交 `.env`、密钥、凭证、私有 prompt、模型、运行 artifact、数据库、日志、
   构建目录或缓存；不 push `main`、force-push 或重写已发布历史。
 - Accepted、Implemented、Verified、Pending 必须分开；科学结论只限实际实验边界。
@@ -76,5 +77,4 @@
 - `docs/PROJECT_PROGRESS.md` 是执行状态、验证证据和余量唯一真源；计划只保存阶段/出口，
   continuity 只保存获批决策，本文只保存路由、当前增量和不可破坏边界。
 - 本文必须同时不超过 80 行和 8192 字节；不得复制完整实现史、测试日志或状态矩阵。
-- 状态变化时只更新拥有该事实的最少文档，并运行 continuity/launcher/helper/diff 治理检查；
-  治理检查不触发 runtime、CPU 或 CUDA 回归。
+- 状态变化时只更新拥有该事实的最少文档，并运行 continuity/launcher/helper/diff 治理检查；治理检查不触发 runtime、CPU 或 CUDA 回归。
