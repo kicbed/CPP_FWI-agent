@@ -146,6 +146,7 @@ function loadGuidedFunctions() {
     'normalizeGuidedPlanNode',
     'normalizeGuidedPlanNodes',
     'hasExactGuidedFixedRecipePlan',
+    'expectedGuidedArtifactOutputs',
     'normalizeGuidedRuntimeNode',
     'normalizeGuidedTimeoutProjection',
     'normalizeGuidedReconciliationProjection',
@@ -1403,6 +1404,19 @@ function testEmbeddingStatusUsesSameOriginHealthProxy() {
   assert.match(source, /health\.model_loaded === true/);
 }
 
+function makeGuided16PlanOutputs() {
+  return [
+    { port: 'inverted_model', data_type: 'inverted_velocity_model_2d' },
+    { port: 'loss', data_type: 'loss_curve' },
+    { port: 'true_model_figure', data_type: 'figure' },
+    { port: 'initial_model_figure', data_type: 'figure' },
+    { port: 'inverted_model_figure', data_type: 'figure' },
+    { port: 'model_error_figure', data_type: 'figure' },
+    { port: 'shot_gathers_figure', data_type: 'figure' },
+    { port: 'loss_curve_figure', data_type: 'figure' },
+  ];
+}
+
 function makeGuidedTask(overrides = {}) {
   const taskId = overrides.task_id || 'task-guided-1';
   const planHash = overrides.plan_hash || `sha256:${'a'.repeat(64)}`;
@@ -1442,16 +1456,7 @@ function makeGuidedTask(overrides = {}) {
       nodes: [{
         node_id: 'invert',
         algorithm: { id: 'deepwave.acoustic_fwi', version: algorithmVersion },
-        outputs: [
-          { port: 'inverted_model', data_type: 'inverted_velocity_model_2d' },
-          { port: 'loss', data_type: 'loss_curve' },
-          { port: 'true_model_figure', data_type: 'figure' },
-          { port: 'initial_model_figure', data_type: 'figure' },
-          { port: 'inverted_model_figure', data_type: 'figure' },
-          { port: 'model_error_figure', data_type: 'figure' },
-          { port: 'shot_gathers_figure', data_type: 'figure' },
-          { port: 'loss_curve_figure', data_type: 'figure' },
-        ],
+        outputs: makeGuided16PlanOutputs(),
       }],
     },
     approval,
@@ -1475,7 +1480,7 @@ function makeGuidedRecipePlanNodes() {
     optimizer: 'adam', learning_rate_milli: 10000,
   };
   const resources = { cpu_cores: 2, gpu_count: 0, wall_time_seconds: 7200 };
-  const node = (nodeId, label, dependencies, outputs, severity) => ({
+  const node = (nodeId, label, dependencies, highlightedOutputs, severity) => ({
     node_id: nodeId,
     label,
     dependencies,
@@ -1487,24 +1492,27 @@ function makeGuidedRecipePlanNodes() {
       code: `${nodeId}_bounded_risk`, severity,
       mitigation: 'Pinned data, Algorithm, Adapter, resources, and artifact validation.',
     }],
-    outputs,
+    outputs: makeGuided16PlanOutputs(),
+    highlighted_outputs: highlightedOutputs,
   });
   return [
     node('data_check', 'A · Dataset check', [], [
-      { port: 'checked_model', data_type: 'velocity_model_2d' },
+      { port: 'inverted_model', data_type: 'inverted_velocity_model_2d' },
+      { port: 'loss', data_type: 'loss_curve' },
     ], 'low'),
     node('forward', 'B · Forward modelling', ['data_check'], [
       { port: 'shot_gathers_figure', data_type: 'figure' },
     ], 'medium'),
     node('quality_check', 'C · Quality check', ['data_check'], [
-      { port: 'quality_report', data_type: 'quality_report' },
+      { port: 'model_error_figure', data_type: 'figure' },
     ], 'medium'),
     node('fwi', 'D · FWI', ['forward', 'quality_check'], [
       { port: 'inverted_model', data_type: 'inverted_velocity_model_2d' },
       { port: 'loss', data_type: 'loss_curve' },
     ], 'high'),
     node('result_check', 'E · Result check', ['fwi'], [
-      { port: 'result_report', data_type: 'quality_report' },
+      { port: 'shot_gathers_figure', data_type: 'figure' },
+      { port: 'model_error_figure', data_type: 'figure' },
     ], 'medium'),
   ];
 }
@@ -1541,7 +1549,7 @@ function makeGuidedRecipeRuntimeNodes() {
       input_hashes: [`sha256:${String(index + 4).repeat(64)}`],
       output_hashes: [`sha256:${String(index + 5).repeat(64)}`],
     },
-    outputs: node.outputs.map(output => ({
+    outputs: node.highlighted_outputs.map(output => ({
       port: output.port,
       content_hash: `sha256:${String(index + 5).repeat(64)}`,
     })),
@@ -1568,6 +1576,7 @@ function makeGuidedRecipeTask(overrides = {}) {
 }
 
 function makeGuidedManifest(type, id, overrides = {}) {
+  const outputPort = type === 'loss_curve' ? 'loss' : 'inverted_model';
   return {
     schema_version: '1.0.0',
     artifact_id: id,
@@ -1583,6 +1592,7 @@ function makeGuidedManifest(type, id, overrides = {}) {
       title: '<svg onload=alert(1)>',
       order: type === 'loss_curve' ? 1 : 0,
     },
+    extensions: { 'org.agent_rpc.adapter': { output_port: outputPort } },
     ...overrides,
   };
 }
@@ -2422,6 +2432,10 @@ function testGuidedFixedRecipePlanAndRuntimeAreExplicitAndBounded() {
     label: 'Forward + quality checks + FWI',
   });
   assert.equal(review.plan.nodeCount, 5);
+  assert.equal(
+    review.plan.nodes.every(node => node.outputs.length === 8), true,
+    'the UI fixture matches the production Algorithm 1.6 physical output contract',
+  );
   assert.deepEqual(
     JSON.parse(JSON.stringify(review.plan.nodes.map(node => [
       node.nodeId, node.dependencies,
@@ -2445,6 +2459,16 @@ function testGuidedFixedRecipePlanAndRuntimeAreExplicitAndBounded() {
 
   const planHtml = api.renderGuidedPlanNodesHtml(review);
   assert.equal((planHtml.match(/data-guided-plan-node=/g) || []).length, 5);
+  assert.equal((planHtml.match(/data-guided-stage-outputs=/g) || []).length, 5);
+  assert.match(
+    planHtml,
+    /data-guided-stage-outputs="forward">shot_gathers_figure:figure<\/dd>/,
+  );
+  assert.match(
+    planHtml,
+    /data-guided-stage-outputs="quality_check">model_error_figure:figure<\/dd>/,
+  );
+  assert.match(planHtml, /Algorithm physical output contract/);
   for (const expected of [
     'data_check', 'forward', 'quality_check', 'fwi', 'result_check',
     'fwi.deepwave_adapter@1.6.0', 'CPU / GPU resources', 'risks', 'outputs',
@@ -2457,6 +2481,18 @@ function testGuidedFixedRecipePlanAndRuntimeAreExplicitAndBounded() {
   const unsafeHtml = api.renderGuidedPlanNodesHtml(unsafeNormalized);
   assert.doesNotMatch(unsafeHtml, /<img src=x/);
   assert.match(unsafeHtml, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  const missingHighlighted = makeGuidedRecipeTask();
+  delete missingHighlighted.plan.nodes[1].highlighted_outputs;
+  assert.equal(
+    api.normalizeGuidedTaskProjection(missingHighlighted), null,
+    'Recipe stage output semantics are required in the production projection',
+  );
+  const tamperedHighlighted = makeGuidedRecipeTask();
+  tamperedHighlighted.plan.nodes[1].highlighted_outputs[0].port = 'model_error_figure';
+  assert.equal(
+    api.normalizeGuidedTaskProjection(tamperedHighlighted), null,
+    'Recipe stage output semantics fail closed when they drift',
+  );
 
   const runtimeSource = makeGuidedRecipeTask({
     status: 'Running',
@@ -2558,6 +2594,25 @@ function testGuidedFixedRecipePlanAndRuntimeAreExplicitAndBounded() {
   assert.equal(failureWhileSiblingRuns.runtimeNodes[2].status, 'Failed');
   assert.equal(failureWhileSiblingRuns.runtimeNodes[3].status, 'Blocked');
   assert.equal(failureWhileSiblingRuns.runtimeNodes[4].status, 'Pending');
+  const forwardFailureWhileQualityRuns = makeGuidedRecipeRuntimeNodes();
+  forwardFailureWhileQualityRuns[1].status = 'Failed';
+  forwardFailureWhileQualityRuns[1].wait_reason = null;
+  forwardFailureWhileQualityRuns[1].failure = { code: 'FORWARD_FAILED' };
+  forwardFailureWhileQualityRuns[2].status = 'Running';
+  forwardFailureWhileQualityRuns[2].wait_reason = null;
+  const symmetricFailure = api.normalizeGuidedTaskProjection(makeGuidedRecipeTask({
+    status: 'Running',
+    approval: { approval_id: 'approval-guided-1', decision: 'approved' },
+    runtime_nodes: forwardFailureWhileQualityRuns,
+  }));
+  assert.ok(
+    symmetricFailure,
+    'either admitted fan-out branch may fail while its sibling finishes',
+  );
+  assert.equal(symmetricFailure.runtimeNodes[1].status, 'Failed');
+  assert.equal(symmetricFailure.runtimeNodes[2].status, 'Running');
+  assert.equal(symmetricFailure.runtimeNodes[3].status, 'Blocked');
+  assert.equal(symmetricFailure.runtimeNodes[4].status, 'Pending');
   const downstreamAfterFailure = makeGuidedRecipeRuntimeNodes();
   downstreamAfterFailure[2].status = 'Failed';
   downstreamAfterFailure[2].wait_reason = null;
@@ -2779,11 +2834,12 @@ function makeCurrentGuidedArtifacts() {
     { port: 'model_error_figure', dataType: 'figure' },
     { port: 'shot_gathers_figure', dataType: 'figure' },
     { port: 'loss_curve_figure', dataType: 'figure' },
-  ];
+  ].map(output => ({ nodeId: 'invert', ...output }));
   const artifacts = outputs.map((output, index) => {
     const isFigure = output.dataType === 'figure';
     return makeGuidedManifest(output.dataType, `artifact-${output.port}`, {
       artifact_type: output.dataType,
+      node_id: output.nodeId,
       media_type: isFigure ? 'image/png'
         : (output.dataType === 'loss_curve' ? 'text/csv' : 'application/x-npy'),
       size_bytes: isFigure ? 4 : 42,
@@ -2833,12 +2889,137 @@ function testCurrentEightAndHistoricalTwoArtifactContracts() {
   duplicatePort[7].extensions['org.agent_rpc.adapter'].output_port = 'true_model_figure';
   assert.equal(api.normalizeGuidedArtifacts(
     { artifacts: duplicatePort }, 'task-guided-1', current.outputs,
-  ).length, 0, 'duplicate output_port fails closed');
+  ).length, 0, 'duplicate node_id/output_port identity fails closed');
   const wrongComponent = structuredClone(current.artifacts);
   wrongComponent[2].display.component = 'download';
   assert.equal(api.normalizeGuidedArtifacts(
     { artifacts: wrongComponent }, 'task-guided-1', current.outputs,
   ).length, 0, 'PNG outputs must use the image component');
+}
+
+async function testGuidedRecipeArtifactsUseNodeScopedOutputIdentity() {
+  const api = loadGuidedFunctions();
+  const task = api.normalizeGuidedTaskProjection(makeGuidedRecipeTask());
+  assert.ok(task);
+  const expected = api.expectedGuidedArtifactOutputs(task);
+  assert.deepEqual(JSON.parse(JSON.stringify(expected.map(output => [
+    output.nodeId, output.port,
+  ]))), [
+    ['data_check', 'inverted_model'],
+    ['data_check', 'loss'],
+    ['forward', 'shot_gathers_figure'],
+    ['quality_check', 'model_error_figure'],
+    ['fwi', 'inverted_model'],
+    ['fwi', 'loss'],
+    ['result_check', 'shot_gathers_figure'],
+    ['result_check', 'model_error_figure'],
+  ]);
+  const physicalDisplayOrder = {
+    inverted_model: 0,
+    loss: 1,
+    model_error_figure: 5,
+    shot_gathers_figure: 6,
+  };
+  const artifacts = expected.map(output => {
+    const isFigure = output.dataType === 'figure';
+    const mediaType = isFigure ? 'image/png'
+      : (output.dataType === 'loss_curve' ? 'text/csv' : 'application/x-npy');
+    return makeGuidedManifest(
+      output.dataType,
+      `artifact-${output.nodeId.replaceAll('_', '-')}-${output.port.replaceAll('_', '-')}`,
+      {
+        node_id: output.nodeId,
+        artifact_type: output.dataType,
+        media_type: mediaType,
+        size_bytes: isFigure ? 4 : 42,
+        display: {
+          component: isFigure ? 'image'
+            : (output.dataType === 'loss_curve' ? 'line_chart' : 'download'),
+          title: `${output.nodeId} / ${output.port}`,
+          order: physicalDisplayOrder[output.port],
+        },
+        extensions: {
+          'org.agent_rpc.adapter': { output_port: output.port },
+          ...(isFigure ? {
+            'org.agent_rpc.figure': { width_px: 1440, height_px: 608 },
+          } : {}),
+        },
+      },
+    );
+  });
+  const normalized = api.normalizeGuidedArtifacts(
+    { artifacts }, 'task-guided-1', expected,
+  );
+  assert.equal(normalized.length, 8);
+  assert.equal(new Set(normalized.map(item => item.outputPort)).size, 4);
+  assert.equal(new Set(normalized.map(
+    item => `${item.nodeId}\u0000${item.outputPort}`,
+  )).size, 8);
+  assert.deepEqual(JSON.parse(JSON.stringify(normalized.map(item => [
+    item.nodeId, item.outputPort,
+  ]))), JSON.parse(JSON.stringify(expected.map(item => [item.nodeId, item.port]))));
+  const objectUrls = Object.fromEntries(
+    normalized.filter(item => item.mediaType === 'image/png')
+      .map(item => [item.artifactId, `blob:guided/${item.artifactId}`]),
+  );
+  const rendered = api.renderGuidedArtifactsHtml(
+    'task-guided-1', normalized, expected, objectUrls, {},
+  );
+  assert.equal((rendered.match(/data-guided-artifact=/g) || []).length, 8);
+  assert.equal((rendered.match(/<img src="blob:/g) || []).length, 4);
+  assert.equal((rendered.match(/downloadGuidedArtifact\(/g) || []).length, 8);
+  assert.match(rendered, /data_check \/ inverted_model/);
+  assert.match(rendered, /fwi \/ inverted_model/);
+
+  const duplicatePair = structuredClone(artifacts);
+  duplicatePair[7].node_id = 'forward';
+  duplicatePair[7].extensions['org.agent_rpc.adapter'].output_port = 'shot_gathers_figure';
+  assert.equal(api.normalizeGuidedArtifacts(
+    { artifacts: duplicatePair }, 'task-guided-1', expected,
+  ).length, 0, 'a repeated node_id/output_port pair fails closed');
+  const tamperedNode = structuredClone(artifacts);
+  tamperedNode[0].node_id = 'unknown_stage';
+  assert.equal(api.normalizeGuidedArtifacts(
+    { artifacts: tamperedNode }, 'task-guided-1', expected,
+  ).length, 0, 'a node_id outside the approved Recipe fails closed');
+  const tamperedPort = structuredClone(artifacts);
+  tamperedPort[2].extensions['org.agent_rpc.adapter'].output_port = 'loss_curve_figure';
+  assert.equal(api.normalizeGuidedArtifacts(
+    { artifacts: tamperedPort }, 'task-guided-1', expected,
+  ).length, 0, 'a node-scoped output_port outside the approved Recipe fails closed');
+
+  let imageLoads = 0;
+  let renders = 0;
+  const loadSandbox = {
+    module: { exports: {} },
+    state: {
+      guided: {
+        taskId: 'task-guided-1',
+        task,
+        generation: 3,
+        artifactLoadInFlight: false,
+        artifacts: [],
+        error: 'stale error',
+      },
+    },
+    isSafeGuidedOpaqueId: api.isSafeGuidedOpaqueId,
+    guidedApiPath: () => '/api/scientific-runtime/v1/tasks/task-guided-1/artifacts',
+    guidedApiRequest: async () => ({ artifacts }),
+    revokeGuidedArtifactObjectUrls() {},
+    expectedGuidedArtifactOutputs: api.expectedGuidedArtifactOutputs,
+    normalizeGuidedArtifacts: api.normalizeGuidedArtifacts,
+    async loadGuidedArtifactImages() { imageLoads += 1; return true; },
+    renderGuidedFwi() { renders += 1; },
+  };
+  vm.runInNewContext([
+    `async ${extractFunction('loadGuidedArtifacts')}`,
+    'module.exports = { loadGuidedArtifacts };',
+  ].join('\n'), loadSandbox);
+  assert.equal(await loadSandbox.module.exports.loadGuidedArtifacts(), true);
+  assert.equal(loadSandbox.state.guided.artifacts.length, 8);
+  assert.equal(loadSandbox.state.guided.error, '');
+  assert.equal(imageLoads, 1);
+  assert.equal(renders, 1);
 }
 
 async function testGuidedImageBlobLoadingIsBoundedAndRevoked() {
@@ -3676,6 +3857,10 @@ async function testGuidedSucceededRefreshRendersArtifactsOnce() {
       return path.endsWith('/artifacts') ? { artifacts: [{}, {}] } : { task_id: taskId };
     },
     normalizeGuidedTaskProjection: () => succeededTask,
+    expectedGuidedArtifactOutputs: () => [
+      { nodeId: 'invert', port: 'inverted_model', dataType: 'inverted_velocity_model_2d' },
+      { nodeId: 'invert', port: 'loss', dataType: 'loss_curve' },
+    ],
     normalizeGuidedArtifacts: (_data, expectedTaskId) => [
       { taskId: expectedTaskId, artifactId: 'artifact-model' },
       { taskId: expectedTaskId, artifactId: 'artifact-loss' },
@@ -4462,6 +4647,7 @@ async function main() {
   await testGuidedRuntimeCancelUsesOneDurableMutation();
   testGuidedArtifactManifestsUseControlledDownloads();
   testCurrentEightAndHistoricalTwoArtifactContracts();
+  await testGuidedRecipeArtifactsUseNodeScopedOutputIdentity();
   await testGuidedImageBlobLoadingIsBoundedAndRevoked();
   await testGuidedImageRetriesAreSingleFlightAndStaleSafe();
   testGuidedCatalogProjectionDoesNotExposePaths();

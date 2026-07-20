@@ -5637,6 +5637,7 @@ class TaskService:
         project_id: str,
         principal_id: str,
         supervisor_lease: RuntimeSupervisorLease,
+        _exact_dag_intent_id: str | None = None,
     ) -> TaskWorkerProjectionResult:
         """Project existing fixed-Adapter evidence under one exact term."""
 
@@ -5649,9 +5650,21 @@ class TaskService:
             or supervisor_lease.principal_id != principal_id
         ):
             raise TaskSupervisorLeaseLost()
-        intent = self._store.get_dispatch_intent(task_id)
+        intent = (
+            self._store.get_dispatch_intent(task_id)
+            if _exact_dag_intent_id is None
+            else self._store.get_dispatch_intent_by_id(_exact_dag_intent_id)
+        )
         if intent is None:
             raise TaskConflict("runtime task has no dispatch intent")
+        if (
+            intent.task_id != task_id
+            or (
+                _exact_dag_intent_id is not None
+                and not self._is_dag_node_execution_intent(intent)
+            )
+        ):
+            raise TaskConflict("runtime Worker projection intent is outside the task")
         if intent.state not in {"dispatching", "dispatched", "retrying"}:
             return TaskWorkerProjectionResult(
                 intent=intent,
@@ -7889,6 +7902,7 @@ class TaskService:
             project_id=project_id,
             principal_id=principal_id,
             supervisor_lease=supervisor_lease,
+            _exact_dag_intent_id=intent.intent_id,
         )
         evidence = projection.evidence
         if (
@@ -7995,6 +8009,7 @@ class TaskService:
             current_intent=self._store.get_dispatch_intent(task_id) or intent,
             projected=True,
         )
+
     def process_runtime_retry(
         self,
         task_id: str,
@@ -8003,7 +8018,7 @@ class TaskService:
         principal_id: str,
         supervisor_lease: RuntimeSupervisorLease,
     ) -> TaskRetryProcessResult:
-        """Run the sole post-ready retry decision before generic status."""
+        """Run post-ready retry or active DAG node-failure decisions."""
 
         _validate_opaque_id(task_id, field="task_id")
         _validate_opaque_id(project_id, field="project_id")
@@ -8048,13 +8063,49 @@ class TaskService:
             )
 
         if self._is_dag_node_execution_intent(intent):
-            return self._process_dag_node_no_retry_failure(
-                task_id=task_id,
-                project_id=project_id,
-                principal_id=principal_id,
-                snapshot=snapshot,
-                intent=intent,
-                supervisor_lease=supervisor_lease,
+            try:
+                active_admissions = self._store.list_active_dag_node_executions(
+                    task_id=task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                )
+            except TaskStoreConflict as error:
+                raise TaskConflict(str(error)) from error
+            if not active_admissions:
+                return result("none")
+            projected = False
+            deferred_code: str | None = None
+            for admission in active_admissions:
+                active_intent = admission.intent
+                if not self._is_dag_node_execution_intent(active_intent):
+                    raise TaskConflict(
+                        "active DAG admission lost its execution identity"
+                    )
+                node_result = self._process_dag_node_no_retry_failure(
+                    task_id=task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                    snapshot=self.get_task(
+                        task_id,
+                        project_id=project_id,
+                        principal_id=principal_id,
+                    ),
+                    intent=active_intent,
+                    supervisor_lease=supervisor_lease,
+                )
+                projected = projected or node_result.projected
+                if deferred_code is None:
+                    deferred_code = node_result.deferred_code
+            return result(
+                "none",
+                current_snapshot=self.get_task(
+                    task_id,
+                    project_id=project_id,
+                    principal_id=principal_id,
+                ),
+                current_intent=self._store.get_dispatch_intent(task_id) or intent,
+                projected=projected,
+                deferred_code=deferred_code,
             )
 
         if (

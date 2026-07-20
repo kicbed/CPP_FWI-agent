@@ -11,9 +11,10 @@
 
 - 活跃分支：`feature/scientific-agent-runtime`；基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`。
 - Accepted：D-003 固定 P0→P1→P2→P3→P4→P5→P6；P4–P6 仍按固定顺序 Pending；只有 P6 出口通过才算全项目完成。
-- Verified：P0、P1、P2、P3。P2 已结束；P3 已完成 v18–v23 deterministic DAG、typed artifact binding、
-  node cache / trusted lineage / same-live checkpoint，以及显式固定 Recipe 的 Guided API/UI/SSE；
-  完整回归和 fresh CPU/CUDA HTTP/SSE 阶段出口通过。
+- Verified：P0、P1、P2、P3。P2 已结束；P3 已完成 v18–v23 deterministic DAG、typed artifact binding、node cache /
+  trusted lineage / same-live checkpoint 及显式固定 Recipe 的 Guided API/UI/SSE；独立最终审查发现的
+  migration prefix、并行 node-local failure 和 UI artifact identity 阻断已关闭；完整回归和 fresh CPU/CUDA HTTP/SSE 阶段出口通过，
+  且绑定同一 clean tree。
 - Pending：P4 Agent Planner、P5 Algorithm SDK、P6 评测与加固；本窗口停止在 P4 之前。
 - 滚动粗估：全项目 P2–P6 粗估基线约 12 个；已 Verified 9 个，当前约 3 个，P2/P3 为 0、
   P4–P6 暂估约 3；这是弹性估算，不是配额。

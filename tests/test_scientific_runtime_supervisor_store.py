@@ -243,131 +243,83 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
-    @staticmethod
-    def _drop_retry_schema(connection: sqlite3.Connection) -> None:
-        connection.execute("DROP VIEW effective_dispatched_intents")
-        for trigger in (
-            "worker_exit_retry_reservation_requires_exact_case",
-            "worker_exit_retry_reservation_requires_active_term",
-            "worker_exit_retry_timeout_retirement_requires_exact_window",
-            "worker_exit_retry_reservation_retires_timeout",
-            "supervised_worker_exit_retry_attempt_requires_active_term",
-            "worker_launch_attempt_requires_retry_reservation",
-            "worker_exit_retry_replacement_requires_exact_case",
-            "worker_exit_retry_replacement_requires_active_term",
-            "worker_exit_retry_exhaustion_requires_exact_case",
-            "worker_exit_retry_reservations_are_immutable",
-            "worker_exit_retry_reservations_cannot_be_deleted",
-            "supervised_worker_exit_retry_attempts_are_immutable",
-            "supervised_worker_exit_retry_attempts_cannot_be_deleted",
-            "worker_exit_retry_timeout_retirements_are_immutable",
-            "worker_exit_retry_timeout_retirements_cannot_be_deleted",
-            "worker_exit_retry_dispatch_replacements_are_immutable",
-            "worker_exit_retry_dispatch_replacements_cannot_be_deleted",
-            "worker_exit_retry_exhaustions_are_immutable",
-            "worker_exit_retry_exhaustions_cannot_be_deleted",
-            "task_cancel_request_requires_exact_running_attempt",
-            "worker_attempt_timeout_window_requires_exact_start",
-            "supervised_timeout_attempt_requires_due_window",
-        ):
-            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-        connection.execute("DROP TABLE worker_exit_retry_exhaustions")
-        connection.execute("DROP TABLE worker_exit_retry_dispatch_replacements")
-        connection.execute("DROP TABLE worker_exit_retry_timeout_retirements")
-        connection.execute("DROP TABLE supervised_worker_exit_retry_attempts")
-        connection.execute("DROP TABLE worker_exit_retry_reservations")
-        for trigger in (
-            "approvals_initialize_retry_budget",
-            "approval_retry_budgets_are_immutable",
-            "approval_retry_budgets_cannot_be_deleted",
-            "worker_retry_reservation_requires_exact_case",
-            "worker_retry_reservation_requires_active_term",
-            "supervised_retry_attempt_requires_active_term",
-            "worker_launch_attempt_requires_retry_reservation",
-            "worker_launch_attempt_rejects_attempt_three",
-            "worker_retry_reservations_are_immutable",
-            "worker_retry_reservations_cannot_be_deleted",
-            "supervised_retry_attempts_are_immutable",
-            "supervised_retry_attempts_cannot_be_deleted",
-            "worker_retry_exhaustion_requires_exact_case",
-            "worker_retry_exhaustions_are_immutable",
-            "worker_retry_exhaustions_cannot_be_deleted",
-        ):
-            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-        connection.execute("DROP TABLE worker_retry_exhaustions")
-        connection.execute("DROP TABLE supervised_retry_attempts")
-        connection.execute("DROP TABLE worker_retry_reservations")
-        connection.execute("DROP TABLE approval_retry_budgets")
-
-    @staticmethod
-    def _drop_negative_reconciliation_schema(
-        connection: sqlite3.Connection,
-    ) -> None:
-        for trigger in (
-            "dispatch_reconciliation_observation_requires_exact_case",
-            "dispatch_reconciliation_observation_requires_active_term",
-            "dispatch_reconciliation_observation_sequence_is_contiguous",
-            "dispatch_reconciliation_negative_requires_exact_case",
-            "dispatch_reconciliation_negative_requires_active_term",
-            "dispatch_reconciliation_observations_are_immutable",
-            "dispatch_reconciliation_observations_cannot_be_deleted",
-            "dispatch_reconciliation_negative_resolutions_are_immutable",
-            "dispatch_reconciliation_negative_resolutions_cannot_be_deleted",
-        ):
-            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-        connection.execute(
-            "DROP TABLE dispatch_reconciliation_negative_resolutions"
+    def _replace_with_real_legacy_schema(self, version: int) -> None:
+        source_database_path = self.database_path
+        legacy_migrations = (
+            Path(self.temporary.name) / f"v{version}-runtime-migrations"
         )
-        connection.execute("DROP TABLE dispatch_reconciliation_observations")
-
-    @staticmethod
-    def _drop_checkpoint_schema(connection: sqlite3.Connection) -> None:
-        for trigger in (
-            "worker_attempt_waiting_requires_checkpoint_capable_intent",
-            "worker_checkpoint_wait_requires_active_term",
-            "worker_checkpoint_wait_requires_exact_live_attempt",
-            "checkpoint_resume_request_requires_current_wait",
-            "checkpoint_resume_authorization_requires_active_term",
-            "checkpoint_resume_authorization_requires_current_wait",
-            "checkpoint_resume_authorization_reuses_worker_request",
-            "checkpoint_resume_outcome_requires_active_term",
-            "checkpoint_resume_outcome_requires_exact_ack",
-            "worker_checkpoint_waits_are_append_only",
-            "worker_checkpoint_waits_cannot_be_deleted",
-            "checkpoint_resume_requests_are_append_only",
-            "checkpoint_resume_requests_cannot_be_deleted",
-            "checkpoint_resume_authorizations_are_append_only",
-            "checkpoint_resume_authorizations_cannot_be_deleted",
-            "checkpoint_resume_outcomes_are_append_only",
-            "checkpoint_resume_outcomes_cannot_be_deleted",
+        legacy_migrations.mkdir(mode=0o700)
+        for migration in sorted(
+            task_store_module.MIGRATIONS_DIRECTORY.glob(
+                "[0-9][0-9][0-9][0-9]_*.sql"
+            )
         ):
-            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-        connection.execute("DROP TABLE task_checkpoint_resume_outcomes")
-        connection.execute(
-            "DROP TABLE supervised_checkpoint_resume_authorizations"
+            if int(migration.name.split("_", 1)[0]) <= version:
+                shutil.copy2(migration, legacy_migrations / migration.name)
+        database_directory = (
+            Path(self.temporary.name) / f"v{version}-runtime-database"
         )
-        connection.execute("DROP TABLE task_checkpoint_resume_requests")
-        connection.execute("DROP TABLE worker_checkpoint_waits")
+        database_directory.mkdir(mode=0o700)
+        legacy_database_path = database_directory / "task.sqlite3"
+        with mock.patch.object(
+            task_store_module,
+            "MIGRATIONS_DIRECTORY",
+            legacy_migrations,
+        ):
+            legacy_store = SQLiteTaskStore(legacy_database_path)
+            expected_manifest = task_store_module._expected_schema_manifest(
+                task_store_module._load_migrations()
+            )
+        self.assertEqual(legacy_store.migration_version(), version)
 
-    @staticmethod
-    def _drop_dag_schema(connection: sqlite3.Connection) -> None:
-        trigger_names = connection.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type = 'trigger' AND name LIKE 'dag_node_%'"
-        ).fetchall()
-        for (trigger_name,) in trigger_names:
-            connection.execute(f'DROP TRIGGER "{trigger_name}"')
-        connection.execute("DROP TABLE dag_node_cache_hit_facts")
-        connection.execute("DROP TABLE dag_node_cache_entries")
-        connection.execute("DROP TABLE dag_node_scheduler_transition_facts")
-        connection.execute("DROP TABLE dag_task_execution_runs")
-        connection.execute("DROP TABLE dag_node_terminal_facts")
-        connection.execute("DROP TABLE dag_node_execution_transition_facts")
-        connection.execute("DROP TABLE dag_node_execution_admissions")
-        connection.execute("DROP TABLE dag_node_succeeded_outputs")
-        connection.execute("DROP TABLE dag_node_input_binding_facts")
-        connection.execute("DROP TABLE dag_node_claim_candidates")
-        connection.execute("DROP TABLE dag_node_state_events")
+        connection = sqlite3.connect(legacy_database_path, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        try:
+            trigger_rows = connection.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type = 'trigger' ORDER BY name"
+            ).fetchall()
+            table_names = [
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                    "AND name != 'schema_migrations' ORDER BY name"
+                ).fetchall()
+            ]
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                "ATTACH DATABASE ? AS source", (str(source_database_path),)
+            )
+            connection.execute("BEGIN IMMEDIATE")
+            for row in trigger_rows:
+                connection.execute(f'DROP TRIGGER "{row["name"]}"')
+            for table_name in table_names:
+                columns = [
+                    row["name"]
+                    for row in connection.execute(
+                        f'PRAGMA table_info("{table_name}")'
+                    ).fetchall()
+                ]
+                quoted_columns = ", ".join(f'"{column}"' for column in columns)
+                connection.execute(
+                    f'INSERT INTO main."{table_name}" ({quoted_columns}) '
+                    f'SELECT {quoted_columns} FROM source."{table_name}"'
+                )
+            connection.commit()
+            connection.execute("DETACH DATABASE source")
+            for row in trigger_rows:
+                connection.execute(row["sql"])
+            connection.execute("PRAGMA foreign_keys = ON")
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+            self.assertEqual(
+                task_store_module._schema_manifest(connection), expected_manifest
+            )
+        finally:
+            connection.close()
+        self.database_path = legacy_database_path
 
     def _acquire(
         self,
@@ -469,11 +421,16 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
         return task_id, dispatcher, runtime, submitted.intent
 
     def _submitted_runtime(
-        self, *, key: str, deferred: bool = False
+        self,
+        *,
+        key: str,
+        deferred: bool = False,
+        algorithm_version: str = "1.6.0",
     ) -> tuple[str, FakeDispatcher, TaskService]:
         task_id, dispatcher, runtime, intent = self._pending_runtime(
             key=key,
             deferred=deferred,
+            algorithm_version=algorithm_version,
         )
         claimed, claimed_now = self.store.claim_dispatch(
             intent_id=intent.intent_id,
@@ -3142,41 +3099,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
     def test_v8_runtime_with_active_lease_upgrades_in_place_to_v21(self) -> None:
-        task_id, _, _ = self._submitted_runtime(key="upgrade-v8-v9")
+        task_id, _, _ = self._submitted_runtime(
+            key="upgrade-v8-v9",
+            algorithm_version="1.4.0",
+        )
         acquired = self._acquire("upgrade-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
-        connection = self._connection()
-        try:
-            self._drop_dag_schema(connection)
-            self._drop_checkpoint_schema(connection)
-            self._drop_negative_reconciliation_schema(connection)
-            self._drop_retry_schema(connection)
-            connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
-            connection.execute(
-                "DROP TABLE supervised_dispatch_reconciliation_attempts"
-            )
-            connection.execute(
-                "DROP TRIGGER task_cancel_request_rejects_authorized_timeout"
-            )
-            connection.execute("DROP TABLE task_timeout_outcomes")
-            connection.execute("DROP TABLE supervised_timeout_attempts")
-            connection.execute("DROP TABLE worker_attempt_timeout_windows")
-            connection.execute(
-                "DROP TRIGGER task_cancel_request_blocks_supervised_dispatch"
-            )
-            connection.execute("DROP TABLE task_cancel_outcomes")
-            connection.execute("DROP TABLE supervised_cancel_attempts")
-            connection.execute("DROP TABLE task_cancel_requests")
-            connection.execute("DROP TABLE supervised_private_receipt_adoptions")
-            connection.execute("DROP TABLE supervised_dispatch_attempts")
-            connection.execute("DROP TABLE supervised_dispatch_adoptions")
-            connection.execute("DROP TABLE worker_attempt_observations")
-            connection.execute("DROP TABLE worker_launch_attempts")
-            connection.execute("DELETE FROM schema_migrations WHERE version >= 9")
-            connection.execute("PRAGMA user_version = 8")
-            connection.commit()
-        finally:
-            connection.close()
+        self._replace_with_real_legacy_schema(8)
 
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.migration_version(), 23)
@@ -3219,36 +3148,13 @@ class ScientificRuntimeSupervisorStoreTest(unittest.TestCase):
             connection.close()
 
     def test_v10_runtime_with_active_lease_upgrades_in_place_to_v21(self) -> None:
-        task_id, _, _ = self._submitted_runtime(key="upgrade-v10-v12")
+        task_id, _, _ = self._submitted_runtime(
+            key="upgrade-v10-v12",
+            algorithm_version="1.4.0",
+        )
         acquired = self._acquire("upgrade-v12-owner", lease_seconds=30)
         self.assertTrue(acquired.acquired)
-        connection = self._connection()
-        try:
-            self._drop_dag_schema(connection)
-            self._drop_checkpoint_schema(connection)
-            self._drop_negative_reconciliation_schema(connection)
-            self._drop_retry_schema(connection)
-            connection.execute("DROP TABLE dispatch_reconciliation_resolutions")
-            connection.execute(
-                "DROP TABLE supervised_dispatch_reconciliation_attempts"
-            )
-            connection.execute(
-                "DROP TRIGGER task_cancel_request_rejects_authorized_timeout"
-            )
-            connection.execute("DROP TABLE task_timeout_outcomes")
-            connection.execute("DROP TABLE supervised_timeout_attempts")
-            connection.execute("DROP TABLE worker_attempt_timeout_windows")
-            connection.execute(
-                "DROP TRIGGER task_cancel_request_blocks_supervised_dispatch"
-            )
-            connection.execute("DROP TABLE task_cancel_outcomes")
-            connection.execute("DROP TABLE supervised_cancel_attempts")
-            connection.execute("DROP TABLE task_cancel_requests")
-            connection.execute("DELETE FROM schema_migrations WHERE version >= 11")
-            connection.execute("PRAGMA user_version = 10")
-            connection.commit()
-        finally:
-            connection.close()
+        self._replace_with_real_legacy_schema(10)
 
         reopened = SQLiteTaskStore(self.database_path)
         self.assertEqual(reopened.migration_version(), 23)

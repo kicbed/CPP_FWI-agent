@@ -28,7 +28,6 @@ from unittest import mock
 import numpy as np
 
 from scientific_runtime import RuntimeSupervisor as ProductionRuntimeSupervisor
-from scientific_runtime import fwi_adapter as fwi_adapter_module
 from scientific_runtime.fwi_adapter import DEFAULT_WORKER_PYTHON
 from scientific_runtime.task_dispatcher import DeepwaveTaskDispatcher
 from web import serve
@@ -152,6 +151,27 @@ class GuidedRecipeProductionE2E(unittest.TestCase):
     def setUp(self) -> None:
         if not DEFAULT_WORKER_PYTHON.is_file() or not os.access(DEFAULT_WORKER_PYTHON, os.X_OK):
             self.skipTest(f"fixed Worker Python is unavailable: {DEFAULT_WORKER_PYTHON}")
+
+    def _clean_source_identity(self) -> tuple[str, str]:
+        project_root = Path(__file__).resolve().parents[2]
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(status.stdout, "", "production E2E requires a clean Git tree")
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=project_root, text=True
+        ).strip()
+        tree = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=project_root, text=True
+        ).strip()
+        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        self.assertRegex(tree, r"^[0-9a-f]{40}$")
+        return commit, tree
 
     @staticmethod
     def _supervisor(tasks, **kwargs):
@@ -450,6 +470,7 @@ class GuidedRecipeProductionE2E(unittest.TestCase):
         return evidence
 
     def test_cpu_recipe_restart_sse_artifact_hash_and_lineage(self) -> None:
+        source_commit, source_tree = self._clean_source_identity()
         recorder = _Recorder()
         with tempfile.TemporaryDirectory(prefix="guided-recipe-e2e-") as private:
             root = Path(private)
@@ -462,19 +483,9 @@ class GuidedRecipeProductionE2E(unittest.TestCase):
                 "SCIENTIFIC_RUNTIME_DB_PATH": str(database),
                 "AGENT_CORS_ORIGIN": ORIGIN,
             }
-            clean_deployment_source = {
-                "identity_complete": True,
-                "git_commit": "1" * 40,
-                "git_tree": "2" * 40,
-                "dirty": False,
-            }
             with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
                 serve, "HOST", "127.0.0.1"
-            ), mock.patch.object(serve, "PORT", 8080), mock.patch.object(
-                fwi_adapter_module,
-                "_git_source_evidence",
-                side_effect=lambda: dict(clean_deployment_source),
-            ):
+            ), mock.patch.object(serve, "PORT", 8080):
                 first, csrf = self._compose(recorder)
                 task_id, plan_hash = self._create_approved(
                     first, csrf, device="cpu", seed=17, suffix="cpu"
@@ -531,6 +542,12 @@ class GuidedRecipeProductionE2E(unittest.TestCase):
                     production_fingerprint["source"]["identity_complete"], True
                 )
                 self.assertIs(production_fingerprint["source"]["dirty"], False)
+                self.assertEqual(
+                    production_fingerprint["source"]["git_commit"], source_commit
+                )
+                self.assertEqual(
+                    production_fingerprint["source"]["git_tree"], source_tree
+                )
                 self.assertRegex(
                     production_fingerprint["environment"]["environment_lock_hash"],
                     r"^sha256:[0-9a-f]{64}$",
@@ -750,6 +767,12 @@ class GuidedRecipeProductionE2E(unittest.TestCase):
                             "source_dirty": production_fingerprint["source"][
                                 "dirty"
                             ],
+                            "source_git_commit": production_fingerprint["source"][
+                                "git_commit"
+                            ],
+                            "source_git_tree": production_fingerprint["source"][
+                                "git_tree"
+                            ],
                             "environment_lock_hash": production_fingerprint[
                                 "environment"
                             ]["environment_lock_hash"],
@@ -787,6 +810,7 @@ class GuidedRecipeProductionE2E(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get(CUDA_GATE) == "1", f"set {CUDA_GATE}=1 to own one real CUDA device")
     def test_cuda_two_workflows_have_one_real_active_worker(self) -> None:
+        source_commit, source_tree = self._clean_source_identity()
         probe = subprocess.run(
             [
                 str(DEFAULT_WORKER_PYTHON),
@@ -828,6 +852,16 @@ class GuidedRecipeProductionE2E(unittest.TestCase):
                     self.assertTrue(runtime.supervisor.stop())
                 self.assertEqual([task["status"] for task in terminal], ["Succeeded", "Succeeded"])
                 self.assertEqual(recorder.max_cuda_active, 1)
+                for task_id, _ in (first, second):
+                    for node_id in NODES:
+                        fingerprint = self._node_fingerprint(database, task_id, node_id)
+                        self.assertEqual(
+                            fingerprint["source"]["git_commit"], source_commit
+                        )
+                        self.assertEqual(
+                            fingerprint["source"]["git_tree"], source_tree
+                        )
+                        self.assertIs(fingerprint["source"]["dirty"], False)
                 evidence = {
                     "schema_version": "1.0.0",
                     "mode": "cuda",
@@ -835,6 +869,11 @@ class GuidedRecipeProductionE2E(unittest.TestCase):
                     "plan_hashes": [first[1], second[1]],
                     "terminal_statuses": [task["status"] for task in terminal],
                     "gpu": {"max_active": recorder.max_cuda_active},
+                    "source": {
+                        "git_commit": source_commit,
+                        "git_tree": source_tree,
+                        "dirty": False,
+                    },
                     "successful_dispatches": {
                         task_id: {node: recorder.count(task_id, node)[1] for node in NODES}
                         for task_id, _ in (first, second)

@@ -23,6 +23,7 @@ from scientific_runtime.fixed_recipe import (
 from scientific_runtime import (
     DispatchError,
     RegistryService,
+    RuntimeSupervisor,
     SQLiteTaskStore,
     TaskConflict,
     TaskDispatchError,
@@ -65,6 +66,7 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
         self._statuses: dict[str, dict] = {}
         self._manifests_by_intent: dict[str, list[dict]] = {}
         self._artifact_data_by_intent: dict[str, dict[str, bytes]] = {}
+        self.worker_projection_deferred_codes: dict[str, str] = {}
 
     @staticmethod
     def _attempt_id(intent) -> str:
@@ -171,6 +173,9 @@ class MultiNodeControlledDagDispatcher(ControlledDagDispatcher):
 
     def observe_existing_worker_attempt(self, intent):
         self._activate(intent)
+        deferred_code = self.worker_projection_deferred_codes.get(intent.node_id)
+        if deferred_code is not None:
+            raise DispatchError(deferred_code)
         return super().observe_existing_worker_attempt(intent)
 
     def probe_existing_dispatch_receipt(self, intent):
@@ -1362,6 +1367,223 @@ class ScientificRuntimeDagRuntimeSchedulerTest(unittest.TestCase):
                 "blocked_by_node_ids": ["quality_check"],
             },
         )
+
+    def _assert_parallel_worker_exit_converges(self, failed_node_id: str) -> None:
+        survivor_node_id = (
+            "quality_check" if failed_node_id == "forward" else "forward"
+        )
+        task_id, _ = self._approved_dag(
+            f"parallel-worker-exit-{failed_node_id}",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        lease = self._acquire(f"parallel-worker-exit-{failed_node_id}-first")
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id, "data_check"
+        )
+        self._run_success(task_id, lease, "data_check")
+        self.assertEqual(self._advance(task_id, lease).admitted_node_id, "forward")
+        self._start_active(task_id, lease, "forward")
+        fan_out = self._advance(task_id, lease)
+        self.assertEqual(fan_out.admitted_node_id, "quality_check")
+        self._start_active(task_id, lease, "quality_check")
+        active_by_node = {
+            intent.node_id: intent
+            for intent in self.store.list_dispatch_intents(task_id)
+            if intent.node_id in {"forward", "quality_check"}
+        }
+        failed_intent = active_by_node[failed_node_id]
+        self.dispatcher.set_terminal_heartbeat(failed_intent, state="failed")
+        self.dispatcher.set_status(
+            failed_intent,
+            state="Failed",
+            updated_at=self._now(),
+        )
+        self.dispatcher._statuses[failed_intent.intent_id]["stage"] = "worker_exit"
+        self.dispatcher._statuses[failed_intent.intent_id]["message"] = (
+            "controlled nonzero Worker exit"
+        )
+        probes_before = self.dispatcher.worker_exit_probe_calls
+
+        runtime = RuntimeSupervisor(
+            self.service,
+            project_id=PROJECT_ID,
+            principal_id=PRINCIPAL_ID,
+            owner_id=f"parallel-worker-exit-{failed_node_id}-first",
+            lease_seconds=2,
+            heartbeat_interval_seconds=1,
+        )
+        cycle, _, _ = runtime._observe_tasks(
+            [self.service.get_task(task_id, **self.scope)],
+            lease,
+            float("inf"),
+        )
+
+        states = self._node_states(task_id)
+        self.assertEqual(states[failed_node_id][1], "Failed")
+        self.assertEqual(states[survivor_node_id][1], "Running")
+        self.assertEqual(states["fwi"][1], "Blocked")
+        self.assertEqual(states["result_check"][1], "Blocked")
+        self.assertEqual(self.service.get_task(task_id, **self.scope).status, "Running")
+        self.assertEqual(cycle.refreshed_task_ids, (task_id,))
+        self.assertEqual(cycle.task_failures, ())
+        self.assertEqual(
+            self.dispatcher.worker_exit_probe_calls,
+            probes_before + 1,
+        )
+        self.assertEqual(
+            [
+                self._dispatch_count(task_id, node_id)
+                for node_id in (
+                    "data_check",
+                    "forward",
+                    "quality_check",
+                    "fwi",
+                    "result_check",
+                )
+            ],
+            [1, 1, 1, 0, 0],
+        )
+
+        lease = self._crash_restart(
+            f"parallel-worker-exit-{failed_node_id}-restart"
+        )
+        recovered = self._advance(task_id, lease)
+        self.assertEqual(recovered.active_intent.node_id, survivor_node_id)
+        self.assertEqual(
+            tuple(intent.node_id for intent in recovered.active_intents),
+            (survivor_node_id,),
+        )
+        recovered_states = self._node_states(task_id)
+        self.assertEqual(recovered_states[failed_node_id][1], "Failed")
+        self.assertEqual(recovered_states["fwi"][1], "Blocked")
+        self.assertEqual(recovered_states["result_check"][1], "Blocked")
+
+        terminal = self._finish_active(
+            task_id,
+            lease,
+            survivor_node_id,
+            state="Succeeded",
+        )
+        self.assertEqual(terminal.snapshot.status, "Failed")
+        self.assertEqual(
+            [
+                self._dispatch_count(task_id, node_id)
+                for node_id in (
+                    "data_check",
+                    "forward",
+                    "quality_check",
+                    "fwi",
+                    "result_check",
+                )
+            ],
+            [1, 1, 1, 0, 0],
+        )
+
+    def test_parallel_newer_branch_worker_exit_converges_after_restart(self) -> None:
+        self._assert_parallel_worker_exit_converges("quality_check")
+
+    def test_parallel_earlier_branch_worker_exit_does_not_wait_for_newer(self) -> None:
+        self._assert_parallel_worker_exit_converges("forward")
+
+    def test_parallel_worker_exit_deferred_code_is_plan_ordered(self) -> None:
+        task_id, _ = self._approved_dag(
+            "parallel-worker-exit-deferred",
+            fixed_recipe=True,
+            include_result_check=True,
+        )
+        lease = self._acquire("parallel-worker-exit-deferred")
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id, "data_check"
+        )
+        self._run_success(task_id, lease, "data_check")
+        self.assertEqual(self._advance(task_id, lease).admitted_node_id, "forward")
+        self._start_active(task_id, lease, "forward")
+        self.assertEqual(
+            self._advance(task_id, lease).admitted_node_id, "quality_check"
+        )
+        self._start_active(task_id, lease, "quality_check")
+        active_by_node = {
+            intent.node_id: intent
+            for intent in self.store.list_dispatch_intents(task_id)
+            if intent.node_id in {"forward", "quality_check"}
+        }
+        for node_id, intent in active_by_node.items():
+            self.dispatcher.set_terminal_heartbeat(intent, state="failed")
+            self.dispatcher.set_status(
+                intent,
+                state="Failed",
+                updated_at=self._now(),
+            )
+            self.dispatcher._statuses[intent.intent_id]["stage"] = "worker_exit"
+            self.dispatcher._statuses[intent.intent_id]["message"] = (
+                f"controlled {node_id} nonzero Worker exit"
+            )
+        self.dispatcher.worker_projection_deferred_codes = {
+            "forward": "WORKER_EVIDENCE_NOT_READY",
+            "quality_check": "WORKER_EVIDENCE_UNAVAILABLE",
+        }
+
+        deferred = self.service.process_runtime_retry(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+
+        self.assertEqual(deferred.state, "none")
+        self.assertEqual(deferred.deferred_code, "WORKER_EVIDENCE_NOT_READY")
+        self.assertFalse(deferred.projected)
+        states = self._node_states(task_id)
+        self.assertEqual(states["forward"][1], "Running")
+        self.assertEqual(states["quality_check"][1], "Running")
+        self.assertEqual(self.dispatcher.worker_exit_probe_calls, 0)
+
+        self.dispatcher.worker_projection_deferred_codes.clear()
+        converged = self.service.process_runtime_retry(
+            task_id,
+            supervisor_lease=lease,
+            **self.scope,
+        )
+
+        self.assertTrue(converged.projected)
+        self.assertIsNone(converged.deferred_code)
+        states = self._node_states(task_id)
+        self.assertEqual(states["forward"][1], "Failed")
+        self.assertEqual(states["quality_check"][1], "Failed")
+        self.assertEqual(states["fwi"][1], "Blocked")
+        self.assertEqual(states["result_check"][1], "Blocked")
+        self.assertEqual(converged.snapshot.status, "Failed")
+        self.assertEqual(self.dispatcher.worker_exit_probe_calls, 2)
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            blocker_document = json.loads(
+                connection.execute(
+                    "SELECT blocker_document_json "
+                    "FROM dag_node_scheduler_transition_facts "
+                    "WHERE task_id = ? AND node_id = 'fwi'",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            blocker_document["blocked_by_node_ids"] = ["unknown-node"]
+            blocker_json, blocker_hash = encode_document(blocker_document)
+            connection.execute(
+                "DROP TRIGGER dag_node_scheduler_transition_facts_are_append_only"
+            )
+            connection.execute(
+                "UPDATE dag_node_scheduler_transition_facts "
+                "SET blocker_document_json = ?, blocker_document_hash = ? "
+                "WHERE task_id = ? AND node_id = 'fwi'",
+                (blocker_json, blocker_hash, task_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(TaskStoreCorruption):
+            self.store.get_dag_node_state_snapshot(
+                task_id=task_id,
+                **self.scope,
+            )
 
     def test_fixed_recipe_restart_dispatches_admitted_branch_before_sibling(
         self,

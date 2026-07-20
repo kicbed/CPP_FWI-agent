@@ -10,7 +10,8 @@
 - 基线：`feature/fwi-deepwave-2d-acoustic@ffeb5bc`
 - 总体状态：**P0、P1、P2、P3 均已 Completed / Verified。P3 以 SQLite v18–v23、
   PlanGraph 1.2 typed artifact binding、deterministic multi-node runtime、node cache / trusted
-  lineage / same-live checkpoint，以及显式选择的固定 Recipe 完成 Guided HTTP/UI/SSE 产品闭环。
+  lineage / same-live checkpoint，以及显式选择的固定 Recipe 完成 Guided HTTP/UI/SSE 产品闭环；
+  独立最终审查发现的 migration prefix、并行 node-local failure 与 UI artifact identity 问题已关闭。
   只有完整生产组合发布 `dag=true`；普通 Guided FWI 和仅注册多算法仍为单节点。P4–P6 Pending，
   只有 P6 出口通过才算全项目完成**
 - 当前阶段：**P3 确定性 DAG Completed / Verified；停止在 P4 之前**
@@ -36,7 +37,7 @@ Git、代码、测试、服务和 Task Store，再使用这里的状态。发生
 | P0 最小 FWI 契约 | Verified | 七类 v1 Schema、canonical plan hash、Gate、fingerprint、状态/API/Adapter/Proto 规范、威胁模型和旧合同审计；Gate 后续补强 draft/plan 及 manifest port 一致性 | 合同当前 32/32；P0 checkpoint 回归：CTest 39/39、FWI Runner 1/1、FWI Python 27/27、Web/embedding Python 13/13、UI/governance PASS | —（阶段完成） |
 | P1 最小持久垂直切片 | Verified | 既有 P1 Task Store/Registry/Adapter/atomic submit/Guided Web 全闭环及 D-006/D-007；D-008/P1-008 增加 Conversation/Task 可选引用、无级联本地对话删除和当前 Algorithm/Adapter 1.4 的 2 数值 + 6 PNG 结果画廊 | Runtime 165/165、Worker 28/28、Web 29/29、Embedding 6/6、CTest 39/39、MCP 1/1 及 UI/治理 PASS；fresh v6 CUDA 10 events、8 artifacts/6 PNG、数值更新和重启不变性 PASS | —（P1 及当前维护切片完成） |
 | P2 持久可靠性加固 | Verified（阶段完成） | SQLite v17；两次串行/累计 2W finite retry；positive/exact-negative/transient/uncertain reconciliation；current Deepwave Algorithm/Adapter 1.6 same-attempt checkpoint/Waiting/resume；scope-bound 只读 RunEvent SSE 与有限 GET polling 回退 | 候选最终树完整 P2 aggregate 592/592 + Node UI PASS；真实 CPU/CUDA Guided HTTP/SSE E2E 均 Succeeded，连续游标续传、same-attempt resume、8 artifacts/6 PNG 与有限非零更新通过 | —（P2 阶段完成；下一出口为 P3） |
-| P3 确定性 DAG | Verified（阶段完成） | readiness；v18–v20 durable binding/单节点内核；v21 multi-node runtime；v22 cache/lineage/checkpoint；v23 仅为固定 Recipe 放行 B/C 并行；显式 Recipe 的 Guided API/UI/SSE、审批/hash 失效、失败阻断和生产 capability 闭环 | 候选最终树相关 aggregate 577/577；去重阶段数值回归 691/691，另有 Node UI/治理 PASS；fresh CPU Guided E2E 与双 Workflow CUDA E2E 均通过，GPU 最大真实并行 1 | —（P3 阶段完成；下一出口为 P4） |
+| P3 确定性 DAG | Verified（阶段完成） | readiness；v18–v20 durable binding/单节点内核；v21 multi-node runtime；v22 cache/lineage/checkpoint；v23 仅为固定 Recipe 放行 B/C 并行；显式 Recipe 的 Guided API/UI/SSE、审批/hash 失效、失败阻断和生产 capability 闭环；独立最终审查阻断已修复 | 修复后候选最终树相关 aggregate 581/581；去重阶段数值回归 695/695，另有 Node UI/治理 PASS；同一 clean HEAD/tree 的 fresh CPU Guided E2E 与双 Workflow CUDA E2E 均通过，GPU 最大真实并行 1 | —（P3 阶段完成；下一出口为 P4） |
 | P4 Agent Planner | Pending | 无 | 无 | 澄清、计划校验、审批和子 Agent 通过 |
 | P5 算法 SDK | Pending | 无 | 无 | 受控数据可匹配多个独立算法；新增真实插件无需 Orchestrator 关键词且 conformance 通过 |
 | P6 评测与加固 | Pending | 无 | 无 | 安全、故障、审计和部署验收通过 |
@@ -1115,6 +1116,30 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
   或 P3 阶段出口。
 - 下一安全动作：单独推进固定 Recipe/Guided 工作包；public `dag=false`，全项目粗估约 4 不变。
 
+### P3 独立最终审查修复与重新出口（2026-07-20）
+
+- 状态：**独立只读审查 FAIL → 修复 Implemented → P3 重新 Verified**。审查发现三个高严重度
+  阻断：旧库升级只校验 migration checksum 而未先校验当前版本 schema、并行 B/C 的 node-local
+  `worker_exit` 会被 task-wide defer、Recipe UI 把 artifact port 当成跨节点全局唯一；同时关闭
+  B/C 非对称失败投影和 stage highlighted output 未进入严格确认合同两项中严重度问题。
+- SQLite 初始化在应用 pending migration 前，按当前 `user_version` 精确比较 v17–v22 prefix
+  table/index/trigger/view manifest；同名弱 trigger、checksum/schema corruption 均在升级前 fail closed，
+  真实 v8/v10 与 v17–v22 历史库、新库、并发初始化及历史任务读取继续通过。
+- Supervisor 保留 timeout/checkpoint 的 task-wide 并行 defer，但按 durable active admission 顺序扫描并
+  精确投影每个 DAG intent 的 node-local failure；B 或 C 先失败、双失败、控制面重启均收敛为 Task
+  Failed，survivor 可继续，D/E 不启动且无重复 dispatch。Blocked 事实保留首次有序根因，未知、重复、
+  重排或消失的 blocker 仍 fail closed。
+- Recipe UI 以 `(node_id, output_port)` 验证 artifact，允许跨节点同名 port，拒绝重复 pair、未知节点和
+  篡改 port；确认页分开显示 stage outputs 与 Algorithm 八项物理输出合同，并对 B/C 任一先失败保持
+  对称投影。普通 Guided FWI、仅注册多算法和历史 PlanGraph 仍为单节点，只有显式 Recipe 生成 DAG。
+- 修复后受影响合并测试 **211/211 PASS**；候选最终 tree 的 P3 相关 aggregate 只运行一次并
+  **581/581 PASS**。其外不重叠的 Worker 34、Web route 34、Embedding 6、根 CTest 39、MCP 1
+  全部通过，去重阶段数值总计 **695/695**；Node UI、治理与一次综合审阅通过且无未解决发现。
+  production CPU/CUDA E2E 均绑定同一 clean 最终 HEAD/tree：CPU 覆盖连续 SSE、B/C 重叠、重启
+  no-duplicate、hash/lineage、cache hit/miss/tamper；双 Workflow CUDA 的单 GPU 最大真实并行仍为 1。
+- 本轮是既有 P3 出口的审查修复，不是新的路线切片，故不重复扣减余量：自基线累计 Verified 仍为
+  9，全项目 P4–P6 滚动粗估仍约 3。P4–P6 保持 Pending，项目未完成；停止在 P4 之前。
+
 ## 新会话恢复协议
 
 新 Codex 在执行 D-003 相关工作前必须：
@@ -1192,6 +1217,7 @@ P0 未改动 C++、现有 Python 数值路径、Web 运行时、旧 prompt 或 `
 | 2026-07-19 | P3 第 6 轮 deterministic multi-node runtime / inherited CPU-GPU locks | 工作包 In progress → Implemented → Verified；P3 仍 In progress | SQLite v21 historical exact per-node intents、per-Task 串行 readiness→admission、fan-out/fan-in、durable descendant blocking、Task 聚合、active-term restart/cancel recovery 与 inherited CPU/GPU flock | aggregate 一次 516 项：511 PASS、5 个陈旧 fixture/assertion 失败；修正后失败子集 5/5 PASS；CPU 最大并行 2、GPU 1；一次综合审阅、pycompile/diff/治理 PASS；未跑完整/数值阶段出口 | 下一工作包为 node cache/checkpoint；不进入 Recipe/API/UI/P3 出口；public dag=false、全项目粗估约 4 不变 |
 | 2026-07-19 | P3 第 7 轮 node cache / trusted lineage / DAG checkpoint | 工作包 In progress → Implemented → Verified；P3 仍 In progress | SQLite v22 canonical scope-local cache identity、executed Succeeded receipt + Adapter artifact 重验、append-only no-Worker hit fact、restart no-rerun、recursive Dataset lineage；exact DAG Waiting/resume 保持同 live Worker/process/attempt 且无 D-012 attempt | aggregate 一次 520 项：509 PASS、10 个 system-Python dependency errors + 1 旧 selector；固定 Worker venv/正确 scheduler 失败入口子集 17/17 PASS；一次综合审阅无阻断/高优先级发现；pycompile/diff/治理 PASS；未跑完整/正式 CPU-CUDA/P3 出口 | 下一工作包为固定 Recipe/Guided；不扩张 API/UI/public dag，不执行 P3 出口；用户明确保持全项目粗估约 4 |
 | 2026-07-20 | P3 固定 Recipe/Guided + 正式阶段出口 | P3 In progress → Implemented → Completed / Verified；P4–P6 Pending | SQLite v23 仅为 exact `forward_qc_fwi@1.0.0` 放行 B/C；固定 typed artifact fan-out/fan-in、terminal Worker evidence、cache-only lifecycle、approval/hash 失效；显式 Recipe 的确认页、API/UI/SSE 与 production-only `dag=true`；普通 Guided/multi-algorithm 仍单节点 | 首轮综合审阅的 8 项发现全部关闭，唯一收口审阅 14/14；候选相关 aggregate 只运行一次并 577/577 PASS；Worker 34/34、Web 34/34、Embedding 6/6、根 CTest 39/39、MCP 1/1，去重数值总计 691/691，Node UI/治理 PASS；fresh CPU E2E 195.737s 与 CUDA E2E 122.880s PASS。出口前开发 CPU 捕获并修复 terminal heartbeat cadence；正式 CPU 另两次仅捕获 E2E 取证查询与 test-only 5s lease，生产代码未再改变，修正后 fresh 运行通过 | 停止在 P4 前；滚动公式由约 4 减 1 为约 3，P4–P6 保持 Pending，整个项目未完成 |
+| 2026-07-20 | P3 独立最终审查修复与重新出口 | 独立审查 FAIL → Implemented → Verified；P3 Completed / Verified 不重复计数 | migration prefix schema fail-closed；并行 DAG exact-intent `worker_exit`/stable first-cause blocking；Recipe stage output、node-scoped artifact 与对称失败 UI；CPU/CUDA 取证绑定真实 clean Git identity | 受影响合并测试 211/211；P3 aggregate 仅一次 581/581；Worker 34/34、Web 34/34、Embedding 6/6、根 CTest 39/39、MCP 1/1，去重阶段数值 695/695；Node UI/治理 PASS；同一 clean 最终 HEAD/tree 的 fresh CPU/CUDA E2E PASS | 修复恢复 P3 Verified，但不新增路线切片或再次扣减；P4–P6 仍 Pending，停止在 P4 前 |
 
 记录规则：
 

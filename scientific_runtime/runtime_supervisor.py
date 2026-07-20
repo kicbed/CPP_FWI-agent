@@ -1080,10 +1080,10 @@ class RuntimeSupervisor:
                     None,
                 )
             )
-            automatic_attempt_controls_deferred = (
+            task_wide_attempt_controls_deferred = (
                 parallel_dag_active or dag_intent_pre_dispatch
             )
-            if not automatic_attempt_controls_deferred and status in {
+            if not task_wide_attempt_controls_deferred and status in {
                 "Running",
                 "Waiting",
             } and (
@@ -1122,7 +1122,7 @@ class RuntimeSupervisor:
                 }:
                     timeout_resolved.append(task_id)
                     continue
-            if not automatic_attempt_controls_deferred and status in {
+            if not task_wide_attempt_controls_deferred and status in {
                 "Running",
                 "Waiting",
             }:
@@ -1580,7 +1580,7 @@ class RuntimeSupervisor:
             )
             if (
                 not timeout_checked_before_checkpoint
-                and not automatic_attempt_controls_deferred
+                and not task_wide_attempt_controls_deferred
             ):
                 try:
                     timeout_result = self._process_task_timeout(task_id, lease)
@@ -1612,7 +1612,13 @@ class RuntimeSupervisor:
                 }:
                     timeout_resolved.append(task_id)
                     continue
-            if automatic_attempt_controls_deferred:
+            # Timeout/checkpoint decisions remain task-wide and therefore stay
+            # deferred while the fixed Recipe has two live branches.  The DAG
+            # retry hook is different: it scans the durable active DAG nodes
+            # and consumes each exact attempt-1 ``worker_exit`` proof without
+            # authorizing a retry.  It must run for dispatched parallel intents
+            # or a failed branch and its descendants can never converge.
+            if dag_intent_pre_dispatch:
                 retry_result = None
             else:
                 try:

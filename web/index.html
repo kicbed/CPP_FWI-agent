@@ -2497,6 +2497,9 @@
       const adapterVersion = adapterSource.version || value.adapter_version || '';
       const dependencies = Array.isArray(value.dependencies) ? value.dependencies : [];
       const outputs = normalizeGuidedPlanOutputs(value.outputs);
+      const hasHighlightedOutputs = Object.hasOwn(value, 'highlighted_outputs');
+      const highlightedOutputs = hasHighlightedOutputs
+        ? normalizeGuidedPlanOutputs(value.highlighted_outputs) : [];
       const parameters = normalizeGuidedBoundedJson(value.parameters || {});
       const resources = normalizeGuidedBoundedJson(value.resources || {});
       const risks = normalizeGuidedBoundedJson(value.risks || []);
@@ -2507,6 +2510,9 @@
           || dependencies.some(item => !isSafeGuidedOpaqueId(item))
           || new Set(dependencies).size !== dependencies.length
           || outputs.length !== (Array.isArray(value.outputs) ? value.outputs.length : 0)
+          || (hasHighlightedOutputs
+            && highlightedOutputs.length !== (Array.isArray(value.highlighted_outputs)
+              ? value.highlighted_outputs.length : 0))
           || parameters === undefined || resources === undefined || risks === undefined
           || (adapterId && !isSafeGuidedIdentifier(adapterId))
           || (adapterVersion && !isSafeGuidedVersion(adapterVersion))) return null;
@@ -2520,6 +2526,7 @@
         resources,
         risks,
         outputs,
+        highlightedOutputs,
       };
     }
 
@@ -2545,14 +2552,27 @@
 
     function hasExactGuidedFixedRecipePlan(nodes) {
       const expected = [
-        ['data_check', []],
-        ['forward', ['data_check']],
-        ['quality_check', ['data_check']],
-        ['fwi', ['forward', 'quality_check']],
-        ['result_check', ['fwi']],
+        ['data_check', [], [
+          { port: 'inverted_model', dataType: 'inverted_velocity_model_2d' },
+          { port: 'loss', dataType: 'loss_curve' },
+        ]],
+        ['forward', ['data_check'], [
+          { port: 'shot_gathers_figure', dataType: 'figure' },
+        ]],
+        ['quality_check', ['data_check'], [
+          { port: 'model_error_figure', dataType: 'figure' },
+        ]],
+        ['fwi', ['forward', 'quality_check'], [
+          { port: 'inverted_model', dataType: 'inverted_velocity_model_2d' },
+          { port: 'loss', dataType: 'loss_curve' },
+        ]],
+        ['result_check', ['fwi'], [
+          { port: 'shot_gathers_figure', dataType: 'figure' },
+          { port: 'model_error_figure', dataType: 'figure' },
+        ]],
       ];
       return Array.isArray(nodes) && nodes.length === expected.length
-        && expected.every(([nodeId, dependencies], index) => {
+        && expected.every(([nodeId, dependencies, highlightedOutputs], index) => {
           const node = nodes[index];
           return node.nodeId === nodeId
             && node.dependencies.join('\u0000') === dependencies.join('\u0000')
@@ -2560,8 +2580,41 @@
             && node.algorithm.version === '1.6.0'
             && node.adapter
             && ['fwi.deepwave_adapter', 'algorithm-adapter-v1'].includes(node.adapter.id)
-            && node.adapter.version === '1.6.0';
+            && node.adapter.version === '1.6.0'
+            && hasExactGuidedFwiPlanOutputs('1.6.0', node.outputs)
+            && node.highlightedOutputs.length === highlightedOutputs.length
+            && highlightedOutputs.every((output, outputIndex) => (
+              node.highlightedOutputs[outputIndex].port === output.port
+              && node.highlightedOutputs[outputIndex].dataType === output.dataType
+            ));
         });
+    }
+
+    function expectedGuidedArtifactOutputs(task) {
+      const nodes = Array.isArray(task?.plan?.nodes) ? task.plan.nodes : [];
+      let outputs = [];
+      if (task?.recipe) {
+        outputs = nodes.flatMap(node => (
+          Array.isArray(node.highlightedOutputs) ? node.highlightedOutputs.map(output => ({
+            nodeId: node.nodeId,
+            port: output.port,
+            dataType: output.dataType,
+          })) : []
+        ));
+      } else if (nodes.length === 1) {
+        outputs = nodes[0].outputs.map(output => ({
+          nodeId: nodes[0].nodeId,
+          port: output.port,
+          dataType: output.dataType,
+        }));
+      }
+      const identities = outputs.map(output => `${output.nodeId}\u0000${output.port}`);
+      if (outputs.length > 16
+          || outputs.some(output => !isSafeGuidedOpaqueId(output.nodeId)
+            || !isSafeGuidedIdentifier(output.port)
+            || !isSafeGuidedIdentifier(output.dataType))
+          || new Set(identities).size !== outputs.length) return [];
+      return outputs;
     }
 
     function normalizeGuidedRuntimeNode(value) {
@@ -2951,6 +3004,8 @@
         if (normalized.plan.nodeCount === 1) {
           const node = normalized.plan.nodes[0];
           if (recipe
+              || Object.hasOwn(rawPlanNodes[0], 'highlighted_outputs')
+              || node.highlightedOutputs.length !== 0
               || node.algorithm.id !== normalized.draft.algorithmId
               || node.algorithm.version !== normalized.draft.algorithmVersion
               || !hasExactGuidedFwiPlanOutputs(
@@ -2963,9 +3018,11 @@
               || !Object.hasOwn(node, 'parameters')
               || !Object.hasOwn(node, 'resources')
               || !Object.hasOwn(node, 'risks')
-              || !Object.hasOwn(node, 'outputs'))
+              || !Object.hasOwn(node, 'outputs')
+              || !Object.hasOwn(node, 'highlighted_outputs'))
             || normalized.plan.nodes.some(node => !node.adapter
-              || node.outputs.length === 0)) {
+              || node.outputs.length === 0
+              || node.highlightedOutputs.length === 0)) {
           return null;
         }
       } else if (normalized.plan.id || normalized.plan.hash || normalized.plan.nodeCount !== 0) {
@@ -2990,11 +3047,14 @@
         const admittedStates = new Set([
           'Queued', 'Running', 'Waiting', 'Retrying', 'Succeeded',
         ]);
+        const activeFanOutStates = new Set(['Queued', 'Running', 'Waiting', 'Retrying']);
+        const forwardStatus = runtimeById.get('forward')?.status;
+        const qualityStatus = runtimeById.get('quality_check')?.status;
         const recipeFailureWhileSiblingRuns = Boolean(recipe
           && normalized.status === 'Running'
           && runtimeById.get('data_check')?.status === 'Succeeded'
-          && runtimeById.get('forward')?.status === 'Running'
-          && runtimeById.get('quality_check')?.status === 'Failed'
+          && ((forwardStatus === 'Failed' && activeFanOutStates.has(qualityStatus))
+            || (qualityStatus === 'Failed' && activeFanOutStates.has(forwardStatus)))
           && ['Pending', 'Blocked'].includes(runtimeById.get('fwi')?.status)
           && ['Pending', 'Blocked'].includes(runtimeById.get('result_check')?.status));
         if (runtimeNodes.some(node => admittedStates.has(node.status)
@@ -3191,13 +3251,23 @@
       const source = value && typeof value === 'object' ? value : {};
       const list = Array.isArray(value) ? value : (Array.isArray(source.artifacts) ? source.artifacts : []);
       const planned = Array.isArray(expectedOutputs) ? expectedOutputs : [];
+      const plannedIdentities = planned.map(output => (
+        output && typeof output === 'object'
+          ? `${output.nodeId}\u0000${output.port}` : ''
+      ));
       if (list.length > 16 || (planned.length > 0 && list.length !== planned.length)) return [];
+      if (planned.some(output => !output || typeof output !== 'object'
+            || !isSafeGuidedOpaqueId(output.nodeId)
+            || !isSafeGuidedIdentifier(output.port)
+            || !isSafeGuidedIdentifier(output.dataType))
+          || new Set(plannedIdentities).size !== planned.length) return [];
       const normalized = list.map(item => {
         const manifest = item && item.manifest && typeof item.manifest === 'object'
           ? item.manifest : item;
         if (!manifest || typeof manifest !== 'object') return null;
         if (!isSafeGuidedOpaqueId(manifest.artifact_id)
             || manifest.task_id !== expectedTaskId
+            || !isSafeGuidedOpaqueId(manifest.node_id)
             || !isSafeGuidedIdentifier(manifest.artifact_type)) return null;
         const display = manifest.display && typeof manifest.display === 'object' ? manifest.display : {};
         const extensions = manifest.extensions && typeof manifest.extensions === 'object'
@@ -3230,6 +3300,7 @@
         return {
           artifactId: manifest.artifact_id,
           taskId: manifest.task_id,
+          nodeId: manifest.node_id,
           type: manifest.artifact_type,
           mediaType: manifest.media_type,
           outputPort,
@@ -3245,22 +3316,33 @@
           height,
         };
       }).filter(Boolean).sort((left, right) => left.order - right.order);
+      const artifactIdentities = normalized.map(
+        item => `${item.nodeId}\u0000${item.outputPort}`,
+      );
       if (normalized.length !== list.length
           || new Set(normalized.map(item => item.artifactId)).size !== normalized.length
-          || (normalized.some(item => item.outputPort)
-            && new Set(normalized.map(item => item.outputPort)).size !== normalized.length)) return [];
+          || normalized.some(item => !item.outputPort)
+          || new Set(artifactIdentities).size !== normalized.length) return [];
       if (planned.length > 0) {
         const mediaForType = {
           inverted_velocity_model_2d: 'application/x-npy',
           loss_curve: 'text/csv',
           figure: 'image/png',
         };
-        const expected = new Map(planned.map(output => [output.port, output.dataType]));
+        const expected = new Map(planned.map(output => [
+          `${output.nodeId}\u0000${output.port}`, output.dataType,
+        ]));
         if (expected.size !== planned.length || normalized.some(artifact => (
-          !expected.has(artifact.outputPort)
-          || artifact.mediaType !== mediaForType[expected.get(artifact.outputPort)]
-          || artifact.type !== expected.get(artifact.outputPort)
+          !expected.has(`${artifact.nodeId}\u0000${artifact.outputPort}`)
+          || artifact.mediaType !== mediaForType[
+            expected.get(`${artifact.nodeId}\u0000${artifact.outputPort}`)
+          ]
+          || artifact.type !== expected.get(`${artifact.nodeId}\u0000${artifact.outputPort}`)
         ))) return [];
+        const byIdentity = new Map(artifactIdentities.map((identity, index) => (
+          [identity, normalized[index]]
+        )));
+        return plannedIdentities.map(identity => byIdentity.get(identity));
       }
       return normalized;
     }
@@ -4186,9 +4268,17 @@
         const dependencies = node.dependencies.length ? node.dependencies.join(', ') : 'none';
         const adapter = node.adapter
           ? `${node.adapter.id}@${node.adapter.version}` : 'legacy task adapter';
-        const outputs = node.outputs.length
+        const algorithmOutputs = node.outputs.length
           ? node.outputs.map(output => `${output.port}:${output.dataType}`).join(', ') : 'none';
-        return `<article class="rounded-lg border border-indigo-200 bg-white p-3" data-guided-plan-node="${escapeHtml(node.nodeId)}"><div class="flex items-start justify-between gap-2"><div><h5 class="font-semibold text-slate-900">${escapeHtml(`${index + 1}. ${node.label}`)}</h5><p class="mt-1 text-xs font-mono text-slate-500">${escapeHtml(node.nodeId)}</p></div><span class="data-pill">Plan node</span></div><dl class="kv-grid mt-3"><dt>dependencies</dt><dd class="font-mono">${escapeHtml(dependencies)}</dd><dt>algorithm</dt><dd class="font-mono">${escapeHtml(`${node.algorithm.id}@${node.algorithm.version}`)}</dd><dt>adapter</dt><dd class="font-mono">${escapeHtml(adapter)}</dd><dt>parameters</dt><dd class="font-mono break-all">${escapeHtml(guidedBoundedJsonText(node.parameters))}</dd><dt>CPU / GPU resources</dt><dd class="font-mono break-all">${escapeHtml(guidedBoundedJsonText(node.resources))}</dd><dt>risks</dt><dd class="break-all">${escapeHtml(guidedBoundedJsonText(node.risks, 'none'))}</dd><dt>outputs</dt><dd class="font-mono break-all">${escapeHtml(outputs)}</dd></dl></article>`;
+        const highlightedOutputs = Array.isArray(node.highlightedOutputs)
+          && node.highlightedOutputs.length
+          ? node.highlightedOutputs.map(
+            output => `${output.port}:${output.dataType}`,
+          ).join(', ') : '';
+        const outputRows = highlightedOutputs
+          ? `<dt>stage outputs</dt><dd class="font-mono break-all" data-guided-stage-outputs="${escapeHtml(node.nodeId)}">${escapeHtml(highlightedOutputs)}</dd><dt>Algorithm physical output contract</dt><dd class="font-mono break-all">${escapeHtml(algorithmOutputs)}</dd>`
+          : `<dt>outputs</dt><dd class="font-mono break-all">${escapeHtml(algorithmOutputs)}</dd>`;
+        return `<article class="rounded-lg border border-indigo-200 bg-white p-3" data-guided-plan-node="${escapeHtml(node.nodeId)}"><div class="flex items-start justify-between gap-2"><div><h5 class="font-semibold text-slate-900">${escapeHtml(`${index + 1}. ${node.label}`)}</h5><p class="mt-1 text-xs font-mono text-slate-500">${escapeHtml(node.nodeId)}</p></div><span class="data-pill">Plan node</span></div><dl class="kv-grid mt-3"><dt>dependencies</dt><dd class="font-mono">${escapeHtml(dependencies)}</dd><dt>algorithm</dt><dd class="font-mono">${escapeHtml(`${node.algorithm.id}@${node.algorithm.version}`)}</dd><dt>adapter</dt><dd class="font-mono">${escapeHtml(adapter)}</dd><dt>parameters</dt><dd class="font-mono break-all">${escapeHtml(guidedBoundedJsonText(node.parameters))}</dd><dt>CPU / GPU resources</dt><dd class="font-mono break-all">${escapeHtml(guidedBoundedJsonText(node.resources))}</dd><dt>risks</dt><dd class="break-all">${escapeHtml(guidedBoundedJsonText(node.risks, 'none'))}</dd>${outputRows}</dl></article>`;
       }).join('');
       return `<section class="mt-4" data-guided-plan-nodes="true"><h5 class="text-xs font-semibold uppercase tracking-wider text-slate-600">PlanGraph nodes</h5><div class="mt-2 grid grid-cols-1 lg:grid-cols-2 gap-3">${cards}</div></section>`;
     }
@@ -4349,7 +4439,10 @@
         return `<section class="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4" data-guided-view="artifacts"><h4 class="font-semibold text-amber-800">ArtifactManifest 尚未就绪</h4><p class="text-sm text-amber-700 mt-1">当前 Plan 精确声明 ${escapeHtml(String(expectedCount))} 个输出；当前收到 ${escapeHtml(String(safeArtifacts.length))} 个合法 manifest。</p><button type="button" onclick="loadGuidedArtifacts()" class="mt-3 px-3 py-2 rounded-lg border border-amber-300 bg-white text-sm text-amber-900">重新获取 artifacts（GET）</button><p class="mt-2 text-xs text-amber-700">只重新读取 task-scoped manifest，不会重试 Worker 或创建新任务。</p></section>`;
       }
       const cards = safeArtifacts.map(artifact => {
-        if (!artifact || artifact.taskId !== taskId || !isSafeGuidedOpaqueId(artifact.artifactId)) return '';
+        if (!artifact || artifact.taskId !== taskId
+            || !isSafeGuidedOpaqueId(artifact.artifactId)
+            || !isSafeGuidedOpaqueId(artifact.nodeId)
+            || !isSafeGuidedIdentifier(artifact.outputPort)) return '';
         const blobUrl = isSafeGuidedBlobUrl(urls[artifact.artifactId])
           ? urls[artifact.artifactId] : '';
         let preview = '';
@@ -4360,7 +4453,7 @@
               ? `<img src="${escapeHtml(blobUrl)}" width="${escapeHtml(String(artifact.width))}" height="${escapeHtml(String(artifact.height))}" alt="${escapeHtml(artifact.title)}" loading="lazy" onerror="handleGuidedArtifactImageError('${escapeHtml(taskId)}','${escapeHtml(artifact.artifactId)}')" class="mt-3 h-auto w-full rounded-lg border border-slate-200 bg-slate-50 object-contain">`
               : '<div class="mt-3 rounded-lg bg-slate-50 p-4 text-center text-xs text-slate-500">正在通过任务作用域 endpoint 加载图片…</div>');
         }
-        return `<article class="rounded-lg border border-slate-200 bg-white p-4" data-guided-artifact="${escapeHtml(artifact.artifactId)}"><div class="flex items-start justify-between gap-3"><div><h5 class="font-semibold text-slate-900">${escapeHtml(artifact.title)}</h5><p class="text-xs text-slate-500 mt-1">${escapeHtml(artifact.outputPort || artifact.type)} · ${escapeHtml(artifact.mediaType)}</p></div><span class="data-pill">ArtifactManifest</span></div>${preview}<dl class="kv-grid mt-3"><dt>artifact_id</dt><dd class="font-mono">${escapeHtml(artifact.artifactId)}</dd><dt>size</dt><dd>${escapeHtml(artifact.sizeBytes === null ? '—' : `${artifact.sizeBytes} bytes`)}</dd><dt>content hash</dt><dd class="font-mono">${escapeHtml(artifact.contentHash || '—')}</dd></dl><button type="button" onclick="downloadGuidedArtifact('${escapeHtml(taskId)}','${escapeHtml(artifact.artifactId)}')" class="mt-3 px-3 py-2 rounded-lg bg-accent text-white text-sm">通过受控 endpoint 下载</button></article>`;
+        return `<article class="rounded-lg border border-slate-200 bg-white p-4" data-guided-artifact="${escapeHtml(artifact.artifactId)}"><div class="flex items-start justify-between gap-3"><div><h5 class="font-semibold text-slate-900">${escapeHtml(artifact.title)}</h5><p class="text-xs text-slate-500 mt-1">${escapeHtml(`${artifact.nodeId} / ${artifact.outputPort}`)} · ${escapeHtml(artifact.mediaType)}</p></div><span class="data-pill">ArtifactManifest</span></div>${preview}<dl class="kv-grid mt-3"><dt>node / output</dt><dd class="font-mono">${escapeHtml(`${artifact.nodeId} / ${artifact.outputPort}`)}</dd><dt>artifact_id</dt><dd class="font-mono">${escapeHtml(artifact.artifactId)}</dd><dt>size</dt><dd>${escapeHtml(artifact.sizeBytes === null ? '—' : `${artifact.sizeBytes} bytes`)}</dd><dt>content hash</dt><dd class="font-mono">${escapeHtml(artifact.contentHash || '—')}</dd></dl><button type="button" onclick="downloadGuidedArtifact('${escapeHtml(taskId)}','${escapeHtml(artifact.artifactId)}')" class="mt-3 px-3 py-2 rounded-lg bg-accent text-white text-sm">通过受控 endpoint 下载</button></article>`;
       }).join('');
       return `<section class="mt-4" data-guided-view="artifacts"><h4 class="font-heading font-semibold text-slate-900 mb-1">任务结果与图像</h4><p class="mb-3 text-xs text-slate-500">结果严格对应当前 Plan 的 ${escapeHtml(String(expectedCount))} 个输出；图片以受控 Blob URL 展示。</p><div class="grid grid-cols-1 md:grid-cols-2 gap-3">${cards}</div></section>`;
     }
@@ -4403,7 +4496,7 @@
           content += renderGuidedArtifactsHtml(
             state.guided.taskId,
             state.guided.artifacts,
-            state.guided.task.plan.outputs,
+            expectedGuidedArtifactOutputs(state.guided.task),
             state.guided.artifactObjectUrls,
             state.guided.artifactImageErrors,
           );
@@ -5121,7 +5214,7 @@
         const data = await guidedApiRequest(guidedApiPath('artifacts', taskId));
         if (state.guided.generation !== generation) return false;
         revokeGuidedArtifactObjectUrls();
-        const expectedOutputs = state.guided.task?.plan?.outputs || [];
+        const expectedOutputs = expectedGuidedArtifactOutputs(state.guided.task);
         state.guided.artifacts = normalizeGuidedArtifacts(data, taskId, expectedOutputs);
         const expectedCount = expectedOutputs.length || 2;
         if (state.guided.artifacts.length !== expectedCount) {

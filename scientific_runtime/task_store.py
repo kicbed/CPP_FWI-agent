@@ -7943,6 +7943,17 @@ class SQLiteTaskStore:
                         "applied task-store migration checksum changed"
                     )
 
+            if not first_install:
+                applied_manifest = (
+                    expected_manifest
+                    if user_version == latest_version
+                    else _expected_schema_manifest(migrations[:user_version])
+                )
+                if _schema_manifest(connection) != applied_manifest:
+                    raise TaskStoreCorruption(
+                        "task database schema does not match the applied migration"
+                    )
+
             for migration in migrations[user_version:]:
                 for statement in _migration_statements(migration.text):
                     connection.execute(statement)
@@ -15606,6 +15617,7 @@ class SQLiteTaskStore:
             blocked.node_id: blocked.blocked_by_node_ids
             for blocked in readiness.blocked_nodes
         }
+        current_states_by_id = {node.node_id: node.state for node in current}
         for node in current:
             if node.state != "Blocked":
                 continue
@@ -15626,8 +15638,40 @@ class SQLiteTaskStore:
             )
             document_json, document_hash = encode_document(document)
             expected_blockers = blockers_by_node.get(node.node_id)
+            persisted_blockers_value = document.get("blocked_by_node_ids")
+            persisted_blockers = (
+                tuple(persisted_blockers_value)
+                if isinstance(persisted_blockers_value, list)
+                and persisted_blockers_value
+                and all(
+                    isinstance(blocker_id, str)
+                    for blocker_id in persisted_blockers_value
+                )
+                else ()
+            )
+            persisted_blocker_set = set(persisted_blockers)
+            # A Blocked transition freezes the exact first-cause roots visible
+            # in that transaction.  Other fan-out branches may fail later, so
+            # current pure readiness may contain more roots; the immutable
+            # first causes must remain a non-empty ordered subset and terminal.
+            blockers_are_stable_first_causes = (
+                expected_blockers is not None
+                and bool(persisted_blockers)
+                and len(persisted_blocker_set) == len(persisted_blockers)
+                and persisted_blockers
+                == tuple(
+                    blocker_id
+                    for blocker_id in expected_blockers
+                    if blocker_id in persisted_blocker_set
+                )
+                and all(
+                    current_states_by_id.get(blocker_id)
+                    in {"Failed", "Cancelled", "Blocked"}
+                    for blocker_id in persisted_blockers
+                )
+            )
             if (
-                expected_blockers is None
+                not blockers_are_stable_first_causes
                 or document_json != fact["blocker_document_json"]
                 or document_hash != fact["blocker_document_hash"]
                 or document
@@ -15640,7 +15684,7 @@ class SQLiteTaskStore:
                     "node_id": node.node_id,
                     "previous_revision": fact["previous_revision"],
                     "blocked_revision": fact["node_revision"],
-                    "blocked_by_node_ids": list(expected_blockers),
+                    "blocked_by_node_ids": list(persisted_blockers),
                     "supervisor_term": {
                         "fencing_token": fact["fencing_token"],
                         "owner_id": fact["owner_id"],

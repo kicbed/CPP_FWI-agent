@@ -467,6 +467,103 @@ class ScientificRuntimeDagExecutionStoreTest(unittest.TestCase):
             value["port"] for value in plan["nodes"][0]["outputs"]
         })
 
+    def test_v17_to_v22_schema_drift_fails_before_pending_migration(self) -> None:
+        cases = {
+            17: (
+                "dispatch_reconciliation_negative_requires_exact_case",
+                "dispatch_reconciliation_negative_resolutions",
+            ),
+            18: (
+                "dag_node_initial_state_requires_current_approved_plan",
+                "dag_node_state_events",
+            ),
+            19: (
+                "dag_node_initial_state_requires_current_approved_plan",
+                "dag_node_state_events",
+            ),
+            20: ("dispatch_intents_are_immutable", "dispatch_intents"),
+            21: (
+                "dag_node_transition_state_requires_exact_active_fact",
+                "dag_node_state_events",
+            ),
+            22: (
+                "dag_node_execution_admission_requires_exact_current_case",
+                "dag_node_execution_admissions",
+            ),
+        }
+        for version, (trigger_name, table_name) in cases.items():
+            with self.subTest(version=version, trigger=trigger_name):
+                legacy_migrations = (
+                    Path(self.temporary.name) / f"schema-drift-v{version}-migrations"
+                )
+                legacy_migrations.mkdir(mode=0o700)
+                for migration in sorted(
+                    task_store_module.MIGRATIONS_DIRECTORY.glob(
+                        "[0-9][0-9][0-9][0-9]_*.sql"
+                    )
+                ):
+                    if int(migration.name.split("_", 1)[0]) <= version:
+                        shutil.copy2(migration, legacy_migrations / migration.name)
+
+                database_directory = (
+                    Path(self.temporary.name) / f"schema-drift-v{version}-database"
+                )
+                database_directory.mkdir(mode=0o700)
+                database_path = database_directory / "task.sqlite3"
+                with mock.patch.object(
+                    task_store_module,
+                    "MIGRATIONS_DIRECTORY",
+                    legacy_migrations,
+                ):
+                    legacy_store = SQLiteTaskStore(database_path)
+                self.assertEqual(legacy_store.migration_version(), version)
+
+                connection = sqlite3.connect(database_path)
+                try:
+                    self.assertIsNotNone(
+                        connection.execute(
+                            "SELECT sql FROM sqlite_master "
+                            "WHERE type = 'trigger' AND name = ?",
+                            (trigger_name,),
+                        ).fetchone()
+                    )
+                    connection.execute(f'DROP TRIGGER "{trigger_name}"')
+                    connection.execute(
+                        f'CREATE TRIGGER "{trigger_name}" '
+                        f'BEFORE INSERT ON "{table_name}" '
+                        "WHEN 0 BEGIN SELECT 1; END;"
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                with self.assertRaisesRegex(
+                    TaskStoreCorruption,
+                    "schema does not match the applied migration",
+                ):
+                    SQLiteTaskStore(database_path)
+
+                connection = sqlite3.connect(database_path)
+                try:
+                    self.assertEqual(
+                        connection.execute("PRAGMA user_version").fetchone()[0],
+                        version,
+                    )
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM schema_migrations"
+                        ).fetchone()[0],
+                        version,
+                    )
+                    trigger_sql = connection.execute(
+                        "SELECT sql FROM sqlite_master "
+                        "WHERE type = 'trigger' AND name = ?",
+                        (trigger_name,),
+                    ).fetchone()[0]
+                    self.assertIn("WHEN 0 BEGIN SELECT 1", trigger_sql)
+                finally:
+                    connection.close()
+
     def test_nonempty_v20_dag_kernel_rebuild_preserves_exact_rows_and_advances(
         self,
     ) -> None:
